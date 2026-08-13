@@ -1,0 +1,346 @@
+package main;
+
+use gomlang::quickjs::runtime;
+use std::fs;
+use std::testing;
+use std::text;
+
+#[test]
+fn parses_eval_file_help_and_stdin_commands() -> unit {
+    match parse_command(Vec::["qjs"]) {
+        Ok(Command::Stdin(_)) => (),
+        _ => testing::fail("expected stdin command"),
+    };
+    match parse_command(Vec::["qjs", "-e", "return 1;"]) {
+        Ok(Command::Evaluate(source, arguments, _)) => {
+            testing::assert_eq(source, "return 1;");
+            testing::assert(arguments.is_empty())
+        },
+        _ => testing::fail("expected eval command"),
+    };
+    match parse_command(Vec::["qjs", "input.js"]) {
+        Ok(Command::File(path, arguments, _)) => {
+            testing::assert_eq(path, "input.js");
+            testing::assert_eq(arguments.len(), 1);
+            testing::assert_eq(arguments[0], "input.js")
+        },
+        _ => testing::fail("expected file command"),
+    };
+    match parse_command(Vec::["qjs", "--help"]) {
+        Ok(Command::Help) => (),
+        _ => testing::fail("expected help command"),
+    }
+}
+
+#[test]
+fn rejects_invalid_command_lines() -> unit {
+    testing::assert(parse_command(Vec::["qjs", "--missing"]).is_err());
+    testing::assert(parse_command(Vec::["qjs", "-e"]).is_err());
+    testing::assert(parse_command(Vec::["qjs", "-I"]).is_err());
+    match parse_command(Vec::["qjs", "one.js", "two.js"]) {
+        Ok(Command::File(_, arguments, _)) => {
+            testing::assert_eq(arguments.len(), 2);
+            testing::assert_eq(arguments[1], "two.js")
+        },
+        _ => testing::fail("expected file arguments"),
+    }
+}
+
+#[test]
+fn parses_module_script_strict_include_std_and_quit_options() -> unit {
+    match parse_command(
+        Vec::["qjs", "--strict", "-I", "setup.js", "--std", "-m", "input.js", "argument"],
+    ) {
+        Ok(Command::File(path, arguments, options)) => {
+            testing::assert_eq(path, "input.js");
+            testing::assert_eq(arguments.len(), 2);
+            testing::assert_eq(arguments[0], "input.js");
+            testing::assert_eq(arguments[1], "argument");
+            testing::assert(options.mode == SourceMode::Module);
+            testing::assert(options.strict);
+            testing::assert_eq(options.includes.len(), 1);
+            testing::assert_eq(options.includes[0], "setup.js")
+        },
+        _ => testing::fail("expected configured file command"),
+    };
+    match parse_command(Vec::["qjs", "-m", "--script", "-e", "return 1;"]) {
+        Ok(Command::Evaluate(_, _, options)) => {
+            testing::assert(options.mode == SourceMode::Script)
+        },
+        _ => testing::fail("expected forced script command"),
+    };
+    match parse_command(Vec::["qjs", "--", "-input.js", "argument"]) {
+        Ok(Command::File(path, arguments, _)) => {
+            testing::assert_eq(path, "-input.js");
+            testing::assert_eq(arguments.len(), 2);
+            testing::assert_eq(arguments[0], "-input.js");
+            testing::assert_eq(arguments[1], "argument")
+        },
+        _ => testing::fail("expected option-terminated file command"),
+    };
+    match parse_command(Vec::["qjs", "-q"]) {
+        Ok(Command::Quit) => (),
+        _ => testing::fail("expected quit command"),
+    }
+}
+
+#[test]
+fn executes_includes_before_strict_main_and_defers_jobs_until_main() -> unit {
+    let path = "__gomlquickjs_qjs_include_780d__.js";
+    match fs::write_file(
+        path,
+        "globalThis.includeValue = 40; Promise.resolve().then(function() { includeValue += 1; });",
+    ) {
+        Ok(()) => (),
+        Err(message) => testing::fail(message),
+    };
+    let options = ExecutionOptions { mode: SourceMode::Script, strict: true, includes: Vec::[path] };
+    let result = run(
+        Command::Evaluate(
+            "if (includeValue !== 40) throw 'include jobs ran early'; if ((function() { return this; })() !== undefined) throw 'script is not strict'; Promise.resolve().then(function() { if (includeValue !== 41) throw 'include job did not run'; });",
+            Vec::[],
+            options,
+        ),
+    );
+    let _ = fs::remove_file(path);
+    match result {
+        Ok(()) => (),
+        Err(message) => testing::fail(message),
+    }
+}
+
+#[test]
+fn forced_module_eval_supports_await_and_forced_script_rejects_it() -> unit {
+    match run(
+        Command::Evaluate(
+            "let value = await Promise.resolve(42); if (value !== 42) throw value;",
+            Vec::[],
+            ExecutionOptions { mode: SourceMode::Module, strict: false, includes: Vec::[] },
+        ),
+    ) {
+        Ok(()) => (),
+        Err(message) => testing::fail(message),
+    };
+    match run(
+        Command::Evaluate(
+            "export let value = await Promise.resolve(42);",
+            Vec::[],
+            default_execution_options(),
+        ),
+    ) {
+        Ok(()) => (),
+        Err(message) => testing::fail(message),
+    };
+    testing::assert(
+        run(
+            Command::Evaluate(
+                "await Promise.resolve(42);",
+                Vec::[],
+                ExecutionOptions { mode: SourceMode::Script, strict: false, includes: Vec::[] },
+            ),
+        ).is_err(),
+    );
+    match run(Command::Quit) {
+        Ok(()) => (),
+        Err(message) => testing::fail(message),
+    }
+}
+
+#[test]
+fn executes_source_through_compiler_and_vm() -> unit {
+    match execute_source("return 6 * 7;") {
+        Ok(runtime::Value::Float(value)) => testing::assert_eq(value, 42.0),
+        Ok(runtime::Value::Int(value)) => testing::assert_eq(value, 42),
+        _ => testing::fail("expected numeric result"),
+    }
+}
+
+#[test]
+fn eval_source_functions_expose_cmdline_metadata() -> unit {
+    match execute_source(
+        "function f(){} return f.fileName + '|' + f.lineNumber + '|' + f.columnNumber;",
+    ) {
+        Ok(value) => expect_host_string(value, "<cmdline>|1|1"),
+        Err(value) => testing::fail(value),
+    };
+    match execute_source_with_arguments_at_path(
+        "function f(){} return f.fileName;",
+        Vec::[],
+        Option::Some("named.js"),
+    ) {
+        Ok(value) => expect_host_string(value, "named.js"),
+        Err(value) => testing::fail(value),
+    }
+}
+
+#[test]
+fn renders_recoverable_compile_diagnostics() -> unit {
+    match execute_source("missing; let = ;") {
+        Err(message) => {
+            testing::assert(text::find(message, "expected variable name").is_some())
+        },
+        Ok(_) => testing::fail("expected compile diagnostics"),
+    }
+}
+
+#[test]
+fn renders_uncaught_error_stack_diagnostics() -> unit {
+    match execute_source("function fail() { throw new TypeError('broken'); } fail();") {
+        Err(message) => {
+            testing::assert(text::find(message, "Thrown(").is_some());
+            testing::assert(text::find(message, "at <cmdline>").is_some())
+        },
+        Ok(_) => testing::fail("expected uncaught runtime diagnostics"),
+    }
+}
+
+#[test]
+fn executes_math_builtins_from_source() -> unit {
+    match execute_source("return Math.max(6, 7) * Math.sqrt(36);") {
+        Ok(runtime::Value::Float(value)) => testing::assert_eq(value, 42.0),
+        Ok(runtime::Value::Int(value)) => testing::assert_eq(value, 42),
+        _ => testing::fail("expected builtin numeric result"),
+    }
+}
+
+#[test]
+fn exposes_eval_and_file_script_arguments() -> unit {
+    match execute_source_with_arguments("return scriptArgs.join('|');", Vec::["alpha", "beta"]) {
+        Ok(value) => expect_host_string(value, "alpha|beta"),
+        Err(value) => testing::fail(value),
+    };
+    match parse_command(Vec::["qjs", "-e", "return 1;", "left", "right"]) {
+        Ok(Command::Evaluate(_, arguments, _)) => {
+            testing::assert_eq(arguments.len(), 2);
+            testing::assert_eq(arguments[0], "left");
+            testing::assert_eq(arguments[1], "right")
+        },
+        _ => testing::fail("expected eval script arguments"),
+    }
+}
+
+#[test]
+fn executes_json_builtins_from_source() -> unit {
+    match execute_source("return JSON.stringify(JSON.parse('{\"value\":42}'));") {
+        Ok(runtime::Value::String(value)) => match value.to_host_string() {
+            Ok(value) => testing::assert_eq(value, "{\"value\":42}"),
+            Err(value) => testing::fail(value.debug()),
+        },
+        _ => testing::fail("expected JSON source result"),
+    }
+}
+
+fn expect_host_string(value: runtime::Value, expected: string) -> unit {
+    match value {
+        runtime::Value::String(value) => match value.to_host_string() {
+            Ok(value) => testing::assert_eq(value, expected),
+            Err(value) => testing::fail(value.debug()),
+        },
+        _ => testing::fail("expected string result"),
+    }
+}
+
+#[test]
+fn executes_bigint_regexp_uri_and_date_builtins_from_source() -> unit {
+    match execute_source("return String(2n ** 100n);") {
+        Ok(value) => expect_host_string(value, "1267650600228229401496703205376"),
+        Err(value) => testing::fail(value),
+    };
+    match execute_source("return RegExp('a+', 'g').test('caa');") {
+        Ok(runtime::Value::Bool(value)) => testing::assert(value),
+        Ok(_) => testing::fail("expected RegExp result"),
+        Err(value) => testing::fail(value),
+    };
+    match execute_source("return decodeURIComponent(encodeURIComponent('a/😀'));") {
+        Ok(value) => expect_host_string(value, "a/😀"),
+        Err(value) => testing::fail(value),
+    };
+    match execute_source("return Date.toISOString(Date.UTC(2000, 1, 30));") {
+        Ok(value) => expect_host_string(value, "2000-03-01T00:00:00.000Z"),
+        Err(value) => testing::fail(value),
+    }
+}
+
+#[test]
+fn executes_symbol_buffer_error_and_promise_builtins_from_source() -> unit {
+    match execute_source("return Symbol.keyFor(Symbol.for('shared'));") {
+        Ok(value) => expect_host_string(value, "shared"),
+        Err(value) => testing::fail(value),
+    };
+    match execute_source(
+        "let buffer = new ArrayBuffer(4); let view = new DataView(buffer); view.setUint32(0, 305419896); return view.getUint32(0);",
+    ) {
+        Ok(runtime::Value::Float(value)) => testing::assert_eq(value, 305419896.0),
+        Ok(runtime::Value::Int(value)) => testing::assert_eq(value, 305419896),
+        Err(value) => testing::fail(value),
+        _ => testing::fail("expected DataView result"),
+    };
+    match execute_source(
+        "try { throw TypeError('broken'); } catch (error) { return error.name + ': ' + error.message; }",
+    ) {
+        Ok(value) => expect_host_string(value, "TypeError: broken"),
+        Err(value) => testing::fail(value),
+    };
+    match execute_source(
+        "let result = 0; Promise.resolve(41).then(function(value) { result = value + 1; }); Promise.drainJobs(); return result;",
+    ) {
+        Ok(runtime::Value::Float(value)) => testing::assert_eq(value, 42.0),
+        Ok(runtime::Value::Int(value)) => testing::assert_eq(value, 42),
+        Err(value) => testing::fail(value),
+        _ => testing::fail("expected Promise result"),
+    }
+}
+
+#[test]
+fn drains_host_jobs_after_top_level_execution() -> unit {
+    match execute_source(
+        "os.setTimeout(function(value) { if (value !== 42) throw TypeError('wrong timer value'); }, 0, 42); return os.platform;",
+    ) {
+        Ok(value) => expect_host_string(value, "linux"),
+        Err(value) => testing::fail(value),
+    };
+    match execute_source("os.setTimeout(function() { throw TypeError('timer ran'); }, 0);") {
+        Ok(_) => testing::fail("expected queued timer failure"),
+        Err(_) => (),
+    };
+    match execute_source(
+        "let timer = os.setTimeout(function() { throw TypeError('cancelled timer ran'); }, 0); os.clearTimeout(timer);",
+    ) {
+        Ok(_) => (),
+        Err(value) => testing::fail(value),
+    }
+}
+
+#[test]
+fn drains_promise_jobs_before_timer_jobs() -> unit {
+    match execute_source(
+        "let count = 0; Promise.resolve().then(function() { std.gc(); }); Promise.reject().catch(function() { count += 1; }); Promise.reject().catch(function() { count += 1; }); Promise.resolve().then(function() { count += 1; }); os.setTimeout(function() { if (count !== 3) throw TypeError('timer ran before promise jobs'); }, 0);",
+    ) {
+        Ok(_) => (),
+        Err(value) => testing::fail(value),
+    }
+}
+
+#[test]
+fn mjs_files_execute_as_modules_with_top_level_await() -> unit {
+    let path = "__gomlquickjs_qjs_tla_8c41__.mjs";
+    match fs::write_file(path, "await Promise.resolve(42);") {
+        Ok(()) => (),
+        Err(message) => testing::fail(message),
+    };
+    match run(Command::File(path, Vec::[path], default_execution_options())) {
+        Ok(()) => (),
+        Err(message) => testing::fail(message),
+    };
+    let _ = fs::remove_file(path);
+}
+
+#[test]
+fn dispatches_pipe_read_and_write_handlers() -> unit {
+    match execute_source(
+        "let completed = 0; let pairs = []; function readHandler(descriptor, index) { let buffer = new Uint32Array(1); let count = os.read(descriptor, buffer.buffer, 0, 4); if (count !== 4 || buffer[0] !== index) throw 'wrong pipe value: ' + index + '/' + count + '/' + buffer[0]; os.setReadHandler(descriptor, null); completed += 1; } function writeHandler(descriptor, index) { let buffer = new Uint32Array(1); buffer[0] = index; os.write(descriptor, buffer.buffer, 0, 4); os.setWriteHandler(descriptor, null); if (index === 0) os.setTimeout(function() { if (completed !== 8) throw 'pipe handlers did not finish: ' + completed; }, 0); } for (let i = 0; i < 8; i++) { let pair = os.pipe(); pairs.push(pair); os.setReadHandler(pair[0], readHandler.bind(null, pair[0], i)); } for (let i = 7; i >= 0; i--) { let pair = pairs[i]; os.setWriteHandler(pair[1], writeHandler.bind(null, pair[1], i)); }",
+    ) {
+        Ok(_) => (),
+        Err(value) => testing::fail(value),
+    }
+}

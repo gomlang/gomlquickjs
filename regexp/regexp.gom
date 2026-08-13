@@ -1,0 +1,2479 @@
+package regexp;
+
+use gomlang::quickjs::runtime;
+use gomlang::quickjs::unicode;
+
+const MAX_NESTING: int = 256;
+
+const MAX_REPEAT: int = 100000;
+
+const MAX_CAPTURES: int = 255;
+
+#[derive(PartialEq, Eq, Debug)]
+pub struct RegexError {
+    pub message: string,
+    pub offset: int,
+}
+
+#[derive(PartialEq, Eq, Debug)]
+pub struct RegexCapture {
+    pub start: int,
+    pub end: int,
+}
+
+#[derive(PartialEq, Eq)]
+pub struct RegexMatch {
+    pub start: int,
+    pub end: int,
+    pub captures: Vec[Option[RegexCapture]],
+}
+
+impl Debug for RegexMatch {
+    fn debug(self: RegexMatch) -> string {
+        "RegexMatch(" + self.start.to_string() + ", " + self.end.to_string() + ", "
+            + (self.captures.len() - 1).to_string()
+            + " captures)"
+    }
+}
+
+impl RegexMatch {
+    pub fn capture_count(self: RegexMatch) -> int {
+        self.captures.len() - 1
+    }
+
+    pub fn capture(self: RegexMatch, index: int) -> Option[RegexCapture] {
+        if index < 0 || index >= self.captures.len() {
+            Option::None
+        } else {
+            self.captures[index]
+        }
+    }
+}
+
+struct Quantifier {
+    minimum: int,
+    maximum: Option[int],
+    greedy: bool,
+}
+
+enum Node {
+    Empty,
+    Literal(uint32),
+    Any,
+    Start,
+    End,
+    WordBoundary(bool),
+    Class(unicode::CharRange, bool),
+    ClassSet(unicode::CharRange, Vec[runtime::JsString]),
+    Sequence(Vec[int]),
+    Alternation(Vec[int]),
+    Repeat(int, int, Option[int], bool),
+    Capture(int, int),
+    BackReference(Vec[int]),
+    LookAhead(int, bool),
+    LookBehind(int, bool),
+    Group(int),
+    ScopedFlags(int, RegexFlags),
+}
+
+fn unicode_mode(flags: RegexFlags) -> bool {
+    flags.unicode || flags.unicode_sets
+}
+
+pub struct Regex {
+    nodes: Vec[Node],
+    root: int,
+    flags: RegexFlags,
+    canonicalizer: unicode::CaseCanonicalizer,
+    capture_count: int,
+    capture_names: Vec[Option[runtime::JsString]],
+}
+
+struct Parser {
+    pattern: runtime::JsString,
+    flags: Ref[RegexFlags],
+    canonicalizer: unicode::CaseCanonicalizer,
+    index: Ref[int],
+    depth: Ref[int],
+    capture_count: Ref[int],
+    total_captures: int,
+    capture_names: Vec[Option[runtime::JsString]],
+    nodes: Vec[Node],
+}
+
+struct CaptureMetadata {
+    count: int,
+    names: Vec[Option[runtime::JsString]],
+}
+
+fn regex_error(message: string, offset: int) -> RegexError {
+    RegexError { message, offset }
+}
+
+fn parser_new(pattern: runtime::JsString, flags: RegexFlags, metadata: CaptureMetadata) -> Parser {
+    Parser {
+        pattern,
+        flags: Ref::new(flags),
+        canonicalizer: unicode::CaseCanonicalizer::new(unicode_mode(flags)),
+        index: Ref::new(0),
+        depth: Ref::new(0),
+        capture_count: Ref::new(0),
+        total_captures: metadata.count,
+        capture_names: metadata.names,
+        nodes: Vec::[],
+    }
+}
+
+fn parser_at_end(parser: Parser) -> bool {
+    parser.index.get() >= parser.pattern.len()
+}
+
+fn parser_current(parser: Parser) -> Option[uint16] {
+    if parser_at_end(parser) {
+        Option::None
+    } else {
+        Option::Some(parser.pattern.get(parser.index.get()))
+    }
+}
+
+fn parser_peek(parser: Parser, distance: int) -> Option[uint16] {
+    let index = parser.index.get() + distance;
+    if index < 0 || index >= parser.pattern.len() {
+        Option::None
+    } else {
+        Option::Some(parser.pattern.get(index))
+    }
+}
+
+fn parser_advance(parser: Parser) -> Option[uint16] {
+    match parser_current(parser) {
+        Some(value) => {
+            parser.index.set(parser.index.get() + 1);
+            Option::Some(value)
+        },
+        None => Option::None,
+    }
+}
+
+fn parser_consume(parser: Parser, expected: uint16) -> bool {
+    match parser_current(parser) {
+        Some(value) => {
+            if value == expected {
+                parser.index.set(parser.index.get() + 1);
+                true
+            } else {
+                false
+            }
+        },
+        None => false,
+    }
+}
+
+fn parser_push_node(parser: Parser, node: Node) -> int {
+    let index = parser.nodes.len();
+    parser.nodes.push(node);
+    index
+}
+
+fn is_decimal_digit(value: uint16) -> bool {
+    value >= 48 && value <= 57
+}
+
+fn group_hex_digit(value: uint16) -> Option[uint32] {
+    if value >= 48 && value <= 57 {
+        Option::Some((value - 48).to_uint32())
+    } else if value >= 65 && value <= 70 {
+        Option::Some((value - 55).to_uint32())
+    } else if value >= 97 && value <= 102 {
+        Option::Some((value - 87).to_uint32())
+    } else {
+        Option::None
+    }
+}
+
+fn parse_group_fixed_escape(pattern: runtime::JsString, start: int) -> Result[
+    (uint32, int),
+    RegexError,
+] {
+    if start + 6 > pattern.len() || pattern.get(start) != 92 || pattern.get(start + 1) != 117 {
+        return Result::Err(regex_error("invalid group name escape", start))
+    } else {};
+    let mut value: uint32 = 0;
+    let mut index = start + 2;
+    while index < start + 6 {
+        let digit = match group_hex_digit(pattern.get(index)) {
+            Some(value) => value,
+            None => return Result::Err(regex_error("invalid group name escape", start)),
+        };
+        value = value * 16 + digit;
+        index += 1;
+    }
+    Result::Ok((value, index))
+}
+
+fn parse_group_unicode_escape(pattern: runtime::JsString, start: int) -> Result[
+    (uint32, int),
+    RegexError,
+] {
+    if start + 2 > pattern.len() || pattern.get(start) != 92 || pattern.get(start + 1) != 117 {
+        return Result::Err(regex_error("invalid group name escape", start))
+    } else {};
+    if start + 2 < pattern.len() && pattern.get(start + 2) == 123 {
+        let mut value: uint32 = 0;
+        let mut index = start + 3;
+        let mut any = false;
+        while index < pattern.len() && pattern.get(index) != 125 {
+            let digit = match group_hex_digit(pattern.get(index)) {
+                Some(value) => value,
+                None => return Result::Err(regex_error("invalid group name escape", start)),
+            };
+            if value > (0x10ffff - digit) / 16 {
+                return Result::Err(regex_error("group name escape is out of range", start))
+            } else {};
+            value = value * 16 + digit;
+            any = true;
+            index += 1;
+        }
+        if !any || index >= pattern.len() {
+            Result::Err(regex_error("unterminated group name escape", start))
+        } else {
+            Result::Ok((value, index + 1))
+        }
+    } else {
+        let (first, next) = parse_group_fixed_escape(pattern, start)?;
+        if first >= 0xd800 && first <= 0xdbff && next + 6 <= pattern.len()
+            && pattern.get(next) == 92
+            && pattern.get(next + 1) == 117 {
+            let (second, end) = parse_group_fixed_escape(pattern, next)?;
+            if second >= 0xdc00 && second <= 0xdfff {
+                Result::Ok((0x10000 + ((first - 0xd800) << 10) + second - 0xdc00, end))
+            } else {
+                Result::Ok((first, next))
+            }
+        } else {
+            Result::Ok((first, next))
+        }
+    }
+}
+
+fn group_identifier_start(tables: unicode::IdentifierTables, value: uint32) -> bool {
+    value == 36 || value == 95 || tables.is_start(value)
+}
+
+fn group_identifier_continue(tables: unicode::IdentifierTables, value: uint32) -> bool {
+    value == 36 || value == 95 || value == 0x200c || value == 0x200d || tables.is_continue(value)
+}
+
+fn append_group_code_point(output: Vec[uint16], value: uint32, offset: int) -> Result[
+    unit,
+    RegexError,
+] {
+    if value > 0x10ffff || (value >= 0xd800 && value <= 0xdfff) {
+        Result::Err(regex_error("invalid group name code point", offset))
+    } else if value <= 0xffff {
+        output.push(value.to_uint16());
+        Result::Ok(())
+    } else {
+        let scalar = value - 0x10000;
+        output.push((0xd800 + (scalar >> 10)).to_uint16());
+        output.push((0xdc00 + (scalar & 0x3ff)).to_uint16());
+        Result::Ok(())
+    }
+}
+
+fn parse_group_name(pattern: runtime::JsString, start: int) -> Result[
+    (runtime::JsString, int),
+    RegexError,
+] {
+    let tables = unicode::IdentifierTables::new();
+    let output: Vec[uint16] = Vec::[];
+    let mut index = start;
+    let mut first = true;
+    while index < pattern.len() {
+        if pattern.get(index) == 62 {
+            if first {
+                return Result::Err(regex_error("group name is empty", start))
+            } else {
+                return Result::Ok((runtime::JsString::from_code_units(output), index + 1))
+            }
+        } else {};
+        let offset = index;
+        let (value, next) = if pattern.get(index) == 92 {
+            parse_group_unicode_escape(pattern, index)?
+        } else {
+            let first_unit = pattern.get(index).to_uint32();
+            if first_unit >= 0xd800 && first_unit <= 0xdbff && index + 1 < pattern.len() {
+                let second = pattern.get(index + 1).to_uint32();
+                if second >= 0xdc00 && second <= 0xdfff {
+                    (0x10000 + ((first_unit - 0xd800) << 10) + second - 0xdc00, index + 2)
+                } else {
+                    (first_unit, index + 1)
+                }
+            } else {
+                (first_unit, index + 1)
+            }
+        };
+        let valid = if first {
+            group_identifier_start(tables, value)
+        } else {
+            group_identifier_continue(tables, value)
+        };
+        if !valid {
+            return Result::Err(regex_error("invalid group name", offset))
+        } else {};
+        append_group_code_point(output, value, offset)?;
+        first = false;
+        index = next;
+    }
+    Result::Err(regex_error("unterminated group name", start))
+}
+
+fn find_capture_names(names: Vec[Option[runtime::JsString]], name: runtime::JsString) -> Vec[int] {
+    let matches: Vec[int] = Vec::[];
+    let mut index = 1;
+    while index < names.len() {
+        match names[index] {
+            Some(value) => if value == name {
+                matches.push(index)
+            } else {},
+            None => {},
+        };
+        index += 1;
+    }
+    matches
+}
+
+fn has_capture_names(names: Vec[Option[runtime::JsString]]) -> bool {
+    let mut index = 1;
+    while index < names.len() {
+        if names[index].is_some() {
+            return true
+        } else {};
+        index += 1;
+    }
+    false
+}
+
+fn capture_metadata(pattern: runtime::JsString) -> Result[CaptureMetadata, RegexError] {
+    let mut index = 0;
+    let mut in_class = false;
+    let mut count = 0;
+    let mut alternative_scope = 0;
+    let names: Vec[Option[runtime::JsString]] = Vec::[Option::None];
+    let name_scopes: Vec[int] = Vec::[0];
+    while index < pattern.len() {
+        let current = pattern.get(index);
+        if current == 92 {
+            index += 2;
+        } else if in_class {
+            if current == 93 {
+                in_class = false;
+            } else {};
+            index += 1;
+        } else if current == 91 {
+            in_class = true;
+            index += 1;
+        } else if current == 40 {
+            let special = index + 1 < pattern.len() && pattern.get(index + 1) == 63;
+            let named = special && index + 3 < pattern.len() && pattern.get(index + 2) == 60
+                && pattern.get(index + 3) != 61
+                && pattern.get(index + 3) != 33;
+            if !special || named {
+                count += 1;
+                if count > MAX_CAPTURES {
+                    return Result::Err(regex_error("too many capture groups", index))
+                } else {};
+                if named {
+                    let (name, end) = parse_group_name(pattern, index + 3)?;
+                    let matches = find_capture_names(names, name);
+                    let mut match_index = 0;
+                    while match_index < matches.len() {
+                        let capture_index = matches[match_index];
+                        if name_scopes[capture_index] == alternative_scope {
+                            return Result::Err(regex_error("duplicate group name", index + 3))
+                        } else {};
+                        match_index += 1;
+                    }
+                    names.push(Option::Some(name));
+                    name_scopes.push(alternative_scope);
+                    index = end - 1;
+                } else {
+                    names.push(Option::None);
+                    name_scopes.push(alternative_scope)
+                }
+            } else {};
+            index += 1;
+        } else if current == 124 {
+            alternative_scope += 1;
+            index += 1;
+        } else {
+            index += 1;
+        }
+    }
+    Result::Ok(CaptureMetadata { count, names })
+}
+
+fn parser_starts_counted_quantifier(parser: Parser) -> bool {
+    match parser_current(parser) {
+        Some(123) => parser_starts_counted_quantifier_at(parser, parser.index.get()),
+        _ => false,
+    }
+}
+
+fn parse_decimal_count(parser: Parser) -> Result[int, RegexError] {
+    let start = parser.index.get();
+    let mut value = 0;
+    let mut any = false;
+    while !parser_at_end(parser) {
+        let current = parser.pattern.get(parser.index.get());
+        if !is_decimal_digit(current) {
+            break
+        } else {};
+        any = true;
+        let digit = (current - 48).to_int();
+        if value > (MAX_REPEAT - digit) / 10 {
+            return Result::Err(regex_error("quantifier exceeds implementation limit", start))
+        } else {};
+        value = value * 10 + digit;
+        parser.index.set(parser.index.get() + 1)
+    }
+    if !any {
+        Result::Err(regex_error("expected decimal repetition count", start))
+    } else {
+        Result::Ok(value)
+    }
+}
+
+enum DecimalEscape {
+    BackReference(int),
+    Literal(uint32),
+}
+
+fn parse_legacy_octal(parser: Parser, first: uint16) -> uint32 {
+    let mut value = (first - 48).to_uint32();
+    let maximum_digits = if first <= 51 {
+        3
+    } else {
+        2
+    };
+    let mut count = 1;
+    while count < maximum_digits {
+        match parser_current(parser) {
+            Some(current) => if current >= 48 && current <= 55 {
+                value = value * 8 + (current - 48).to_uint32();
+                parser_advance(parser);
+                count += 1;
+            } else {
+                break
+            },
+            None => break,
+        }
+    }
+    value
+}
+
+fn parse_decimal_escape(parser: Parser, offset: int) -> Result[DecimalEscape, RegexError] {
+    let start = parser.index.get();
+    let mut value = 0;
+    let mut overflow = false;
+    while !parser_at_end(parser) {
+        let current = parser.pattern.get(parser.index.get());
+        if !is_decimal_digit(current) {
+            break
+        } else {};
+        let digit = (current - 48).to_int();
+        if value > (MAX_CAPTURES - digit) / 10 {
+            overflow = true;
+        } else if !overflow {
+            value = value * 10 + digit;
+        } else {};
+        parser.index.set(parser.index.get() + 1)
+    }
+    if !overflow && value > 0 && value <= parser.total_captures {
+        Result::Ok(DecimalEscape::BackReference(value))
+    } else if unicode_mode(parser.flags.get()) {
+        Result::Err(regex_error("backreference is out of range", offset))
+    } else {
+        parser.index.set(start);
+        let first = parser_advance(parser).unwrap_or(48);
+        if first >= 49 && first <= 55 {
+            Result::Ok(DecimalEscape::Literal(parse_legacy_octal(parser, first)))
+        } else {
+            Result::Ok(DecimalEscape::Literal(first.to_uint32()))
+        }
+    }
+}
+
+enum ClassUnit {
+    Single(uint32),
+    Set(unicode::CharRange),
+}
+
+struct ClassSet {
+    range: unicode::CharRange,
+    strings: Vec[runtime::JsString],
+}
+
+struct ClassSetOperand {
+    value: ClassSet,
+    single: Option[uint32],
+    offset: int,
+}
+
+fn class_set_empty() -> ClassSet {
+    ClassSet { range: unicode::CharRange::new(), strings: Vec::[] }
+}
+
+fn class_set_contains_string(values: Vec[runtime::JsString], value: runtime::JsString) -> bool {
+    for current in values {
+        if current == value {
+            return true
+        } else {}
+    }
+    false
+}
+
+fn class_set_add_string(values: Vec[runtime::JsString], value: runtime::JsString) -> unit {
+    if !class_set_contains_string(values, value) {
+        values.push(value)
+    } else {}
+}
+
+fn class_set_union(left: ClassSet, right: ClassSet) -> ClassSet {
+    let strings = left.strings;
+    for value in right.strings {
+        class_set_add_string(strings, value)
+    }
+    ClassSet { range: left.range.union(right.range), strings }
+}
+
+fn class_set_intersection(left: ClassSet, right: ClassSet) -> ClassSet {
+    let strings: Vec[runtime::JsString] = Vec::[];
+    for value in left.strings {
+        if class_set_contains_string(right.strings, value) {
+            strings.push(value)
+        } else {}
+    }
+    ClassSet { range: left.range.intersection(right.range), strings }
+}
+
+fn class_set_difference(left: ClassSet, right: ClassSet) -> ClassSet {
+    let strings: Vec[runtime::JsString] = Vec::[];
+    for value in left.strings {
+        if !class_set_contains_string(right.strings, value) {
+            strings.push(value)
+        } else {}
+    }
+    ClassSet { range: left.range.difference(right.range), strings }
+}
+
+fn add_known_range(range: unicode::CharRange, first: uint32, last: uint32) -> unit {
+    match range.add_range(first, last) {
+        Ok(()) => (),
+        Err(_) => (),
+    }
+}
+
+fn digit_class() -> unicode::CharRange {
+    let range = unicode::CharRange::new();
+    add_known_range(range, 48, 57);
+    range
+}
+
+fn word_class() -> unicode::CharRange {
+    let range = digit_class();
+    add_known_range(range, 65, 90);
+    add_known_range(range, 95, 95);
+    add_known_range(range, 97, 122);
+    range
+}
+
+fn space_class() -> unicode::CharRange {
+    let range = unicode::CharRange::new();
+    add_known_range(range, 0x0009, 0x000d);
+    add_known_range(range, 0x0020, 0x0020);
+    add_known_range(range, 0x00a0, 0x00a0);
+    add_known_range(range, 0x1680, 0x1680);
+    add_known_range(range, 0x2000, 0x200a);
+    add_known_range(range, 0x2028, 0x2029);
+    add_known_range(range, 0x202f, 0x202f);
+    add_known_range(range, 0x205f, 0x205f);
+    add_known_range(range, 0x3000, 0x3000);
+    add_known_range(range, 0xfeff, 0xfeff);
+    range
+}
+
+struct EscapedClass {
+    range: unicode::CharRange,
+    negated: bool,
+}
+
+fn escaped_class(value: uint16) -> Option[EscapedClass] {
+    if value == 100 {
+        Option::Some(EscapedClass { range: digit_class(), negated: false })
+    } else if value == 68 {
+        Option::Some(EscapedClass { range: digit_class(), negated: true })
+    } else if value == 119 {
+        Option::Some(EscapedClass { range: word_class(), negated: false })
+    } else if value == 87 {
+        Option::Some(EscapedClass { range: word_class(), negated: true })
+    } else if value == 115 {
+        Option::Some(EscapedClass { range: space_class(), negated: false })
+    } else if value == 83 {
+        Option::Some(EscapedClass { range: space_class(), negated: true })
+    } else {
+        Option::None
+    }
+}
+
+fn hex_digit(value: uint16) -> Option[uint16] {
+    if value >= 48 && value <= 57 {
+        Option::Some(value - 48)
+    } else if value >= 65 && value <= 70 {
+        Option::Some(value - 55)
+    } else if value >= 97 && value <= 102 {
+        Option::Some(value - 87)
+    } else {
+        Option::None
+    }
+}
+
+fn parse_fixed_hex(parser: Parser, digits: int, offset: int) -> Result[uint32, RegexError] {
+    let mut value: uint32 = 0;
+    let mut index = 0;
+    while index < digits {
+        let current = match parser_advance(parser) {
+            Some(current) => current,
+            None => return Result::Err(regex_error("unterminated hexadecimal escape", offset)),
+        };
+        let digit = match hex_digit(current) {
+            Some(digit) => digit,
+            None => return Result::Err(regex_error("invalid hexadecimal escape", offset)),
+        };
+        value = value * 16 + digit.to_uint32();
+        index += 1;
+    }
+    Result::Ok(value)
+}
+
+fn parse_unicode_code_point_escape(parser: Parser, offset: int) -> Result[uint32, RegexError] {
+    parser_advance(parser);
+    let mut value: uint32 = 0;
+    let mut any = false;
+    while !parser_at_end(parser) && parser_current(parser) != Option::Some(125) {
+        let digit = match hex_digit(parser_current(parser).unwrap_or(0)) {
+            Some(value) => value.to_uint32(),
+            None => return Result::Err(regex_error("invalid Unicode code point escape", offset)),
+        };
+        if value > (0x10ffff - digit) / 16 {
+            return Result::Err(regex_error("Unicode code point escape is out of range", offset))
+        } else {};
+        value = value * 16 + digit;
+        any = true;
+        parser_advance(parser);
+    }
+    if !any || !parser_consume(parser, 125) {
+        Result::Err(regex_error("unterminated Unicode code point escape", offset))
+    } else {
+        Result::Ok(value)
+    }
+}
+
+fn parse_character_escape(parser: Parser, offset: int, in_class: bool) -> Result[uint32, RegexError] {
+    let value = match parser_advance(parser) {
+        Some(value) => value,
+        None => return Result::Err(regex_error("unterminated escape sequence", offset)),
+    };
+    if value == 110 {
+        Result::Ok(10)
+    } else if value == 114 {
+        Result::Ok(13)
+    } else if value == 116 {
+        Result::Ok(9)
+    } else if value == 102 {
+        Result::Ok(12)
+    } else if value == 118 {
+        Result::Ok(11)
+    } else if value == 98 && in_class {
+        Result::Ok(8)
+    } else if value == 120 {
+        parse_fixed_hex(parser, 2, offset)
+    } else if value == 117 {
+        if unicode_mode(parser.flags.get()) && parser_current(parser) == Option::Some(123) {
+            parse_unicode_code_point_escape(parser, offset)
+        } else {
+            parse_fixed_hex(parser, 4, offset)
+        }
+    } else if value == 99 {
+        let control = match parser_advance(parser) {
+            Some(control) => control,
+            None => return Result::Err(regex_error("unterminated control escape", offset)),
+        };
+        if (control >= 65 && control <= 90) || (control >= 97 && control <= 122) {
+            Result::Ok((control & 31).to_uint32())
+        } else if in_class && !unicode_mode(parser.flags.get())
+            && ((control >= 48 && control <= 57) || control == 95) {
+            Result::Ok((control & 31).to_uint32())
+        } else {
+            Result::Err(regex_error("invalid control escape", offset))
+        }
+    } else if value == 48 {
+        if unicode_mode(parser.flags.get())
+            && match parser_current(parser) {
+                Some(next) => is_decimal_digit(next),
+                None => false,
+            } {
+            Result::Err(regex_error("invalid decimal escape in regular expression", offset))
+        } else if unicode_mode(parser.flags.get()) {
+            Result::Ok(0)
+        } else {
+            Result::Ok(parse_legacy_octal(parser, value))
+        }
+    } else if in_class && value >= 49 && value <= 55 {
+        if unicode_mode(parser.flags.get()) {
+            Result::Err(regex_error("invalid decimal escape in regular expression", offset))
+        } else {
+            Result::Ok(parse_legacy_octal(parser, value))
+        }
+    } else if value == 10 || value == 13 || value == 0x2028 || value == 0x2029 {
+        Result::Err(regex_error("line terminator in escape sequence", offset))
+    } else if unicode_mode(parser.flags.get())
+        && ((value >= 48 && value <= 57) || (value >= 65 && value <= 90)
+            || (value >= 97 && value <= 122)) {
+        Result::Err(regex_error("invalid identity escape in unicode mode", offset))
+    } else {
+        Result::Ok(value.to_uint32())
+    }
+}
+
+fn parser_code_point(parser: Parser, first: uint16) -> uint32 {
+    if unicode_mode(parser.flags.get()) && runtime::is_high_surrogate(first) {
+        match parser_current(parser) {
+            Some(second) => match runtime::combine_surrogates(first, second) {
+                Some(value) => {
+                    parser_advance(parser);
+                    value
+                },
+                None => first.to_uint32(),
+            },
+            None => first.to_uint32(),
+        }
+    } else {
+        first.to_uint32()
+    }
+}
+
+fn parse_escaped_code_point(parser: Parser, offset: int, in_class: bool) -> Result[
+    uint32,
+    RegexError,
+] {
+    let first = parse_character_escape(parser, offset, in_class)?;
+    if unicode_mode(parser.flags.get()) && first >= 0xd800 && first <= 0xdbff
+        && parser_current(parser) == Option::Some(92)
+        && parser_peek(parser, 1) == Option::Some(117) {
+        let saved = parser.index.get();
+        parser_advance(parser);
+        let second = parse_character_escape(parser, saved, in_class)?;
+        if second >= 0xdc00 && second <= 0xdfff {
+            Result::Ok(0x10000 + ((first - 0xd800) << 10) + second - 0xdc00)
+        } else {
+            parser.index.set(saved);
+            Result::Ok(first)
+        }
+    } else {
+        Result::Ok(first)
+    }
+}
+
+fn add_class_range(range: unicode::CharRange, first: uint32, last: uint32, offset: int) -> Result[
+    unit,
+    RegexError,
+] {
+    if first > last {
+        Result::Err(regex_error("character class range is reversed", offset))
+    } else {
+        match range.add_range(first, last) {
+            Result::Ok(()) => Result::Ok(()),
+            Result::Err(error) => Result::Err(regex_error(error.to_string(), offset)),
+        }
+    }
+}
+
+fn parser_class_range(parser: Parser, escaped: EscapedClass) -> unicode::CharRange {
+    let range = if parser.flags.get().ignore_case {
+        parser.canonicalizer.canonicalized_range(escaped.range)
+    } else {
+        escaped.range
+    };
+    if escaped.negated {
+        range.complement()
+    } else {
+        range
+    }
+}
+
+fn parse_property_escape(parser: Parser, offset: int) -> Result[unicode::CharRange, RegexError] {
+    let marker = parser_advance(parser).unwrap_or(0);
+    if !unicode_mode(parser.flags.get()) {
+        return Result::Err(regex_error("Unicode property escape requires `u` or `v` mode", offset))
+    } else if !parser_consume(parser, 123) {
+        return Result::Err(regex_error("expected `{` after Unicode property escape", offset))
+    } else {};
+    let start = parser.index.get();
+    while !parser_at_end(parser) && parser_current(parser) != Option::Some(125) {
+        parser_advance(parser);
+    }
+    let end = parser.index.get();
+    if start == end || !parser_consume(parser, 125) {
+        return Result::Err(regex_error("unterminated Unicode property escape", offset))
+    } else {};
+    let name = match parser.pattern.slice(start, end).to_host_string() {
+        Ok(value) => value,
+        Err(_) => return Result::Err(regex_error("invalid Unicode property name", offset)),
+    };
+    let source = match unicode::regexp_property_range(name) {
+        Some(value) => value,
+        None => return Result::Err(regex_error("unknown Unicode property", offset)),
+    };
+    let flags = parser.flags.get();
+    let negated = marker == 80;
+    if negated && flags.unicode_sets {
+        let folded = if flags.ignore_case {
+            parser.canonicalizer.canonicalized_range(source)
+        } else {
+            source
+        };
+        Result::Ok(folded.complement())
+    } else if negated {
+        let inverted = source.complement();
+        Result::Ok(
+            if flags.ignore_case {
+                parser.canonicalizer.canonicalized_range(inverted)
+            } else {
+                inverted
+            },
+        )
+    } else {
+        Result::Ok(
+            if flags.ignore_case {
+                parser.canonicalizer.canonicalized_range(source)
+            } else {
+                source
+            },
+        )
+    }
+}
+
+fn add_parser_class_range(
+    parser: Parser,
+    range: unicode::CharRange,
+    first: uint32,
+    last: uint32,
+    offset: int,
+) -> Result[unit, RegexError] {
+    let values = unicode::CharRange::new();
+    add_class_range(values, first, last, offset)?;
+    if parser.flags.get().ignore_case {
+        range.union_with(parser.canonicalizer.canonicalized_range(values))
+    } else {
+        range.union_with(values)
+    };
+    Result::Ok(())
+}
+
+fn append_class_code_point(output: Vec[uint16], value: uint32) -> unit {
+    if value <= 0xffff {
+        output.push(value.to_uint16())
+    } else {
+        match runtime::split_code_point(value) {
+            Some((high, low)) => {
+                output.push(high);
+                output.push(low)
+            },
+            None => (),
+        }
+    }
+}
+
+fn canonicalize_class_string(parser: Parser, value: runtime::JsString) -> runtime::JsString {
+    if !parser.flags.get().ignore_case {
+        return value
+    } else {};
+    let output: Vec[uint16] = Vec::with_capacity(value.len());
+    let mut index = 0;
+    while index < value.len() {
+        let first = value.get(index);
+        let (code_point, width) = if runtime::is_high_surrogate(first) && index + 1 < value.len() {
+            match runtime::combine_surrogates(first, value.get(index + 1)) {
+                Some(value) => (value, 2),
+                None => (first.to_uint32(), 1),
+            }
+        } else {
+            (first.to_uint32(), 1)
+        };
+        append_class_code_point(output, parser.canonicalizer.canonicalize(code_point));
+        index += width;
+    }
+    runtime::JsString::from_code_units(output)
+}
+
+fn class_set_from_single(parser: Parser, value: uint32, offset: int) -> Result[ClassSet, RegexError] {
+    let range = unicode::CharRange::new();
+    add_parser_class_range(parser, range, value, value, offset)?;
+    Result::Ok(ClassSet { range, strings: Vec::[] })
+}
+
+fn class_set_add_sequence(parser: Parser, target: ClassSet, value: runtime::JsString, offset: int) -> Result[
+    unit,
+    RegexError,
+] {
+    let code_point = if value.len() == 1 {
+        Option::Some(value.get(0).to_uint32())
+    } else if value.len() == 2 {
+        runtime::combine_surrogates(value.get(0), value.get(1))
+    } else {
+        Option::None
+    };
+    match code_point {
+        Some(value) => add_parser_class_range(parser, target.range, value, value, offset),
+        None => {
+            class_set_add_string(target.strings, canonicalize_class_string(parser, value));
+            Result::Ok(())
+        },
+    }
+}
+
+fn parse_class_unit(parser: Parser) -> Result[ClassUnit, RegexError] {
+    let offset = parser.index.get();
+    let value = match parser_advance(parser) {
+        Some(value) => value,
+        None => return Result::Err(regex_error("unterminated character class", offset)),
+    };
+    if value == 92 {
+        match parser_current(parser) {
+            Some(98) => {
+                parser_advance(parser);
+                Result::Ok(ClassUnit::Single(8))
+            },
+            Some(current) => match escaped_class(current) {
+                Some(escaped) => {
+                    parser_advance(parser);
+                    Result::Ok(ClassUnit::Set(parser_class_range(parser, escaped)))
+                },
+                None => if (current == 112 || current == 80) && unicode_mode(parser.flags.get()) {
+                    Result::Ok(ClassUnit::Set(parse_property_escape(parser, offset)?))
+                } else {
+                    Result::Ok(ClassUnit::Single(parse_escaped_code_point(parser, offset, true)?))
+                },
+            },
+            None => Result::Err(regex_error("unterminated character class", offset)),
+        }
+    } else {
+        Result::Ok(ClassUnit::Single(parser_code_point(parser, value)))
+    }
+}
+
+fn parse_v_string_disjunction(parser: Parser, offset: int) -> Result[ClassSet, RegexError] {
+    parser_advance(parser);
+    if !parser_consume(parser, 123) {
+        return Result::Err(regex_error("expected `{` after `\\q`", offset))
+    } else {};
+    let result = class_set_empty();
+    let units: Vec[uint16] = Vec::[];
+    loop {
+        match parser_current(parser) {
+            Some(124) | Some(125) => {
+                class_set_add_sequence(
+                    parser,
+                    result,
+                    runtime::JsString::from_code_units(units),
+                    offset,
+                )?;
+                units.clear();
+                if parser_consume(parser, 125) {
+                    return Result::Ok(result)
+                } else {
+                    parser_advance(parser);
+                }
+            },
+            Some(92) => {
+                let escape_offset = parser.index.get();
+                parser_advance(parser);
+                append_class_code_point(
+                    units,
+                    parse_escaped_code_point(parser, escape_offset, true)?,
+                )
+            },
+            Some(value) => {
+                parser_advance(parser);
+                append_class_code_point(units, parser_code_point(parser, value))
+            },
+            None => return Result::Err(regex_error("unterminated `\\q` string set", offset)),
+        }
+    }
+}
+
+fn parse_v_base_operand(parser: Parser) -> Result[ClassSetOperand, RegexError] {
+    let offset = parser.index.get();
+    let current = match parser_advance(parser) {
+        Some(value) => value,
+        None => return Result::Err(regex_error("unterminated Unicode set", offset)),
+    };
+    if current == 91 {
+        Result::Ok(
+            ClassSetOperand {
+                value: parse_v_class_value(parser, offset)?,
+                single: Option::None,
+                offset,
+            },
+        )
+    } else if current == 92 {
+        match parser_current(parser) {
+            Some(113) => Result::Ok(
+                ClassSetOperand {
+                    value: parse_v_string_disjunction(parser, offset)?,
+                    single: Option::None,
+                    offset,
+                },
+            ),
+            Some(112) | Some(80) => Result::Ok(
+                ClassSetOperand {
+                    value: ClassSet {
+                        range: parse_property_escape(parser, offset)?,
+                        strings: Vec::[],
+                    },
+                    single: Option::None,
+                    offset,
+                },
+            ),
+            Some(value) => match escaped_class(value) {
+                Some(escaped) => {
+                    parser_advance(parser);
+                    Result::Ok(
+                        ClassSetOperand {
+                            value: ClassSet {
+                                range: parser_class_range(parser, escaped),
+                                strings: Vec::[],
+                            },
+                            single: Option::None,
+                            offset,
+                        },
+                    )
+                },
+                None => {
+                    let value = parse_escaped_code_point(parser, offset, true)?;
+                    Result::Ok(
+                        ClassSetOperand {
+                            value: class_set_from_single(parser, value, offset)?,
+                            single: Option::Some(value),
+                            offset,
+                        },
+                    )
+                },
+            },
+            None => Result::Err(regex_error("unterminated Unicode set escape", offset)),
+        }
+    } else if current == 93 || current == 38 && parser_current(parser) == Option::Some(38)
+        || current == 45 && parser_current(parser) == Option::Some(45) {
+        Result::Err(regex_error("expected Unicode set operand", offset))
+    } else {
+        let value = parser_code_point(parser, current);
+        Result::Ok(
+            ClassSetOperand {
+                value: class_set_from_single(parser, value, offset)?,
+                single: Option::Some(value),
+                offset,
+            },
+        )
+    }
+}
+
+fn parse_v_operand(parser: Parser) -> Result[ClassSetOperand, RegexError] {
+    let first = parse_v_base_operand(parser)?;
+    match first.single {
+        Some(first_value) => if parser_current(parser) == Option::Some(45)
+            && parser_peek(parser, 1) != Option::Some(45)
+            && parser_peek(parser, 1) != Option::Some(93)
+            && parser_peek(parser, 1).is_some() {
+            parser_advance(parser);
+            let last = parse_v_base_operand(parser)?;
+            match last.single {
+                Some(last_value) => {
+                    let range = unicode::CharRange::new();
+                    add_parser_class_range(parser, range, first_value, last_value, first.offset)?;
+                    Result::Ok(
+                        ClassSetOperand {
+                            value: ClassSet { range, strings: Vec::[] },
+                            single: Option::None,
+                            offset: first.offset,
+                        },
+                    )
+                },
+                None => Result::Err(
+                    regex_error("Unicode set range must end with a character", last.offset),
+                ),
+            }
+        } else {
+            Result::Ok(first)
+        },
+        None => Result::Ok(first),
+    }
+}
+
+fn v_set_operator(parser: Parser) -> int {
+    if parser_current(parser) == Option::Some(38) && parser_peek(parser, 1) == Option::Some(38) {
+        1
+    } else if parser_current(parser) == Option::Some(45)
+        && parser_peek(parser, 1) == Option::Some(45) {
+        2
+    } else {
+        0
+    }
+}
+
+fn parse_v_union(parser: Parser) -> Result[(ClassSet, int), RegexError] {
+    let mut result = class_set_empty();
+    let mut count = 0;
+    while !parser_at_end(parser) && parser_current(parser) != Option::Some(93)
+        && v_set_operator(parser) == 0 {
+        result = class_set_union(result, parse_v_operand(parser)?.value);
+        count += 1;
+    }
+    Result::Ok((result, count))
+}
+
+fn parse_v_class_value(parser: Parser, offset: int) -> Result[ClassSet, RegexError] {
+    let negated = parser_consume(parser, 94);
+    let (mut result, left_count) = parse_v_union(parser)?;
+    let mut operation = v_set_operator(parser);
+    if operation != 0 && left_count != 1 {
+        return Result::Err(regex_error("Unicode set operator requires one left operand", offset))
+    } else {};
+    let selected_operation = operation;
+    while operation != 0 {
+        if operation != selected_operation {
+            return Result::Err(regex_error("cannot mix Unicode set operators", parser.index.get()))
+        } else {};
+        parser_advance(parser);
+        parser_advance(parser);
+        let (right, count) = parse_v_union(parser)?;
+        if count != 1 {
+            return Result::Err(
+                regex_error("Unicode set operator requires one right operand", parser.index.get()),
+            )
+        } else {};
+        result = if operation == 1 {
+            class_set_intersection(result, right)
+        } else {
+            class_set_difference(result, right)
+        };
+        operation = v_set_operator(parser);
+    }
+    if !parser_consume(parser, 93) {
+        return Result::Err(regex_error("unterminated Unicode set", offset))
+    } else if negated && !result.strings.is_empty() {
+        return Result::Err(regex_error("negated Unicode set cannot contain strings", offset))
+    } else if negated {
+        result.range.invert()
+    } else {};
+    Result::Ok(result)
+}
+
+fn parse_v_class(parser: Parser, offset: int) -> Result[int, RegexError] {
+    let value = parse_v_class_value(parser, offset)?;
+    Result::Ok(parser_push_node(parser, Node::ClassSet(value.range, value.strings)))
+}
+
+fn parse_class(parser: Parser, offset: int) -> Result[int, RegexError] {
+    if parser.flags.get().unicode_sets {
+        return parse_v_class(parser, offset)
+    } else {};
+    let negated = parser_consume(parser, 94);
+    let range = unicode::CharRange::new();
+    while !parser_at_end(parser) {
+        if parser_consume(parser, 93) {
+            return Result::Ok(parser_push_node(parser, Node::Class(range, negated)))
+        } else {};
+        let first_offset = parser.index.get();
+        let first = parse_class_unit(parser)?;
+        match first {
+            ClassUnit::Set(values) => {
+                range.union_with(values)
+            },
+            ClassUnit::Single(first_value) => if parser_consume(parser, 45) {
+                match parser_current(parser) {
+                    Some(93) | None => {
+                        add_parser_class_range(
+                            parser,
+                            range,
+                            first_value,
+                            first_value,
+                            first_offset,
+                        )?;
+                        add_parser_class_range(parser, range, 45, 45, parser.index.get() - 1)?
+                    },
+                    Some(_) => match parse_class_unit(parser)? {
+                        ClassUnit::Single(last_value) => {
+                            add_parser_class_range(
+                                parser,
+                                range,
+                                first_value,
+                                last_value,
+                                first_offset,
+                            )?
+                        },
+                        ClassUnit::Set(_) => {
+                            return Result::Err(
+                                regex_error(
+                                    "character class escape cannot end a range",
+                                    first_offset,
+                                ),
+                            )
+                        },
+                    },
+                }
+            } else {
+                add_parser_class_range(parser, range, first_value, first_value, first_offset)?
+            },
+        }
+    }
+    Result::Err(regex_error("unterminated character class", offset))
+}
+
+fn modifier_index(value: uint16) -> int {
+    if value == 105 {
+        0
+    } else if value == 109 {
+        1
+    } else if value == 115 {
+        2
+    } else {
+        0 - 1
+    }
+}
+
+fn inline_flags(parser: Parser, offset: int) -> Result[RegexFlags, RegexError] {
+    let additions: Vec[bool] = Vec::[false, false, false];
+    let removals: Vec[bool] = Vec::[false, false, false];
+    let mut removing = false;
+    let mut any = false;
+    while !parser_at_end(parser) && parser_current(parser) != Option::Some(58) {
+        let current = parser_current(parser).unwrap_or(0);
+        if current == 45 && !removing {
+            removing = true;
+            parser_advance(parser);
+        } else {
+            let index = modifier_index(current);
+            if index < 0 || additions[index] || removals[index] {
+                return Result::Err(regex_error("invalid modifiers", offset))
+            } else {};
+            if removing {
+                removals.set(index, true)
+            } else {
+                additions.set(index, true)
+            };
+            any = true;
+            parser_advance(parser);
+        }
+    }
+    if !any || !parser_consume(parser, 58) {
+        return Result::Err(regex_error("invalid modifiers", offset))
+    } else {};
+    let base = parser.flags.get();
+    Result::Ok(
+        RegexFlags {
+            has_indices: base.has_indices,
+            global: base.global,
+            ignore_case: if additions[0] {
+                true
+            } else if removals[0] {
+                false
+            } else {
+                base.ignore_case
+            },
+            multiline: if additions[1] {
+                true
+            } else if removals[1] {
+                false
+            } else {
+                base.multiline
+            },
+            dot_all: if additions[2] {
+                true
+            } else if removals[2] {
+                false
+            } else {
+                base.dot_all
+            },
+            unicode: base.unicode,
+            unicode_sets: base.unicode_sets,
+            sticky: base.sticky,
+        },
+    )
+}
+
+fn parse_atom(parser: Parser) -> Result[int, RegexError] {
+    let offset = parser.index.get();
+    let value = match parser_advance(parser) {
+        Some(value) => value,
+        None => return Result::Err(regex_error("expected regular expression atom", offset)),
+    };
+    if value == 40 {
+        if parser.depth.get() >= MAX_NESTING {
+            return Result::Err(regex_error("regular expression nesting limit exceeded", offset))
+        } else {};
+        let mut capturing = true;
+        let mut lookahead = false;
+        let mut lookbehind = false;
+        let mut positive = true;
+        let mut capture_name: Option[runtime::JsString] = Option::None;
+        let mut scoped_flags: Option[RegexFlags] = Option::None;
+        if parser_consume(parser, 63) {
+            capturing = false;
+            if parser_consume(parser, 58) {} else if parser_consume(parser, 61) {
+                lookahead = true;
+            } else if parser_consume(parser, 33) {
+                lookahead = true;
+                positive = false;
+            } else if parser_consume(parser, 60) {
+                if parser_consume(parser, 61) {
+                    lookbehind = true;
+                } else if parser_consume(parser, 33) {
+                    lookbehind = true;
+                    positive = false;
+                } else {
+                    let (name, end) = parse_group_name(parser.pattern, parser.index.get())?;
+                    parser.index.set(end);
+                    capturing = true;
+                    capture_name = Option::Some(name);
+                }
+            } else if match parser_current(parser) {
+                Some(105) | Some(109) | Some(115) | Some(45) => true,
+                _ => false,
+            } {
+                scoped_flags = Option::Some(inline_flags(parser, offset)?);
+            } else {
+                return Result::Err(regex_error("invalid group", offset))
+            }
+        } else {};
+        let capture_index = if capturing {
+            let index = parser.capture_count.get() + 1;
+            parser.capture_count.set(index);
+            match capture_name {
+                Some(name) => match parser.capture_names[index] {
+                    Some(expected) => if name != expected {
+                        return Result::Err(regex_error("capture group metadata mismatch", offset))
+                    } else {},
+                    None => return Result::Err(
+                        regex_error("capture group metadata mismatch", offset),
+                    ),
+                },
+                None => {},
+            };
+            index
+        } else {
+            0
+        };
+        let saved_flags = parser.flags.get();
+        match scoped_flags {
+            Some(value) => parser.flags.set(value),
+            None => (),
+        };
+        parser.depth.set(parser.depth.get() + 1);
+        let child = parse_alternation(parser);
+        parser.depth.set(parser.depth.get() - 1);
+        parser.flags.set(saved_flags);
+        let parsed = child?;
+        if !parser_consume(parser, 41) {
+            Result::Err(regex_error("unterminated group", offset))
+        } else if capturing {
+            Result::Ok(parser_push_node(parser, Node::Capture(parsed, capture_index)))
+        } else if lookahead {
+            Result::Ok(parser_push_node(parser, Node::LookAhead(parsed, positive)))
+        } else if lookbehind {
+            Result::Ok(parser_push_node(parser, Node::LookBehind(parsed, positive)))
+        } else if scoped_flags.is_some() {
+            Result::Ok(
+                parser_push_node(
+                    parser,
+                    Node::ScopedFlags(parsed, scoped_flags.unwrap_or(saved_flags)),
+                ),
+            )
+        } else {
+            Result::Ok(parser_push_node(parser, Node::Group(parsed)))
+        }
+    } else if value == 46 {
+        Result::Ok(parser_push_node(parser, Node::Any))
+    } else if value == 94 {
+        Result::Ok(parser_push_node(parser, Node::Start))
+    } else if value == 36 {
+        Result::Ok(parser_push_node(parser, Node::End))
+    } else if value == 91 {
+        parse_class(parser, offset)
+    } else if value == 92 {
+        match parser_current(parser) {
+            Some(98) => {
+                parser_advance(parser);
+                Result::Ok(parser_push_node(parser, Node::WordBoundary(true)))
+            },
+            Some(66) => {
+                parser_advance(parser);
+                Result::Ok(parser_push_node(parser, Node::WordBoundary(false)))
+            },
+            Some(current) => match escaped_class(current) {
+                Some(escaped) => {
+                    parser_advance(parser);
+                    Result::Ok(
+                        parser_push_node(
+                            parser,
+                            Node::Class(parser_class_range(parser, escaped), false),
+                        ),
+                    )
+                },
+                None => if (current == 112 || current == 80) && unicode_mode(parser.flags.get()) {
+                    Result::Ok(
+                        parser_push_node(
+                            parser,
+                            Node::Class(parse_property_escape(parser, offset)?, false),
+                        ),
+                    )
+                } else if current == 107 && parser_peek(parser, 1) == Option::Some(60)
+                    && (unicode_mode(parser.flags.get()) || has_capture_names(parser.capture_names)) {
+                    parser_advance(parser);
+                    parser_advance(parser);
+                    let (name, end) = parse_group_name(parser.pattern, parser.index.get())?;
+                    parser.index.set(end);
+                    let captures = find_capture_names(parser.capture_names, name);
+                    if captures.is_empty() {
+                        Result::Err(regex_error("group name is not defined", offset))
+                    } else {
+                        Result::Ok(parser_push_node(parser, Node::BackReference(captures)))
+                    }
+                } else if current >= 49 && current <= 57 {
+                    match parse_decimal_escape(parser, offset)? {
+                        DecimalEscape::BackReference(capture) => Result::Ok(
+                            parser_push_node(parser, Node::BackReference(Vec::[capture])),
+                        ),
+                        DecimalEscape::Literal(value) => {
+                            Result::Ok(parser_push_node(parser, Node::Literal(value)))
+                        },
+                    }
+                } else if current == 99 && !unicode_mode(parser.flags.get())
+                    && match parser_peek(parser, 1) {
+                        Some(next) => !((next >= 65 && next <= 90) || (next >= 97 && next <= 122)),
+                        None => true,
+                    } {
+                    parser_advance(parser);
+                    let slash = parser_push_node(parser, Node::Literal(92));
+                    let letter = parser_push_node(parser, Node::Literal(99));
+                    Result::Ok(parser_push_node(parser, Node::Sequence(Vec::[slash, letter])))
+                } else {
+                    let escaped = parse_escaped_code_point(parser, offset, false)?;
+                    Result::Ok(parser_push_node(parser, Node::Literal(escaped)))
+                },
+            },
+            None => Result::Err(regex_error("unterminated escape sequence", offset)),
+        }
+    } else if value == 42 || value == 43 || value == 63 {
+        Result::Err(regex_error("quantifier has no preceding atom", offset))
+    } else if value == 123
+        && (unicode_mode(parser.flags.get()) || parser_starts_counted_quantifier_at(parser, offset)) {
+        Result::Err(regex_error("quantifier has no preceding atom", offset))
+    } else if value == 125 && unicode_mode(parser.flags.get()) {
+        Result::Err(regex_error("quantifier has no preceding atom", offset))
+    } else if value == 93 && unicode_mode(parser.flags.get()) {
+        Result::Err(regex_error("unmatched closing bracket", offset))
+    } else {
+        Result::Ok(parser_push_node(parser, Node::Literal(parser_code_point(parser, value))))
+    }
+}
+
+fn parser_valid_counted_quantifier_at(parser: Parser, offset: int) -> bool {
+    let mut index = offset + 1;
+    if index >= parser.pattern.len() || !is_decimal_digit(parser.pattern.get(index)) {
+        return false
+    } else {};
+    while index < parser.pattern.len() && is_decimal_digit(parser.pattern.get(index)) {
+        index += 1;
+    }
+    if index < parser.pattern.len() && parser.pattern.get(index) == 125 {
+        true
+    } else if index < parser.pattern.len() && parser.pattern.get(index) == 44 {
+        index += 1;
+        while index < parser.pattern.len() && is_decimal_digit(parser.pattern.get(index)) {
+            index += 1;
+        }
+        index < parser.pattern.len() && parser.pattern.get(index) == 125
+    } else {
+        false
+    }
+}
+
+fn parser_starts_counted_quantifier_at(parser: Parser, offset: int) -> bool {
+    if offset + 1 >= parser.pattern.len() {
+        false
+    } else if unicode_mode(parser.flags.get()) {
+        is_decimal_digit(parser.pattern.get(offset + 1))
+    } else {
+        parser_valid_counted_quantifier_at(parser, offset)
+    }
+}
+
+fn parse_counted_quantifier(parser: Parser, offset: int) -> Result[Quantifier, RegexError] {
+    parser.index.set(parser.index.get() + 1);
+    let minimum = parse_decimal_count(parser)?;
+    let maximum = if parser_consume(parser, 125) {
+        Option::Some(minimum)
+    } else if parser_consume(parser, 44) {
+        if parser_consume(parser, 125) {
+            Option::None
+        } else {
+            let value = parse_decimal_count(parser)?;
+            if !parser_consume(parser, 125) {
+                return Result::Err(regex_error("unterminated counted quantifier", offset))
+            } else {};
+            Option::Some(value)
+        }
+    } else {
+        return Result::Err(regex_error("invalid counted quantifier", offset))
+    };
+    match maximum {
+        Some(value) => {
+            if value < minimum {
+                return Result::Err(
+                    regex_error("quantifier maximum is smaller than minimum", offset),
+                )
+            } else {}
+        },
+        None => {},
+    };
+    let greedy = !parser_consume(parser, 63);
+    Result::Ok(Quantifier { minimum, maximum, greedy })
+}
+
+fn parse_quantifier(parser: Parser) -> Result[Option[Quantifier], RegexError] {
+    let offset = parser.index.get();
+    let current = match parser_current(parser) {
+        Some(value) => value,
+        None => return Result::Ok(Option::None),
+    };
+    if current == 63 {
+        parser.index.set(offset + 1);
+        let greedy = !parser_consume(parser, 63);
+        Result::Ok(Option::Some(Quantifier { minimum: 0, maximum: Option::Some(1), greedy }))
+    } else if current == 42 {
+        parser.index.set(offset + 1);
+        let greedy = !parser_consume(parser, 63);
+        Result::Ok(Option::Some(Quantifier { minimum: 0, maximum: Option::None, greedy }))
+    } else if current == 43 {
+        parser.index.set(offset + 1);
+        let greedy = !parser_consume(parser, 63);
+        Result::Ok(Option::Some(Quantifier { minimum: 1, maximum: Option::None, greedy }))
+    } else if parser_starts_counted_quantifier(parser) {
+        Result::Ok(Option::Some(parse_counted_quantifier(parser, offset)?))
+    } else {
+        Result::Ok(Option::None)
+    }
+}
+
+fn parse_repetition(parser: Parser) -> Result[int, RegexError] {
+    let atom = parse_atom(parser)?;
+    let quantifier_offset = parser.index.get();
+    let lookahead = match parser.nodes[atom] {
+        Node::LookAhead(_, _) => true,
+        _ => false,
+    };
+    let lookbehind = match parser.nodes[atom] {
+        Node::LookBehind(_, _) => true,
+        _ => false,
+    };
+    match parse_quantifier(parser)? {
+        Some(quantifier) => {
+            if lookbehind {
+                Result::Err(
+                    regex_error("lookbehind assertion cannot be quantified", quantifier_offset),
+                )
+            } else if lookahead && unicode_mode(parser.flags.get()) {
+                Result::Err(
+                    regex_error("lookahead assertion cannot be quantified", quantifier_offset),
+                )
+            } else if parser_starts_counted_quantifier(parser)
+                || parser_starts_simple_quantifier(parser) {
+                Result::Err(regex_error("multiple quantifiers on one atom", parser.index.get()))
+            } else {
+                Result::Ok(
+                    parser_push_node(
+                        parser,
+                        Node::Repeat(
+                            atom,
+                            quantifier.minimum,
+                            quantifier.maximum,
+                            quantifier.greedy,
+                        ),
+                    ),
+                )
+            }
+        },
+        None => Result::Ok(atom),
+    }
+}
+
+fn parser_starts_simple_quantifier(parser: Parser) -> bool {
+    match parser_current(parser) {
+        Some(42) | Some(43) => true,
+        _ => false,
+    }
+}
+
+fn parse_sequence(parser: Parser) -> Result[int, RegexError] {
+    let children: Vec[int] = Vec::[];
+    while !parser_at_end(parser) {
+        match parser_current(parser) {
+            Some(41) | Some(124) => break,
+            _ => children.push(parse_repetition(parser)?),
+        }
+    }
+    if children.is_empty() {
+        Result::Ok(parser_push_node(parser, Node::Empty))
+    } else if children.len() == 1 {
+        Result::Ok(children[0])
+    } else {
+        Result::Ok(parser_push_node(parser, Node::Sequence(children)))
+    }
+}
+
+fn parse_alternation(parser: Parser) -> Result[int, RegexError] {
+    let branches: Vec[int] = Vec::[];
+    branches.push(parse_sequence(parser)?);
+    while parser_consume(parser, 124) {
+        branches.push(parse_sequence(parser)?)
+    }
+    if branches.len() == 1 {
+        Result::Ok(branches[0])
+    } else {
+        Result::Ok(parser_push_node(parser, Node::Alternation(branches)))
+    }
+}
+
+fn compile_parsed(pattern: runtime::JsString, flags: RegexFlags) -> Result[Regex, RegexError] {
+    let metadata = capture_metadata(pattern)?;
+    let parser = parser_new(pattern, flags, metadata);
+    let root = parse_alternation(parser)?;
+    if !parser_at_end(parser) {
+        Result::Err(regex_error("unmatched closing parenthesis", parser.index.get()))
+    } else {
+        Result::Ok(
+            Regex {
+                nodes: parser.nodes,
+                root,
+                flags,
+                canonicalizer: parser.canonicalizer,
+                capture_count: parser.total_captures,
+                capture_names: parser.capture_names,
+            },
+        )
+    }
+}
+
+pub fn compile(pattern: runtime::JsString) -> Result[Regex, RegexError] {
+    compile_parsed(pattern, RegexFlags::new())
+}
+
+pub fn compile_with_flags(pattern: runtime::JsString, flags: string) -> Result[Regex, RegexError] {
+    compile_parsed(pattern, parse_flags(flags)?)
+}
+
+pub fn compile_utf8(pattern: string) -> Result[Regex, RegexError] {
+    let bytes = pattern.to_bytes();
+    compile(runtime::JsString::from_utf8(bytes.slice(0, bytes.len())))
+}
+
+pub fn compile_utf8_with_flags(pattern: string, flags: string) -> Result[Regex, RegexError] {
+    let bytes = pattern.to_bytes();
+    compile_with_flags(runtime::JsString::from_utf8(bytes.slice(0, bytes.len())), flags)
+}
+
+#[derive(PartialEq, Eq)]
+struct MatchState {
+    position: int,
+    captures: Vec[Option[RegexCapture]],
+}
+
+fn empty_captures(count: int) -> Vec[Option[RegexCapture]] {
+    let values: Vec[Option[RegexCapture]] = Vec::with_capacity(count + 1);
+    let mut index = 0;
+    while index <= count {
+        values.push(Option::None);
+        index += 1;
+    }
+    values
+}
+
+fn copy_captures(values: Vec[Option[RegexCapture]]) -> Vec[Option[RegexCapture]] {
+    let output: Vec[Option[RegexCapture]] = Vec::with_capacity(values.len());
+    let mut index = 0;
+    while index < values.len() {
+        output.push(values[index]);
+        index += 1;
+    }
+    output
+}
+
+fn with_capture(state: MatchState, index: int, value: Option[RegexCapture]) -> MatchState {
+    let captures = copy_captures(state.captures);
+    captures.set(index, value);
+    MatchState { position: state.position, captures }
+}
+
+fn append_unique(target: Vec[MatchState], value: MatchState) -> unit {
+    let mut index = 0;
+    while index < target.len() {
+        if target[index] == value {
+            return
+        } else {};
+        index += 1;
+    }
+    target.push(value)
+}
+
+fn append_unique_all(target: Vec[MatchState], source: Vec[MatchState]) -> unit {
+    let mut index = 0;
+    while index < source.len() {
+        append_unique(target, source[index]);
+        index += 1;
+    }
+}
+
+fn clear_node_capture_slots(regex: Regex, node: int, captures: Vec[Option[RegexCapture]]) -> unit {
+    match regex.nodes[node] {
+        Node::Sequence(children) | Node::Alternation(children) => {
+            let mut index = 0;
+            while index < children.len() {
+                clear_node_capture_slots(regex, children[index], captures);
+                index += 1;
+            }
+        },
+        Node::Repeat(child, _, _, _) | Node::LookAhead(child, _) | Node::LookBehind(child, _) | Node::Group(child) | Node::ScopedFlags(child, _) => {
+            clear_node_capture_slots(regex, child, captures)
+        },
+        Node::Capture(child, index) => {
+            captures.set(index, Option::None);
+            clear_node_capture_slots(regex, child, captures)
+        },
+        _ => (),
+    }
+}
+
+fn clear_node_captures(regex: Regex, node: int, state: MatchState) -> MatchState {
+    let captures = copy_captures(state.captures);
+    clear_node_capture_slots(regex, node, captures);
+    MatchState { position: state.position, captures }
+}
+
+fn repeat_limit(minimum: int, maximum: Option[int], input_length: int) -> int {
+    match maximum {
+        Some(value) => value,
+        None => minimum + input_length + 1,
+    }
+}
+
+enum RepeatWork {
+    Explore(int, MatchState),
+    Accept(MatchState),
+}
+
+fn match_repeat(
+    regex: Regex,
+    flags: RegexFlags,
+    child: int,
+    minimum: int,
+    maximum: Option[int],
+    greedy: bool,
+    input: runtime::JsString,
+    start: MatchState,
+    backward: bool,
+) -> Vec[MatchState] {
+    let output: Vec[MatchState] = Vec::[];
+    let work: Vec[RepeatWork] = Vec::[RepeatWork::Explore(0, start)];
+    let limit = repeat_limit(minimum, maximum, input.len());
+    while !work.is_empty() {
+        match work.pop() {
+            Some(RepeatWork::Accept(state)) => append_unique(output, state),
+            Some(RepeatWork::Explore(count, state)) => {
+                let can_accept = count >= minimum;
+                if !greedy && can_accept {
+                    append_unique(output, state)
+                } else {};
+                if greedy && can_accept {
+                    work.push(RepeatWork::Accept(state))
+                } else {};
+                if count < limit {
+                    let reset = clear_node_captures(regex, child, state);
+                    let outcomes = match_node_direction_flags(
+                        regex,
+                        flags,
+                        child,
+                        input,
+                        reset,
+                        backward,
+                    );
+                    let mut index = outcomes.len();
+                    while index > 0 {
+                        let outcome = outcomes[index - 1];
+                        if count + 1 <= minimum || outcome.position != state.position {
+                            work.push(RepeatWork::Explore(count + 1, outcome))
+                        } else {};
+                        index -= 1;
+                    }
+                } else {}
+            },
+            None => (),
+        }
+    }
+    output
+}
+
+fn match_sequence(
+    regex: Regex,
+    flags: RegexFlags,
+    children: Vec[int],
+    input: runtime::JsString,
+    start: MatchState,
+    backward: bool,
+) -> Vec[MatchState] {
+    let mut positions = Vec::[start];
+    let mut child_index = 0;
+    while child_index < children.len() && !positions.is_empty() {
+        let next: Vec[MatchState] = Vec::[];
+        let mut position_index = 0;
+        let node_index = if backward {
+            children.len() - child_index - 1
+        } else {
+            child_index
+        };
+        while position_index < positions.len() {
+            append_unique_all(
+                next,
+                match_node_direction_flags(
+                    regex,
+                    flags,
+                    children[node_index],
+                    input,
+                    positions[position_index],
+                    backward,
+                ),
+            );
+            position_index += 1;
+        }
+        positions = next;
+        child_index += 1;
+    }
+    positions
+}
+
+fn class_matches(range: unicode::CharRange, negated: bool, value: uint32) -> bool {
+    let contains = range.contains(value);
+    if negated {
+        !contains
+    } else {
+        contains
+    }
+}
+
+fn class_string_match_width(
+    regex: Regex,
+    flags: RegexFlags,
+    expected: runtime::JsString,
+    input: runtime::JsString,
+    position: int,
+    backward: bool,
+) -> Option[int] {
+    let mut expected_position = if backward {
+        expected.len()
+    } else {
+        0
+    };
+    let mut input_position = position;
+    while if backward {
+        expected_position > 0
+    } else {
+        expected_position < expected.len()
+    } {
+        if backward && input_position <= 0 || !backward && input_position >= input.len() {
+            return Option::None
+        } else {};
+        let (expected_value, expected_width) = if backward {
+            input_backward_code_point(expected, expected_position, true)
+        } else {
+            input_forward_code_point(expected, expected_position, true)
+        };
+        let (actual_value, actual_width) = if backward {
+            input_backward_code_point(input, input_position, true)
+        } else {
+            input_forward_code_point(input, input_position, true)
+        };
+        if !literal_matches(regex, flags, expected_value, actual_value) {
+            return Option::None
+        } else if backward {
+            expected_position -= expected_width;
+            input_position -= actual_width;
+        } else {
+            expected_position += expected_width;
+            input_position += actual_width;
+        }
+    }
+    Option::Some(
+        if backward {
+            position - input_position
+        } else {
+            input_position - position
+        },
+    )
+}
+
+fn class_set_string_outcomes(
+    regex: Regex,
+    flags: RegexFlags,
+    strings: Vec[runtime::JsString],
+    input: runtime::JsString,
+    state: MatchState,
+    backward: bool,
+) -> Vec[MatchState] {
+    let output: Vec[MatchState] = Vec::[];
+    let used: Vec[bool] = Vec::with_capacity(strings.len());
+    for _ in 0..strings.len() {
+        used.push(false)
+    }
+    for _ in 0..strings.len() {
+        let mut selected = 0 - 1;
+        let mut selected_length = 0 - 1;
+        for index in 0..strings.len() {
+            if !used[index] && strings[index].len() > selected_length {
+                selected = index;
+                selected_length = strings[index].len();
+            } else {}
+        }
+        if selected >= 0 {
+            used.set(selected, true);
+            match class_string_match_width(
+                regex,
+                flags,
+                strings[selected],
+                input,
+                state.position,
+                backward,
+            ) {
+                Some(width) => append_unique(
+                    output,
+                    MatchState {
+                        position: if backward {
+                            state.position - width
+                        } else {
+                            state.position + width
+                        },
+                        captures: state.captures,
+                    },
+                ),
+                None => (),
+            }
+        } else {}
+    }
+    output
+}
+
+fn is_line_terminator(value: uint16) -> bool {
+    value == 10 || value == 13 || value == 0x2028 || value == 0x2029
+}
+
+fn dot_matches(flags: RegexFlags, value: uint32) -> bool {
+    flags.dot_all || value > 0xffff || !is_line_terminator(value.to_uint16())
+}
+
+fn literal_matches(regex: Regex, flags: RegexFlags, expected: uint32, actual: uint32) -> bool {
+    if flags.ignore_case {
+        regex.canonicalizer.canonicalize(expected) == regex.canonicalizer.canonicalize(actual)
+    } else {
+        expected == actual
+    }
+}
+
+fn input_forward_code_point(input: runtime::JsString, position: int, unicode: bool) -> (uint32, int) {
+    let first = input.get(position);
+    if unicode && runtime::is_high_surrogate(first) && position + 1 < input.len() {
+        match runtime::combine_surrogates(first, input.get(position + 1)) {
+            Some(value) => (value, 2),
+            None => (first.to_uint32(), 1),
+        }
+    } else {
+        (first.to_uint32(), 1)
+    }
+}
+
+fn input_backward_code_point(input: runtime::JsString, position: int, unicode: bool) -> (
+    uint32,
+    int,
+) {
+    let last = input.get(position - 1);
+    if unicode && runtime::is_low_surrogate(last) && position >= 2 {
+        match runtime::combine_surrogates(input.get(position - 2), last) {
+            Some(value) => (value, 2),
+            None => (last.to_uint32(), 1),
+        }
+    } else {
+        (last.to_uint32(), 1)
+    }
+}
+
+fn starts_line(flags: RegexFlags, input: runtime::JsString, position: int) -> bool {
+    position == 0
+        || (flags.multiline && position > 0 && is_line_terminator(input.get(position - 1)))
+}
+
+fn ends_line(flags: RegexFlags, input: runtime::JsString, position: int) -> bool {
+    position == input.len()
+        || (position < input.len() && is_line_terminator(input.get(position))
+            && (flags.multiline || position + 1 == input.len()
+                || (input.get(position) == 13 && position + 2 == input.len()
+                    && input.get(position + 1) == 10)))
+}
+
+fn word_code_point(regex: Regex, flags: RegexFlags, value: uint32) -> bool {
+    let value = if flags.ignore_case && unicode_mode(flags) {
+        regex.canonicalizer.canonicalize(value)
+    } else {
+        value
+    };
+    (value >= 48 && value <= 57) || (value >= 65 && value <= 90) || value == 95
+        || (value >= 97 && value <= 122)
+}
+
+fn word_at(regex: Regex, flags: RegexFlags, input: runtime::JsString, position: int) -> bool {
+    if position < 0 || position >= input.len() {
+        false
+    } else {
+        word_code_point(regex, flags, input.get(position).to_uint32())
+    }
+}
+
+fn is_word_boundary(regex: Regex, flags: RegexFlags, input: runtime::JsString, position: int) -> bool {
+    word_at(regex, flags, input, position - 1) != word_at(regex, flags, input, position)
+}
+
+fn backreference_matches(
+    regex: Regex,
+    flags: RegexFlags,
+    input: runtime::JsString,
+    capture: RegexCapture,
+    position: int,
+) -> bool {
+    let length = capture.end - capture.start;
+    if position + length > input.len() {
+        false
+    } else {
+        let mut index = 0;
+        while index < length {
+            if !literal_matches(
+                regex,
+                flags,
+                input.get(capture.start + index).to_uint32(),
+                input.get(position + index).to_uint32(),
+            ) {
+                return false
+            } else {};
+            index += 1;
+        }
+        true
+    }
+}
+
+fn backward_backreference_matches(
+    regex: Regex,
+    flags: RegexFlags,
+    input: runtime::JsString,
+    capture: RegexCapture,
+    position: int,
+) -> bool {
+    let length = capture.end - capture.start;
+    if position - length < 0 {
+        false
+    } else {
+        let mut index = 0;
+        while index < length {
+            if !literal_matches(
+                regex,
+                flags,
+                input.get(capture.end - index - 1).to_uint32(),
+                input.get(position - index - 1).to_uint32(),
+            ) {
+                return false
+            } else {};
+            index += 1;
+        }
+        true
+    }
+}
+
+fn match_backreferences(
+    regex: Regex,
+    flags: RegexFlags,
+    indices: Vec[int],
+    input: runtime::JsString,
+    state: MatchState,
+    backward: bool,
+) -> Vec[MatchState] {
+    let mut index = 0;
+    while index < indices.len() {
+        match state.captures[indices[index]] {
+            Some(capture) => if (backward
+                && backward_backreference_matches(regex, flags, input, capture, state.position))
+                || (!backward && backreference_matches(regex, flags, input, capture, state.position)) {
+                let length = capture.end - capture.start;
+                return Vec::[
+                    MatchState {
+                        position: if backward {
+                            state.position - length
+                        } else {
+                            state.position + length
+                        },
+                        captures: state.captures,
+                    },
+                ]
+            } else {
+                return Vec::[]
+            },
+            None => {},
+        };
+        index += 1;
+    }
+    Vec::[state]
+}
+
+fn match_node_direction_flags(
+    regex: Regex,
+    flags: RegexFlags,
+    node: int,
+    input: runtime::JsString,
+    state: MatchState,
+    backward: bool,
+) -> Vec[MatchState] {
+    match regex.nodes[node] {
+        Node::Empty => Vec::[state],
+        Node::Literal(expected) => {
+            let available = if backward {
+                state.position > 0
+            } else {
+                state.position < input.len()
+            };
+            if available {
+                let (actual, width) = if backward {
+                    input_backward_code_point(input, state.position, unicode_mode(flags))
+                } else {
+                    input_forward_code_point(input, state.position, unicode_mode(flags))
+                };
+                if literal_matches(regex, flags, expected, actual) {
+                    Vec::[
+                        MatchState {
+                            position: if backward {
+                                state.position - width
+                            } else {
+                                state.position + width
+                            },
+                            captures: state.captures,
+                        },
+                    ]
+                } else {
+                    Vec::[]
+                }
+            } else {
+                Vec::[]
+            }
+        },
+        Node::Any => {
+            let available = if backward {
+                state.position > 0
+            } else {
+                state.position < input.len()
+            };
+            if available {
+                let (actual, width) = if backward {
+                    input_backward_code_point(input, state.position, unicode_mode(flags))
+                } else {
+                    input_forward_code_point(input, state.position, unicode_mode(flags))
+                };
+                if dot_matches(flags, actual) {
+                    Vec::[
+                        MatchState {
+                            position: if backward {
+                                state.position - width
+                            } else {
+                                state.position + width
+                            },
+                            captures: state.captures,
+                        },
+                    ]
+                } else {
+                    Vec::[]
+                }
+            } else {
+                Vec::[]
+            }
+        },
+        Node::Start => {
+            if starts_line(flags, input, state.position) {
+                Vec::[state]
+            } else {
+                Vec::[]
+            }
+        },
+        Node::End => {
+            if ends_line(flags, input, state.position) {
+                Vec::[state]
+            } else {
+                Vec::[]
+            }
+        },
+        Node::WordBoundary(expected) => {
+            if is_word_boundary(regex, flags, input, state.position) == expected {
+                Vec::[state]
+            } else {
+                Vec::[]
+            }
+        },
+        Node::Class(range, negated) => {
+            let available = if backward {
+                state.position > 0
+            } else {
+                state.position < input.len()
+            };
+            if available {
+                let (actual, width) = if backward {
+                    input_backward_code_point(input, state.position, unicode_mode(flags))
+                } else {
+                    input_forward_code_point(input, state.position, unicode_mode(flags))
+                };
+                if class_matches(range, negated, actual) {
+                    Vec::[
+                        MatchState {
+                            position: if backward {
+                                state.position - width
+                            } else {
+                                state.position + width
+                            },
+                            captures: state.captures,
+                        },
+                    ]
+                } else {
+                    Vec::[]
+                }
+            } else {
+                Vec::[]
+            }
+        },
+        Node::ClassSet(range, strings) => {
+            let output = class_set_string_outcomes(regex, flags, strings, input, state, backward);
+            let available = if backward {
+                state.position > 0
+            } else {
+                state.position < input.len()
+            };
+            if available {
+                let (actual, width) = if backward {
+                    input_backward_code_point(input, state.position, true)
+                } else {
+                    input_forward_code_point(input, state.position, true)
+                };
+                if range.contains(actual) {
+                    append_unique(
+                        output,
+                        MatchState {
+                            position: if backward {
+                                state.position - width
+                            } else {
+                                state.position + width
+                            },
+                            captures: state.captures,
+                        },
+                    )
+                } else {}
+            } else {};
+            output
+        },
+        Node::Sequence(children) => {
+            match_sequence(regex, flags, children, input, state, backward)
+        },
+        Node::Alternation(branches) => {
+            let output: Vec[MatchState] = Vec::[];
+            let mut index = 0;
+            while index < branches.len() {
+                append_unique_all(
+                    output,
+                    match_node_direction_flags(
+                        regex,
+                        flags,
+                        branches[index],
+                        input,
+                        state,
+                        backward,
+                    ),
+                );
+                index += 1;
+            }
+            output
+        },
+        Node::Repeat(child, minimum, maximum, greedy) => {
+            match_repeat(regex, flags, child, minimum, maximum, greedy, input, state, backward)
+        },
+        Node::Capture(child, index) => {
+            let start = state.position;
+            let cleared = clear_node_captures(regex, node, state);
+            let outcomes = match_node_direction_flags(regex, flags, child, input, cleared, backward);
+            let output: Vec[MatchState] = Vec::with_capacity(outcomes.len());
+            let mut outcome_index = 0;
+            while outcome_index < outcomes.len() {
+                let outcome = outcomes[outcome_index];
+                output.push(
+                    with_capture(
+                        outcome,
+                        index,
+                        Option::Some(
+                            if backward {
+                                RegexCapture { start: outcome.position, end: start }
+                            } else {
+                                RegexCapture { start, end: outcome.position }
+                            },
+                        ),
+                    ),
+                );
+                outcome_index += 1;
+            }
+            output
+        },
+        Node::BackReference(indices) => {
+            match_backreferences(regex, flags, indices, input, state, backward)
+        },
+        Node::LookAhead(child, positive) => {
+            let reset = clear_node_captures(regex, child, state);
+            let outcomes = match_node_direction_flags(regex, flags, child, input, reset, false);
+            if positive {
+                if outcomes.is_empty() {
+                    Vec::[]
+                } else {
+                    let selected = outcomes[0];
+                    Vec::[MatchState { position: state.position, captures: selected.captures }]
+                }
+            } else if outcomes.is_empty() {
+                Vec::[reset]
+            } else {
+                Vec::[]
+            }
+        },
+        Node::LookBehind(child, positive) => {
+            let reset = clear_node_captures(regex, child, state);
+            let outcomes = match_node_direction_flags(regex, flags, child, input, reset, true);
+            if positive {
+                if outcomes.is_empty() {
+                    Vec::[]
+                } else {
+                    let selected = outcomes[0];
+                    Vec::[MatchState { position: state.position, captures: selected.captures }]
+                }
+            } else if outcomes.is_empty() {
+                Vec::[reset]
+            } else {
+                Vec::[]
+            }
+        },
+        Node::Group(child) => {
+            match_node_direction_flags(regex, flags, child, input, state, backward)
+        },
+        Node::ScopedFlags(child, scoped) => {
+            match_node_direction_flags(regex, scoped, child, input, state, backward)
+        },
+    }
+}
+
+fn match_node_direction(
+    regex: Regex,
+    node: int,
+    input: runtime::JsString,
+    state: MatchState,
+    backward: bool,
+) -> Vec[MatchState] {
+    match_node_direction_flags(regex, regex.flags, node, input, state, backward)
+}
+
+fn match_node(regex: Regex, node: int, input: runtime::JsString, state: MatchState) -> Vec[
+    MatchState,
+] {
+    match_node_direction(regex, node, input, state, false)
+}
+
+pub fn match_at(regex: Regex, input: runtime::JsString, start: int) -> Option[RegexMatch] {
+    if start < 0 || start > input.len() {
+        return Option::None
+    } else {};
+    let initial = MatchState { position: start, captures: empty_captures(regex.capture_count) };
+    let outcomes = match_node(regex, regex.root, input, initial);
+    if outcomes.is_empty() {
+        Option::None
+    } else {
+        let outcome = outcomes[0];
+        let captures = copy_captures(outcome.captures);
+        captures.set(0, Option::Some(RegexCapture { start, end: outcome.position }));
+        Option::Some(RegexMatch { start, end: outcome.position, captures })
+    }
+}
+
+pub fn search(regex: Regex, input: runtime::JsString) -> Option[RegexMatch] {
+    let mut start = 0;
+    while start <= input.len() {
+        match match_at(regex, input, start) {
+            Some(value) => return Option::Some(value),
+            None => {},
+        };
+        if regex.flags.sticky {
+            return Option::None
+        } else {};
+        if unicode_mode(regex.flags) && start < input.len() {
+            let (_, width) = input_forward_code_point(input, start, true);
+            start += width;
+        } else {
+            start += 1;
+        }
+    }
+    Option::None
+}
+
+pub fn is_match(regex: Regex, input: runtime::JsString) -> bool {
+    search(regex, input).is_some()
+}
+
+impl Regex {
+    pub fn capture_count(self: Regex) -> int {
+        self.capture_count
+    }
+
+    pub fn capture_name(self: Regex, index: int) -> Option[runtime::JsString] {
+        if index <= 0 || index >= self.capture_names.len() {
+            Option::None
+        } else {
+            self.capture_names[index]
+        }
+    }
+
+    pub fn has_named_captures(self: Regex) -> bool {
+        has_capture_names(self.capture_names)
+    }
+
+    pub fn search(self: Regex, input: runtime::JsString) -> Option[RegexMatch] {
+        search(self, input)
+    }
+
+    pub fn match_at(self: Regex, input: runtime::JsString, start: int) -> Option[RegexMatch] {
+        match_at(self, input, start)
+    }
+
+    pub fn is_match(self: Regex, input: runtime::JsString) -> bool {
+        is_match(self, input)
+    }
+}

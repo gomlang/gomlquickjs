@@ -1,0 +1,649 @@
+package ast;
+
+#[derive(PartialEq, Eq, Debug)]
+pub struct Span {
+    pub start: int,
+    pub end: int,
+}
+
+pub struct Program {
+    pub body: Vec[Stmt],
+    pub span: Span,
+}
+
+#[derive(PartialEq, Eq, Debug)]
+pub enum VariableKind {
+    Let,
+    Const,
+    Var,
+}
+
+pub struct VariableDeclarator {
+    pub name: string,
+    pub pattern: Ref[BindingPattern],
+    pub initializer: Option[Ref[Expr]],
+    pub span: Span,
+}
+
+pub struct SwitchCase {
+    pub test: Option[Ref[Expr]],
+    pub consequent: Vec[Stmt],
+    pub span: Span,
+}
+
+pub struct CatchClause {
+    pub binding: Option[string],
+    pub pattern: Option[Ref[BindingPattern]],
+    pub body: Vec[Stmt],
+    pub span: Span,
+}
+
+pub enum BindingPattern {
+    Identifier {
+        name: string,
+        span: Span,
+    },
+    Array {
+        elements: Vec[ArrayBindingElement],
+        span: Span,
+    },
+    Object {
+        properties: Vec[ObjectBindingProperty],
+        span: Span,
+    },
+}
+
+pub enum ArrayBindingElement {
+    Hole,
+    Element {
+        pattern: Ref[BindingPattern],
+        initializer: Option[Ref[Expr]],
+        rest: bool,
+        span: Span,
+    },
+}
+
+pub enum ObjectBindingProperty {
+    Property {
+        key: ObjectPropertyKey,
+        pattern: Ref[BindingPattern],
+        initializer: Option[Ref[Expr]],
+        span: Span,
+    },
+    Rest {
+        pattern: Ref[BindingPattern],
+        span: Span,
+    },
+}
+
+pub enum AssignmentPattern {
+    Target {
+        target: Ref[Expr],
+        span: Span,
+    },
+    Array {
+        elements: Vec[ArrayAssignmentElement],
+        span: Span,
+    },
+    Object {
+        properties: Vec[ObjectAssignmentProperty],
+        span: Span,
+    },
+}
+
+pub enum ArrayAssignmentElement {
+    Hole,
+    Element {
+        pattern: Ref[AssignmentPattern],
+        initializer: Option[Ref[Expr]],
+        rest: bool,
+        span: Span,
+    },
+}
+
+pub enum ObjectAssignmentProperty {
+    Property {
+        key: ObjectPropertyKey,
+        pattern: Ref[AssignmentPattern],
+        initializer: Option[Ref[Expr]],
+        span: Span,
+    },
+    Rest {
+        pattern: Ref[AssignmentPattern],
+        span: Span,
+    },
+}
+
+pub fn assignment_pattern_span(pattern: AssignmentPattern) -> Span {
+    match pattern {
+        AssignmentPattern::Target { span, .. } | AssignmentPattern::Array { span, .. } | AssignmentPattern::Object {
+            span,
+            ..,
+        } => span,
+    }
+}
+
+pub struct FunctionParameter {
+    pub name: string,
+    pub pattern: Ref[BindingPattern],
+    pub initializer: Option[Ref[Expr]],
+    pub rest: bool,
+    pub span: Span,
+}
+
+pub fn binding_pattern_span(pattern: BindingPattern) -> Span {
+    match pattern {
+        BindingPattern::Identifier { span, .. } | BindingPattern::Array { span, .. } | BindingPattern::Object {
+            span,
+            ..,
+        } => span,
+    }
+}
+
+#[derive(PartialEq, Eq, Debug)]
+pub enum ClassElementKind {
+    Method,
+    Getter,
+    Setter,
+    Field,
+    StaticBlock,
+}
+
+pub struct ClassElement {
+    pub name: string,
+    pub private_member: bool,
+    pub computed_name: Option[Ref[Expr]],
+    pub kind: ClassElementKind,
+    pub static_member: bool,
+    pub generator: bool,
+    pub asynchronous: bool,
+    pub initializer: Option[Ref[Expr]],
+    pub parameters: Vec[FunctionParameter],
+    pub body: Vec[Stmt],
+    pub span: Span,
+    pub function_start: int,
+}
+
+pub enum ObjectPropertyKey {
+    Identifier(string),
+    String(string),
+    Number(string),
+    Computed(Ref[Expr]),
+    Spread,
+}
+
+#[derive(PartialEq, Eq, Debug)]
+pub enum ObjectPropertyKind {
+    Data,
+    Method,
+    Getter,
+    Setter,
+}
+
+pub struct ObjectProperty {
+    pub key: ObjectPropertyKey,
+    pub kind: ObjectPropertyKind,
+    pub value: Ref[Expr],
+    pub span: Span,
+}
+
+pub enum ArrayElement {
+    Hole,
+    Value(Ref[Expr]),
+    Spread(Ref[Expr]),
+}
+
+pub struct ImportSpecifier {
+    pub imported: string,
+    pub local: string,
+    pub span: Span,
+}
+
+pub struct ExportSpecifier {
+    pub local: string,
+    pub exported: string,
+    pub span: Span,
+}
+
+pub struct ImportAttribute {
+    pub key: string,
+    pub value: string,
+    pub span: Span,
+}
+
+pub enum Stmt {
+    Empty {
+        span: Span,
+    },
+    Debugger {
+        span: Span,
+    },
+    Expression {
+        expression: Ref[Expr],
+        span: Span,
+    },
+    Block {
+        body: Vec[Stmt],
+        span: Span,
+    },
+    VariableDeclaration {
+        kind: VariableKind,
+        declarations: Vec[VariableDeclarator],
+        span: Span,
+    },
+    ImportNamespace {
+        local: string,
+        source: string,
+        attributes: Vec[ImportAttribute],
+        span: Span,
+    },
+    ImportNamed {
+        specifiers: Vec[ImportSpecifier],
+        source: string,
+        attributes: Vec[ImportAttribute],
+        span: Span,
+    },
+    ImportSideEffect {
+        source: string,
+        attributes: Vec[ImportAttribute],
+        span: Span,
+    },
+    ExportNamed {
+        specifiers: Vec[ExportSpecifier],
+        source: Option[string],
+        attributes: Vec[ImportAttribute],
+        span: Span,
+    },
+    ExportDeclaration {
+        declaration: Ref[Stmt],
+        span: Span,
+    },
+    ExportDefault {
+        expression: Ref[Expr],
+        local: string,
+        span: Span,
+    },
+    ExportAll {
+        source: string,
+        attributes: Vec[ImportAttribute],
+        span: Span,
+    },
+    FunctionDeclaration {
+        name: string,
+        parameters: Vec[FunctionParameter],
+        body: Vec[Stmt],
+        generator: bool,
+        asynchronous: bool,
+        span: Span,
+    },
+    ClassDeclaration {
+        name: string,
+        heritage: Option[Ref[Expr]],
+        elements: Vec[ClassElement],
+        span: Span,
+    },
+    If {
+        test: Ref[Expr],
+        consequent: Ref[Stmt],
+        alternate: Option[Ref[Stmt]],
+        span: Span,
+    },
+    While {
+        test: Ref[Expr],
+        body: Ref[Stmt],
+        span: Span,
+    },
+    With {
+        object: Ref[Expr],
+        body: Ref[Stmt],
+        span: Span,
+    },
+    For {
+        initializer: Option[Ref[Stmt]],
+        test: Option[Ref[Expr]],
+        update: Option[Ref[Expr]],
+        body: Ref[Stmt],
+        span: Span,
+    },
+    ForOf {
+        kind: VariableKind,
+        name: string,
+        pattern: Ref[BindingPattern],
+        target: Option[Ref[Expr]],
+        iterable: Ref[Expr],
+        body: Ref[Stmt],
+        span: Span,
+    },
+    ForIn {
+        kind: VariableKind,
+        name: string,
+        pattern: Ref[BindingPattern],
+        initializer: Option[Ref[Expr]],
+        target: Option[Ref[Expr]],
+        object: Ref[Expr],
+        body: Ref[Stmt],
+        span: Span,
+    },
+    DoWhile {
+        body: Ref[Stmt],
+        test: Ref[Expr],
+        span: Span,
+    },
+    Switch {
+        discriminant: Ref[Expr],
+        cases: Vec[SwitchCase],
+        span: Span,
+    },
+    Break {
+        label: Option[string],
+        span: Span,
+    },
+    Continue {
+        label: Option[string],
+        span: Span,
+    },
+    Labelled {
+        label: string,
+        body: Ref[Stmt],
+        span: Span,
+    },
+    Return {
+        argument: Option[Ref[Expr]],
+        span: Span,
+    },
+    Throw {
+        argument: Ref[Expr],
+        span: Span,
+    },
+    Try {
+        block: Vec[Stmt],
+        handler: Option[CatchClause],
+        finalizer: Option[Vec[Stmt]],
+        span: Span,
+    },
+}
+
+#[derive(PartialEq, Eq, Debug)]
+pub enum UnaryOperator {
+    LogicalNot,
+    BitwiseNot,
+    Plus,
+    Minus,
+    Typeof,
+    Void,
+    Delete,
+}
+
+#[derive(PartialEq, Eq, Debug)]
+pub enum BinaryOperator {
+    Power,
+    Multiply,
+    Divide,
+    Remainder,
+    Add,
+    Subtract,
+    ShiftLeft,
+    ShiftRight,
+    ShiftRightUnsigned,
+    Less,
+    LessEqual,
+    Greater,
+    GreaterEqual,
+    In,
+    Instanceof,
+    Equal,
+    NotEqual,
+    StrictEqual,
+    StrictNotEqual,
+    BitwiseAnd,
+    BitwiseXor,
+    BitwiseOr,
+    LogicalAnd,
+    LogicalOr,
+    NullishCoalescing,
+}
+
+#[derive(PartialEq, Eq, Debug)]
+pub enum AssignmentOperator {
+    Assign,
+    Add,
+    Subtract,
+    Multiply,
+    Divide,
+    Remainder,
+    Power,
+    ShiftLeft,
+    ShiftRight,
+    ShiftRightUnsigned,
+    BitwiseAnd,
+    BitwiseOr,
+    BitwiseXor,
+    LogicalAnd,
+    LogicalOr,
+    NullishCoalescing,
+}
+
+#[derive(PartialEq, Eq, Debug)]
+pub enum UpdateOperator {
+    Increment,
+    Decrement,
+}
+
+pub enum Expr {
+    This {
+        span: Span,
+    },
+    Super {
+        span: Span,
+    },
+    NewTarget {
+        span: Span,
+    },
+    ImportMeta {
+        span: Span,
+    },
+    Identifier {
+        name: string,
+        span: Span,
+    },
+    PrivateIdentifier {
+        name: string,
+        span: Span,
+    },
+    Number {
+        raw: string,
+        span: Span,
+    },
+    BigInt {
+        raw: string,
+        span: Span,
+    },
+    String {
+        value: string,
+        raw: string,
+        span: Span,
+    },
+    RegExp {
+        pattern: string,
+        flags: string,
+        span: Span,
+    },
+    TaggedTemplate {
+        tag: Ref[Expr],
+        cooked: Vec[Option[string]],
+        raw: Vec[string],
+        substitutions: Vec[Ref[Expr]],
+        span: Span,
+    },
+    Bool {
+        value: bool,
+        span: Span,
+    },
+    Null {
+        span: Span,
+    },
+    Parenthesized {
+        expression: Ref[Expr],
+        span: Span,
+    },
+    Unary {
+        operator: UnaryOperator,
+        argument: Ref[Expr],
+        span: Span,
+    },
+    Binary {
+        operator: BinaryOperator,
+        left: Ref[Expr],
+        right: Ref[Expr],
+        span: Span,
+    },
+    Conditional {
+        test: Ref[Expr],
+        consequent: Ref[Expr],
+        alternate: Ref[Expr],
+        span: Span,
+    },
+    Assignment {
+        operator: AssignmentOperator,
+        left: Ref[Expr],
+        right: Ref[Expr],
+        span: Span,
+    },
+    DestructuringAssignment {
+        pattern: Ref[AssignmentPattern],
+        right: Ref[Expr],
+        span: Span,
+    },
+    Update {
+        operator: UpdateOperator,
+        argument: Ref[Expr],
+        prefix: bool,
+        span: Span,
+    },
+    Sequence {
+        expressions: Vec[Ref[Expr]],
+        span: Span,
+    },
+    Spread {
+        argument: Ref[Expr],
+        span: Span,
+    },
+    Member {
+        object: Ref[Expr],
+        property: Ref[Expr],
+        computed: bool,
+        optional: bool,
+        span: Span,
+    },
+    Call {
+        callee: Ref[Expr],
+        arguments: Vec[Expr],
+        span: Span,
+    },
+    DynamicImport {
+        specifier: Ref[Expr],
+        options: Option[Ref[Expr]],
+        span: Span,
+    },
+    New {
+        callee: Ref[Expr],
+        arguments: Vec[Expr],
+        span: Span,
+    },
+    Function {
+        name: Option[string],
+        parameters: Vec[FunctionParameter],
+        body: Vec[Stmt],
+        generator: bool,
+        asynchronous: bool,
+        span: Span,
+    },
+    Await {
+        argument: Ref[Expr],
+        span: Span,
+    },
+    Yield {
+        argument: Option[Ref[Expr]],
+        delegate: bool,
+        span: Span,
+    },
+    Class {
+        name: Option[string],
+        heritage: Option[Ref[Expr]],
+        elements: Vec[ClassElement],
+        span: Span,
+    },
+    Arrow {
+        parameters: Vec[FunctionParameter],
+        body: Vec[Stmt],
+        expression_body: bool,
+        asynchronous: bool,
+        span: Span,
+    },
+    Object {
+        properties: Vec[ObjectProperty],
+        span: Span,
+    },
+    Array {
+        elements: Vec[ArrayElement],
+        span: Span,
+    },
+    Error {
+        span: Span,
+    },
+}
+
+pub fn span(start: int, end: int) -> Span {
+    Span { start, end }
+}
+
+pub fn expr_span(value: Expr) -> Span {
+    match value {
+        This { span } | Super { span } | NewTarget { span } | ImportMeta { span } | Identifier {
+            span,
+            ..,
+        } | PrivateIdentifier { span, .. } | Number { span, .. } | BigInt { span, .. } | String {
+            span,
+            ..,
+        } | RegExp { span, .. } | TaggedTemplate { span, .. } | Bool { span, .. } | Null { span } | Parenthesized {
+            span,
+            ..,
+        } | Unary { span, .. } | Binary { span, .. } | Conditional { span, .. } | Assignment {
+            span,
+            ..,
+        } | DestructuringAssignment { span, .. } | Update { span, .. } | Sequence { span, .. } | Spread {
+            span,
+            ..,
+        } | Member { span, .. } | Call { span, .. } | DynamicImport { span, .. } | New { span, .. } | Function {
+            span,
+            ..,
+        } | Await { span, .. } | Yield { span, .. } | Class { span, .. } | Arrow { span, .. } | Object {
+            span,
+            ..,
+        } | Array { span, .. } | Error { span } => span,
+    }
+}
+
+pub fn stmt_span(value: Stmt) -> Span {
+    match value {
+        Empty { span } | Debugger { span } | Expression { span, .. } | Block { span, .. } | VariableDeclaration {
+            span,
+            ..,
+        } | ImportNamespace { span, .. } | ImportNamed { span, .. } | ImportSideEffect { span, .. } | ExportNamed {
+            span,
+            ..,
+        } | ExportDeclaration { span, .. } | ExportDefault { span, .. } | ExportAll { span, .. } | FunctionDeclaration {
+            span,
+            ..,
+        } | ClassDeclaration { span, .. } | If { span, .. } | While { span, .. } | With { span, .. } | For {
+            span,
+            ..,
+        } | ForOf { span, .. } | ForIn { span, .. } | DoWhile { span, .. } | Switch { span, .. } | Break {
+            span,
+            ..,
+        } | Continue { span, .. } | Labelled { span, .. } | Return { span, .. } | Throw { span, .. } | Try {
+            span,
+            ..,
+        } => span,
+    }
+}

@@ -1,0 +1,2394 @@
+package runtime;
+
+use gomlang::quickjs::arraybuffer;
+use gomlang::quickjs::dtoa;
+use std::collections;
+use std::math;
+use std::num;
+
+#[derive(Hash, PartialEq, Eq)]
+pub enum PropertyKey {
+    String(JsString),
+    Symbol(Symbol),
+}
+
+pub fn string_property_key(value: string) -> PropertyKey {
+    let bytes = value.to_bytes();
+    PropertyKey::String(JsString::from_utf8(bytes.slice(0, bytes.len())))
+}
+
+pub fn js_string_property_key(value: JsString) -> PropertyKey {
+    PropertyKey::String(value)
+}
+
+pub enum PropertyDescriptor {
+    Data {
+        value: Value,
+        writable: bool,
+        enumerable: bool,
+        configurable: bool,
+    },
+    Accessor {
+        get: Option[Value],
+        set: Option[Value],
+        enumerable: bool,
+        configurable: bool,
+    },
+}
+
+pub enum PrivateElement {
+    Field(Value),
+    Method(Value),
+    Accessor {
+        get: Option[Value],
+        set: Option[Value],
+    },
+}
+
+pub enum ObjectKind {
+    Ordinary,
+    Array,
+    Function,
+}
+
+pub enum TypedArrayView {
+    Uint8(arraybuffer::Uint8Array),
+    Int32(arraybuffer::Int32Array),
+    Float64(arraybuffer::Float64Array),
+    Numeric(arraybuffer::NumericArray),
+    BigInt(arraybuffer::BigIntArray),
+}
+
+struct TypedArrayState {
+    view: TypedArrayView,
+    buffer_object: ObjectId,
+}
+
+enum TypedArrayNumericIndex {
+    Invalid,
+    Index(int),
+}
+
+fn typed_array_length(view: TypedArrayView) -> int {
+    match view {
+        TypedArrayView::Uint8(value) => value.length(),
+        TypedArrayView::Int32(value) => value.length(),
+        TypedArrayView::Float64(value) => value.length(),
+        TypedArrayView::Numeric(value) => value.length(),
+        TypedArrayView::BigInt(value) => value.length(),
+    }
+}
+
+fn typed_array_element(view: TypedArrayView, index: int) -> Option[Value] {
+    if index < 0 || index >= typed_array_length(view) {
+        Option::None
+    } else {
+        match view {
+            TypedArrayView::Uint8(value) => match value.get(index) {
+                Ok(value) => Option::Some(Value::Int(value.to_int32())),
+                Err(_) => Option::None,
+            },
+            TypedArrayView::Int32(value) => match value.get(index) {
+                Ok(value) => Option::Some(Value::Int(value)),
+                Err(_) => Option::None,
+            },
+            TypedArrayView::Float64(value) => match value.get(index) {
+                Ok(value) => Option::Some(Value::Float(value)),
+                Err(_) => Option::None,
+            },
+            TypedArrayView::Numeric(value) => match value.get(index) {
+                Ok(value) => Option::Some(Value::Float(value)),
+                Err(_) => Option::None,
+            },
+            TypedArrayView::BigInt(value) => match value.get(index) {
+                Ok(value) => Option::Some(Value::BigInt(BigInt::from_integer(value))),
+                Err(_) => Option::None,
+            },
+        }
+    }
+}
+
+fn typed_array_set_element(view: TypedArrayView, index: int, value: float64) -> bool {
+    if index < 0 || index >= typed_array_length(view) {
+        false
+    } else {
+        match view {
+            TypedArrayView::Uint8(target) => target.set(index, value).is_ok(),
+            TypedArrayView::Int32(target) => target.set(index, value).is_ok(),
+            TypedArrayView::Float64(target) => target.set(index, value).is_ok(),
+            TypedArrayView::Numeric(target) => target.set(index, value).is_ok(),
+            TypedArrayView::BigInt(_) => false,
+        }
+    }
+}
+
+fn typed_array_set_value(view: TypedArrayView, index: int, value: Value) -> Result[bool, TypeError] {
+    match view {
+        TypedArrayView::BigInt(target) => {
+            let converted = primitive_to_bigint(value)?;
+            if index < 0 || index >= target.length() {
+                Result::Ok(false)
+            } else {
+                Result::Ok(target.set(index, converted.integer()).is_ok())
+            }
+        },
+        _ => {
+            let converted = primitive_to_number(value)?;
+            Result::Ok(typed_array_set_element(view, index, converted))
+        },
+    }
+}
+
+fn typed_array_numeric_index(key: PropertyKey) -> Option[TypedArrayNumericIndex] {
+    let value = match key {
+        PropertyKey::String(value) => value,
+        PropertyKey::Symbol(_) => return Option::None,
+    };
+    let source = match value.to_host_string() {
+        Ok(value) => value,
+        Err(_) => return Option::None,
+    };
+    if source == "-0" {
+        return Option::Some(TypedArrayNumericIndex::Invalid)
+    } else {};
+    let number = match primitive_to_number(Value::String(value)) {
+        Ok(value) => value,
+        Err(_) => return Option::None,
+    };
+    if dtoa::number_to_string(number) != source {
+        Option::None
+    } else if !math::is_finite(number) || number < 0.0 || math::trunc(number) != number
+        || number > 2147483647.0 {
+        Option::Some(TypedArrayNumericIndex::Invalid)
+    } else {
+        match num::parse_int(dtoa::number_to_string(number)) {
+            Ok(value) => Option::Some(TypedArrayNumericIndex::Index(value)),
+            Err(_) => Option::Some(TypedArrayNumericIndex::Invalid),
+        }
+    }
+}
+
+#[derive(PartialEq, Eq, Debug)]
+pub enum PrimitivePrototypeKind {
+    Boolean,
+    Number,
+    String,
+    BigInt,
+    Symbol,
+}
+
+pub struct ObjectId {
+    heap_identity_value: Ref[bool],
+    slot_value: int,
+    generation_value: uint64,
+    callable_value: bool,
+}
+
+impl ObjectId {
+    pub fn slot(self: ObjectId) -> int {
+        self.slot_value
+    }
+
+    pub fn generation(self: ObjectId) -> uint64 {
+        self.generation_value
+    }
+
+    pub fn is_callable(self: ObjectId) -> bool {
+        self.callable_value
+    }
+}
+
+impl PartialEq for ObjectId {
+    fn eq(self: ObjectId, other: ObjectId) -> bool {
+        self.heap_identity_value == other.heap_identity_value && self.slot_value == other.slot_value
+            && self.generation_value == other.generation_value
+    }
+}
+
+impl Eq for ObjectId {}
+
+impl Hash for ObjectId {
+    fn hash(self: ObjectId) -> uint64 {
+        ptr_hash(self.heap_identity_value) * 1099511628211 + Hash::hash(self.slot_value) * 16777619
+            + self.generation_value
+    }
+}
+
+impl Debug for ObjectId {
+    fn debug(self: ObjectId) -> string {
+        "ObjectId(" + self.slot_value.to_string() + ", " + self.generation_value.to_string() + ")"
+    }
+}
+
+pub struct Object {
+    kind_value: ObjectKind,
+    prototype_value: Ref[Option[ObjectId]],
+    extensible_value: Ref[bool],
+    properties_value: collections::IndexMap[PropertyKey, PropertyDescriptor],
+    private_elements_value: HashMap[ObjectId, PrivateElement],
+    primitive_value_value: Ref[Option[Value]],
+    argument_map_value: HashMap[uint32, Ref[Value]],
+    typed_array_value: Ref[Option[TypedArrayState]],
+    proxy_value: Ref[Option[ProxyData]],
+}
+
+struct ProxyData {
+    target_value: Ref[Option[ObjectId]],
+    handler_value: Ref[Option[ObjectId]],
+}
+
+impl Object {
+    pub fn kind(self: Object) -> ObjectKind {
+        self.kind_value
+    }
+
+    pub fn prototype(self: Object) -> Option[ObjectId] {
+        self.prototype_value.get()
+    }
+
+    pub fn extensible(self: Object) -> bool {
+        self.extensible_value.get()
+    }
+
+    pub fn prevent_extensions(self: Object) -> unit {
+        self.extensible_value.set(false)
+    }
+
+    pub fn own_property(self: Object, key: PropertyKey) -> Option[PropertyDescriptor] {
+        match self.typed_array_value.get() {
+            Some(state) => match typed_array_numeric_index(key) {
+                Some(TypedArrayNumericIndex::Index(index)) => {
+                    typed_array_element(state.view, index).map(
+                        |value| data_descriptor(value, true, true, true),
+                    )
+                },
+                Some(TypedArrayNumericIndex::Invalid) => Option::None,
+                None => match self.properties_value.get(key) {
+                    Some(value) => Option::Some(mapped_descriptor(self, key, value)),
+                    None => Option::None,
+                },
+            },
+            None => match self.properties_value.get(key) {
+                Some(value) => Option::Some(mapped_descriptor(self, key, value)),
+                None => Option::None,
+            },
+        }
+    }
+
+    pub fn own_property_count(self: Object) -> int {
+        self.properties_value.len()
+            + match self.typed_array_value.get() {
+                Some(value) => typed_array_length(value.view),
+                None => 0,
+            }
+    }
+
+    pub fn private_element(self: Object, name: ObjectId) -> Option[PrivateElement] {
+        self.private_elements_value.get(name)
+    }
+
+    pub fn primitive_value(self: Object) -> Option[Value] {
+        self.primitive_value_value.get()
+    }
+
+    pub fn set_primitive_value(self: Object, value: Value) -> unit {
+        self.primitive_value_value.set(Option::Some(value))
+    }
+
+    pub fn is_proxy(self: Object) -> bool {
+        self.proxy_value.get().is_some()
+    }
+
+    pub fn proxy_target(self: Object) -> Option[ObjectId] {
+        match self.proxy_value.get() {
+            Some(value) => value.target_value.get(),
+            None => Option::None,
+        }
+    }
+
+    pub fn proxy_handler(self: Object) -> Option[ObjectId] {
+        match self.proxy_value.get() {
+            Some(value) => value.handler_value.get(),
+            None => Option::None,
+        }
+    }
+
+    pub fn revoke_proxy(self: Object) -> bool {
+        match self.proxy_value.get() {
+            Some(value) => {
+                value.target_value.set(Option::None);
+                value.handler_value.set(Option::None);
+                true
+            },
+            None => false,
+        }
+    }
+}
+
+enum HeapSlot {
+    Occupied {
+        generation: uint64,
+        object: Object,
+    },
+    Vacant {
+        generation: uint64,
+        next: Option[int],
+    },
+}
+
+struct WeakEntry {
+    owner: ObjectId,
+    key: Value,
+    value: Value,
+}
+
+struct FinalizationCell {
+    owner: ObjectId,
+    target: Value,
+    held: Value,
+    token: Option[Value],
+    callback: Value,
+}
+
+pub struct FinalizationJob {
+    pub callback: Value,
+    pub held: Value,
+}
+
+pub struct Heap {
+    identity_value: Ref[bool],
+    slots_value: Vec[HeapSlot],
+    free_head_value: Ref[Option[int]],
+    live_count_value: Ref[int],
+    object_prototype_value: Ref[Option[ObjectId]],
+    function_prototype_value: Ref[Option[ObjectId]],
+    array_prototype_value: Ref[Option[ObjectId]],
+    boolean_prototype_value: Ref[Option[ObjectId]],
+    number_prototype_value: Ref[Option[ObjectId]],
+    string_prototype_value: Ref[Option[ObjectId]],
+    bigint_prototype_value: Ref[Option[ObjectId]],
+    symbol_prototype_value: Ref[Option[ObjectId]],
+    weak_entries_value: Vec[Option[WeakEntry]],
+    finalization_cells_value: Vec[Option[FinalizationCell]],
+    finalization_jobs_value: Vec[FinalizationJob],
+}
+
+pub struct GcStats {
+    pub live_before: int,
+    pub reachable: int,
+    pub collected: int,
+    pub live_after: int,
+}
+
+pub struct GcEdge {
+    pub owner: ObjectId,
+    pub values: Vec[Value],
+}
+
+fn object_is_callable(kind: ObjectKind) -> bool {
+    match kind {
+        ObjectKind::Function => true,
+        ObjectKind::Ordinary | ObjectKind::Array => false,
+    }
+}
+
+fn make_object(kind: ObjectKind, prototype: Option[ObjectId]) -> Object {
+    Object {
+        kind_value: kind,
+        prototype_value: Ref::new(prototype),
+        extensible_value: Ref::new(true),
+        properties_value: collections::IndexMap::new(),
+        private_elements_value: HashMap::{},
+        primitive_value_value: Ref::new(Option::None),
+        argument_map_value: HashMap::{},
+        typed_array_value: Ref::new(Option::None),
+        proxy_value: Ref::new(Option::None),
+    }
+}
+
+fn enqueue_object(heap: Heap, id: ObjectId, marked: Vec[bool], pending: Vec[ObjectId]) -> unit {
+    if heap.identity_value == id.heap_identity_value && id.slot_value >= 0
+        && id.slot_value < heap.slots_value.len()
+        && !marked.get(id.slot_value) {
+        match heap.slots_value.get(id.slot_value) {
+            HeapSlot::Occupied { generation, .. } => if generation == id.generation_value {
+                marked.set(id.slot_value, true);
+                pending.push(id)
+            } else {},
+            HeapSlot::Vacant { .. } => (),
+        }
+    } else {}
+}
+
+fn enqueue_value(
+    heap: Heap,
+    value: Value,
+    marked: Vec[bool],
+    symbols: collections::HashSet[uint64],
+    pending: Vec[ObjectId],
+) -> unit {
+    match value {
+        Value::Object(id) => enqueue_object(heap, id, marked, pending),
+        Value::Symbol(value) => {
+            symbols.insert(value.id());
+        },
+        _ => (),
+    }
+}
+
+fn enqueue_optional_value(
+    heap: Heap,
+    value: Option[Value],
+    marked: Vec[bool],
+    symbols: collections::HashSet[uint64],
+    pending: Vec[ObjectId],
+) -> unit {
+    match value {
+        Some(value) => enqueue_value(heap, value, marked, symbols, pending),
+        None => (),
+    }
+}
+
+fn enqueue_descriptor(
+    heap: Heap,
+    descriptor: PropertyDescriptor,
+    marked: Vec[bool],
+    symbols: collections::HashSet[uint64],
+    pending: Vec[ObjectId],
+) -> unit {
+    match descriptor {
+        PropertyDescriptor::Data { value, .. } => enqueue_value(
+            heap,
+            value,
+            marked,
+            symbols,
+            pending,
+        ),
+        PropertyDescriptor::Accessor { get, set, .. } => {
+            enqueue_optional_value(heap, get, marked, symbols, pending);
+            enqueue_optional_value(heap, set, marked, symbols, pending)
+        },
+    }
+}
+
+fn enqueue_private_element(
+    heap: Heap,
+    element: PrivateElement,
+    marked: Vec[bool],
+    symbols: collections::HashSet[uint64],
+    pending: Vec[ObjectId],
+) -> unit {
+    match element {
+        PrivateElement::Field(value) | PrivateElement::Method(value) => {
+            enqueue_value(heap, value, marked, symbols, pending)
+        },
+        PrivateElement::Accessor { get, set } => {
+            enqueue_optional_value(heap, get, marked, symbols, pending);
+            enqueue_optional_value(heap, set, marked, symbols, pending)
+        },
+    }
+}
+
+fn drain_pending(
+    heap: Heap,
+    marked: Vec[bool],
+    symbols: collections::HashSet[uint64],
+    pending: Vec[ObjectId],
+) -> unit {
+    while !pending.is_empty() {
+        let current = match pending.pop() {
+            Some(value) => value,
+            None => continue,
+        };
+        match heap.get(current) {
+            Some(object) => {
+                match object.prototype_value.get() {
+                    Some(prototype) => enqueue_object(heap, prototype, marked, pending),
+                    None => (),
+                };
+                for (key, descriptor) in object.properties_value.entries() {
+                    match key {
+                        PropertyKey::Symbol(value) => {
+                            symbols.insert(value.id());
+                        },
+                        PropertyKey::String(_) => (),
+                    };
+                    enqueue_descriptor(heap, descriptor, marked, symbols, pending)
+                }
+                for (name, element) in object.private_elements_value.entries() {
+                    enqueue_object(heap, name, marked, pending);
+                    enqueue_private_element(heap, element, marked, symbols, pending)
+                }
+                enqueue_optional_value(
+                    heap,
+                    object.primitive_value_value.get(),
+                    marked,
+                    symbols,
+                    pending,
+                );
+                for (_, cell) in object.argument_map_value.entries() {
+                    enqueue_value(heap, cell.get(), marked, symbols, pending)
+                }
+                match object.typed_array_value.get() {
+                    Some(value) => enqueue_object(heap, value.buffer_object, marked, pending),
+                    None => (),
+                };
+                match object.proxy_value.get() {
+                    Some(value) => {
+                        match value.target_value.get() {
+                            Some(target) => enqueue_object(heap, target, marked, pending),
+                            None => (),
+                        };
+                        match value.handler_value.get() {
+                            Some(handler) => enqueue_object(heap, handler, marked, pending),
+                            None => (),
+                        }
+                    },
+                    None => (),
+                }
+            },
+            None => (),
+        }
+    }
+}
+
+fn marked_object(heap: Heap, id: ObjectId, marked: Vec[bool]) -> bool {
+    if heap.identity_value != id.heap_identity_value || id.slot_value < 0
+        || id.slot_value >= marked.len()
+        || !marked[id.slot_value] {
+        false
+    } else {
+        match heap.slots_value[id.slot_value] {
+            HeapSlot::Occupied { generation, .. } => generation == id.generation_value,
+            HeapSlot::Vacant { .. } => false,
+        }
+    }
+}
+
+fn marked_weak_key(
+    heap: Heap,
+    value: Value,
+    marked: Vec[bool],
+    symbols: collections::HashSet[uint64],
+) -> bool {
+    match value {
+        Value::Object(object) => marked_object(heap, object, marked),
+        Value::Symbol(value) => symbols.contains(value.id()),
+        _ => false,
+    }
+}
+
+fn enqueue_conditional_value(
+    heap: Heap,
+    value: Value,
+    marked: Vec[bool],
+    symbols: collections::HashSet[uint64],
+    pending: Vec[ObjectId],
+) -> bool {
+    match value {
+        Value::Object(object) => if marked_object(heap, object, marked) {
+            false
+        } else {
+            enqueue_object(heap, object, marked, pending);
+            marked_object(heap, object, marked)
+        },
+        Value::Symbol(value) => symbols.insert(value.id()),
+        _ => false,
+    }
+}
+
+fn mark_conditional_edges(
+    heap: Heap,
+    marked: Vec[bool],
+    symbols: collections::HashSet[uint64],
+    pending: Vec[ObjectId],
+    edges: Vec[GcEdge],
+) -> unit {
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for edge in edges {
+            if marked_object(heap, edge.owner, marked) {
+                for value in edge.values {
+                    changed = enqueue_conditional_value(heap, value, marked, symbols, pending)
+                        || changed;
+                }
+            } else {}
+        }
+        for candidate in heap.weak_entries_value {
+            match candidate {
+                Some(entry) => if marked_object(heap, entry.owner, marked)
+                    && marked_weak_key(heap, entry.key, marked, symbols) {
+                    changed = enqueue_conditional_value(heap, entry.value, marked, symbols, pending)
+                        || changed;
+                } else {},
+                None => (),
+            }
+        }
+        for candidate in heap.finalization_cells_value {
+            match candidate {
+                Some(cell) => if marked_object(heap, cell.owner, marked) {
+                    changed = enqueue_conditional_value(heap, cell.held, marked, symbols, pending)
+                        || changed;
+                    changed = enqueue_conditional_value(
+                        heap,
+                        cell.callback,
+                        marked,
+                        symbols,
+                        pending,
+                    )
+                        || changed;
+                } else {},
+                None => (),
+            }
+        }
+        drain_pending(heap, marked, symbols, pending)
+    }
+}
+
+fn mark_reachable(
+    heap: Heap,
+    roots: Vec[Value],
+    marked: Vec[bool],
+    symbols: collections::HashSet[uint64],
+    edges: Vec[GcEdge],
+) -> int {
+    let pending: Vec[ObjectId] = Vec::[];
+    for root in roots {
+        enqueue_value(heap, root, marked, symbols, pending)
+    }
+    drain_pending(heap, marked, symbols, pending);
+    mark_conditional_edges(heap, marked, symbols, pending, edges);
+    let mut reachable = 0;
+    let mut index = 0;
+    while index < marked.len() {
+        if marked.get(index) {
+            reachable += 1;
+        } else {};
+        index += 1;
+    }
+    reachable
+}
+
+impl Heap {
+    pub fn new() -> Heap {
+        Heap {
+            identity_value: Ref::new(false),
+            slots_value: Vec::[],
+            free_head_value: Ref::new(Option::None),
+            live_count_value: Ref::new(0),
+            object_prototype_value: Ref::new(Option::None),
+            function_prototype_value: Ref::new(Option::None),
+            array_prototype_value: Ref::new(Option::None),
+            boolean_prototype_value: Ref::new(Option::None),
+            number_prototype_value: Ref::new(Option::None),
+            string_prototype_value: Ref::new(Option::None),
+            bigint_prototype_value: Ref::new(Option::None),
+            symbol_prototype_value: Ref::new(Option::None),
+            weak_entries_value: Vec::[],
+            finalization_cells_value: Vec::[],
+            finalization_jobs_value: Vec::[],
+        }
+    }
+
+    fn make_id(self: Heap, slot: int, generation: uint64, callable: bool) -> ObjectId {
+        ObjectId {
+            heap_identity_value: self.identity_value,
+            slot_value: slot,
+            generation_value: generation,
+            callable_value: callable,
+        }
+    }
+
+    fn append(self: Heap, object: Object, callable: bool) -> ObjectId {
+        let slot = self.slots_value.len();
+        self.slots_value.push(HeapSlot::Occupied { generation: 0, object });
+        self.live_count_value.set(self.live_count_value.get() + 1);
+        self.make_id(slot, 0, callable)
+    }
+
+    fn allocate_validated(self: Heap, kind: ObjectKind, prototype: Option[ObjectId]) -> ObjectId {
+        let callable = object_is_callable(kind);
+        let object = make_object(kind, prototype);
+        match self.free_head_value.get() {
+            Some(slot) => if slot >= 0 && slot < self.slots_value.len() {
+                match self.slots_value.get(slot) {
+                    HeapSlot::Vacant { generation, next } => {
+                        self.slots_value.set(slot, HeapSlot::Occupied { generation, object });
+                        self.free_head_value.set(next);
+                        self.live_count_value.set(self.live_count_value.get() + 1);
+                        self.make_id(slot, generation, callable)
+                    },
+                    HeapSlot::Occupied { .. } => {
+                        self.free_head_value.set(Option::None);
+                        self.append(object, callable)
+                    },
+                }
+            } else {
+                self.free_head_value.set(Option::None);
+                self.append(object, callable)
+            },
+            None => self.append(object, callable),
+        }
+    }
+
+    pub fn allocate(self: Heap, kind: ObjectKind, prototype: Option[ObjectId]) -> Result[
+        ObjectId,
+        TypeError,
+    ] {
+        match prototype {
+            Some(value) => if self.contains(value) {
+                Result::Ok(self.allocate_validated(kind, Option::Some(value)))
+            } else {
+                Result::Err(TypeError { message: "prototype does not belong to this heap" })
+            },
+            None => Result::Ok(self.allocate_validated(kind, Option::None)),
+        }
+    }
+
+    pub fn contains(self: Heap, id: ObjectId) -> bool {
+        if self.identity_value != id.heap_identity_value || id.slot_value < 0
+            || id.slot_value >= self.slots_value.len() {
+            false
+        } else {
+            match self.slots_value.get(id.slot_value) {
+                HeapSlot::Occupied { generation, .. } => generation == id.generation_value,
+                HeapSlot::Vacant { .. } => false,
+            }
+        }
+    }
+
+    pub fn get(self: Heap, id: ObjectId) -> Option[Object] {
+        if self.identity_value != id.heap_identity_value || id.slot_value < 0
+            || id.slot_value >= self.slots_value.len() {
+            Option::None
+        } else {
+            match self.slots_value.get(id.slot_value) {
+                HeapSlot::Occupied { generation, object } => if generation == id.generation_value {
+                    Option::Some(object)
+                } else {
+                    Option::None
+                },
+                HeapSlot::Vacant { .. } => Option::None,
+            }
+        }
+    }
+
+    pub fn free(self: Heap, id: ObjectId) -> bool {
+        if !self.contains(id) {
+            false
+        } else {
+            let generation = match self.slots_value.get(id.slot_value) {
+                HeapSlot::Occupied { generation, .. } => generation,
+                HeapSlot::Vacant { generation, .. } => generation,
+            };
+            self.slots_value.set(
+                id.slot_value,
+                HeapSlot::Vacant { generation: generation + 1, next: self.free_head_value.get() },
+            );
+            self.free_head_value.set(Option::Some(id.slot_value));
+            self.live_count_value.set(self.live_count_value.get() - 1);
+            true
+        }
+    }
+
+    pub fn live_count(self: Heap) -> int {
+        self.live_count_value.get()
+    }
+
+    pub fn slot_count(self: Heap) -> int {
+        self.slots_value.len()
+    }
+
+    pub fn array_prototype(self: Heap) -> Option[ObjectId] {
+        self.array_prototype_value.get()
+    }
+
+    pub fn primitive_prototype(self: Heap, kind: PrimitivePrototypeKind) -> Option[ObjectId] {
+        match kind {
+            PrimitivePrototypeKind::Boolean => self.boolean_prototype_value.get(),
+            PrimitivePrototypeKind::Number => self.number_prototype_value.get(),
+            PrimitivePrototypeKind::String => self.string_prototype_value.get(),
+            PrimitivePrototypeKind::BigInt => self.bigint_prototype_value.get(),
+            PrimitivePrototypeKind::Symbol => self.symbol_prototype_value.get(),
+        }
+    }
+
+    pub fn set_primitive_prototype(self: Heap, kind: PrimitivePrototypeKind, prototype: ObjectId) -> bool {
+        if !self.contains(prototype) {
+            false
+        } else {
+            match kind {
+                PrimitivePrototypeKind::Boolean => {
+                    self.boolean_prototype_value.set(Option::Some(prototype))
+                },
+                PrimitivePrototypeKind::Number => {
+                    self.number_prototype_value.set(Option::Some(prototype))
+                },
+                PrimitivePrototypeKind::String => {
+                    self.string_prototype_value.set(Option::Some(prototype))
+                },
+                PrimitivePrototypeKind::BigInt => {
+                    self.bigint_prototype_value.set(Option::Some(prototype))
+                },
+                PrimitivePrototypeKind::Symbol => {
+                    self.symbol_prototype_value.set(Option::Some(prototype))
+                },
+            };
+            true
+        }
+    }
+
+    pub fn object_prototype(self: Heap) -> Option[ObjectId] {
+        self.object_prototype_value.get()
+    }
+
+    pub fn set_object_prototype(self: Heap, prototype: ObjectId) -> bool {
+        if self.contains(prototype) {
+            self.object_prototype_value.set(Option::Some(prototype));
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn function_prototype(self: Heap) -> Option[ObjectId] {
+        self.function_prototype_value.get()
+    }
+
+    pub fn set_function_prototype(self: Heap, prototype: ObjectId) -> bool {
+        if self.contains(prototype) && prototype.is_callable() {
+            self.function_prototype_value.set(Option::Some(prototype));
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn set_array_prototype(self: Heap, prototype: ObjectId) -> bool {
+        if self.contains(prototype) {
+            self.array_prototype_value.set(Option::Some(prototype));
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn collect(self: Heap, roots: Vec[Value]) -> GcStats {
+        let edges: Vec[GcEdge] = Vec::[];
+        self.collect_with_edges(roots, edges)
+    }
+
+    pub fn collect_with_edges(self: Heap, roots: Vec[Value], edges: Vec[GcEdge]) -> GcStats {
+        let live_before = self.live_count_value.get();
+        let marked: Vec[bool] = Vec::with_capacity(self.slots_value.len());
+        let mut fill = 0;
+        while fill < self.slots_value.len() {
+            marked.push(false);
+            fill += 1;
+        }
+        let all_roots = roots;
+        match self.object_prototype_value.get() {
+            Some(value) => all_roots.push(Value::Object(value)),
+            None => (),
+        };
+        match self.function_prototype_value.get() {
+            Some(value) => all_roots.push(Value::Object(value)),
+            None => (),
+        };
+        match self.array_prototype_value.get() {
+            Some(value) => all_roots.push(Value::Object(value)),
+            None => (),
+        };
+        for prototype in Vec::[
+            self.boolean_prototype_value,
+            self.number_prototype_value,
+            self.string_prototype_value,
+            self.bigint_prototype_value,
+            self.symbol_prototype_value,
+        ] {
+            match prototype.get() {
+                Some(value) => all_roots.push(Value::Object(value)),
+                None => (),
+            }
+        }
+        for job in self.finalization_jobs_value {
+            all_roots.push(job.callback);
+            all_roots.push(job.held)
+        }
+        let marked_symbols: collections::HashSet[uint64] = collections::HashSet::new();
+        let reachable = mark_reachable(self, all_roots, marked, marked_symbols, edges);
+        let mut finalization_index = 0;
+        while finalization_index < self.finalization_cells_value.len() {
+            match self.finalization_cells_value[finalization_index] {
+                Some(cell) => if !marked_object(self, cell.owner, marked) {
+                    self.finalization_cells_value[finalization_index] = Option::None;
+                } else if !marked_weak_key(self, cell.target, marked, marked_symbols) {
+                    self.finalization_jobs_value.push(
+                        FinalizationJob { callback: cell.callback, held: cell.held },
+                    );
+                    self.finalization_cells_value[finalization_index] = Option::None;
+                } else {
+                    let token = match cell.token {
+                        Some(value) => if marked_weak_key(self, value, marked, marked_symbols) {
+                            Option::Some(value)
+                        } else {
+                            Option::None
+                        },
+                        None => Option::None,
+                    };
+                    self.finalization_cells_value[finalization_index] = Option::Some(
+                        FinalizationCell {
+                            owner: cell.owner,
+                            target: cell.target,
+                            held: cell.held,
+                            token,
+                            callback: cell.callback,
+                        },
+                    );
+                },
+                None => (),
+            };
+            finalization_index += 1;
+        }
+        let mut collected = 0;
+        let mut slot = 0;
+        while slot < self.slots_value.len() {
+            if !marked.get(slot) {
+                match self.slots_value.get(slot) {
+                    HeapSlot::Occupied { generation, .. } => {
+                        self.slots_value.set(
+                            slot,
+                            HeapSlot::Vacant {
+                                generation: generation + 1,
+                                next: self.free_head_value.get(),
+                            },
+                        );
+                        self.free_head_value.set(Option::Some(slot));
+                        collected += 1;
+                    },
+                    HeapSlot::Vacant { .. } => (),
+                }
+            } else {};
+            slot += 1;
+        }
+        self.live_count_value.set(reachable);
+        let mut weak_index = 0;
+        while weak_index < self.weak_entries_value.len() {
+            match self.weak_entries_value[weak_index] {
+                Some(entry) => if !self.contains(entry.owner)
+                    || !marked_weak_key(self, entry.key, marked, marked_symbols) {
+                    self.weak_entries_value[weak_index] = Option::None;
+                } else {},
+                None => (),
+            };
+            weak_index += 1;
+        }
+        GcStats { live_before, reachable, collected, live_after: reachable }
+    }
+}
+
+fn weak_key_live(heap: Heap, value: Value) -> bool {
+    match value {
+        Value::Object(object) => heap.contains(object),
+        Value::Symbol(_) => true,
+        _ => false,
+    }
+}
+
+pub fn is_weak_target(heap: Heap, value: Value) -> bool {
+    weak_key_live(heap, value)
+}
+
+fn weak_entry_index(heap: Heap, owner: ObjectId, key: Value) -> Option[int] {
+    let mut index = 0;
+    while index < heap.weak_entries_value.len() {
+        match heap.weak_entries_value[index] {
+            Some(entry) => if !heap.contains(entry.owner) || !weak_key_live(heap, entry.key) {
+                heap.weak_entries_value[index] = Option::None;
+            } else if entry.owner == owner && same_value_zero(entry.key, key) {
+                return Option::Some(index)
+            } else {},
+            None => (),
+        };
+        index += 1;
+    }
+    Option::None
+}
+
+pub fn weak_map_set(heap: Heap, owner: ObjectId, key: Value, value: Value) -> bool {
+    if !heap.contains(owner) || !weak_key_live(heap, key) {
+        false
+    } else {
+        match weak_entry_index(heap, owner, key) {
+            Some(index) => {
+                heap.weak_entries_value[index] = Option::Some(WeakEntry { owner, key, value });
+            },
+            None => heap.weak_entries_value.push(Option::Some(WeakEntry { owner, key, value })),
+        };
+        true
+    }
+}
+
+pub fn weak_map_get(heap: Heap, owner: ObjectId, key: Value) -> Option[Value] {
+    if !heap.contains(owner) || !weak_key_live(heap, key) {
+        Option::None
+    } else {
+        match weak_entry_index(heap, owner, key) {
+            Some(index) => match heap.weak_entries_value[index] {
+                Some(entry) => Option::Some(entry.value),
+                None => Option::None,
+            },
+            None => Option::None,
+        }
+    }
+}
+
+pub fn weak_map_has(heap: Heap, owner: ObjectId, key: Value) -> bool {
+    if !heap.contains(owner) || !weak_key_live(heap, key) {
+        false
+    } else {
+        weak_entry_index(heap, owner, key).is_some()
+    }
+}
+
+pub fn weak_map_delete(heap: Heap, owner: ObjectId, key: Value) -> bool {
+    if !heap.contains(owner) || !weak_key_live(heap, key) {
+        false
+    } else {
+        match weak_entry_index(heap, owner, key) {
+            Some(index) => {
+                heap.weak_entries_value[index] = Option::None;
+                true
+            },
+            None => false,
+        }
+    }
+}
+
+pub fn weak_set_add(heap: Heap, owner: ObjectId, key: Value) -> bool {
+    weak_map_set(heap, owner, key, Value::Undefined)
+}
+
+pub fn weak_set_has(heap: Heap, owner: ObjectId, key: Value) -> bool {
+    weak_map_has(heap, owner, key)
+}
+
+pub fn weak_set_delete(heap: Heap, owner: ObjectId, key: Value) -> bool {
+    weak_map_delete(heap, owner, key)
+}
+
+pub fn weak_ref_set(heap: Heap, owner: ObjectId, target: Value) -> bool {
+    weak_map_set(heap, owner, target, Value::Undefined)
+}
+
+pub fn weak_ref_deref(heap: Heap, owner: ObjectId) -> Option[Value] {
+    if !heap.contains(owner) {
+        Option::None
+    } else {
+        let mut index = 0;
+        while index < heap.weak_entries_value.len() {
+            match heap.weak_entries_value[index] {
+                Some(entry) => if entry.owner == owner && weak_key_live(heap, entry.key) {
+                    return Option::Some(entry.key)
+                } else {},
+                None => (),
+            };
+            index += 1;
+        }
+        Option::None
+    }
+}
+
+pub fn finalization_register(
+    heap: Heap,
+    owner: ObjectId,
+    callback: Value,
+    target: Value,
+    held: Value,
+    token: Option[Value],
+) -> bool {
+    let callable = match callback {
+        Value::Object(object) => object.is_callable() && heap.contains(object),
+        _ => false,
+    };
+    let token_valid = match token {
+        Some(value) => weak_key_live(heap, value),
+        None => true,
+    };
+    if !heap.contains(owner) || !callable || !weak_key_live(heap, target)
+        || same_value(target, held)
+        || !token_valid {
+        false
+    } else {
+        heap.finalization_cells_value.push(
+            Option::Some(FinalizationCell { owner, target, held, token, callback }),
+        );
+        true
+    }
+}
+
+pub fn finalization_unregister(heap: Heap, owner: ObjectId, token: Value) -> Option[bool] {
+    if !heap.contains(owner) || !weak_key_live(heap, token) {
+        Option::None
+    } else {
+        let mut removed = false;
+        let mut index = 0;
+        while index < heap.finalization_cells_value.len() {
+            match heap.finalization_cells_value[index] {
+                Some(cell) => if cell.owner == owner {
+                    match cell.token {
+                        Some(candidate) => if weak_key_live(heap, candidate)
+                            && same_value(candidate, token) {
+                            heap.finalization_cells_value[index] = Option::None;
+                            removed = true;
+                        } else {},
+                        None => (),
+                    }
+                } else {},
+                None => (),
+            };
+            index += 1;
+        }
+        Option::Some(removed)
+    }
+}
+
+pub fn take_finalization_jobs(heap: Heap) -> Vec[FinalizationJob] {
+    let jobs: Vec[FinalizationJob] = Vec::with_capacity(heap.finalization_jobs_value.len());
+    for job in heap.finalization_jobs_value {
+        jobs.push(job)
+    }
+    heap.finalization_jobs_value.clear();
+    jobs
+}
+
+pub fn pop_finalization_job(heap: Heap) -> Option[FinalizationJob] {
+    if heap.finalization_jobs_value.is_empty() {
+        Option::None
+    } else {
+        Option::Some(heap.finalization_jobs_value.remove(0))
+    }
+}
+
+pub fn new_object(heap: Heap, kind: ObjectKind, prototype: Option[ObjectId]) -> Result[
+    ObjectId,
+    TypeError,
+] {
+    heap.allocate(kind, prototype)
+}
+
+pub fn new_proxy(heap: Heap, target: ObjectId, handler: ObjectId) -> Result[ObjectId, TypeError] {
+    if !heap.contains(target) || !heap.contains(handler) {
+        return Result::Err(TypeError { message: "proxy target and handler must be live objects" })
+    } else {};
+    let (kind, prototype) = match heap.get(target) {
+        Some(value) => (value.kind(), value.prototype()),
+        None => return Result::Err(TypeError { message: "proxy target is invalid" }),
+    };
+    let proxy = new_object(heap, kind, prototype)?;
+    match heap.get(proxy) {
+        Some(value) => {
+            value.proxy_value.set(
+                Option::Some(
+                    ProxyData {
+                        target_value: Ref::new(Option::Some(target)),
+                        handler_value: Ref::new(Option::Some(handler)),
+                    },
+                ),
+            );
+            Result::Ok(proxy)
+        },
+        None => Result::Err(TypeError { message: "proxy allocation failed" }),
+    }
+}
+
+pub fn revoke_proxy(heap: Heap, proxy: ObjectId) -> bool {
+    match heap.get(proxy) {
+        Some(value) => value.revoke_proxy(),
+        None => false,
+    }
+}
+
+pub fn register_typed_array(
+    heap: Heap,
+    object: ObjectId,
+    view: TypedArrayView,
+    buffer_object: ObjectId,
+) -> bool {
+    if !heap.contains(buffer_object) {
+        false
+    } else {
+        match heap.get(object) {
+            Some(target) => {
+                target.typed_array_value.set(Option::Some(TypedArrayState { view, buffer_object }));
+                true
+            },
+            None => false,
+        }
+    }
+}
+
+pub fn is_typed_array(heap: Heap, object: ObjectId) -> bool {
+    match heap.get(object) {
+        Some(value) => value.typed_array_value.get().is_some(),
+        None => false,
+    }
+}
+
+pub fn typed_array_element_length(heap: Heap, object: ObjectId) -> Option[int] {
+    match heap.get(object) {
+        Some(value) => match value.typed_array_value.get() {
+            Some(value) => Option::Some(typed_array_length(value.view)),
+            None => Option::None,
+        },
+        None => Option::None,
+    }
+}
+
+pub fn typed_array_view(heap: Heap, object: ObjectId) -> Option[TypedArrayView] {
+    match heap.get(object) {
+        Some(value) => match value.typed_array_value.get() {
+            Some(value) => Option::Some(value.view),
+            None => Option::None,
+        },
+        None => Option::None,
+    }
+}
+
+pub fn typed_array_buffer_object(heap: Heap, object: ObjectId) -> Option[ObjectId] {
+    match heap.get(object) {
+        Some(value) => match value.typed_array_value.get() {
+            Some(value) => Option::Some(value.buffer_object),
+            None => Option::None,
+        },
+        None => Option::None,
+    }
+}
+
+pub fn is_shared_typed_array(heap: Heap, object: ObjectId) -> bool {
+    match typed_array_view(heap, object) {
+        Some(TypedArrayView::Uint8(value)) => value.buffer().is_shared(),
+        Some(TypedArrayView::Int32(value)) => value.buffer().is_shared(),
+        Some(TypedArrayView::Float64(value)) => value.buffer().is_shared(),
+        Some(TypedArrayView::Numeric(value)) => value.buffer().is_shared(),
+        Some(TypedArrayView::BigInt(value)) => value.buffer().is_shared(),
+        None => false,
+    }
+}
+
+pub fn is_typed_array_detached(heap: Heap, object: ObjectId) -> bool {
+    match heap.get(object) {
+        Some(target) => match target.typed_array_value.get() {
+            Some(value) => match value.view {
+                TypedArrayView::Uint8(view) => view.buffer().is_detached(),
+                TypedArrayView::Int32(view) => view.buffer().is_detached(),
+                TypedArrayView::Float64(view) => view.buffer().is_detached(),
+                TypedArrayView::Numeric(view) => view.buffer().is_detached(),
+                TypedArrayView::BigInt(view) => view.buffer().is_detached(),
+            },
+            None => false,
+        },
+        None => false,
+    }
+}
+
+pub fn is_typed_array_out_of_bounds(heap: Heap, object: ObjectId) -> bool {
+    match typed_array_view(heap, object) {
+        Some(TypedArrayView::Uint8(value)) => value.is_out_of_bounds(),
+        Some(TypedArrayView::Int32(value)) => value.is_out_of_bounds(),
+        Some(TypedArrayView::Float64(value)) => value.is_out_of_bounds(),
+        Some(TypedArrayView::Numeric(value)) => value.is_out_of_bounds(),
+        Some(TypedArrayView::BigInt(value)) => value.is_out_of_bounds(),
+        None => false,
+    }
+}
+
+pub fn is_typed_array_length_tracking(heap: Heap, object: ObjectId) -> bool {
+    match typed_array_view(heap, object) {
+        Some(TypedArrayView::Uint8(value)) => value.is_length_tracking(),
+        Some(TypedArrayView::Int32(value)) => value.is_length_tracking(),
+        Some(TypedArrayView::Float64(value)) => value.is_length_tracking(),
+        Some(TypedArrayView::Numeric(value)) => value.is_length_tracking(),
+        Some(TypedArrayView::BigInt(value)) => value.is_length_tracking(),
+        None => false,
+    }
+}
+
+pub fn is_typed_array_numeric_property(heap: Heap, object: ObjectId, key: PropertyKey) -> bool {
+    match heap.get(object) {
+        Some(value) => value.typed_array_value.get().is_some()
+            && typed_array_numeric_index(key).is_some(),
+        None => false,
+    }
+}
+
+pub fn is_bigint_typed_array(heap: Heap, object: ObjectId) -> bool {
+    match heap.get(object) {
+        Some(target) => match target.typed_array_value.get() {
+            Some(value) => match value.view {
+                TypedArrayView::BigInt(_) => true,
+                _ => false,
+            },
+            None => false,
+        },
+        None => false,
+    }
+}
+
+pub fn is_typed_array_valid_numeric_property(heap: Heap, object: ObjectId, key: PropertyKey) -> bool {
+    match heap.get(object) {
+        Some(target) => match target.typed_array_value.get() {
+            Some(value) => match typed_array_numeric_index(key) {
+                Some(TypedArrayNumericIndex::Index(index)) => {
+                    typed_array_element(value.view, index).is_some()
+                },
+                _ => false,
+            },
+            None => false,
+        },
+        None => false,
+    }
+}
+
+pub fn new_ordinary_object(heap: Heap, prototype: Option[ObjectId]) -> Result[ObjectId, TypeError] {
+    new_object(
+        heap,
+        ObjectKind::Ordinary,
+        match prototype {
+            Some(value) => Option::Some(value),
+            None => heap.object_prototype(),
+        },
+    )
+}
+
+pub fn new_null_prototype_object(heap: Heap) -> Result[ObjectId, TypeError] {
+    new_object(heap, ObjectKind::Ordinary, Option::None)
+}
+
+fn array_length_value(length: int) -> Value {
+    if length <= 2147483647 {
+        Value::Int(length.to_int32())
+    } else {
+        Value::Float(num::parse_float64(length.to_string()).unwrap_or(0.0))
+    }
+}
+
+pub fn new_array(heap: Heap, length: int) -> Result[ObjectId, TypeError] {
+    if length < 0 || length > 4294967295 {
+        return Result::Err(TypeError { message: "invalid array length" })
+    } else {};
+    let object = new_object(heap, ObjectKind::Array, heap.array_prototype())?;
+    if ordinary_define_own_property(
+        heap,
+        object,
+        string_property_key("length"),
+        data_descriptor(array_length_value(length), true, false, false),
+    ) {
+        Result::Ok(object)
+    } else {
+        let _ = heap.free(object);
+        Result::Err(TypeError { message: "cannot define array length" })
+    }
+}
+
+pub fn primitive_value(heap: Heap, object: ObjectId) -> Option[Value] {
+    match heap.get(object) {
+        Some(value) => value.primitive_value(),
+        None => Option::None,
+    }
+}
+
+pub fn set_primitive_value(heap: Heap, object: ObjectId, value: Value) -> bool {
+    match heap.get(object) {
+        Some(target) => {
+            target.set_primitive_value(value);
+            true
+        },
+        None => false,
+    }
+}
+
+pub fn map_argument_index(heap: Heap, object: ObjectId, index: uint32, cell: Ref[Value]) -> bool {
+    match heap.get(object) {
+        Some(target) => {
+            target.argument_map_value[index] = cell;
+            true
+        },
+        None => false,
+    }
+}
+
+pub fn data_descriptor(value: Value, writable: bool, enumerable: bool, configurable: bool) -> PropertyDescriptor {
+    PropertyDescriptor::Data { value, writable, enumerable, configurable }
+}
+
+pub fn accessor_descriptor(
+    get: Option[Value],
+    set: Option[Value],
+    enumerable: bool,
+    configurable: bool,
+) -> PropertyDescriptor {
+    PropertyDescriptor::Accessor { get, set, enumerable, configurable }
+}
+
+pub fn descriptor_enumerable(value: PropertyDescriptor) -> bool {
+    match value {
+        Data { enumerable, .. } | Accessor { enumerable, .. } => enumerable,
+    }
+}
+
+pub fn descriptor_configurable(value: PropertyDescriptor) -> bool {
+    match value {
+        Data { configurable, .. } | Accessor { configurable, .. } => configurable,
+    }
+}
+
+pub fn descriptor_writable(value: PropertyDescriptor) -> bool {
+    match value {
+        Data { writable, .. } => writable,
+        Accessor { .. } => false,
+    }
+}
+
+pub fn descriptor_value(value: PropertyDescriptor) -> Option[Value] {
+    match value {
+        Data { value, .. } => Option::Some(value),
+        Accessor { .. } => Option::None,
+    }
+}
+
+pub fn descriptor_get(value: PropertyDescriptor) -> Option[Value] {
+    match value {
+        Accessor { get, .. } => get,
+        Data { .. } => Option::None,
+    }
+}
+
+pub fn descriptor_set(value: PropertyDescriptor) -> Option[Value] {
+    match value {
+        Accessor { set, .. } => set,
+        Data { .. } => Option::None,
+    }
+}
+
+pub fn descriptor_is_data(value: PropertyDescriptor) -> bool {
+    match value {
+        Data { .. } => true,
+        Accessor { .. } => false,
+    }
+}
+
+fn descriptor_sealed(value: PropertyDescriptor, frozen: bool) -> PropertyDescriptor {
+    match value {
+        Data { value, writable, enumerable, configurable: _ } => PropertyDescriptor::Data {
+            value,
+            writable: writable && !frozen,
+            enumerable,
+            configurable: false,
+        },
+        Accessor { get, set, enumerable, configurable: _ } => {
+            PropertyDescriptor::Accessor { get, set, enumerable, configurable: false }
+        },
+    }
+}
+
+fn optional_value_same(left: Option[Value], right: Option[Value]) -> bool {
+    match (left, right) {
+        (None, None) => true,
+        (Some(left_value), Some(right_value)) => same_value(left_value, right_value),
+        _ => false,
+    }
+}
+
+fn compatible_descriptor(current: PropertyDescriptor, next: PropertyDescriptor) -> bool {
+    if descriptor_configurable(current) {
+        true
+    } else if descriptor_configurable(next)
+        || descriptor_enumerable(current) != descriptor_enumerable(next) {
+        false
+    } else {
+        match (current, next) {
+            (
+                Data {
+                    value: current_value,
+                    writable: current_writable,
+                    enumerable: _,
+                    configurable: _,
+                },
+                Data { value: next_value, writable: next_writable, enumerable: _, configurable: _ },
+            ) => if current_writable {
+                true
+            } else {
+                !next_writable && same_value(current_value, next_value)
+            },
+            (
+                Accessor { get: current_get, set: current_set, enumerable: _, configurable: _ },
+                Accessor { get: next_get, set: next_set, enumerable: _, configurable: _ },
+            ) => optional_value_same(current_get, next_get)
+                && optional_value_same(current_set, next_set),
+            _ => false,
+        }
+    }
+}
+
+pub fn compatible_property_descriptor(
+    extensible: bool,
+    next: PropertyDescriptor,
+    current: Option[PropertyDescriptor],
+) -> bool {
+    match current {
+        Some(value) => compatible_descriptor(value, next),
+        None => extensible,
+    }
+}
+
+fn argument_index(key: PropertyKey) -> Option[uint32] {
+    match key {
+        PropertyKey::String(value) => canonical_array_index(value),
+        PropertyKey::Symbol(_) => Option::None,
+    }
+}
+
+fn mapped_descriptor(target: Object, key: PropertyKey, descriptor: PropertyDescriptor) -> PropertyDescriptor {
+    match (argument_index(key), descriptor) {
+        (Some(index), PropertyDescriptor::Data { value: _, writable, enumerable, configurable }) => match target.argument_map_value.get(
+            index,
+        ) {
+            Some(cell) => PropertyDescriptor::Data {
+                value: cell.get(),
+                writable,
+                enumerable,
+                configurable,
+            },
+            None => descriptor,
+        },
+        _ => descriptor,
+    }
+}
+
+fn update_argument_mapping(target: Object, key: PropertyKey, descriptor: PropertyDescriptor) -> unit {
+    match argument_index(key) {
+        Some(index) => match target.argument_map_value.get(index) {
+            Some(cell) => match descriptor {
+                PropertyDescriptor::Data { value, writable, .. } => {
+                    cell.set(value);
+                    if !writable {
+                        let _ = target.argument_map_value.remove(index);
+                    } else {}
+                },
+                PropertyDescriptor::Accessor { .. } => {
+                    let _ = target.argument_map_value.remove(index);
+                },
+            },
+            None => (),
+        },
+        None => (),
+    }
+}
+
+pub fn prevent_extensions(heap: Heap, object: ObjectId) -> bool {
+    match heap.get(object) {
+        Some(target) => {
+            target.prevent_extensions();
+            true
+        },
+        None => false,
+    }
+}
+
+pub fn seal_object(heap: Heap, object: ObjectId, frozen: bool) -> bool {
+    let target = match heap.get(object) {
+        Some(value) => value,
+        None => return false,
+    };
+    target.prevent_extensions();
+    match target.typed_array_value.get() {
+        Some(value) => if typed_array_length(value.view) > 0 {
+            return false
+        } else {},
+        None => (),
+    };
+    let keys = target.properties_value.keys();
+    for key in keys {
+        match target.properties_value.get(key) {
+            Some(descriptor) => {
+                let next = descriptor_sealed(mapped_descriptor(target, key, descriptor), frozen);
+                target.properties_value.insert(key, next);
+                update_argument_mapping(target, key, next);
+            },
+            None => (),
+        }
+    }
+    true
+}
+
+pub fn object_is_sealed(heap: Heap, object: ObjectId, frozen: bool) -> bool {
+    let target = match heap.get(object) {
+        Some(value) => value,
+        None => return false,
+    };
+    if target.extensible() {
+        return false
+    } else {};
+    match target.typed_array_value.get() {
+        Some(value) => if typed_array_length(value.view) > 0 {
+            return false
+        } else {},
+        None => (),
+    };
+    for descriptor in target.properties_value.values() {
+        if descriptor_configurable(descriptor)
+            || frozen && descriptor_is_data(descriptor) && descriptor_writable(descriptor) {
+            return false
+        } else {}
+    }
+    true
+}
+
+fn ordinary_define_own_property(
+    heap: Heap,
+    object: ObjectId,
+    key: PropertyKey,
+    descriptor: PropertyDescriptor,
+) -> bool {
+    match heap.get(object) {
+        Some(target) => match target.properties_value.get(key) {
+            Some(current) => if compatible_descriptor(
+                mapped_descriptor(target, key, current),
+                descriptor,
+            ) {
+                target.properties_value.insert(key, descriptor);
+                update_argument_mapping(target, key, descriptor);
+                true
+            } else {
+                false
+            },
+            None => if target.extensible_value.get() {
+                target.properties_value.insert(key, descriptor);
+                true
+            } else {
+                false
+            },
+        },
+        None => false,
+    }
+}
+
+fn array_descriptor_length(descriptor: PropertyDescriptor) -> Option[int] {
+    match descriptor {
+        PropertyDescriptor::Data { value: Value::Int(value), .. } => if value >= 0 {
+            Option::Some(value.to_int())
+        } else {
+            Option::None
+        },
+        PropertyDescriptor::Data { value: Value::Float(value), .. } => if math::is_finite(value)
+            && value >= 0.0
+            && value <= 4294967295.0
+            && math::trunc(value) == value {
+            match num::parse_int(value.to_string()) {
+                Ok(value) => Option::Some(value),
+                Err(_) => Option::None,
+            }
+        } else {
+            Option::None
+        },
+        _ => Option::None,
+    }
+}
+
+fn array_current_length(target: Object) -> Option[(int, bool)] {
+    match target.properties_value.get(string_property_key("length")) {
+        Some(descriptor) => match array_descriptor_length(descriptor) {
+            Some(length) => Option::Some((length, descriptor_writable(descriptor))),
+            None => Option::None,
+        },
+        None => Option::None,
+    }
+}
+
+fn normalized_array_length_descriptor(descriptor: PropertyDescriptor, length: int) -> Option[
+    PropertyDescriptor,
+] {
+    match descriptor {
+        PropertyDescriptor::Data { value: _, writable, enumerable, configurable } => {
+            Option::Some(
+                PropertyDescriptor::Data {
+                    value: array_length_value(length),
+                    writable,
+                    enumerable,
+                    configurable,
+                },
+            )
+        },
+        _ => Option::None,
+    }
+}
+
+fn array_define_length(heap: Heap, object: ObjectId, descriptor: PropertyDescriptor) -> bool {
+    let target = match heap.get(object) {
+        Some(value) => value,
+        None => return false,
+    };
+    let (old_length, old_writable) = match array_current_length(target) {
+        Some(value) => value,
+        None => match array_descriptor_length(descriptor) {
+            Some(length) => match normalized_array_length_descriptor(descriptor, length) {
+                Some(value) => return ordinary_define_own_property(
+                    heap,
+                    object,
+                    string_property_key("length"),
+                    value,
+                ),
+                None => return false,
+            },
+            None => return false,
+        },
+    };
+    let new_length = match array_descriptor_length(descriptor) {
+        Some(value) => value,
+        None => return false,
+    };
+    let normalized = match normalized_array_length_descriptor(descriptor, new_length) {
+        Some(value) => value,
+        None => return false,
+    };
+    if new_length >= old_length {
+        return ordinary_define_own_property(heap, object, string_property_key("length"), normalized)
+    } else if !old_writable {
+        return false
+    } else {};
+    let final_writable = descriptor_writable(normalized);
+    let temporary = match normalized {
+        PropertyDescriptor::Data { value, writable: _, enumerable, configurable } => {
+            PropertyDescriptor::Data { value, writable: true, enumerable, configurable }
+        },
+        _ => return false,
+    };
+    if !ordinary_define_own_property(heap, object, string_property_key("length"), temporary) {
+        return false
+    } else {};
+    let keys = own_property_keys(heap, object);
+    let mut cursor = keys.len();
+    while cursor > 0 {
+        cursor -= 1;
+        let key = keys[cursor];
+        match key {
+            PropertyKey::String(value) => match canonical_array_index(value) {
+                Some(index) => if index.to_int() >= new_length
+                    && !delete_property(heap, object, key) {
+                    let rollback = data_descriptor(
+                        array_length_value(index.to_int() + 1),
+                        final_writable,
+                        false,
+                        false,
+                    );
+                    let _ = ordinary_define_own_property(
+                        heap,
+                        object,
+                        string_property_key("length"),
+                        rollback,
+                    );
+                    return false
+                } else {},
+                None => (),
+            },
+            PropertyKey::Symbol(_) => (),
+        }
+    }
+    if final_writable {
+        true
+    } else {
+        ordinary_define_own_property(
+            heap,
+            object,
+            string_property_key("length"),
+            match normalized {
+                PropertyDescriptor::Data { value, writable: _, enumerable, configurable } => {
+                    PropertyDescriptor::Data { value, writable: false, enumerable, configurable }
+                },
+                _ => normalized,
+            },
+        )
+    }
+}
+
+fn array_define_index(
+    heap: Heap,
+    object: ObjectId,
+    key: PropertyKey,
+    index: uint32,
+    descriptor: PropertyDescriptor,
+) -> bool {
+    let target = match heap.get(object) {
+        Some(value) => value,
+        None => return false,
+    };
+    let (length, writable) = match array_current_length(target) {
+        Some(value) => value,
+        None => return false,
+    };
+    if index.to_int() >= length && !writable {
+        return false
+    } else if !ordinary_define_own_property(heap, object, key, descriptor) {
+        return false
+    } else if index.to_int() < length {
+        return true
+    } else {};
+    ordinary_define_own_property(
+        heap,
+        object,
+        string_property_key("length"),
+        data_descriptor(array_length_value(index.to_int() + 1), writable, false, false),
+    )
+}
+
+fn typed_array_define_numeric_property(
+    state: TypedArrayState,
+    key: PropertyKey,
+    descriptor: PropertyDescriptor,
+) -> bool {
+    let index = match typed_array_numeric_index(key) {
+        Some(TypedArrayNumericIndex::Index(value)) => value,
+        Some(TypedArrayNumericIndex::Invalid) | None => return false,
+    };
+    if typed_array_element(state.view, index).is_none() {
+        return false
+    } else {};
+    match descriptor {
+        PropertyDescriptor::Data { value, writable, enumerable, configurable } => if writable
+            && enumerable
+            && configurable {
+            match typed_array_set_value(state.view, index, value) {
+                Ok(value) => value,
+                Err(_) => false,
+            }
+        } else {
+            false
+        },
+        PropertyDescriptor::Accessor { .. } => false,
+    }
+}
+
+pub fn define_own_property(
+    heap: Heap,
+    object: ObjectId,
+    key: PropertyKey,
+    descriptor: PropertyDescriptor,
+) -> bool {
+    let target = match heap.get(object) {
+        Some(value) => value,
+        None => return false,
+    };
+    match target.typed_array_value.get() {
+        Some(value) => if typed_array_numeric_index(key).is_some() {
+            return typed_array_define_numeric_property(value, key, descriptor)
+        } else {},
+        None => (),
+    };
+    match target.kind() {
+        ObjectKind::Array => match key {
+            PropertyKey::String(value) => if value
+                == JsString::from_utf8("length".to_bytes().slice(0, "length".to_bytes().len())) {
+                array_define_length(heap, object, descriptor)
+            } else {
+                match canonical_array_index(value) {
+                    Some(index) => array_define_index(heap, object, key, index, descriptor),
+                    None => ordinary_define_own_property(heap, object, key, descriptor),
+                }
+            },
+            PropertyKey::Symbol(_) => ordinary_define_own_property(heap, object, key, descriptor),
+        },
+        _ => ordinary_define_own_property(heap, object, key, descriptor),
+    }
+}
+
+pub fn define_private_field(heap: Heap, object: ObjectId, name: ObjectId, value: Value) -> bool {
+    if !heap.contains(name) {
+        return false
+    } else {};
+    match heap.get(object) {
+        Some(target) => if target.private_elements_value.get(name).is_some() {
+            false
+        } else {
+            target.private_elements_value.set(name, PrivateElement::Field(value));
+            true
+        },
+        None => false,
+    }
+}
+
+pub fn define_private_method(heap: Heap, object: ObjectId, name: ObjectId, value: Value) -> bool {
+    if !heap.contains(name) {
+        return false
+    } else {};
+    match heap.get(object) {
+        Some(target) => if target.private_elements_value.get(name).is_some() {
+            false
+        } else {
+            target.private_elements_value.set(name, PrivateElement::Method(value));
+            true
+        },
+        None => false,
+    }
+}
+
+pub fn define_private_accessor(
+    heap: Heap,
+    object: ObjectId,
+    name: ObjectId,
+    value: Value,
+    getter: bool,
+) -> bool {
+    if !heap.contains(name) {
+        return false
+    } else {};
+    match heap.get(object) {
+        Some(target) => match target.private_elements_value.get(name) {
+            None => {
+                target.private_elements_value.set(
+                    name,
+                    if getter {
+                        PrivateElement::Accessor { get: Option::Some(value), set: Option::None }
+                    } else {
+                        PrivateElement::Accessor { get: Option::None, set: Option::Some(value) }
+                    },
+                );
+                true
+            },
+            Some(PrivateElement::Accessor { get, set }) => if getter && get.is_none() {
+                target.private_elements_value.set(
+                    name,
+                    PrivateElement::Accessor { get: Option::Some(value), set },
+                );
+                true
+            } else if !getter && set.is_none() {
+                target.private_elements_value.set(
+                    name,
+                    PrivateElement::Accessor { get, set: Option::Some(value) },
+                );
+                true
+            } else {
+                false
+            },
+            Some(_) => false,
+        },
+        None => false,
+    }
+}
+
+pub fn private_element(heap: Heap, object: ObjectId, name: ObjectId) -> Option[PrivateElement] {
+    match heap.get(object) {
+        Some(target) => target.private_elements_value.get(name),
+        None => Option::None,
+    }
+}
+
+pub fn has_private_element(heap: Heap, object: ObjectId, name: ObjectId) -> bool {
+    match heap.get(object) {
+        Some(target) => target.private_elements_value.get(name).is_some(),
+        None => false,
+    }
+}
+
+pub fn set_private_field(heap: Heap, object: ObjectId, name: ObjectId, value: Value) -> bool {
+    match heap.get(object) {
+        Some(target) => match target.private_elements_value.get(name) {
+            Some(PrivateElement::Field(_)) => {
+                target.private_elements_value.set(name, PrivateElement::Field(value));
+                true
+            },
+            _ => false,
+        },
+        None => false,
+    }
+}
+
+pub fn delete_property(heap: Heap, object: ObjectId, key: PropertyKey) -> bool {
+    match heap.get(object) {
+        Some(target) => match target.typed_array_value.get() {
+            Some(value) => match typed_array_numeric_index(key) {
+                Some(TypedArrayNumericIndex::Index(index)) => {
+                    typed_array_element(value.view, index).is_none()
+                },
+                Some(TypedArrayNumericIndex::Invalid) => true,
+                None => delete_ordinary_property(target, key),
+            },
+            None => delete_ordinary_property(target, key),
+        },
+        None => false,
+    }
+}
+
+fn delete_ordinary_property(target: Object, key: PropertyKey) -> bool {
+    match target.properties_value.get(key) {
+        Some(descriptor) => if descriptor_configurable(descriptor) {
+            target.properties_value.remove(key);
+            match argument_index(key) {
+                Some(index) => {
+                    let _ = target.argument_map_value.remove(index);
+                },
+                None => (),
+            };
+            true
+        } else {
+            false
+        },
+        None => true,
+    }
+}
+
+pub fn set_prototype_of(heap: Heap, object: ObjectId, prototype: Option[ObjectId]) -> bool {
+    let target = match heap.get(object) {
+        Some(value) => value,
+        None => return false,
+    };
+    match prototype {
+        Some(value) => if !heap.contains(value) {
+            return false
+        } else {},
+        None => (),
+    };
+    if target.prototype_value.get() == prototype {
+        true
+    } else if !target.extensible_value.get() {
+        false
+    } else {
+        let mut cursor = prototype;
+        while cursor.is_some() {
+            match cursor {
+                Some(current) => if current == object {
+                    return false
+                } else {
+                    match heap.get(current) {
+                        Some(candidate) => {
+                            cursor = candidate.prototype_value.get();
+                        },
+                        None => return false,
+                    }
+                },
+                None => (),
+            }
+        }
+        target.prototype_value.set(prototype);
+        true
+    }
+}
+
+fn invalid_object_error() -> TypeError {
+    TypeError { message: "object does not belong to this heap or is no longer alive" }
+}
+
+pub fn get_property(heap: Heap, object: ObjectId, key: PropertyKey) -> Result[
+    Option[Value],
+    TypeError,
+] {
+    if !heap.contains(object) {
+        return Result::Err(invalid_object_error())
+    } else {};
+    let mut cursor = Option::Some(object);
+    while cursor.is_some() {
+        match cursor {
+            Some(current) => {
+                let target = match heap.get(current) {
+                    Some(value) => value,
+                    None => return Result::Err(invalid_object_error()),
+                };
+                match target.own_property(key) {
+                    Some(descriptor) => match descriptor {
+                        Data { value, .. } => return Result::Ok(Option::Some(value)),
+                        Accessor { get: None, .. } => {
+                            return Result::Ok(Option::Some(Value::Undefined))
+                        },
+                        Accessor { get: Some(_), .. } => {
+                            return Result::Err(
+                                TypeError {
+                                    message: "accessor invocation requires the call runtime",
+                                },
+                            )
+                        },
+                    },
+                    None => match target.typed_array_value.get() {
+                        Some(_) => if typed_array_numeric_index(key).is_some() {
+                            return Result::Ok(Option::None)
+                        } else {
+                            cursor = target.prototype_value.get();
+                        },
+                        None => {
+                            cursor = target.prototype_value.get();
+                        },
+                    },
+                }
+            },
+            None => (),
+        }
+    }
+    Result::Ok(Option::None)
+}
+
+pub fn get_property_descriptor(heap: Heap, object: ObjectId, key: PropertyKey) -> Result[
+    Option[PropertyDescriptor],
+    TypeError,
+] {
+    if !heap.contains(object) {
+        return Result::Err(invalid_object_error())
+    } else {};
+    let mut cursor = Option::Some(object);
+    while cursor.is_some() {
+        match cursor {
+            Some(current) => {
+                let target = match heap.get(current) {
+                    Some(value) => value,
+                    None => return Result::Err(invalid_object_error()),
+                };
+                match target.own_property(key) {
+                    Some(value) => return Result::Ok(Option::Some(value)),
+                    None => match target.typed_array_value.get() {
+                        Some(_) => if typed_array_numeric_index(key).is_some() {
+                            return Result::Ok(Option::None)
+                        } else {
+                            cursor = target.prototype_value.get();
+                        },
+                        None => {
+                            cursor = target.prototype_value.get();
+                        },
+                    },
+                }
+            },
+            None => (),
+        }
+    }
+    Result::Ok(Option::None)
+}
+
+pub fn set_existing_data_property(heap: Heap, object: ObjectId, key: PropertyKey, value: Value) -> bool {
+    match heap.get(object) {
+        Some(target) => match target.typed_array_value.get() {
+            Some(state) => match typed_array_numeric_index(key) {
+                Some(TypedArrayNumericIndex::Index(index)) => match typed_array_set_value(
+                    state.view,
+                    index,
+                    value,
+                ) {
+                    Ok(value) => value,
+                    Err(_) => false,
+                },
+                Some(TypedArrayNumericIndex::Invalid) => false,
+                None => set_existing_ordinary_data_property(target, key, value),
+            },
+            None => set_existing_ordinary_data_property(target, key, value),
+        },
+        None => false,
+    }
+}
+
+fn set_existing_ordinary_data_property(target: Object, key: PropertyKey, value: Value) -> bool {
+    match target.properties_value.get(key) {
+        Some(Data { value: _, writable, enumerable, configurable }) => if writable {
+            target.properties_value.insert(
+                key,
+                PropertyDescriptor::Data { value, writable, enumerable, configurable },
+            );
+            update_argument_mapping(
+                target,
+                key,
+                PropertyDescriptor::Data { value, writable, enumerable, configurable },
+            );
+            true
+        } else {
+            false
+        },
+        _ => false,
+    }
+}
+
+fn inherited_descriptor(heap: Heap, object: ObjectId, key: PropertyKey) -> Result[
+    Option[PropertyDescriptor],
+    TypeError,
+] {
+    let target = match heap.get(object) {
+        Some(value) => value,
+        None => return Result::Err(invalid_object_error()),
+    };
+    let mut cursor = target.prototype_value.get();
+    while cursor.is_some() {
+        match cursor {
+            Some(current) => {
+                let candidate = match heap.get(current) {
+                    Some(value) => value,
+                    None => return Result::Err(invalid_object_error()),
+                };
+                match candidate.own_property(key) {
+                    Some(descriptor) => return Result::Ok(Option::Some(descriptor)),
+                    None => match candidate.typed_array_value.get() {
+                        Some(_) => if typed_array_numeric_index(key).is_some() {
+                            return Result::Ok(Option::None)
+                        } else {
+                            cursor = candidate.prototype_value.get();
+                        },
+                        None => {
+                            cursor = candidate.prototype_value.get();
+                        },
+                    },
+                }
+            },
+            None => (),
+        }
+    }
+    Result::Ok(Option::None)
+}
+
+pub fn set_property(heap: Heap, object: ObjectId, key: PropertyKey, value: Value) -> Result[
+    bool,
+    TypeError,
+] {
+    let target = match heap.get(object) {
+        Some(value) => value,
+        None => return Result::Err(invalid_object_error()),
+    };
+    match target.typed_array_value.get() {
+        Some(state) => match typed_array_numeric_index(key) {
+            Some(TypedArrayNumericIndex::Index(index)) => {
+                let written = typed_array_set_value(state.view, index, value)?;
+                if typed_array_element(state.view, index).is_some() {
+                    return Result::Ok(written)
+                } else {
+                    return Result::Ok(true)
+                }
+            },
+            Some(TypedArrayNumericIndex::Invalid) => {
+                let _ = typed_array_set_value(state.view, -1, value)?;
+                return Result::Ok(true)
+            },
+            None => (),
+        },
+        None => (),
+    };
+    let array_length = match target.kind() {
+        ObjectKind::Array => key == string_property_key("length"),
+        _ => false,
+    };
+    if array_length {
+        return match target.properties_value.get(key) {
+            Some(PropertyDescriptor::Data { value: _, writable, enumerable, configurable }) => if writable {
+                Result::Ok(
+                    define_own_property(
+                        heap,
+                        object,
+                        key,
+                        PropertyDescriptor::Data { value, writable, enumerable, configurable },
+                    ),
+                )
+            } else {
+                Result::Ok(false)
+            },
+            _ => Result::Ok(false),
+        }
+    } else {};
+    match target.properties_value.get(key) {
+        Some(Data { value: _, writable, enumerable, configurable }) => if writable {
+            target.properties_value.insert(
+                key,
+                PropertyDescriptor::Data { value, writable, enumerable, configurable },
+            );
+            update_argument_mapping(
+                target,
+                key,
+                PropertyDescriptor::Data { value, writable, enumerable, configurable },
+            );
+            Result::Ok(true)
+        } else {
+            Result::Ok(false)
+        },
+        Some(Accessor { set: None, .. }) => Result::Ok(false),
+        Some(Accessor { set: Some(_), .. }) => Result::Err(
+            TypeError { message: "accessor invocation requires the call runtime" },
+        ),
+        None => match inherited_descriptor(heap, object, key) {
+            Err(error) => Result::Err(error),
+            Ok(Some(Data { writable: false, .. })) | Ok(Some(Accessor { set: None, .. })) => {
+                Result::Ok(false)
+            },
+            Ok(Some(Accessor { set: Some(_), .. })) => Result::Err(
+                TypeError { message: "accessor invocation requires the call runtime" },
+            ),
+            Ok(_) => Result::Ok(
+                define_own_property(heap, object, key, data_descriptor(value, true, true, true)),
+            ),
+        },
+    }
+}
+
+fn canonical_array_index(value: JsString) -> Option[uint32] {
+    if value.len() == 1 && value.get(0) == 48 {
+        Option::Some(0)
+    } else if value.len() == 0 || value.get(0) == 48 {
+        Option::None
+    } else {
+        let mut index = 0;
+        let mut result: uint64 = 0;
+        while index < value.len() {
+            let current = value.get(index);
+            if current < 48 || current > 57 {
+                return Option::None
+            } else {
+                result = result * 10 + (current - 48).to_uint64();
+                if result > 4294967294 {
+                    return Option::None
+                } else {}
+            };
+            index += 1;
+        }
+        Option::Some(result.to_uint32())
+    }
+}
+
+fn compare_indexed_key(left: (uint32, PropertyKey), right: (uint32, PropertyKey)) -> int {
+    if left.0 < right.0 {
+        -1
+    } else if left.0 > right.0 {
+        1
+    } else {
+        0
+    }
+}
+
+pub fn own_property_keys(heap: Heap, object: ObjectId) -> Vec[PropertyKey] {
+    let target = match heap.get(object) {
+        Some(value) => value,
+        None => return Vec::[],
+    };
+    let indexed: Vec[(uint32, PropertyKey)] = Vec::[];
+    let strings: Vec[PropertyKey] = Vec::[];
+    let symbols: Vec[PropertyKey] = Vec::[];
+    for key in target.properties_value.keys() {
+        match key {
+            PropertyKey::String(value) => match canonical_array_index(value) {
+                Some(index) => indexed.push((index, key)),
+                None => strings.push(key),
+            },
+            PropertyKey::Symbol(_) => symbols.push(key),
+        }
+    }
+    collections::sort_by(indexed, compare_indexed_key);
+    let typed_length = match target.typed_array_value.get() {
+        Some(value) => typed_array_length(value.view),
+        None => 0,
+    };
+    let result = Vec::with_capacity(typed_length + indexed.len() + strings.len() + symbols.len());
+    let mut typed_index = 0;
+    while typed_index < typed_length {
+        result.push(string_property_key(typed_index.to_string()));
+        typed_index += 1;
+    }
+    for entry in indexed {
+        result.push(entry.1)
+    }
+    for key in strings {
+        result.push(key)
+    }
+    for key in symbols {
+        result.push(key)
+    }
+    result
+}

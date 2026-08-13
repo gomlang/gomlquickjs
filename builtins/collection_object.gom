@@ -1,0 +1,2439 @@
+package builtins;
+
+use gomlang::quickjs::arrayx;
+use gomlang::quickjs::collections;
+use gomlang::quickjs::dtoa;
+use gomlang::quickjs::runtime;
+use gomlang::quickjs::vm;
+use std::math;
+use std::num;
+
+struct MapInstallData {
+    constructor: runtime::Value,
+    prototype: runtime::ObjectId,
+    states: HashMap[runtime::ObjectId, collections::JsMap],
+}
+
+struct SetRecord {
+    object: runtime::Value,
+    size: int,
+    has: runtime::Value,
+    keys: runtime::Value,
+}
+
+struct CollectionInstall {
+    map: runtime::Value,
+    set: runtime::Value,
+    weak_map: runtime::Value,
+    weak_set: runtime::Value,
+    weak_ref: runtime::Value,
+    finalization_registry: runtime::Value,
+}
+
+fn collection_object(value: runtime::Value, kind: string) -> Result[
+    runtime::ObjectId,
+    vm::NativeError,
+] {
+    match value {
+        runtime::Value::Object(value) => Result::Ok(value),
+        _ => Result::Err(native_error(kind + " method called on incompatible receiver")),
+    }
+}
+
+fn map_state(states: HashMap[runtime::ObjectId, collections::JsMap], value: runtime::Value) -> Result[
+    collections::JsMap,
+    vm::NativeError,
+] {
+    let object = collection_object(value, "Map")?;
+    match states.get(object) {
+        Some(value) => Result::Ok(value),
+        None => Result::Err(native_error("Map method called on incompatible receiver")),
+    }
+}
+
+fn set_state(states: HashMap[runtime::ObjectId, collections::JsSet], value: runtime::Value) -> Result[
+    collections::JsSet,
+    vm::NativeError,
+] {
+    let object = collection_object(value, "Set")?;
+    match states.get(object) {
+        Some(value) => Result::Ok(value),
+        None => Result::Err(native_error("Set method called on incompatible receiver")),
+    }
+}
+
+fn weak_map_state(states: HashMap[runtime::ObjectId, bool], value: runtime::Value) -> Result[
+    runtime::ObjectId,
+    vm::NativeError,
+] {
+    let object = collection_object(value, "WeakMap")?;
+    match states.get(object) {
+        Some(_) => Result::Ok(object),
+        None => Result::Err(native_error("WeakMap method called on incompatible receiver")),
+    }
+}
+
+fn weak_set_state(states: HashMap[runtime::ObjectId, bool], value: runtime::Value) -> Result[
+    runtime::ObjectId,
+    vm::NativeError,
+] {
+    let object = collection_object(value, "WeakSet")?;
+    match states.get(object) {
+        Some(_) => Result::Ok(object),
+        None => Result::Err(native_error("WeakSet method called on incompatible receiver")),
+    }
+}
+
+fn weak_ref_state(states: HashMap[runtime::ObjectId, bool], value: runtime::Value) -> Result[
+    runtime::ObjectId,
+    vm::NativeError,
+] {
+    let object = collection_object(value, "WeakRef")?;
+    match states.get(object) {
+        Some(_) => Result::Ok(object),
+        None => Result::Err(native_error("WeakRef method called on incompatible receiver")),
+    }
+}
+
+fn map_construct(
+    heap: runtime::Heap,
+    states: HashMap[runtime::ObjectId, collections::JsMap],
+    prototype: runtime::ObjectId,
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+) -> Result[runtime::Value, vm::NativeError] {
+    let _ = this_value;
+    let _ = arguments;
+    let object = allocate_ordinary(heap, Option::Some(prototype))?;
+    states[object] = collections::JsMap::new();
+    Result::Ok(runtime::Value::Object(object))
+}
+
+fn map_get(
+    heap: runtime::Heap,
+    states: HashMap[runtime::ObjectId, collections::JsMap],
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+) -> Result[runtime::Value, vm::NativeError] {
+    let _ = heap;
+    match map_state(states, this_value)?.get(argument(arguments, 0)) {
+        Some(value) => Result::Ok(value),
+        None => Result::Ok(runtime::Value::Undefined),
+    }
+}
+
+fn map_set(
+    heap: runtime::Heap,
+    states: HashMap[runtime::ObjectId, collections::JsMap],
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+) -> Result[runtime::Value, vm::NativeError] {
+    let _ = heap;
+    map_state(states, this_value)?.set(argument(arguments, 0), argument(arguments, 1));
+    Result::Ok(this_value)
+}
+
+fn collection_callable(value: runtime::Value, message: string) -> Result[
+    runtime::Value,
+    vm::VmError,
+] {
+    match value {
+        runtime::Value::Object(object) => if object.is_callable() {
+            Result::Ok(value)
+        } else {
+            Result::Err(function_vm_error(message))
+        },
+        _ => Result::Err(function_vm_error(message)),
+    }
+}
+
+fn map_get_or_insert(
+    context: vm::Context,
+    states: HashMap[runtime::ObjectId, collections::JsMap],
+    computed: bool,
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+    depth: int,
+) -> Result[runtime::Value, vm::VmError] {
+    let state = match map_state(states, this_value) {
+        Ok(value) => value,
+        Err(value) => return Result::Err(function_vm_error(value.message)),
+    };
+    let callback: Option[runtime::Value] = if computed {
+        Option::Some(collection_callable(argument(arguments, 1), "not a function")?)
+    } else {
+        Option::None
+    };
+    let key = argument(arguments, 0);
+    match state.get(key) {
+        Some(value) => Result::Ok(value),
+        None => {
+            let value = match callback {
+                Some(callback) => {
+                    let value = context.invoke_with_this_at_depth(
+                        callback,
+                        Vec::[key],
+                        runtime::Value::Undefined,
+                        depth,
+                    )?;
+                    let _ = state.delete(key);
+                    value
+                },
+                None => argument(arguments, 1),
+            };
+            state.set(key, value);
+            Result::Ok(value)
+        },
+    }
+}
+
+fn map_has(
+    heap: runtime::Heap,
+    states: HashMap[runtime::ObjectId, collections::JsMap],
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+) -> Result[runtime::Value, vm::NativeError] {
+    let _ = heap;
+    Result::Ok(runtime::Value::Bool(map_state(states, this_value)?.has(argument(arguments, 0))))
+}
+
+fn map_delete(
+    heap: runtime::Heap,
+    states: HashMap[runtime::ObjectId, collections::JsMap],
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+) -> Result[runtime::Value, vm::NativeError] {
+    let _ = heap;
+    Result::Ok(runtime::Value::Bool(map_state(states, this_value)?.delete(argument(arguments, 0))))
+}
+
+fn map_clear(
+    heap: runtime::Heap,
+    states: HashMap[runtime::ObjectId, collections::JsMap],
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+) -> Result[runtime::Value, vm::NativeError] {
+    let _ = heap;
+    let _ = arguments;
+    map_state(states, this_value)?.clear();
+    Result::Ok(runtime::Value::Undefined)
+}
+
+fn map_size(
+    heap: runtime::Heap,
+    states: HashMap[runtime::ObjectId, collections::JsMap],
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+) -> Result[runtime::Value, vm::NativeError] {
+    let _ = heap;
+    let _ = arguments;
+    Result::Ok(array_length_value(map_state(states, this_value)?.size()))
+}
+
+fn pair_array(heap: runtime::Heap, key: runtime::Value, value: runtime::Value) -> Result[
+    runtime::Value,
+    vm::NativeError,
+] {
+    let object = allocate_array(heap, Vec::[key, value], 2)?;
+    Result::Ok(runtime::Value::Object(object))
+}
+
+fn map_entries(
+    heap: runtime::Heap,
+    states: HashMap[runtime::ObjectId, collections::JsMap],
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+) -> Result[runtime::Value, vm::NativeError] {
+    let _ = arguments;
+    let entries = map_state(states, this_value)?.entries();
+    let object = allocate_array(heap, Vec::[], entries.len())?;
+    let mut index = 0;
+    while index < entries.len() {
+        define_data(
+            heap,
+            object,
+            runtime::string_property_key(index.to_string()),
+            pair_array(heap, entries[index].key, entries[index].value)?,
+            true,
+            true,
+            true,
+        )?;
+        index += 1;
+    }
+    Result::Ok(runtime::Value::Object(object))
+}
+
+fn values_array(heap: runtime::Heap, values: Vec[runtime::Value]) -> Result[
+    runtime::Value,
+    vm::NativeError,
+] {
+    let object = allocate_array(heap, Vec::[], values.len())?;
+    let mut index = 0;
+    while index < values.len() {
+        define_data(
+            heap,
+            object,
+            runtime::string_property_key(index.to_string()),
+            values[index],
+            true,
+            true,
+            true,
+        )?;
+        index += 1;
+    }
+    Result::Ok(runtime::Value::Object(object))
+}
+
+fn map_keys(
+    heap: runtime::Heap,
+    states: HashMap[runtime::ObjectId, collections::JsMap],
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+) -> Result[runtime::Value, vm::NativeError] {
+    let _ = arguments;
+    values_array(heap, map_state(states, this_value)?.keys())
+}
+
+fn map_values(
+    heap: runtime::Heap,
+    states: HashMap[runtime::ObjectId, collections::JsMap],
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+) -> Result[runtime::Value, vm::NativeError] {
+    let _ = arguments;
+    values_array(heap, map_state(states, this_value)?.values())
+}
+
+fn set_construct(
+    heap: runtime::Heap,
+    states: HashMap[runtime::ObjectId, collections::JsSet],
+    prototype: runtime::ObjectId,
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+) -> Result[runtime::Value, vm::NativeError] {
+    let _ = this_value;
+    let _ = arguments;
+    let object = allocate_ordinary(heap, Option::Some(prototype))?;
+    states[object] = collections::JsSet::new();
+    Result::Ok(runtime::Value::Object(object))
+}
+
+fn set_add(
+    heap: runtime::Heap,
+    states: HashMap[runtime::ObjectId, collections::JsSet],
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+) -> Result[runtime::Value, vm::NativeError] {
+    let _ = heap;
+    set_state(states, this_value)?.add(argument(arguments, 0));
+    Result::Ok(this_value)
+}
+
+fn set_has(
+    heap: runtime::Heap,
+    states: HashMap[runtime::ObjectId, collections::JsSet],
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+) -> Result[runtime::Value, vm::NativeError] {
+    let _ = heap;
+    Result::Ok(runtime::Value::Bool(set_state(states, this_value)?.has(argument(arguments, 0))))
+}
+
+fn set_delete(
+    heap: runtime::Heap,
+    states: HashMap[runtime::ObjectId, collections::JsSet],
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+) -> Result[runtime::Value, vm::NativeError] {
+    let _ = heap;
+    Result::Ok(runtime::Value::Bool(set_state(states, this_value)?.delete(argument(arguments, 0))))
+}
+
+fn set_clear(
+    heap: runtime::Heap,
+    states: HashMap[runtime::ObjectId, collections::JsSet],
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+) -> Result[runtime::Value, vm::NativeError] {
+    let _ = heap;
+    let _ = arguments;
+    set_state(states, this_value)?.clear();
+    Result::Ok(runtime::Value::Undefined)
+}
+
+fn set_size(
+    heap: runtime::Heap,
+    states: HashMap[runtime::ObjectId, collections::JsSet],
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+) -> Result[runtime::Value, vm::NativeError] {
+    let _ = heap;
+    let _ = arguments;
+    Result::Ok(array_length_value(set_state(states, this_value)?.size()))
+}
+
+fn set_values(
+    heap: runtime::Heap,
+    states: HashMap[runtime::ObjectId, collections::JsSet],
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+) -> Result[runtime::Value, vm::NativeError] {
+    let _ = arguments;
+    values_array(heap, set_state(states, this_value)?.values())
+}
+
+fn weak_map_get(
+    heap: runtime::Heap,
+    states: HashMap[runtime::ObjectId, bool],
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+) -> Result[runtime::Value, vm::NativeError] {
+    match runtime::weak_map_get(heap, weak_map_state(states, this_value)?, argument(arguments, 0)) {
+        Some(value) => Result::Ok(value),
+        None => Result::Ok(runtime::Value::Undefined),
+    }
+}
+
+fn weak_map_set(
+    heap: runtime::Heap,
+    states: HashMap[runtime::ObjectId, bool],
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+) -> Result[runtime::Value, vm::NativeError] {
+    if runtime::weak_map_set(
+        heap,
+        weak_map_state(states, this_value)?,
+        argument(arguments, 0),
+        argument(arguments, 1),
+    ) {
+        Result::Ok(this_value)
+    } else {
+        Result::Err(native_error("WeakMap key must be an object or symbol"))
+    }
+}
+
+fn weak_map_has(
+    heap: runtime::Heap,
+    states: HashMap[runtime::ObjectId, bool],
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+) -> Result[runtime::Value, vm::NativeError] {
+    Result::Ok(
+        runtime::Value::Bool(
+            runtime::weak_map_has(heap, weak_map_state(states, this_value)?, argument(arguments, 0)),
+        ),
+    )
+}
+
+fn weak_map_delete(
+    heap: runtime::Heap,
+    states: HashMap[runtime::ObjectId, bool],
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+) -> Result[runtime::Value, vm::NativeError] {
+    Result::Ok(
+        runtime::Value::Bool(
+            runtime::weak_map_delete(
+                heap,
+                weak_map_state(states, this_value)?,
+                argument(arguments, 0),
+            ),
+        ),
+    )
+}
+
+fn weak_map_get_or_insert(
+    context: vm::Context,
+    states: HashMap[runtime::ObjectId, bool],
+    computed: bool,
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+    depth: int,
+) -> Result[runtime::Value, vm::VmError] {
+    let object = match weak_map_state(states, this_value) {
+        Ok(value) => value,
+        Err(value) => return Result::Err(function_vm_error(value.message)),
+    };
+    let callback: Option[runtime::Value] = if computed {
+        Option::Some(collection_callable(argument(arguments, 1), "not a function")?)
+    } else {
+        Option::None
+    };
+    let key = argument(arguments, 0);
+    if !runtime::is_weak_target(context.heap(), key) {
+        return Result::Err(function_vm_error("invalid value used as WeakMap key"))
+    } else {};
+    match runtime::weak_map_get(context.heap(), object, key) {
+        Some(value) => Result::Ok(value),
+        None => {
+            let value = match callback {
+                Some(callback) => {
+                    let value = context.invoke_with_this_at_depth(
+                        callback,
+                        Vec::[key],
+                        runtime::Value::Undefined,
+                        depth,
+                    )?;
+                    let _ = runtime::weak_map_delete(context.heap(), object, key);
+                    value
+                },
+                None => argument(arguments, 1),
+            };
+            if runtime::weak_map_set(context.heap(), object, key, value) {
+                Result::Ok(value)
+            } else {
+                Result::Err(function_vm_error("invalid value used as WeakMap key"))
+            }
+        },
+    }
+}
+
+fn weak_set_add(
+    heap: runtime::Heap,
+    states: HashMap[runtime::ObjectId, bool],
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+) -> Result[runtime::Value, vm::NativeError] {
+    if runtime::weak_set_add(heap, weak_set_state(states, this_value)?, argument(arguments, 0)) {
+        Result::Ok(this_value)
+    } else {
+        Result::Err(native_error("WeakSet value must be an object or symbol"))
+    }
+}
+
+fn weak_set_has(
+    heap: runtime::Heap,
+    states: HashMap[runtime::ObjectId, bool],
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+) -> Result[runtime::Value, vm::NativeError] {
+    Result::Ok(
+        runtime::Value::Bool(
+            runtime::weak_set_has(heap, weak_set_state(states, this_value)?, argument(arguments, 0)),
+        ),
+    )
+}
+
+fn weak_set_delete(
+    heap: runtime::Heap,
+    states: HashMap[runtime::ObjectId, bool],
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+) -> Result[runtime::Value, vm::NativeError] {
+    Result::Ok(
+        runtime::Value::Bool(
+            runtime::weak_set_delete(
+                heap,
+                weak_set_state(states, this_value)?,
+                argument(arguments, 0),
+            ),
+        ),
+    )
+}
+
+fn weak_ref_deref(
+    context: vm::Context,
+    states: HashMap[runtime::ObjectId, bool],
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+) -> Result[runtime::Value, vm::VmError] {
+    let _ = arguments;
+    let owner = match weak_ref_state(states, this_value) {
+        Ok(value) => value,
+        Err(value) => return Result::Err(function_vm_error(value.message)),
+    };
+    let _ = context.collect_garbage();
+    match runtime::weak_ref_deref(context.heap(), owner) {
+        Some(value) => Result::Ok(value),
+        None => Result::Ok(runtime::Value::Undefined),
+    }
+}
+
+fn finalization_registry_callback(
+    heap: runtime::Heap,
+    callback_name: runtime::ObjectId,
+    value: runtime::Value,
+) -> Result[(runtime::ObjectId, runtime::Value), vm::NativeError] {
+    let object = collection_object(value, "FinalizationRegistry")?;
+    match runtime::private_element(heap, object, callback_name) {
+        Some(runtime::PrivateElement::Field(callback)) => Result::Ok((object, callback)),
+        _ => Result::Err(
+            native_error("FinalizationRegistry method called on incompatible receiver"),
+        ),
+    }
+}
+
+fn finalization_registry_register(
+    heap: runtime::Heap,
+    callback_name: runtime::ObjectId,
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+) -> Result[runtime::Value, vm::NativeError] {
+    let state = finalization_registry_callback(heap, callback_name, this_value)?;
+    let target = argument(arguments, 0);
+    let held = argument(arguments, 1);
+    if !runtime::is_weak_target(heap, target) {
+        return Result::Err(native_error("FinalizationRegistry target is invalid"))
+    } else if runtime::same_value(target, held) {
+        return Result::Err(native_error("FinalizationRegistry held value cannot be the target"))
+    } else {};
+    let token = match argument(arguments, 2) {
+        runtime::Value::Undefined => Option::None,
+        value => if runtime::is_weak_target(heap, value) {
+            Option::Some(value)
+        } else {
+            return Result::Err(native_error("FinalizationRegistry unregister token is invalid"))
+        },
+    };
+    if runtime::finalization_register(heap, state.0, state.1, target, held, token) {
+        Result::Ok(runtime::Value::Undefined)
+    } else {
+        Result::Err(native_error("cannot register FinalizationRegistry target"))
+    }
+}
+
+fn finalization_registry_unregister(
+    heap: runtime::Heap,
+    callback_name: runtime::ObjectId,
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+) -> Result[runtime::Value, vm::NativeError] {
+    let state = finalization_registry_callback(heap, callback_name, this_value)?;
+    let token = argument(arguments, 0);
+    match runtime::finalization_unregister(heap, state.0, token) {
+        Some(value) => Result::Ok(runtime::Value::Bool(value)),
+        None => Result::Err(native_error("FinalizationRegistry unregister token is invalid")),
+    }
+}
+
+enum MapIteratorKind {
+    Keys,
+    Values,
+    Entries,
+}
+
+enum SetIteratorKind {
+    Values,
+    Entries,
+}
+
+fn collection_iterator_object(context: vm::Context, next: runtime::Value) -> Result[
+    runtime::Value,
+    vm::VmError,
+] {
+    let iterator = iterator_allocate_object(context)?;
+    if !runtime::define_own_property(
+        context.heap(),
+        iterator,
+        runtime::string_property_key("next"),
+        runtime::data_descriptor(next, true, false, true),
+    ) {
+        return Result::Err(function_vm_error("cannot define collection iterator next"))
+    } else {};
+    let symbol = match context.iterator_symbol() {
+        Some(value) => value,
+        None => return Result::Ok(runtime::Value::Object(iterator)),
+    };
+    let identity = context.new_native_function(array_iterator_identity)?;
+    if !runtime::define_own_property(
+        context.heap(),
+        iterator,
+        runtime::PropertyKey::Symbol(symbol),
+        runtime::data_descriptor(identity, true, false, true),
+    ) {
+        Result::Err(function_vm_error("cannot define collection iterator identity"))
+    } else {
+        Result::Ok(runtime::Value::Object(iterator))
+    }
+}
+
+fn map_iterator_value(context: vm::Context, kind: MapIteratorKind, entry: collections::MapEntry) -> Result[
+    runtime::Value,
+    vm::VmError,
+] {
+    match kind {
+        MapIteratorKind::Keys => Result::Ok(entry.key),
+        MapIteratorKind::Values => Result::Ok(entry.value),
+        MapIteratorKind::Entries => match pair_array(context.heap(), entry.key, entry.value) {
+            Ok(value) => Result::Ok(value),
+            Err(value) => Result::Err(function_vm_error(value.message)),
+        },
+    }
+}
+
+fn create_map_iterator(
+    context: vm::Context,
+    states: HashMap[runtime::ObjectId, collections::JsMap],
+    kind: MapIteratorKind,
+    this_value: runtime::Value,
+) -> Result[runtime::Value, vm::VmError] {
+    let object = match this_value {
+        runtime::Value::Object(value) => value,
+        _ => return Result::Err(function_vm_error("Map method called on incompatible receiver")),
+    };
+    if states.get(object).is_none() {
+        return Result::Err(function_vm_error("Map method called on incompatible receiver"))
+    } else {};
+    let index = Ref::new(0);
+    let next = context.new_vm_function(
+        |next_this, arguments, depth| {
+            let _ = next_this;
+            let _ = arguments;
+            let _ = depth;
+            let state = match states.get(object) {
+                Some(value) => value,
+                None => {
+                    return Result::Err(function_vm_error("Map iterator has an invalid receiver"))
+                },
+            };
+            while index.get() < state.slot_len() {
+                let current = index.get();
+                index.set(current + 1);
+                match state.entry_at(current) {
+                    Some(entry) => {
+                        return array_iterator_result(
+                            context,
+                            map_iterator_value(context, kind, entry)?,
+                            false,
+                        )
+                    },
+                    None => (),
+                }
+            }
+            array_iterator_result(context, runtime::Value::Undefined, true)
+        },
+    )?;
+    collection_iterator_object(context, next)
+}
+
+fn set_iterator_value(context: vm::Context, kind: SetIteratorKind, value: runtime::Value) -> Result[
+    runtime::Value,
+    vm::VmError,
+] {
+    match kind {
+        SetIteratorKind::Values => Result::Ok(value),
+        SetIteratorKind::Entries => match pair_array(context.heap(), value, value) {
+            Ok(value) => Result::Ok(value),
+            Err(value) => Result::Err(function_vm_error(value.message)),
+        },
+    }
+}
+
+fn create_set_iterator(
+    context: vm::Context,
+    states: HashMap[runtime::ObjectId, collections::JsSet],
+    kind: SetIteratorKind,
+    this_value: runtime::Value,
+) -> Result[runtime::Value, vm::VmError] {
+    let object = match this_value {
+        runtime::Value::Object(value) => value,
+        _ => return Result::Err(function_vm_error("Set method called on incompatible receiver")),
+    };
+    if states.get(object).is_none() {
+        return Result::Err(function_vm_error("Set method called on incompatible receiver"))
+    } else {};
+    let index = Ref::new(0);
+    let next = context.new_vm_function(
+        |next_this, arguments, depth| {
+            let _ = next_this;
+            let _ = arguments;
+            let _ = depth;
+            let state = match states.get(object) {
+                Some(value) => value,
+                None => {
+                    return Result::Err(function_vm_error("Set iterator has an invalid receiver"))
+                },
+            };
+            while index.get() < state.slot_len() {
+                let current = index.get();
+                index.set(current + 1);
+                match state.value_at(current) {
+                    Some(value) => {
+                        return array_iterator_result(
+                            context,
+                            set_iterator_value(context, kind, value)?,
+                            false,
+                        )
+                    },
+                    None => (),
+                }
+            }
+            array_iterator_result(context, runtime::Value::Undefined, true)
+        },
+    )?;
+    collection_iterator_object(context, next)
+}
+
+fn collection_callback(arguments: Vec[runtime::Value], kind: string) -> Result[
+    runtime::Value,
+    vm::VmError,
+] {
+    let callback = argument(arguments, 0);
+    match callback {
+        runtime::Value::Object(object) => if object.is_callable() {
+            Result::Ok(callback)
+        } else {
+            Result::Err(function_vm_error(kind + ".prototype.forEach callback is not callable"))
+        },
+        _ => {
+            Result::Err(function_vm_error(kind + ".prototype.forEach callback is not callable"))
+        },
+    }
+}
+
+fn map_for_each(
+    context: vm::Context,
+    states: HashMap[runtime::ObjectId, collections::JsMap],
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+    depth: int,
+) -> Result[runtime::Value, vm::VmError] {
+    let object = match collection_object(this_value, "Map") {
+        Ok(value) => value,
+        Err(value) => return Result::Err(function_vm_error(value.message)),
+    };
+    let state = match states.get(object) {
+        Some(value) => value,
+        None => return Result::Err(function_vm_error("Map method called on incompatible receiver")),
+    };
+    let callback = collection_callback(arguments, "Map")?;
+    let receiver = argument(arguments, 1);
+    let mut index = 0;
+    while index < state.slot_len() {
+        match state.entry_at(index) {
+            Some(entry) => {
+                let _ = context.invoke_with_this_at_depth(
+                    callback,
+                    Vec::[entry.value, entry.key, this_value],
+                    receiver,
+                    depth,
+                )?;
+            },
+            None => (),
+        };
+        index += 1;
+    }
+    Result::Ok(runtime::Value::Undefined)
+}
+
+fn set_for_each(
+    context: vm::Context,
+    states: HashMap[runtime::ObjectId, collections::JsSet],
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+    depth: int,
+) -> Result[runtime::Value, vm::VmError] {
+    let object = match collection_object(this_value, "Set") {
+        Ok(value) => value,
+        Err(value) => return Result::Err(function_vm_error(value.message)),
+    };
+    let state = match states.get(object) {
+        Some(value) => value,
+        None => return Result::Err(function_vm_error("Set method called on incompatible receiver")),
+    };
+    let callback = collection_callback(arguments, "Set")?;
+    let receiver = argument(arguments, 1);
+    let mut index = 0;
+    while index < state.slot_len() {
+        match state.value_at(index) {
+            Some(value) => {
+                let _ = context.invoke_with_this_at_depth(
+                    callback,
+                    Vec::[value, value, this_value],
+                    receiver,
+                    depth,
+                )?;
+            },
+            None => (),
+        };
+        index += 1;
+    }
+    Result::Ok(runtime::Value::Undefined)
+}
+
+fn collection_iterator_start(context: vm::Context, source: runtime::Value, depth: int) -> Result[
+    (runtime::Value, runtime::Value),
+    vm::VmError,
+] {
+    let symbol = match context.iterator_symbol() {
+        Some(value) => value,
+        None => return Result::Err(function_vm_error("iterator symbol is not installed")),
+    };
+    let method = context.read_property_at_depth(source, runtime::Value::Symbol(symbol), depth)?;
+    match method {
+        runtime::Value::Object(object) => if !object.is_callable() {
+            return Result::Err(function_vm_error("iterator method is not callable"))
+        } else {},
+        _ => return Result::Err(function_vm_error("value is not iterable")),
+    };
+    let arguments: Vec[runtime::Value] = Vec::[];
+    let iterator = context.invoke_with_this_at_depth(method, arguments, source, depth)?;
+    match iterator {
+        runtime::Value::Object(_) => (),
+        _ => return Result::Err(function_vm_error("iterator result is not an object")),
+    };
+    let next = context.read_property_at_depth(
+        iterator,
+        runtime::Value::String(js_string("next")),
+        depth,
+    )?;
+    match next {
+        runtime::Value::Object(object) => if object.is_callable() {
+            Result::Ok((iterator, next))
+        } else {
+            Result::Err(function_vm_error("iterator next is not callable"))
+        },
+        _ => Result::Err(function_vm_error("iterator next is not callable")),
+    }
+}
+
+fn collection_iterator_step(
+    context: vm::Context,
+    iterator: runtime::Value,
+    next: runtime::Value,
+    depth: int,
+) -> Result[Option[runtime::Value], vm::VmError] {
+    let arguments: Vec[runtime::Value] = Vec::[];
+    let result = context.invoke_with_this_at_depth(next, arguments, iterator, depth)?;
+    match result {
+        runtime::Value::Object(_) => (),
+        _ => return Result::Err(function_vm_error("iterator next result is not an object")),
+    };
+    let done = context.read_property_at_depth(
+        result,
+        runtime::Value::String(js_string("done")),
+        depth,
+    )?;
+    if runtime::to_boolean(done) {
+        Result::Ok(Option::None)
+    } else {
+        match context.read_property_at_depth(
+            result,
+            runtime::Value::String(js_string("value")),
+            depth,
+        ) {
+            Ok(value) => Result::Ok(Option::Some(value)),
+            Err(value) => Result::Err(value),
+        }
+    }
+}
+
+fn collection_close_with_error(
+    context: vm::Context,
+    iterator: runtime::Value,
+    depth: int,
+    value: vm::VmError,
+) -> Result[runtime::Value, vm::VmError] {
+    let _ = array_from_close(context, iterator, depth);
+    Result::Err(value)
+}
+
+fn map_result(
+    heap: runtime::Heap,
+    states: HashMap[runtime::ObjectId, collections::JsMap],
+    prototype: runtime::ObjectId,
+) -> Result[(runtime::Value, collections::JsMap), vm::VmError] {
+    let object = match allocate_ordinary(heap, Option::Some(prototype)) {
+        Ok(value) => value,
+        Err(value) => return Result::Err(function_native_error(value)),
+    };
+    let state = collections::JsMap::new();
+    states[object] = state;
+    Result::Ok((runtime::Value::Object(object), state))
+}
+
+fn map_group_by(
+    context: vm::Context,
+    states: HashMap[runtime::ObjectId, collections::JsMap],
+    prototype: runtime::ObjectId,
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+    depth: int,
+) -> Result[runtime::Value, vm::VmError] {
+    let _ = this_value;
+    let callback = collection_callable(argument(arguments, 1), "not a function")?;
+    let started = collection_iterator_start(context, argument(arguments, 0), depth)?;
+    let iterator = started.0;
+    let next = started.1;
+    let result: (runtime::Value, collections::JsMap) = map_result(context.heap(), states, prototype)?;
+    let output = result.0;
+    let state = result.1;
+    let callback_this = match context.global_object() {
+        Some(value) => runtime::Value::Object(value),
+        None => runtime::Value::Undefined,
+    };
+    let mut count = 0;
+    while count < ARRAY_FROM_LIMIT {
+        let item = match collection_iterator_step(context, iterator, next, depth) {
+            Ok(Some(value)) => value,
+            Ok(None) => return Result::Ok(output),
+            Err(value) => return Result::Err(value),
+        };
+        let key = match context.invoke_with_this_at_depth(
+            callback,
+            Vec::[item, array_length_value(count)],
+            callback_this,
+            depth,
+        ) {
+            Ok(value) => value,
+            Err(value) => return collection_close_with_error(context, iterator, depth, value),
+        };
+        let group = match state.get(key) {
+            Some(runtime::Value::Object(value)) => value,
+            Some(_) => {
+                return collection_close_with_error(
+                    context,
+                    iterator,
+                    depth,
+                    function_vm_error("Map.groupBy group is not an Array"),
+                )
+            },
+            None => {
+                let value = match allocate_array(context.heap(), Vec::[], 0) {
+                    Ok(value) => value,
+                    Err(value) => {
+                        return collection_close_with_error(
+                            context,
+                            iterator,
+                            depth,
+                            function_native_error(value),
+                        )
+                    },
+                };
+                state.set(key, runtime::Value::Object(value));
+                value
+            },
+        };
+        match arrayx::push(context.heap(), group, Vec::[item]) {
+            Ok(_) => (),
+            Err(value) => {
+                return collection_close_with_error(
+                    context,
+                    iterator,
+                    depth,
+                    function_vm_error(value.to_string()),
+                )
+            },
+        };
+        count += 1;
+    }
+    collection_close_with_error(
+        context,
+        iterator,
+        depth,
+        function_range_error("Map.groupBy input exceeds implementation limit"),
+    )
+}
+
+fn set_record_size(context: vm::Context, value: runtime::Value, depth: int) -> Result[
+    int,
+    vm::VmError,
+] {
+    let number = match number_value_at_depth(context, value, depth)? {
+        runtime::Value::Float(value) => value,
+        _ => 0.0,
+    };
+    if math::is_nan(number) {
+        Result::Err(function_vm_error(".size is not a number"))
+    } else if number < 0.0 {
+        Result::Err(function_range_error(".size must be positive"))
+    } else if !math::is_finite(number) || number >= 9007199254740991.0 {
+        Result::Ok(9007199254740991)
+    } else {
+        Result::Ok(num::parse_int(dtoa::number_to_string(math::trunc(number))).unwrap_or(0))
+    }
+}
+
+fn set_record_callable(value: runtime::Value, name: string) -> Result[runtime::Value, vm::VmError] {
+    match value {
+        runtime::Value::Undefined => Result::Err(function_vm_error("." + name + " is undefined")),
+        runtime::Value::Object(object) => if object.is_callable() {
+            Result::Ok(value)
+        } else {
+            Result::Err(function_vm_error("." + name + " is not a function"))
+        },
+        _ => Result::Err(function_vm_error("." + name + " is not a function")),
+    }
+}
+
+fn get_set_record(context: vm::Context, value: runtime::Value, depth: int) -> Result[
+    SetRecord,
+    vm::VmError,
+] {
+    let size_value = context.read_property_at_depth(
+        value,
+        runtime::Value::String(js_string("size")),
+        depth,
+    )?;
+    let size = set_record_size(context, size_value, depth)?;
+    let has = set_record_callable(
+        context.read_property_at_depth(value, runtime::Value::String(js_string("has")), depth)?,
+        "has",
+    )?;
+    let keys = set_record_callable(
+        context.read_property_at_depth(value, runtime::Value::String(js_string("keys")), depth)?,
+        "keys",
+    )?;
+    Result::Ok(SetRecord { object: value, size, has, keys })
+}
+
+fn set_record_has(context: vm::Context, record: SetRecord, value: runtime::Value, depth: int) -> Result[
+    bool,
+    vm::VmError,
+] {
+    Result::Ok(
+        runtime::to_boolean(
+            context.invoke_with_this_at_depth(record.has, Vec::[value], record.object, depth)?,
+        ),
+    )
+}
+
+fn set_record_iterator(context: vm::Context, record: SetRecord, depth: int) -> Result[
+    (runtime::Value, runtime::Value),
+    vm::VmError,
+] {
+    let arguments: Vec[runtime::Value] = Vec::[];
+    let iterator = context.invoke_with_this_at_depth(record.keys, arguments, record.object, depth)?;
+    match iterator {
+        runtime::Value::Object(_) => (),
+        _ => return Result::Err(function_vm_error("set-like keys result is not an object")),
+    };
+    let next = set_record_callable(
+        context.read_property_at_depth(iterator, runtime::Value::String(js_string("next")), depth)?,
+        "next",
+    )?;
+    Result::Ok((iterator, next))
+}
+
+fn set_result(
+    heap: runtime::Heap,
+    states: HashMap[runtime::ObjectId, collections::JsSet],
+    prototype: runtime::ObjectId,
+) -> Result[(runtime::Value, collections::JsSet), vm::VmError] {
+    let object = match allocate_ordinary(heap, Option::Some(prototype)) {
+        Ok(value) => value,
+        Err(value) => return Result::Err(function_native_error(value)),
+    };
+    let state = collections::JsSet::new();
+    states[object] = state;
+    Result::Ok((runtime::Value::Object(object), state))
+}
+
+fn set_copy_result(
+    heap: runtime::Heap,
+    states: HashMap[runtime::ObjectId, collections::JsSet],
+    prototype: runtime::ObjectId,
+    source: collections::JsSet,
+) -> Result[(runtime::Value, collections::JsSet), vm::VmError] {
+    let result: (runtime::Value, collections::JsSet) = set_result(heap, states, prototype)?;
+    for value in source.values() {
+        result.1.add(value)
+    }
+    Result::Ok(result)
+}
+
+fn set_is_disjoint_from(
+    context: vm::Context,
+    states: HashMap[runtime::ObjectId, collections::JsSet],
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+    depth: int,
+) -> Result[runtime::Value, vm::VmError] {
+    let state = match set_state(states, this_value) {
+        Ok(value) => value,
+        Err(value) => return Result::Err(function_vm_error(value.message)),
+    };
+    let record = get_set_record(context, argument(arguments, 0), depth)?;
+    if state.size() <= record.size {
+        let mut index = 0;
+        while index < state.slot_len() {
+            match state.value_at(index) {
+                Some(value) => if set_record_has(context, record, value, depth)? {
+                    return Result::Ok(runtime::Value::Bool(false))
+                } else {},
+                None => (),
+            };
+            index += 1;
+        }
+    } else {
+        let started = set_record_iterator(context, record, depth)?;
+        let mut count = 0;
+        while count < ARRAY_FROM_LIMIT {
+            match collection_iterator_step(context, started.0, started.1, depth)? {
+                Some(value) => if state.has(value) {
+                    array_from_close(context, started.0, depth)?;
+                    return Result::Ok(runtime::Value::Bool(false))
+                } else {},
+                None => return Result::Ok(runtime::Value::Bool(true)),
+            };
+            count += 1;
+        }
+        return collection_close_with_error(
+            context,
+            started.0,
+            depth,
+            function_range_error("set-like keys iterator exceeds implementation limit"),
+        )
+    };
+    Result::Ok(runtime::Value::Bool(true))
+}
+
+fn set_is_subset_of(
+    context: vm::Context,
+    states: HashMap[runtime::ObjectId, collections::JsSet],
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+    depth: int,
+) -> Result[runtime::Value, vm::VmError] {
+    let state = match set_state(states, this_value) {
+        Ok(value) => value,
+        Err(value) => return Result::Err(function_vm_error(value.message)),
+    };
+    let record = get_set_record(context, argument(arguments, 0), depth)?;
+    if state.size() > record.size {
+        return Result::Ok(runtime::Value::Bool(false))
+    } else {};
+    let mut index = 0;
+    while index < state.slot_len() {
+        match state.value_at(index) {
+            Some(value) => if !set_record_has(context, record, value, depth)? {
+                return Result::Ok(runtime::Value::Bool(false))
+            } else {},
+            None => (),
+        };
+        index += 1;
+    }
+    Result::Ok(runtime::Value::Bool(true))
+}
+
+fn set_is_superset_of(
+    context: vm::Context,
+    states: HashMap[runtime::ObjectId, collections::JsSet],
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+    depth: int,
+) -> Result[runtime::Value, vm::VmError] {
+    let state = match set_state(states, this_value) {
+        Ok(value) => value,
+        Err(value) => return Result::Err(function_vm_error(value.message)),
+    };
+    let record = get_set_record(context, argument(arguments, 0), depth)?;
+    if state.size() < record.size {
+        return Result::Ok(runtime::Value::Bool(false))
+    } else {};
+    let started = set_record_iterator(context, record, depth)?;
+    let mut count = 0;
+    while count < ARRAY_FROM_LIMIT {
+        match collection_iterator_step(context, started.0, started.1, depth)? {
+            Some(value) => if !state.has(value) {
+                array_from_close(context, started.0, depth)?;
+                return Result::Ok(runtime::Value::Bool(false))
+            } else {},
+            None => return Result::Ok(runtime::Value::Bool(true)),
+        };
+        count += 1;
+    }
+    collection_close_with_error(
+        context,
+        started.0,
+        depth,
+        function_range_error("set-like keys iterator exceeds implementation limit"),
+    )
+}
+
+fn set_intersection(
+    context: vm::Context,
+    states: HashMap[runtime::ObjectId, collections::JsSet],
+    prototype: runtime::ObjectId,
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+    depth: int,
+) -> Result[runtime::Value, vm::VmError] {
+    let state = match set_state(states, this_value) {
+        Ok(value) => value,
+        Err(value) => return Result::Err(function_vm_error(value.message)),
+    };
+    let record = get_set_record(context, argument(arguments, 0), depth)?;
+    let result = set_result(context.heap(), states, prototype)?;
+    if state.size() > record.size {
+        let started = set_record_iterator(context, record, depth)?;
+        let mut count = 0;
+        while count < ARRAY_FROM_LIMIT {
+            match collection_iterator_step(context, started.0, started.1, depth)? {
+                Some(value) => if state.has(value) {
+                    result.1.add(value)
+                } else {},
+                None => return Result::Ok(result.0),
+            };
+            count += 1;
+        }
+        collection_close_with_error(
+            context,
+            started.0,
+            depth,
+            function_range_error("set-like keys iterator exceeds implementation limit"),
+        )
+    } else {
+        let mut index = 0;
+        while index < state.slot_len() {
+            match state.value_at(index) {
+                Some(value) => if set_record_has(context, record, value, depth)? {
+                    result.1.add(value)
+                } else {},
+                None => (),
+            };
+            index += 1;
+        }
+        Result::Ok(result.0)
+    }
+}
+
+fn set_difference(
+    context: vm::Context,
+    states: HashMap[runtime::ObjectId, collections::JsSet],
+    prototype: runtime::ObjectId,
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+    depth: int,
+) -> Result[runtime::Value, vm::VmError] {
+    let state = match set_state(states, this_value) {
+        Ok(value) => value,
+        Err(value) => return Result::Err(function_vm_error(value.message)),
+    };
+    let record = get_set_record(context, argument(arguments, 0), depth)?;
+    let result = set_copy_result(context.heap(), states, prototype, state)?;
+    if state.size() <= record.size {
+        let mut index = 0;
+        while index < result.1.slot_len() {
+            match result.1.value_at(index) {
+                Some(value) => if set_record_has(context, record, value, depth)? {
+                    let _ = result.1.delete(value);
+                } else {},
+                None => (),
+            };
+            index += 1;
+        }
+        Result::Ok(result.0)
+    } else {
+        let started = set_record_iterator(context, record, depth)?;
+        let mut count = 0;
+        while count < ARRAY_FROM_LIMIT {
+            match collection_iterator_step(context, started.0, started.1, depth)? {
+                Some(value) => {
+                    let _ = result.1.delete(value);
+                },
+                None => return Result::Ok(result.0),
+            };
+            count += 1;
+        }
+        collection_close_with_error(
+            context,
+            started.0,
+            depth,
+            function_range_error("set-like keys iterator exceeds implementation limit"),
+        )
+    }
+}
+
+fn set_symmetric_difference(
+    context: vm::Context,
+    states: HashMap[runtime::ObjectId, collections::JsSet],
+    prototype: runtime::ObjectId,
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+    depth: int,
+) -> Result[runtime::Value, vm::VmError] {
+    let state = match set_state(states, this_value) {
+        Ok(value) => value,
+        Err(value) => return Result::Err(function_vm_error(value.message)),
+    };
+    let record = get_set_record(context, argument(arguments, 0), depth)?;
+    let started = set_record_iterator(context, record, depth)?;
+    let result = set_copy_result(context.heap(), states, prototype, state)?;
+    let mut count = 0;
+    while count < ARRAY_FROM_LIMIT {
+        match collection_iterator_step(context, started.0, started.1, depth)? {
+            Some(value) => if state.has(value) {
+                let _ = result.1.delete(value);
+            } else if !result.1.has(value) {
+                result.1.add(value)
+            } else {},
+            None => return Result::Ok(result.0),
+        };
+        count += 1;
+    }
+    collection_close_with_error(
+        context,
+        started.0,
+        depth,
+        function_range_error("set-like keys iterator exceeds implementation limit"),
+    )
+}
+
+fn set_union(
+    context: vm::Context,
+    states: HashMap[runtime::ObjectId, collections::JsSet],
+    prototype: runtime::ObjectId,
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+    depth: int,
+) -> Result[runtime::Value, vm::VmError] {
+    let state = match set_state(states, this_value) {
+        Ok(value) => value,
+        Err(value) => return Result::Err(function_vm_error(value.message)),
+    };
+    let record = get_set_record(context, argument(arguments, 0), depth)?;
+    let started = set_record_iterator(context, record, depth)?;
+    let result = set_copy_result(context.heap(), states, prototype, state)?;
+    let mut count = 0;
+    while count < ARRAY_FROM_LIMIT {
+        match collection_iterator_step(context, started.0, started.1, depth)? {
+            Some(value) => result.1.add(value),
+            None => return Result::Ok(result.0),
+        };
+        count += 1;
+    }
+    collection_close_with_error(
+        context,
+        started.0,
+        depth,
+        function_range_error("set-like keys iterator exceeds implementation limit"),
+    )
+}
+
+fn initialize_map(
+    context: vm::Context,
+    states: HashMap[runtime::ObjectId, collections::JsMap],
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+    depth: int,
+) -> Result[runtime::Value, vm::VmError] {
+    let object = match this_value {
+        runtime::Value::Object(value) => value,
+        _ => return Result::Err(function_vm_error("Map constructor requires new")),
+    };
+    let state = collections::JsMap::new();
+    states[object] = state;
+    let source = argument(arguments, 0);
+    match source {
+        runtime::Value::Undefined | runtime::Value::Null => {
+            return Result::Ok(runtime::Value::Object(object))
+        },
+        _ => (),
+    };
+    let adder = context.read_property_at_depth(
+        this_value,
+        runtime::Value::String(js_string("set")),
+        depth,
+    )?;
+    match adder {
+        runtime::Value::Object(value) => if !value.is_callable() {
+            return Result::Err(function_vm_error("Map set method is not callable"))
+        } else {},
+        _ => return Result::Err(function_vm_error("Map set method is not callable")),
+    };
+    let started = collection_iterator_start(context, source, depth)?;
+    let iterator = started.0;
+    let next = started.1;
+    let mut count = 0;
+    while count < 16777216 {
+        let entry = match collection_iterator_step(context, iterator, next, depth)? {
+            Some(value) => value,
+            None => return Result::Ok(runtime::Value::Object(object)),
+        };
+        match entry {
+            runtime::Value::Object(_) => (),
+            _ => {
+                return collection_close_with_error(
+                    context,
+                    iterator,
+                    depth,
+                    function_vm_error("Map iterator value is not an object"),
+                )
+            },
+        };
+        let key = match context.read_property_at_depth(entry, runtime::Value::Int(0), depth) {
+            Ok(value) => value,
+            Err(value) => return collection_close_with_error(context, iterator, depth, value),
+        };
+        let value = match context.read_property_at_depth(entry, runtime::Value::Int(1), depth) {
+            Ok(value) => value,
+            Err(value) => return collection_close_with_error(context, iterator, depth, value),
+        };
+        match context.invoke_with_this_at_depth(adder, Vec::[key, value], this_value, depth) {
+            Ok(_) => (),
+            Err(value) => return collection_close_with_error(context, iterator, depth, value),
+        };
+        count += 1;
+    }
+    collection_close_with_error(
+        context,
+        iterator,
+        depth,
+        function_vm_error("Map input exceeds implementation limit"),
+    )
+}
+
+fn initialize_set(
+    context: vm::Context,
+    states: HashMap[runtime::ObjectId, collections::JsSet],
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+    depth: int,
+) -> Result[runtime::Value, vm::VmError] {
+    let object = match this_value {
+        runtime::Value::Object(value) => value,
+        _ => return Result::Err(function_vm_error("Set constructor requires new")),
+    };
+    let state = collections::JsSet::new();
+    states[object] = state;
+    let source = argument(arguments, 0);
+    match source {
+        runtime::Value::Undefined | runtime::Value::Null => {
+            return Result::Ok(runtime::Value::Object(object))
+        },
+        _ => (),
+    };
+    let adder = context.read_property_at_depth(
+        this_value,
+        runtime::Value::String(js_string("add")),
+        depth,
+    )?;
+    match adder {
+        runtime::Value::Object(value) => if !value.is_callable() {
+            return Result::Err(function_vm_error("Set add method is not callable"))
+        } else {},
+        _ => return Result::Err(function_vm_error("Set add method is not callable")),
+    };
+    let started = collection_iterator_start(context, source, depth)?;
+    let iterator = started.0;
+    let next = started.1;
+    let mut count = 0;
+    while count < 16777216 {
+        match collection_iterator_step(context, iterator, next, depth)? {
+            Some(value) => match context.invoke_with_this_at_depth(
+                adder,
+                Vec::[value],
+                this_value,
+                depth,
+            ) {
+                Ok(_) => (),
+                Err(value) => {
+                    return collection_close_with_error(context, iterator, depth, value)
+                },
+            },
+            None => return Result::Ok(runtime::Value::Object(object)),
+        };
+        count += 1;
+    }
+    collection_close_with_error(
+        context,
+        iterator,
+        depth,
+        function_vm_error("Set input exceeds implementation limit"),
+    )
+}
+
+fn initialize_weak_map(
+    context: vm::Context,
+    states: HashMap[runtime::ObjectId, bool],
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+    depth: int,
+) -> Result[runtime::Value, vm::VmError] {
+    let object = match this_value {
+        runtime::Value::Object(value) => value,
+        _ => return Result::Err(function_vm_error("WeakMap constructor requires new")),
+    };
+    states[object] = true;
+    let source = argument(arguments, 0);
+    match source {
+        runtime::Value::Undefined | runtime::Value::Null => {
+            return Result::Ok(runtime::Value::Object(object))
+        },
+        _ => (),
+    };
+    let adder = context.read_property_at_depth(
+        this_value,
+        runtime::Value::String(js_string("set")),
+        depth,
+    )?;
+    match adder {
+        runtime::Value::Object(value) => if !value.is_callable() {
+            return Result::Err(function_vm_error("WeakMap set method is not callable"))
+        } else {},
+        _ => return Result::Err(function_vm_error("WeakMap set method is not callable")),
+    };
+    let started = collection_iterator_start(context, source, depth)?;
+    let iterator = started.0;
+    let next = started.1;
+    let mut count = 0;
+    while count < 16777216 {
+        let entry = match collection_iterator_step(context, iterator, next, depth)? {
+            Some(value) => value,
+            None => return Result::Ok(runtime::Value::Object(object)),
+        };
+        match entry {
+            runtime::Value::Object(_) => (),
+            _ => {
+                return collection_close_with_error(
+                    context,
+                    iterator,
+                    depth,
+                    function_vm_error("WeakMap iterator value is not an object"),
+                )
+            },
+        };
+        let key = match context.read_property_at_depth(entry, runtime::Value::Int(0), depth) {
+            Ok(value) => value,
+            Err(value) => return collection_close_with_error(context, iterator, depth, value),
+        };
+        let value = match context.read_property_at_depth(entry, runtime::Value::Int(1), depth) {
+            Ok(value) => value,
+            Err(value) => return collection_close_with_error(context, iterator, depth, value),
+        };
+        match context.invoke_with_this_at_depth(adder, Vec::[key, value], this_value, depth) {
+            Ok(_) => (),
+            Err(value) => return collection_close_with_error(context, iterator, depth, value),
+        };
+        count += 1;
+    }
+    collection_close_with_error(
+        context,
+        iterator,
+        depth,
+        function_vm_error("WeakMap input exceeds implementation limit"),
+    )
+}
+
+fn initialize_weak_set(
+    context: vm::Context,
+    states: HashMap[runtime::ObjectId, bool],
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+    depth: int,
+) -> Result[runtime::Value, vm::VmError] {
+    let object = match this_value {
+        runtime::Value::Object(value) => value,
+        _ => return Result::Err(function_vm_error("WeakSet constructor requires new")),
+    };
+    states[object] = true;
+    let source = argument(arguments, 0);
+    match source {
+        runtime::Value::Undefined | runtime::Value::Null => {
+            return Result::Ok(runtime::Value::Object(object))
+        },
+        _ => (),
+    };
+    let adder = context.read_property_at_depth(
+        this_value,
+        runtime::Value::String(js_string("add")),
+        depth,
+    )?;
+    match adder {
+        runtime::Value::Object(value) => if !value.is_callable() {
+            return Result::Err(function_vm_error("WeakSet add method is not callable"))
+        } else {},
+        _ => return Result::Err(function_vm_error("WeakSet add method is not callable")),
+    };
+    let started = collection_iterator_start(context, source, depth)?;
+    let iterator = started.0;
+    let next = started.1;
+    let mut count = 0;
+    while count < 16777216 {
+        match collection_iterator_step(context, iterator, next, depth)? {
+            Some(value) => match context.invoke_with_this_at_depth(
+                adder,
+                Vec::[value],
+                this_value,
+                depth,
+            ) {
+                Ok(_) => (),
+                Err(value) => {
+                    return collection_close_with_error(context, iterator, depth, value)
+                },
+            },
+            None => return Result::Ok(runtime::Value::Object(object)),
+        };
+        count += 1;
+    }
+    collection_close_with_error(
+        context,
+        iterator,
+        depth,
+        function_vm_error("WeakSet input exceeds implementation limit"),
+    )
+}
+
+fn initialize_weak_ref(
+    context: vm::Context,
+    states: HashMap[runtime::ObjectId, bool],
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+    depth: int,
+) -> Result[runtime::Value, vm::VmError] {
+    let _ = depth;
+    let object = match this_value {
+        runtime::Value::Object(value) => value,
+        _ => return Result::Err(function_vm_error("WeakRef constructor requires new")),
+    };
+    if runtime::weak_ref_set(context.heap(), object, argument(arguments, 0)) {
+        states[object] = true;
+        Result::Ok(runtime::Value::Object(object))
+    } else {
+        Result::Err(function_vm_error("WeakRef target must be an object or symbol"))
+    }
+}
+
+fn initialize_finalization_registry(
+    context: vm::Context,
+    callback_name: runtime::ObjectId,
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+    depth: int,
+) -> Result[runtime::Value, vm::VmError] {
+    let _ = depth;
+    let object = match this_value {
+        runtime::Value::Object(value) => value,
+        _ => {
+            return Result::Err(function_vm_error("FinalizationRegistry constructor requires new"))
+        },
+    };
+    let callback = argument(arguments, 0);
+    match callback {
+        runtime::Value::Object(value) => if value.is_callable() && context.heap().contains(value) {
+            if runtime::define_private_field(context.heap(), object, callback_name, callback) {
+                Result::Ok(runtime::Value::Object(object))
+            } else {
+                Result::Err(function_vm_error("cannot initialize FinalizationRegistry"))
+            }
+        } else {
+            Result::Err(function_vm_error("FinalizationRegistry callback is not callable"))
+        },
+        _ => Result::Err(function_vm_error("FinalizationRegistry callback is not callable")),
+    }
+}
+
+fn install_map(context: vm::Context) -> Result[MapInstallData, BuiltinError] {
+    let heap = context.heap();
+    let prototype = match allocate_ordinary(heap, Option::None) {
+        Ok(value) => value,
+        Err(value) => return Result::Err(BuiltinError { message: value.message }),
+    };
+    let states: HashMap[runtime::ObjectId, collections::JsMap] = HashMap::{};
+    define_value(
+        heap,
+        prototype,
+        "set",
+        allocate_function(
+            context,
+            "Map.prototype.set",
+            |heap, this_value, arguments| {
+                map_set(heap, states, this_value, arguments)
+            },
+        )?,
+        true,
+        true,
+    )?;
+    define_value(
+        heap,
+        prototype,
+        "get",
+        allocate_function(
+            context,
+            "Map.prototype.get",
+            |heap, this_value, arguments| {
+                map_get(heap, states, this_value, arguments)
+            },
+        )?,
+        true,
+        true,
+    )?;
+    define_value(
+        heap,
+        prototype,
+        "getOrInsert",
+        allocate_vm_function(
+            context,
+            "Map.prototype.getOrInsert",
+            |this_value, arguments, depth| {
+                map_get_or_insert(context, states, false, this_value, arguments, depth)
+            },
+        )?,
+        true,
+        true,
+    )?;
+    define_value(
+        heap,
+        prototype,
+        "getOrInsertComputed",
+        allocate_vm_function(
+            context,
+            "Map.prototype.getOrInsertComputed",
+            |this_value, arguments, depth| {
+                map_get_or_insert(context, states, true, this_value, arguments, depth)
+            },
+        )?,
+        true,
+        true,
+    )?;
+    for (name, function) in Vec::[
+        (
+            "has",
+            allocate_function(
+                context,
+                "Map.prototype.has",
+                |heap, this_value, arguments| {
+                    map_has(heap, states, this_value, arguments)
+                },
+            )?,
+        ),
+        (
+            "delete",
+            allocate_function(
+                context,
+                "Map.prototype.delete",
+                |heap, this_value, arguments| {
+                    map_delete(heap, states, this_value, arguments)
+                },
+            )?,
+        ),
+        (
+            "clear",
+            allocate_function(
+                context,
+                "Map.prototype.clear",
+                |heap, this_value, arguments| {
+                    map_clear(heap, states, this_value, arguments)
+                },
+            )?,
+        ),
+    ] {
+        define_value(heap, prototype, name, function, true, true)?
+    }
+    let size = allocate_function(
+        context,
+        "get Map.prototype.size",
+        |heap, this_value, arguments| {
+            map_size(heap, states, this_value, arguments)
+        },
+    )?;
+    if !runtime::define_own_property(
+        heap,
+        prototype,
+        runtime::string_property_key("size"),
+        runtime::accessor_descriptor(Option::Some(size), Option::None, false, true),
+    ) {
+        return Result::Err(BuiltinError { message: "cannot define Map size" })
+    } else {};
+    let entries = allocate_vm_function(
+        context,
+        "Map.prototype.entries",
+        |this_value, arguments, depth| {
+            let _ = arguments;
+            let _ = depth;
+            create_map_iterator(context, states, MapIteratorKind::Entries, this_value)
+        },
+    )?;
+    let keys = allocate_vm_function(
+        context,
+        "Map.prototype.keys",
+        |this_value, arguments, depth| {
+            let _ = arguments;
+            let _ = depth;
+            create_map_iterator(context, states, MapIteratorKind::Keys, this_value)
+        },
+    )?;
+    let values = allocate_vm_function(
+        context,
+        "Map.prototype.values",
+        |this_value, arguments, depth| {
+            let _ = arguments;
+            let _ = depth;
+            create_map_iterator(context, states, MapIteratorKind::Values, this_value)
+        },
+    )?;
+    define_value(
+        heap,
+        prototype,
+        "forEach",
+        allocate_vm_function(
+            context,
+            "Map.prototype.forEach",
+            |this_value, arguments, depth| {
+                map_for_each(context, states, this_value, arguments, depth)
+            },
+        )?,
+        true,
+        true,
+    )?;
+    define_value(heap, prototype, "values", values, true, true)?;
+    define_value(heap, prototype, "keys", keys, true, true)?;
+    define_value(heap, prototype, "entries", entries, true, true)?;
+    match context.iterator_symbol() {
+        Some(symbol) => if !runtime::define_own_property(
+            heap,
+            prototype,
+            runtime::PropertyKey::Symbol(symbol),
+            runtime::data_descriptor(entries, true, false, true),
+        ) {
+            return Result::Err(BuiltinError { message: "cannot define Map iterator" })
+        } else {},
+        None => (),
+    };
+    let constructor = allocate_vm_function(
+        context,
+        "Map",
+        |this_value, arguments, depth| {
+            initialize_map(context, states, this_value, arguments, depth)
+        },
+    )?;
+    let object = function_object(constructor, "Map")?;
+    define_value(
+        heap,
+        object,
+        "groupBy",
+        allocate_vm_function(
+            context,
+            "Map.groupBy",
+            |this_value, arguments, depth| {
+                map_group_by(context, states, prototype, this_value, arguments, depth)
+            },
+        )?,
+        true,
+        true,
+    )?;
+    define_value(heap, object, "prototype", runtime::Value::Object(prototype), false, false)?;
+    match context.well_known_symbol(vm::WellKnownSymbolKind::Species) {
+        Some(symbol) => {
+            let getter = allocate_function_with_length(
+                context,
+                "get [Symbol.species]",
+                0,
+                array_species_getter,
+            )?;
+            if !runtime::define_own_property(
+                heap,
+                object,
+                runtime::PropertyKey::Symbol(symbol),
+                runtime::accessor_descriptor(Option::Some(getter), Option::None, false, true),
+            ) {
+                return Result::Err(BuiltinError { message: "cannot define Map species" })
+            } else {}
+        },
+        None => (),
+    };
+    define_value(heap, prototype, "constructor", constructor, true, true)?;
+    define_to_string_tag(context, prototype, "Map")?;
+    mark_constructor(context, constructor, "Map")?;
+    Result::Ok(MapInstallData { constructor, prototype, states })
+}
+
+fn install_set(context: vm::Context, map: MapInstallData) -> Result[runtime::Value, BuiltinError] {
+    let heap = context.heap();
+    let prototype = match allocate_ordinary(heap, Option::None) {
+        Ok(value) => value,
+        Err(value) => return Result::Err(BuiltinError { message: value.message }),
+    };
+    let states: HashMap[runtime::ObjectId, collections::JsSet] = HashMap::{};
+    for (name, function) in Vec::[
+        (
+            "add",
+            allocate_function(
+                context,
+                "Set.prototype.add",
+                |heap, this_value, arguments| {
+                    set_add(heap, states, this_value, arguments)
+                },
+            )?,
+        ),
+        (
+            "has",
+            allocate_function(
+                context,
+                "Set.prototype.has",
+                |heap, this_value, arguments| {
+                    set_has(heap, states, this_value, arguments)
+                },
+            )?,
+        ),
+        (
+            "delete",
+            allocate_function(
+                context,
+                "Set.prototype.delete",
+                |heap, this_value, arguments| {
+                    set_delete(heap, states, this_value, arguments)
+                },
+            )?,
+        ),
+        (
+            "clear",
+            allocate_function(
+                context,
+                "Set.prototype.clear",
+                |heap, this_value, arguments| {
+                    set_clear(heap, states, this_value, arguments)
+                },
+            )?,
+        ),
+    ] {
+        define_value(heap, prototype, name, function, true, true)?
+    }
+    let size = allocate_function(
+        context,
+        "get Set.prototype.size",
+        |heap, this_value, arguments| {
+            set_size(heap, states, this_value, arguments)
+        },
+    )?;
+    if !runtime::define_own_property(
+        heap,
+        prototype,
+        runtime::string_property_key("size"),
+        runtime::accessor_descriptor(Option::Some(size), Option::None, false, true),
+    ) {
+        return Result::Err(BuiltinError { message: "cannot define Set size" })
+    } else {};
+    let values = allocate_vm_function(
+        context,
+        "Set.prototype.values",
+        |this_value, arguments, depth| {
+            let _ = arguments;
+            let _ = depth;
+            create_set_iterator(context, states, SetIteratorKind::Values, this_value)
+        },
+    )?;
+    let entries = allocate_vm_function(
+        context,
+        "Set.prototype.entries",
+        |this_value, arguments, depth| {
+            let _ = arguments;
+            let _ = depth;
+            create_set_iterator(context, states, SetIteratorKind::Entries, this_value)
+        },
+    )?;
+    define_value(
+        heap,
+        prototype,
+        "forEach",
+        allocate_vm_function(
+            context,
+            "Set.prototype.forEach",
+            |this_value, arguments, depth| {
+                set_for_each(context, states, this_value, arguments, depth)
+            },
+        )?,
+        true,
+        true,
+    )?;
+    for (name, function) in Vec::[
+        (
+            "isDisjointFrom",
+            allocate_vm_function(
+                context,
+                "Set.prototype.isDisjointFrom",
+                |this_value, arguments, depth| {
+                    set_is_disjoint_from(context, states, this_value, arguments, depth)
+                },
+            )?,
+        ),
+        (
+            "isSubsetOf",
+            allocate_vm_function(
+                context,
+                "Set.prototype.isSubsetOf",
+                |this_value, arguments, depth| {
+                    set_is_subset_of(context, states, this_value, arguments, depth)
+                },
+            )?,
+        ),
+        (
+            "isSupersetOf",
+            allocate_vm_function(
+                context,
+                "Set.prototype.isSupersetOf",
+                |this_value, arguments, depth| {
+                    set_is_superset_of(context, states, this_value, arguments, depth)
+                },
+            )?,
+        ),
+        (
+            "intersection",
+            allocate_vm_function(
+                context,
+                "Set.prototype.intersection",
+                |this_value, arguments, depth| {
+                    set_intersection(context, states, prototype, this_value, arguments, depth)
+                },
+            )?,
+        ),
+        (
+            "difference",
+            allocate_vm_function(
+                context,
+                "Set.prototype.difference",
+                |this_value, arguments, depth| {
+                    set_difference(context, states, prototype, this_value, arguments, depth)
+                },
+            )?,
+        ),
+        (
+            "symmetricDifference",
+            allocate_vm_function(
+                context,
+                "Set.prototype.symmetricDifference",
+                |this_value, arguments, depth| {
+                    set_symmetric_difference(
+                        context,
+                        states,
+                        prototype,
+                        this_value,
+                        arguments,
+                        depth,
+                    )
+                },
+            )?,
+        ),
+        (
+            "union",
+            allocate_vm_function(
+                context,
+                "Set.prototype.union",
+                |this_value, arguments, depth| {
+                    set_union(context, states, prototype, this_value, arguments, depth)
+                },
+            )?,
+        ),
+    ] {
+        define_value(heap, prototype, name, function, true, true)?
+    }
+    define_value(heap, prototype, "values", values, true, true)?;
+    define_value(heap, prototype, "keys", values, true, true)?;
+    define_value(heap, prototype, "entries", entries, true, true)?;
+    match context.iterator_symbol() {
+        Some(symbol) => if !runtime::define_own_property(
+            heap,
+            prototype,
+            runtime::PropertyKey::Symbol(symbol),
+            runtime::data_descriptor(values, true, false, true),
+        ) {
+            return Result::Err(BuiltinError { message: "cannot define Set iterator" })
+        } else {},
+        None => (),
+    };
+    let constructor = allocate_vm_function(
+        context,
+        "Set",
+        |this_value, arguments, depth| {
+            initialize_set(context, states, this_value, arguments, depth)
+        },
+    )?;
+    let object = function_object(constructor, "Set")?;
+    define_value(
+        heap,
+        object,
+        "groupBy",
+        allocate_vm_function(
+            context,
+            "Set.groupBy",
+            |this_value, arguments, depth| {
+                map_group_by(context, map.states, map.prototype, this_value, arguments, depth)
+            },
+        )?,
+        true,
+        true,
+    )?;
+    define_value(heap, object, "prototype", runtime::Value::Object(prototype), false, false)?;
+    match context.well_known_symbol(vm::WellKnownSymbolKind::Species) {
+        Some(symbol) => {
+            let getter = allocate_function_with_length(
+                context,
+                "get [Symbol.species]",
+                0,
+                array_species_getter,
+            )?;
+            if !runtime::define_own_property(
+                heap,
+                object,
+                runtime::PropertyKey::Symbol(symbol),
+                runtime::accessor_descriptor(Option::Some(getter), Option::None, false, true),
+            ) {
+                return Result::Err(BuiltinError { message: "cannot define Set species" })
+            } else {}
+        },
+        None => (),
+    };
+    define_value(heap, prototype, "constructor", constructor, true, true)?;
+    define_to_string_tag(context, prototype, "Set")?;
+    mark_constructor(context, constructor, "Set")?;
+    Result::Ok(constructor)
+}
+
+fn install_weak_map(context: vm::Context) -> Result[runtime::Value, BuiltinError] {
+    let heap = context.heap();
+    let prototype = match allocate_ordinary(heap, heap.object_prototype()) {
+        Ok(value) => value,
+        Err(value) => return Result::Err(BuiltinError { message: value.message }),
+    };
+    let states: HashMap[runtime::ObjectId, bool] = HashMap::{};
+    for (name, function) in Vec::[
+        (
+            "set",
+            allocate_function(
+                context,
+                "WeakMap.prototype.set",
+                |heap, this_value, arguments| {
+                    weak_map_set(heap, states, this_value, arguments)
+                },
+            )?,
+        ),
+        (
+            "get",
+            allocate_function(
+                context,
+                "WeakMap.prototype.get",
+                |heap, this_value, arguments| {
+                    weak_map_get(heap, states, this_value, arguments)
+                },
+            )?,
+        ),
+    ] {
+        define_value(heap, prototype, name, function, true, true)?
+    }
+    define_value(
+        heap,
+        prototype,
+        "getOrInsert",
+        allocate_vm_function(
+            context,
+            "WeakMap.prototype.getOrInsert",
+            |this_value, arguments, depth| {
+                weak_map_get_or_insert(context, states, false, this_value, arguments, depth)
+            },
+        )?,
+        true,
+        true,
+    )?;
+    define_value(
+        heap,
+        prototype,
+        "getOrInsertComputed",
+        allocate_vm_function(
+            context,
+            "WeakMap.prototype.getOrInsertComputed",
+            |this_value, arguments, depth| {
+                weak_map_get_or_insert(context, states, true, this_value, arguments, depth)
+            },
+        )?,
+        true,
+        true,
+    )?;
+    for (name, function) in Vec::[
+        (
+            "has",
+            allocate_function(
+                context,
+                "WeakMap.prototype.has",
+                |heap, this_value, arguments| {
+                    weak_map_has(heap, states, this_value, arguments)
+                },
+            )?,
+        ),
+        (
+            "delete",
+            allocate_function(
+                context,
+                "WeakMap.prototype.delete",
+                |heap, this_value, arguments| {
+                    weak_map_delete(heap, states, this_value, arguments)
+                },
+            )?,
+        ),
+    ] {
+        define_value(heap, prototype, name, function, true, true)?
+    }
+    let constructor = allocate_vm_function(
+        context,
+        "WeakMap",
+        |this_value, arguments, depth| {
+            initialize_weak_map(context, states, this_value, arguments, depth)
+        },
+    )?;
+    let object = function_object(constructor, "WeakMap")?;
+    define_value(heap, object, "prototype", runtime::Value::Object(prototype), false, false)?;
+    define_value(heap, prototype, "constructor", constructor, true, true)?;
+    define_to_string_tag(context, prototype, "WeakMap")?;
+    mark_constructor(context, constructor, "WeakMap")?;
+    Result::Ok(constructor)
+}
+
+fn install_weak_set(context: vm::Context) -> Result[runtime::Value, BuiltinError] {
+    let heap = context.heap();
+    let prototype = match allocate_ordinary(heap, heap.object_prototype()) {
+        Ok(value) => value,
+        Err(value) => return Result::Err(BuiltinError { message: value.message }),
+    };
+    let states: HashMap[runtime::ObjectId, bool] = HashMap::{};
+    define_to_string_tag(context, prototype, "WeakSet")?;
+    for (name, function) in Vec::[
+        (
+            "add",
+            allocate_function(
+                context,
+                "WeakSet.prototype.add",
+                |heap, this_value, arguments| {
+                    weak_set_add(heap, states, this_value, arguments)
+                },
+            )?,
+        ),
+        (
+            "has",
+            allocate_function(
+                context,
+                "WeakSet.prototype.has",
+                |heap, this_value, arguments| {
+                    weak_set_has(heap, states, this_value, arguments)
+                },
+            )?,
+        ),
+        (
+            "delete",
+            allocate_function(
+                context,
+                "WeakSet.prototype.delete",
+                |heap, this_value, arguments| {
+                    weak_set_delete(heap, states, this_value, arguments)
+                },
+            )?,
+        ),
+    ] {
+        define_value(heap, prototype, name, function, true, true)?
+    }
+    let constructor = allocate_vm_function(
+        context,
+        "WeakSet",
+        |this_value, arguments, depth| {
+            initialize_weak_set(context, states, this_value, arguments, depth)
+        },
+    )?;
+    let object = function_object(constructor, "WeakSet")?;
+    define_value(heap, object, "prototype", runtime::Value::Object(prototype), false, false)?;
+    define_value(heap, prototype, "constructor", constructor, true, true)?;
+    mark_constructor(context, constructor, "WeakSet")?;
+    Result::Ok(constructor)
+}
+
+fn install_weak_ref(context: vm::Context) -> Result[runtime::Value, BuiltinError] {
+    let heap = context.heap();
+    let prototype = match allocate_ordinary(heap, heap.object_prototype()) {
+        Ok(value) => value,
+        Err(value) => return Result::Err(BuiltinError { message: value.message }),
+    };
+    let states: HashMap[runtime::ObjectId, bool] = HashMap::{};
+    define_to_string_tag(context, prototype, "WeakRef")?;
+    define_value(
+        heap,
+        prototype,
+        "deref",
+        allocate_vm_function(
+            context,
+            "WeakRef.prototype.deref",
+            |this_value, arguments, depth| {
+                let _ = depth;
+                weak_ref_deref(context, states, this_value, arguments)
+            },
+        )?,
+        true,
+        true,
+    )?;
+    let constructor = allocate_vm_function(
+        context,
+        "WeakRef",
+        |this_value, arguments, depth| {
+            initialize_weak_ref(context, states, this_value, arguments, depth)
+        },
+    )?;
+    let object = function_object(constructor, "WeakRef")?;
+    define_value(heap, object, "prototype", runtime::Value::Object(prototype), false, false)?;
+    define_value(heap, prototype, "constructor", constructor, true, true)?;
+    mark_constructor(context, constructor, "WeakRef")?;
+    Result::Ok(constructor)
+}
+
+fn install_finalization_registry(context: vm::Context) -> Result[runtime::Value, BuiltinError] {
+    let heap = context.heap();
+    let prototype = match allocate_ordinary(heap, heap.object_prototype()) {
+        Ok(value) => value,
+        Err(value) => return Result::Err(BuiltinError { message: value.message }),
+    };
+    let callback_name = match runtime::new_ordinary_object(heap, Option::None) {
+        Ok(value) => value,
+        Err(value) => return Result::Err(BuiltinError { message: value.message }),
+    };
+    define_to_string_tag(context, prototype, "FinalizationRegistry")?;
+    define_value(
+        heap,
+        prototype,
+        "register",
+        allocate_function(
+            context,
+            "FinalizationRegistry.prototype.register",
+            |heap, this_value, arguments| {
+                finalization_registry_register(heap, callback_name, this_value, arguments)
+            },
+        )?,
+        true,
+        true,
+    )?;
+    define_value(
+        heap,
+        prototype,
+        "unregister",
+        allocate_function(
+            context,
+            "FinalizationRegistry.prototype.unregister",
+            |heap, this_value, arguments| {
+                finalization_registry_unregister(heap, callback_name, this_value, arguments)
+            },
+        )?,
+        true,
+        true,
+    )?;
+    let constructor = allocate_vm_function(
+        context,
+        "FinalizationRegistry",
+        |this_value, arguments, depth| {
+            initialize_finalization_registry(context, callback_name, this_value, arguments, depth)
+        },
+    )?;
+    let object = function_object(constructor, "FinalizationRegistry")?;
+    if !runtime::define_private_field(
+        heap,
+        object,
+        callback_name,
+        runtime::Value::Object(callback_name),
+    ) {
+        return Result::Err(BuiltinError { message: "cannot root FinalizationRegistry state" })
+    } else {};
+    define_value(heap, object, "prototype", runtime::Value::Object(prototype), false, false)?;
+    define_value(heap, prototype, "constructor", constructor, true, true)?;
+    mark_constructor(context, constructor, "FinalizationRegistry")?;
+    Result::Ok(constructor)
+}
+
+fn install_collections(context: vm::Context) -> Result[CollectionInstall, BuiltinError] {
+    let map = install_map(context)?;
+    let map_constructor = map.constructor;
+    let set = install_set(context, map)?;
+    Result::Ok(
+        CollectionInstall {
+            map: map_constructor,
+            set,
+            weak_map: install_weak_map(context)?,
+            weak_set: install_weak_set(context)?,
+            weak_ref: install_weak_ref(context)?,
+            finalization_registry: install_finalization_registry(context)?,
+        },
+    )
+}

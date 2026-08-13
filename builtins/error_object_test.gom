@@ -1,0 +1,141 @@
+package builtins;
+
+use gomlang::quickjs::bytecode;
+use gomlang::quickjs::runtime;
+use gomlang::quickjs::vm;
+use std::testing;
+
+fn error_invoke_method(
+    context: vm::Context,
+    receiver: runtime::Value,
+    callable: runtime::Value,
+    arguments: Vec[runtime::Value],
+) -> Result[runtime::Value, vm::VmError] {
+    let code: Vec[bytecode::Instruction] = Vec::[
+        bytecode::Instruction::GetLoc(0),
+        bytecode::Instruction::GetLoc(1),
+    ];
+    let mut index = 0;
+    while index < arguments.len() {
+        code.push(bytecode::Instruction::GetLoc(index + 2));
+        index += 1;
+    }
+    code.push(bytecode::Instruction::CallMethod(arguments.len()));
+    code.push(bytecode::Instruction::Return);
+    let locals: Vec[runtime::Value] = Vec::with_capacity(arguments.len() + 2);
+    locals.push(receiver);
+    locals.push(callable);
+    for value in arguments {
+        locals.push(value)
+    }
+    context.execute_with_locals(bytecode::Function::new(Vec::[], code, locals.len()), locals)
+}
+
+fn error_object(value: runtime::Value, fallback: runtime::ObjectId) -> runtime::ObjectId {
+    match value {
+        runtime::Value::Object(value) => value,
+        _ => {
+            testing::fail("expected error object");
+            fallback
+        },
+    }
+}
+
+#[test]
+fn error_constructors_create_named_objects_with_message_and_cause() -> unit {
+    let context = vm::Context::new(runtime::Heap::new());
+    let realm = expect_realm(install(context));
+    let options = match runtime::new_ordinary_object(context.heap(), Option::None) {
+        Ok(value) => value,
+        Err(value) => {
+            testing::fail(value.message);
+            realm.global_object()
+        },
+    };
+    testing::assert(
+        runtime::define_own_property(
+            context.heap(),
+            options,
+            runtime::string_property_key("cause"),
+            runtime::data_descriptor(runtime::Value::Int(42), true, true, true),
+        ),
+    );
+    let constructor = property(context.heap(), realm.global_object(), "TypeError");
+    let instance = error_object(
+        expect_value(
+            invoke(
+                context,
+                constructor,
+                Vec::[runtime::Value::String(js_string("broken")), runtime::Value::Object(options)],
+            ),
+        ),
+        realm.global_object(),
+    );
+    assert_value(
+        property(context.heap(), instance, "name"),
+        runtime::Value::String(js_string("TypeError")),
+    );
+    assert_value(
+        property(context.heap(), instance, "message"),
+        runtime::Value::String(js_string("broken")),
+    );
+    assert_value(property(context.heap(), instance, "cause"), runtime::Value::Int(42));
+    let to_string = property(context.heap(), instance, "toString");
+    assert_value(
+        expect_value(
+            error_invoke_method(context, runtime::Value::Object(instance), to_string, Vec::[]),
+        ),
+        runtime::Value::String(js_string("TypeError: broken")),
+    )
+}
+
+#[test]
+fn error_subtypes_share_error_prototype_and_aggregate_errors_value() -> unit {
+    let context = vm::Context::new(runtime::Heap::new());
+    let realm = expect_realm(install(context));
+    let error_constructor = error_object(
+        property(context.heap(), realm.global_object(), "Error"),
+        realm.global_object(),
+    );
+    let range_constructor = error_object(
+        property(context.heap(), realm.global_object(), "RangeError"),
+        realm.global_object(),
+    );
+    let error_prototype = error_object(
+        property(context.heap(), error_constructor, "prototype"),
+        realm.global_object(),
+    );
+    let range_prototype = error_object(
+        property(context.heap(), range_constructor, "prototype"),
+        realm.global_object(),
+    );
+    match context.heap().get(range_prototype) {
+        Some(value) => match value.prototype() {
+            Some(value) => testing::assert(value == error_prototype),
+            None => testing::fail("missing Error prototype inheritance"),
+        },
+        None => testing::fail("missing RangeError prototype"),
+    };
+    let errors = match runtime::new_array(context.heap(), 0) {
+        Ok(value) => value,
+        Err(value) => {
+            testing::fail(value.message);
+            realm.global_object()
+        },
+    };
+    let aggregate = error_object(
+        expect_value(
+            invoke(
+                context,
+                property(context.heap(), realm.global_object(), "AggregateError"),
+                Vec::[runtime::Value::Object(errors), runtime::Value::String(js_string("many"))],
+            ),
+        ),
+        realm.global_object(),
+    );
+    assert_value(property(context.heap(), aggregate, "errors"), runtime::Value::Object(errors));
+    assert_value(
+        property(context.heap(), aggregate, "name"),
+        runtime::Value::String(js_string("AggregateError")),
+    )
+}

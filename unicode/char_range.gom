@@ -1,0 +1,197 @@
+package unicode;
+
+pub const CHAR_RANGE_LIMIT: uint32 = 0x80000000;
+
+pub enum CharRangeError {
+    ReversedRange(uint32, uint32),
+    ValueOutOfRange(uint32),
+}
+
+impl ToString for CharRangeError {
+    fn to_string(self: CharRangeError) -> string {
+        match self {
+            CharRangeError::ReversedRange(first, last) => {
+                "reversed character range: " + first.to_string() + "..=" + last.to_string()
+            },
+            CharRangeError::ValueOutOfRange(value) => {
+                "character range value exceeds QuickJS 31-bit domain: " + value.to_string()
+            },
+        }
+    }
+}
+
+impl Debug for CharRangeError {
+    fn debug(self: CharRangeError) -> string {
+        self.to_string()
+    }
+}
+
+pub struct CharRange {
+    points: Vec[uint32],
+}
+
+fn combine_points(left: Vec[uint32], right: Vec[uint32], operation: int) -> Vec[uint32] {
+    let output: Vec[uint32] = Vec::with_capacity(left.len() + right.len());
+    let mut left_index = 0;
+    let mut right_index = 0;
+    while left_index < left.len() || right_index < right.len() {
+        let value = if left_index < left.len() && right_index < right.len() {
+            if left[left_index] < right[right_index] {
+                let current = left[left_index];
+                left_index += 1;
+                current
+            } else if left[left_index] > right[right_index] {
+                let current = right[right_index];
+                right_index += 1;
+                current
+            } else {
+                let current = left[left_index];
+                left_index += 1;
+                right_index += 1;
+                current
+            }
+        } else if left_index < left.len() {
+            let current = left[left_index];
+            left_index += 1;
+            current
+        } else {
+            let current = right[right_index];
+            right_index += 1;
+            current
+        };
+        let left_inside = left_index % 2 == 1;
+        let right_inside = right_index % 2 == 1;
+        let result_inside = if operation == 0 {
+            left_inside || right_inside
+        } else if operation == 1 {
+            left_inside && right_inside
+        } else if operation == 2 {
+            left_inside && !right_inside
+        } else {
+            left_inside != right_inside
+        };
+        if result_inside != (output.len() % 2 == 1) {
+            output.push(value)
+        } else {}
+    }
+    output
+}
+
+fn replace_points(target: Vec[uint32], source: Vec[uint32]) -> unit {
+    target.clear();
+    target.reserve(source.len());
+    for value in source {
+        target.push(value)
+    }
+}
+
+impl CharRange {
+    pub fn new() -> CharRange {
+        CharRange { points: Vec::[] }
+    }
+
+    pub fn full() -> CharRange {
+        CharRange { points: Vec::[0.to_uint32(), CHAR_RANGE_LIMIT] }
+    }
+
+    pub fn from_char(value: uint32) -> Result[CharRange, CharRangeError] {
+        let range = CharRange::new();
+        range.add_char(value)?;
+        Result::Ok(range)
+    }
+
+    pub fn from_range(first: uint32, last: uint32) -> Result[CharRange, CharRangeError] {
+        let range = CharRange::new();
+        range.add_range(first, last)?;
+        Result::Ok(range)
+    }
+
+    pub fn add_char(self: CharRange, value: uint32) -> Result[unit, CharRangeError] {
+        self.add_range(value, value)
+    }
+
+    pub fn add_range(self: CharRange, first: uint32, last: uint32) -> Result[unit, CharRangeError] {
+        if first > last {
+            return Result::Err(CharRangeError::ReversedRange(first, last))
+        } else if last >= CHAR_RANGE_LIMIT {
+            return Result::Err(CharRangeError::ValueOutOfRange(last))
+        } else {};
+        let interval = Vec::[first, last + 1];
+        replace_points(self.points, combine_points(self.points, interval, 0));
+        Result::Ok(())
+    }
+
+    pub fn contains(self: CharRange, value: uint32) -> bool {
+        if value >= CHAR_RANGE_LIMIT {
+            return false
+        } else {};
+        let mut low = 0;
+        let mut high = self.points.len();
+        while low < high {
+            let middle = low + (high - low) / 2;
+            if self.points[middle] <= value {
+                low = middle + 1;
+            } else {
+                high = middle;
+            }
+        }
+        low % 2 == 1
+    }
+
+    pub fn is_empty(self: CharRange) -> bool {
+        self.points.is_empty()
+    }
+
+    pub fn range_count(self: CharRange) -> int {
+        self.points.len() / 2
+    }
+
+    pub fn range_at(self: CharRange, index: int) -> Option[(uint32, uint32)] {
+        if index < 0 || index >= self.range_count() {
+            Option::None
+        } else {
+            Option::Some((self.points[index * 2], self.points[index * 2 + 1] - 1))
+        }
+    }
+
+    pub fn ranges(self: CharRange) -> Vec[(uint32, uint32)] {
+        let output: Vec[(uint32, uint32)] = Vec::with_capacity(self.range_count());
+        for index in 0..self.range_count() {
+            output.push((self.points[index * 2], self.points[index * 2 + 1] - 1))
+        }
+        output
+    }
+
+    pub fn union(self: CharRange, other: CharRange) -> CharRange {
+        CharRange { points: combine_points(self.points, other.points, 0) }
+    }
+
+    pub fn union_with(self: CharRange, other: CharRange) -> unit {
+        replace_points(self.points, combine_points(self.points, other.points, 0))
+    }
+
+    pub fn intersection(self: CharRange, other: CharRange) -> CharRange {
+        CharRange { points: combine_points(self.points, other.points, 1) }
+    }
+
+    pub fn intersect_with(self: CharRange, other: CharRange) -> unit {
+        replace_points(self.points, combine_points(self.points, other.points, 1))
+    }
+
+    pub fn complement(self: CharRange) -> CharRange {
+        CharRange::full().difference(self)
+    }
+
+    pub fn invert(self: CharRange) -> unit {
+        let inverted = self.complement();
+        replace_points(self.points, inverted.points)
+    }
+
+    pub fn difference(self: CharRange, other: CharRange) -> CharRange {
+        CharRange { points: combine_points(self.points, other.points, 2) }
+    }
+
+    pub fn symmetric_difference(self: CharRange, other: CharRange) -> CharRange {
+        CharRange { points: combine_points(self.points, other.points, 3) }
+    }
+}

@@ -1,0 +1,4044 @@
+package parser;
+
+use gomlang::quickjs::ast;
+use gomlang::quickjs::lexer;
+use std::text;
+
+#[derive(PartialEq, Eq, Debug)]
+pub struct ParseError {
+    pub message: string,
+    pub span: ast::Span,
+}
+
+pub struct ParseResult {
+    pub program: ast::Program,
+    pub errors: Vec[ParseError],
+}
+
+struct Parser {
+    tokens: Vec[lexer::Token],
+    index: Ref[int],
+    errors: Vec[ParseError],
+}
+
+enum InfixKind {
+    Binary(ast::BinaryOperator),
+}
+
+struct InfixInfo {
+    kind: InfixKind,
+    precedence: int,
+    right_associative: bool,
+}
+
+struct ParsedFunction {
+    start: int,
+    name: Option[string],
+    parameters: Vec[ast::FunctionParameter],
+    body: Vec[ast::Stmt],
+    generator: bool,
+    asynchronous: bool,
+    end: int,
+}
+
+struct ParsedClass {
+    start: int,
+    name: Option[string],
+    heritage: Option[Ref[ast::Expr]],
+    elements: Vec[ast::ClassElement],
+    end: int,
+}
+
+struct ParsedBindingPropertyKey {
+    key: ast::ObjectPropertyKey,
+    shorthand: Option[string],
+    start: int,
+    end: int,
+}
+
+fn convert_span(value: lexer::Span) -> ast::Span {
+    ast::span(value.start, value.end)
+}
+
+fn current_token(parser: Parser) -> lexer::Token {
+    parser.tokens[parser.index.get()]
+}
+
+fn lookahead_token(parser: Parser, offset: int) -> lexer::Token {
+    let index = parser.index.get() + offset;
+    if index >= 0 && index < parser.tokens.len() {
+        parser.tokens[index]
+    } else {
+        parser.tokens[parser.tokens.len() - 1]
+    }
+}
+
+fn current_kind(parser: Parser) -> lexer::TokenKind {
+    current_token(parser).kind
+}
+
+fn at(parser: Parser, kind: lexer::TokenKind) -> bool {
+    current_kind(parser) == kind
+}
+
+fn at_eof(parser: Parser) -> bool {
+    at(parser, lexer::TokenKind::Eof)
+}
+
+fn bump(parser: Parser) -> lexer::Token {
+    let token = current_token(parser);
+    if !at_eof(parser) {
+        parser.index.set(parser.index.get() + 1)
+    } else {};
+    token
+}
+
+fn missing_span(parser: Parser) -> ast::Span {
+    let start = current_token(parser).span.start;
+    ast::span(start, start)
+}
+
+fn report(parser: Parser, message: string, span: ast::Span) -> unit {
+    parser.errors.push(ParseError { message, span })
+}
+
+fn report_current(parser: Parser, message: string) -> unit {
+    report(parser, message, convert_span(current_token(parser).span))
+}
+
+fn is_statement_start(kind: lexer::TokenKind) -> bool {
+    match kind {
+        LBrace | Semicolon | LetKeyword | ConstKeyword | VarKeyword | FunctionKeyword | ClassKeyword | ImportKeyword | ExportKeyword | IfKeyword | DoKeyword | WhileKeyword | ForKeyword | SwitchKeyword | CaseKeyword | DefaultKeyword | BreakKeyword | ContinueKeyword | ReturnKeyword | ThrowKeyword | TryKeyword => true,
+        _ => false,
+    }
+}
+
+fn is_expression_boundary(kind: lexer::TokenKind) -> bool {
+    match kind {
+        Eof | Semicolon | Comma | Colon | RParen | RBracket | RBrace | LetKeyword | ConstKeyword | VarKeyword | ImportKeyword | ExportKeyword | IfKeyword | ElseKeyword | DoKeyword | WhileKeyword | ForKeyword | SwitchKeyword | CaseKeyword | DefaultKeyword | BreakKeyword | ContinueKeyword | ReturnKeyword | ThrowKeyword | TryKeyword | CatchKeyword | FinallyKeyword => true,
+        _ => false,
+    }
+}
+
+fn is_identifier_name(kind: lexer::TokenKind) -> bool {
+    match kind {
+        Identifier | NullKeyword | FalseKeyword | TrueKeyword | IfKeyword | ElseKeyword | ReturnKeyword | VarKeyword | ThisKeyword | DeleteKeyword | VoidKeyword | TypeofKeyword | NewKeyword | InKeyword | InstanceofKeyword | DoKeyword | WhileKeyword | ForKeyword | BreakKeyword | ContinueKeyword | SwitchKeyword | CaseKeyword | DefaultKeyword | ThrowKeyword | TryKeyword | CatchKeyword | FinallyKeyword | FunctionKeyword | DebuggerKeyword | WithKeyword | ClassKeyword | ConstKeyword | EnumKeyword | ExportKeyword | ExtendsKeyword | ImportKeyword | SuperKeyword | ImplementsKeyword | InterfaceKeyword | LetKeyword | PackageKeyword | PrivateKeyword | ProtectedKeyword | PublicKeyword | StaticKeyword | YieldKeyword | AwaitKeyword => true,
+        _ => false,
+    }
+}
+
+fn synchronize_statement(parser: Parser) -> int {
+    while !at_eof(parser) {
+        let token = current_token(parser);
+        if token.kind == lexer::TokenKind::Semicolon {
+            return bump(parser).span.end
+        } else if token.kind == lexer::TokenKind::RBrace || is_statement_start(token.kind)
+            || token.line_break_before {
+            return token.span.start
+        } else {
+            bump(parser);
+        }
+    }
+    current_token(parser).span.start
+}
+
+fn synchronize_right_paren(parser: Parser) -> unit {
+    while !at_eof(parser) && !at(parser, lexer::TokenKind::RParen)
+        && !at(parser, lexer::TokenKind::LBrace)
+        && !at(parser, lexer::TokenKind::RBrace)
+        && !at(parser, lexer::TokenKind::Semicolon)
+        && !is_statement_start(current_kind(parser)) {
+        bump(parser);
+    }
+}
+
+fn synchronize_right_bracket(parser: Parser) -> unit {
+    while !at_eof(parser) && !at(parser, lexer::TokenKind::RBracket)
+        && !at(parser, lexer::TokenKind::RParen)
+        && !at(parser, lexer::TokenKind::RBrace)
+        && !at(parser, lexer::TokenKind::Semicolon)
+        && !is_statement_start(current_kind(parser)) {
+        bump(parser);
+    }
+}
+
+fn synchronize_call_argument(parser: Parser) -> unit {
+    while !at_eof(parser) && !at(parser, lexer::TokenKind::Comma)
+        && !at(parser, lexer::TokenKind::RParen)
+        && !at(parser, lexer::TokenKind::RBracket)
+        && !at(parser, lexer::TokenKind::RBrace)
+        && !at(parser, lexer::TokenKind::Semicolon)
+        && !is_statement_start(current_kind(parser)) {
+        bump(parser);
+    }
+}
+
+fn consume_statement_terminator(parser: Parser, fallback_end: int) -> int {
+    if at(parser, lexer::TokenKind::Semicolon) {
+        bump(parser).span.end
+    } else if at_eof(parser) || at(parser, lexer::TokenKind::RBrace)
+        || current_token(parser).line_break_before {
+        fallback_end
+    } else {
+        report(parser, "expected `;`", missing_span(parser));
+        synchronize_statement(parser)
+    }
+}
+
+fn consume_for_semicolon(parser: Parser, fallback_end: int) -> int {
+    if at(parser, lexer::TokenKind::Semicolon) {
+        bump(parser).span.end
+    } else {
+        report(parser, "expected `;` in for statement", missing_span(parser));
+        while !at_eof(parser) && !at(parser, lexer::TokenKind::Semicolon)
+            && !at(parser, lexer::TokenKind::RParen)
+            && !at(parser, lexer::TokenKind::LBrace) {
+            bump(parser);
+        }
+        if at(parser, lexer::TokenKind::Semicolon) {
+            bump(parser).span.end
+        } else {
+            fallback_end
+        }
+    }
+}
+
+fn stmt_end(value: ast::Stmt) -> int {
+    ast::stmt_span(value).end
+}
+
+fn expr_end(value: ast::Expr) -> int {
+    ast::expr_span(value).end
+}
+
+fn error_expr(parser: Parser, message: string) -> ast::Expr {
+    let token = current_token(parser);
+    if is_expression_boundary(token.kind) {
+        let span = missing_span(parser);
+        report(parser, message, span);
+        ast::Expr::Error { span }
+    } else {
+        let consumed = bump(parser);
+        let span = convert_span(consumed.span);
+        report(parser, message, span);
+        ast::Expr::Error { span }
+    }
+}
+
+fn finish_right_paren(parser: Parser, message: string) -> int {
+    if at(parser, lexer::TokenKind::RParen) {
+        bump(parser).span.end
+    } else {
+        report(parser, message, missing_span(parser));
+        synchronize_right_paren(parser);
+        if at(parser, lexer::TokenKind::RParen) {
+            bump(parser).span.end
+        } else {
+            current_token(parser).span.start
+        }
+    }
+}
+
+fn finish_right_bracket(parser: Parser, fallback_end: int) -> int {
+    if at(parser, lexer::TokenKind::RBracket) {
+        bump(parser).span.end
+    } else {
+        report(parser, "expected `]`", missing_span(parser));
+        synchronize_right_bracket(parser);
+        if at(parser, lexer::TokenKind::RBracket) {
+            bump(parser).span.end
+        } else {
+            fallback_end
+        }
+    }
+}
+
+fn infix_info(kind: lexer::TokenKind) -> Option[InfixInfo] {
+    match kind {
+        NullishCoalescing => Option::Some(
+            InfixInfo {
+                kind: InfixKind::Binary(ast::BinaryOperator::NullishCoalescing),
+                precedence: 2,
+                right_associative: false,
+            },
+        ),
+        LogicalOr => Option::Some(
+            InfixInfo {
+                kind: InfixKind::Binary(ast::BinaryOperator::LogicalOr),
+                precedence: 3,
+                right_associative: false,
+            },
+        ),
+        LogicalAnd => Option::Some(
+            InfixInfo {
+                kind: InfixKind::Binary(ast::BinaryOperator::LogicalAnd),
+                precedence: 4,
+                right_associative: false,
+            },
+        ),
+        BitOr => Option::Some(
+            InfixInfo {
+                kind: InfixKind::Binary(ast::BinaryOperator::BitwiseOr),
+                precedence: 5,
+                right_associative: false,
+            },
+        ),
+        BitXor => Option::Some(
+            InfixInfo {
+                kind: InfixKind::Binary(ast::BinaryOperator::BitwiseXor),
+                precedence: 6,
+                right_associative: false,
+            },
+        ),
+        BitAnd => Option::Some(
+            InfixInfo {
+                kind: InfixKind::Binary(ast::BinaryOperator::BitwiseAnd),
+                precedence: 7,
+                right_associative: false,
+            },
+        ),
+        Equal => Option::Some(
+            InfixInfo {
+                kind: InfixKind::Binary(ast::BinaryOperator::Equal),
+                precedence: 8,
+                right_associative: false,
+            },
+        ),
+        NotEqual => Option::Some(
+            InfixInfo {
+                kind: InfixKind::Binary(ast::BinaryOperator::NotEqual),
+                precedence: 8,
+                right_associative: false,
+            },
+        ),
+        StrictEqual => Option::Some(
+            InfixInfo {
+                kind: InfixKind::Binary(ast::BinaryOperator::StrictEqual),
+                precedence: 8,
+                right_associative: false,
+            },
+        ),
+        StrictNotEqual => Option::Some(
+            InfixInfo {
+                kind: InfixKind::Binary(ast::BinaryOperator::StrictNotEqual),
+                precedence: 8,
+                right_associative: false,
+            },
+        ),
+        Less => Option::Some(
+            InfixInfo {
+                kind: InfixKind::Binary(ast::BinaryOperator::Less),
+                precedence: 9,
+                right_associative: false,
+            },
+        ),
+        LessEqual => Option::Some(
+            InfixInfo {
+                kind: InfixKind::Binary(ast::BinaryOperator::LessEqual),
+                precedence: 9,
+                right_associative: false,
+            },
+        ),
+        Greater => Option::Some(
+            InfixInfo {
+                kind: InfixKind::Binary(ast::BinaryOperator::Greater),
+                precedence: 9,
+                right_associative: false,
+            },
+        ),
+        GreaterEqual => Option::Some(
+            InfixInfo {
+                kind: InfixKind::Binary(ast::BinaryOperator::GreaterEqual),
+                precedence: 9,
+                right_associative: false,
+            },
+        ),
+        InKeyword => Option::Some(
+            InfixInfo {
+                kind: InfixKind::Binary(ast::BinaryOperator::In),
+                precedence: 9,
+                right_associative: false,
+            },
+        ),
+        InstanceofKeyword => Option::Some(
+            InfixInfo {
+                kind: InfixKind::Binary(ast::BinaryOperator::Instanceof),
+                precedence: 9,
+                right_associative: false,
+            },
+        ),
+        ShiftLeft => Option::Some(
+            InfixInfo {
+                kind: InfixKind::Binary(ast::BinaryOperator::ShiftLeft),
+                precedence: 10,
+                right_associative: false,
+            },
+        ),
+        ShiftRight => Option::Some(
+            InfixInfo {
+                kind: InfixKind::Binary(ast::BinaryOperator::ShiftRight),
+                precedence: 10,
+                right_associative: false,
+            },
+        ),
+        ShiftRightUnsigned => Option::Some(
+            InfixInfo {
+                kind: InfixKind::Binary(ast::BinaryOperator::ShiftRightUnsigned),
+                precedence: 10,
+                right_associative: false,
+            },
+        ),
+        Plus => Option::Some(
+            InfixInfo {
+                kind: InfixKind::Binary(ast::BinaryOperator::Add),
+                precedence: 11,
+                right_associative: false,
+            },
+        ),
+        Minus => Option::Some(
+            InfixInfo {
+                kind: InfixKind::Binary(ast::BinaryOperator::Subtract),
+                precedence: 11,
+                right_associative: false,
+            },
+        ),
+        Star => Option::Some(
+            InfixInfo {
+                kind: InfixKind::Binary(ast::BinaryOperator::Multiply),
+                precedence: 12,
+                right_associative: false,
+            },
+        ),
+        Slash => Option::Some(
+            InfixInfo {
+                kind: InfixKind::Binary(ast::BinaryOperator::Divide),
+                precedence: 12,
+                right_associative: false,
+            },
+        ),
+        Percent => Option::Some(
+            InfixInfo {
+                kind: InfixKind::Binary(ast::BinaryOperator::Remainder),
+                precedence: 12,
+                right_associative: false,
+            },
+        ),
+        Power => Option::Some(
+            InfixInfo {
+                kind: InfixKind::Binary(ast::BinaryOperator::Power),
+                precedence: 13,
+                right_associative: true,
+            },
+        ),
+        _ => Option::None,
+    }
+}
+
+fn assignment_operator(kind: lexer::TokenKind) -> Option[ast::AssignmentOperator] {
+    match kind {
+        Assign => Option::Some(ast::AssignmentOperator::Assign),
+        PlusAssign => Option::Some(ast::AssignmentOperator::Add),
+        MinusAssign => Option::Some(ast::AssignmentOperator::Subtract),
+        StarAssign => Option::Some(ast::AssignmentOperator::Multiply),
+        SlashAssign => Option::Some(ast::AssignmentOperator::Divide),
+        PercentAssign => Option::Some(ast::AssignmentOperator::Remainder),
+        PowerAssign => Option::Some(ast::AssignmentOperator::Power),
+        ShiftLeftAssign => Option::Some(ast::AssignmentOperator::ShiftLeft),
+        ShiftRightAssign => Option::Some(ast::AssignmentOperator::ShiftRight),
+        ShiftRightUnsignedAssign => Option::Some(ast::AssignmentOperator::ShiftRightUnsigned),
+        BitAndAssign => Option::Some(ast::AssignmentOperator::BitwiseAnd),
+        BitOrAssign => Option::Some(ast::AssignmentOperator::BitwiseOr),
+        BitXorAssign => Option::Some(ast::AssignmentOperator::BitwiseXor),
+        LogicalAndAssign => Option::Some(ast::AssignmentOperator::LogicalAnd),
+        LogicalOrAssign => Option::Some(ast::AssignmentOperator::LogicalOr),
+        NullishCoalescingAssign => Option::Some(ast::AssignmentOperator::NullishCoalescing),
+        _ => Option::None,
+    }
+}
+
+fn prefix_operator(kind: lexer::TokenKind) -> Option[ast::UnaryOperator] {
+    match kind {
+        LogicalNot => Option::Some(ast::UnaryOperator::LogicalNot),
+        BitNot => Option::Some(ast::UnaryOperator::BitwiseNot),
+        Plus => Option::Some(ast::UnaryOperator::Plus),
+        Minus => Option::Some(ast::UnaryOperator::Minus),
+        TypeofKeyword => Option::Some(ast::UnaryOperator::Typeof),
+        VoidKeyword => Option::Some(ast::UnaryOperator::Void),
+        DeleteKeyword => Option::Some(ast::UnaryOperator::Delete),
+        _ => Option::None,
+    }
+}
+
+fn update_operator(kind: lexer::TokenKind) -> Option[ast::UpdateOperator] {
+    match kind {
+        Increment => Option::Some(ast::UpdateOperator::Increment),
+        Decrement => Option::Some(ast::UpdateOperator::Decrement),
+        _ => Option::None,
+    }
+}
+
+fn assignment_target(value: ast::Expr) -> bool {
+    match value {
+        ast::Expr::Identifier { .. } => true,
+        ast::Expr::Member { optional, .. } => !optional,
+        _ => false,
+    }
+}
+
+fn logical_or_nullish(operator: ast::BinaryOperator) -> bool {
+    operator == ast::BinaryOperator::LogicalAnd || operator == ast::BinaryOperator::LogicalOr
+        || operator == ast::BinaryOperator::NullishCoalescing
+}
+
+fn mixed_nullish(left: ast::Expr, operator: ast::BinaryOperator, right: ast::Expr) -> bool {
+    let left_operator = match left {
+        ast::Expr::Binary { operator, .. } => Option::Some(operator),
+        _ => Option::None,
+    };
+    let right_operator = match right {
+        ast::Expr::Binary { operator, .. } => Option::Some(operator),
+        _ => Option::None,
+    };
+    if !logical_or_nullish(operator) {
+        false
+    } else {
+        match (left_operator, right_operator) {
+            (Some(left_value), Some(right_value)) => {
+                (operator == ast::BinaryOperator::NullishCoalescing
+                    && (left_value == ast::BinaryOperator::LogicalAnd
+                        || left_value == ast::BinaryOperator::LogicalOr
+                        || right_value == ast::BinaryOperator::LogicalAnd
+                        || right_value == ast::BinaryOperator::LogicalOr))
+                    || (operator == ast::BinaryOperator::LogicalAnd
+                        || operator == ast::BinaryOperator::LogicalOr)
+                        && (left_value == ast::BinaryOperator::NullishCoalescing
+                            || right_value == ast::BinaryOperator::NullishCoalescing)
+            },
+            (Some(value), None) | (None, Some(value)) => {
+                (operator == ast::BinaryOperator::NullishCoalescing
+                    && (value == ast::BinaryOperator::LogicalAnd
+                        || value == ast::BinaryOperator::LogicalOr))
+                    || (operator == ast::BinaryOperator::LogicalAnd
+                        || operator == ast::BinaryOperator::LogicalOr)
+                        && value == ast::BinaryOperator::NullishCoalescing
+            },
+            (None, None) => false,
+        }
+    }
+}
+
+fn parse_parenthesized(parser: Parser) -> ast::Expr {
+    let start = bump(parser).span.start;
+    let expression = if at(parser, lexer::TokenKind::RParen) {
+        error_expr(parser, "expected expression")
+    } else {
+        parse_expression(parser)
+    };
+    let end = finish_right_paren(parser, "expected `)`");
+    ast::Expr::Parenthesized { expression: Ref::new(expression), span: ast::span(start, end) }
+}
+
+fn parenthesized_arrow_start(parser: Parser) -> bool {
+    if !at(parser, lexer::TokenKind::LParen) {
+        return false
+    } else {};
+    let mut depth = 0;
+    let mut offset = 0;
+    let mut done = false;
+    while !done {
+        let token = lookahead_token(parser, offset);
+        match token.kind {
+            lexer::TokenKind::LParen => {
+                depth += 1;
+            },
+            lexer::TokenKind::RParen => {
+                depth -= 1;
+                if depth == 0 {
+                    return lookahead_token(parser, offset + 1).kind == lexer::TokenKind::Arrow
+                } else {}
+            },
+            lexer::TokenKind::Eof => {
+                done = true;
+            },
+            _ => (),
+        };
+        offset += 1;
+    }
+    false
+}
+
+fn synchronize_function_parameter(parser: Parser) -> unit {
+    while !at_eof(parser) && !at(parser, lexer::TokenKind::Comma)
+        && !at(parser, lexer::TokenKind::RParen)
+        && !at(parser, lexer::TokenKind::LBrace) {
+        bump(parser);
+    }
+}
+
+fn invalid_binding_pattern(parser: Parser, message: string) -> ast::BindingPattern {
+    let token = current_token(parser);
+    report(parser, message, convert_span(token.span));
+    if token.kind != lexer::TokenKind::Comma && token.kind != lexer::TokenKind::RParen
+        && token.kind != lexer::TokenKind::RBracket
+        && token.kind != lexer::TokenKind::RBrace
+        && token.kind != lexer::TokenKind::Assign
+        && token.kind != lexer::TokenKind::Eof {
+        bump(parser);
+    } else {};
+    ast::BindingPattern::Identifier { name: "", span: convert_span(token.span) }
+}
+
+fn parse_binding_identifier(parser: Parser) -> ast::BindingPattern {
+    let token = current_token(parser);
+    if token.kind == lexer::TokenKind::Identifier && !token.is_reserved {
+        bump(parser);
+        ast::BindingPattern::Identifier { name: token.value, span: convert_span(token.span) }
+    } else {
+        invalid_binding_pattern(
+            parser,
+            if token.is_reserved {
+                "reserved word cannot be used as a binding name"
+            } else {
+                "expected binding name or pattern"
+            },
+        )
+    }
+}
+
+fn parse_binding_initializer(parser: Parser, rest: bool) -> Option[Ref[ast::Expr]] {
+    if !at(parser, lexer::TokenKind::Assign) {
+        Option::None
+    } else {
+        let assign = bump(parser);
+        if rest {
+            report(parser, "rest binding cannot have an initializer", convert_span(assign.span))
+        } else {};
+        if at(parser, lexer::TokenKind::Comma) || at(parser, lexer::TokenKind::RParen)
+            || at(parser, lexer::TokenKind::RBracket)
+            || at(parser, lexer::TokenKind::RBrace) {
+            Option::Some(Ref::new(error_expr(parser, "expected binding initializer")))
+        } else {
+            Option::Some(Ref::new(parse_assignment_expression(parser)))
+        }
+    }
+}
+
+fn parse_array_binding_pattern(parser: Parser) -> ast::BindingPattern {
+    let open = bump(parser);
+    let elements: Vec[ast::ArrayBindingElement] = Vec::[];
+    let mut end = open.span.end;
+    let mut done = false;
+    while !done && !at_eof(parser) {
+        if at(parser, lexer::TokenKind::RBracket) {
+            end = bump(parser).span.end;
+            done = true;
+        } else if at(parser, lexer::TokenKind::Comma) {
+            elements.push(ast::ArrayBindingElement::Hole);
+            end = bump(parser).span.end;
+        } else {
+            let start = current_token(parser).span.start;
+            let rest = if at(parser, lexer::TokenKind::Ellipsis) {
+                bump(parser);
+                true
+            } else {
+                false
+            };
+            let pattern = parse_binding_pattern(parser);
+            let initializer = parse_binding_initializer(parser, rest);
+            end = match initializer {
+                Some(value) => ast::expr_span(value.get()).end,
+                None => ast::binding_pattern_span(pattern).end,
+            };
+            elements.push(
+                ast::ArrayBindingElement::Element {
+                    pattern: Ref::new(pattern),
+                    initializer,
+                    rest,
+                    span: ast::span(start, end),
+                },
+            );
+            if at(parser, lexer::TokenKind::Comma) {
+                if rest {
+                    report(
+                        parser,
+                        "rest binding must be last",
+                        convert_span(current_token(parser).span),
+                    )
+                } else {};
+                end = bump(parser).span.end;
+            } else if !at(parser, lexer::TokenKind::RBracket) {
+                report(parser, "expected `,` or `]` after binding", missing_span(parser));
+                synchronize_right_bracket(parser)
+            } else {}
+        }
+    }
+    if !done {
+        report(parser, "expected `]` after binding pattern", missing_span(parser))
+    } else {};
+    ast::BindingPattern::Array { elements, span: ast::span(open.span.start, end) }
+}
+
+fn parse_binding_property_key(parser: Parser) -> Option[ParsedBindingPropertyKey] {
+    if at(parser, lexer::TokenKind::LBracket) {
+        let open = bump(parser);
+        let expression = if at(parser, lexer::TokenKind::RBracket) || at_eof(parser) {
+            error_expr(parser, "expected computed binding property name")
+        } else {
+            parse_assignment_expression(parser)
+        };
+        let end = finish_right_bracket(parser, expr_end(expression));
+        Option::Some(
+            ParsedBindingPropertyKey {
+                key: ast::ObjectPropertyKey::Computed(Ref::new(expression)),
+                shorthand: Option::None,
+                start: open.span.start,
+                end,
+            },
+        )
+    } else {
+        let token = current_token(parser);
+        if is_identifier_name(token.kind) {
+            bump(parser);
+            Option::Some(
+                ParsedBindingPropertyKey {
+                    key: ast::ObjectPropertyKey::Identifier(token.value),
+                    shorthand: if token.kind == lexer::TokenKind::Identifier && !token.is_reserved {
+                        Option::Some(token.value)
+                    } else {
+                        Option::None
+                    },
+                    start: token.span.start,
+                    end: token.span.end,
+                },
+            )
+        } else if token.kind == lexer::TokenKind::String {
+            bump(parser);
+            Option::Some(
+                ParsedBindingPropertyKey {
+                    key: ast::ObjectPropertyKey::String(token.value),
+                    shorthand: Option::None,
+                    start: token.span.start,
+                    end: token.span.end,
+                },
+            )
+        } else if token.kind == lexer::TokenKind::Number {
+            bump(parser);
+            Option::Some(
+                ParsedBindingPropertyKey {
+                    key: ast::ObjectPropertyKey::Number(token.value),
+                    shorthand: Option::None,
+                    start: token.span.start,
+                    end: token.span.end,
+                },
+            )
+        } else {
+            report(parser, "expected binding property name", convert_span(token.span));
+            if token.kind != lexer::TokenKind::Comma && token.kind != lexer::TokenKind::RBrace {
+                bump(parser);
+            } else {};
+            Option::None
+        }
+    }
+}
+
+fn parse_object_binding_property(parser: Parser) -> Option[ast::ObjectBindingProperty] {
+    if at(parser, lexer::TokenKind::Ellipsis) {
+        let spread = bump(parser);
+        let pattern = parse_binding_identifier(parser);
+        let initializer = parse_binding_initializer(parser, true);
+        let end = match initializer {
+            Some(value) => ast::expr_span(value.get()).end,
+            None => ast::binding_pattern_span(pattern).end,
+        };
+        Option::Some(
+            ast::ObjectBindingProperty::Rest {
+                pattern: Ref::new(pattern),
+                span: ast::span(spread.span.start, end),
+            },
+        )
+    } else {
+        match parse_binding_property_key(parser) {
+            None => Option::None,
+            Some(parsed) => {
+                let pattern = if at(parser, lexer::TokenKind::Colon) {
+                    bump(parser);
+                    parse_binding_pattern(parser)
+                } else {
+                    match parsed.shorthand {
+                        Some(name) => ast::BindingPattern::Identifier {
+                            name,
+                            span: ast::span(parsed.start, parsed.end),
+                        },
+                        None => invalid_binding_pattern(
+                            parser,
+                            "binding property requires `:` and a target",
+                        ),
+                    }
+                };
+                let initializer = parse_binding_initializer(parser, false);
+                let end = match initializer {
+                    Some(value) => ast::expr_span(value.get()).end,
+                    None => ast::binding_pattern_span(pattern).end,
+                };
+                Option::Some(
+                    ast::ObjectBindingProperty::Property {
+                        key: parsed.key,
+                        pattern: Ref::new(pattern),
+                        initializer,
+                        span: ast::span(parsed.start, end),
+                    },
+                )
+            },
+        }
+    }
+}
+
+fn parse_object_binding_pattern(parser: Parser) -> ast::BindingPattern {
+    let open = bump(parser);
+    let properties: Vec[ast::ObjectBindingProperty] = Vec::[];
+    let mut end = open.span.end;
+    let mut done = false;
+    let mut saw_rest = false;
+    while !done && !at_eof(parser) {
+        if at(parser, lexer::TokenKind::RBrace) {
+            end = bump(parser).span.end;
+            done = true;
+        } else {
+            let rest = at(parser, lexer::TokenKind::Ellipsis);
+            match parse_object_binding_property(parser) {
+                Some(property) => {
+                    end = match property {
+                        ast::ObjectBindingProperty::Property { span, .. } | ast::ObjectBindingProperty::Rest {
+                            span,
+                            ..,
+                        } => span.end,
+                    };
+                    properties.push(property)
+                },
+                None => (),
+            };
+            if rest {
+                saw_rest = true;
+            } else {};
+            if at(parser, lexer::TokenKind::Comma) {
+                if saw_rest {
+                    report(
+                        parser,
+                        "rest binding must be last",
+                        convert_span(current_token(parser).span),
+                    )
+                } else {};
+                end = bump(parser).span.end;
+            } else if !at(parser, lexer::TokenKind::RBrace) {
+                report(parser, "expected `,` or `}` after binding", missing_span(parser));
+                synchronize_object_property(parser);
+                if at(parser, lexer::TokenKind::Comma) {
+                    end = bump(parser).span.end;
+                } else {}
+            } else {}
+        }
+    }
+    if !done {
+        report(parser, "expected `}` after binding pattern", missing_span(parser))
+    } else {};
+    ast::BindingPattern::Object { properties, span: ast::span(open.span.start, end) }
+}
+
+fn parse_binding_pattern(parser: Parser) -> ast::BindingPattern {
+    if at(parser, lexer::TokenKind::LBracket) {
+        parse_array_binding_pattern(parser)
+    } else if at(parser, lexer::TokenKind::LBrace) {
+        parse_object_binding_pattern(parser)
+    } else {
+        parse_binding_identifier(parser)
+    }
+}
+
+fn parse_variable_binding_pattern(parser: Parser) -> ast::BindingPattern {
+    let token = current_token(parser);
+    if token.kind == lexer::TokenKind::Identifier && token.is_reserved {
+        invalid_binding_pattern(parser, "reserved word cannot be used as a variable name")
+    } else if token.kind == lexer::TokenKind::Identifier || token.kind == lexer::TokenKind::LBracket
+        || token.kind == lexer::TokenKind::LBrace {
+        parse_binding_pattern(parser)
+    } else {
+        invalid_binding_pattern(parser, "expected variable name")
+    }
+}
+
+fn parse_catch_binding_pattern(parser: Parser) -> ast::BindingPattern {
+    let token = current_token(parser);
+    if token.kind == lexer::TokenKind::Identifier && token.is_reserved {
+        invalid_binding_pattern(parser, "reserved word cannot be used as a catch binding")
+    } else if token.kind == lexer::TokenKind::Identifier || token.kind == lexer::TokenKind::LBracket
+        || token.kind == lexer::TokenKind::LBrace {
+        parse_binding_pattern(parser)
+    } else {
+        invalid_binding_pattern(parser, "expected catch binding")
+    }
+}
+
+fn parse_function_parameters(parser: Parser) -> Vec[ast::FunctionParameter] {
+    let parameters: Vec[ast::FunctionParameter] = Vec::[];
+    if at(parser, lexer::TokenKind::LParen) {
+        bump(parser);
+    } else {
+        report(parser, "expected `(` after function name", missing_span(parser));
+    };
+    let mut done = false;
+    while !done && !at_eof(parser) {
+        if at(parser, lexer::TokenKind::RParen) {
+            bump(parser);
+            done = true;
+        } else {
+            let start = current_token(parser).span.start;
+            let rest = if at(parser, lexer::TokenKind::Ellipsis) {
+                bump(parser);
+                true
+            } else {
+                false
+            };
+            let token = current_token(parser);
+            if token.kind == lexer::TokenKind::Identifier && !token.is_reserved
+                || token.kind == lexer::TokenKind::LBracket
+                || token.kind == lexer::TokenKind::LBrace {
+                let pattern = parse_binding_pattern(parser);
+                let name = match pattern {
+                    ast::BindingPattern::Identifier { name, .. } => name,
+                    _ => "",
+                };
+                let initializer = parse_binding_initializer(parser, rest);
+                let end = match initializer {
+                    Some(value) => ast::expr_span(value.get()).end,
+                    None => ast::binding_pattern_span(pattern).end,
+                };
+                parameters.push(
+                    ast::FunctionParameter {
+                        name,
+                        pattern: Ref::new(pattern),
+                        initializer,
+                        rest,
+                        span: ast::span(start, end),
+                    },
+                );
+            } else {
+                report(
+                    parser,
+                    if token.is_reserved {
+                        "reserved word cannot be used as a parameter name"
+                    } else {
+                        "expected parameter name"
+                    },
+                    convert_span(token.span),
+                );
+                if token.kind != lexer::TokenKind::Comma && token.kind != lexer::TokenKind::RParen {
+                    bump(parser);
+                } else {}
+            };
+            if at(parser, lexer::TokenKind::Comma) {
+                if rest {
+                    report(
+                        parser,
+                        "rest parameter must be last",
+                        convert_span(current_token(parser).span),
+                    )
+                } else {};
+                bump(parser);
+                if at(parser, lexer::TokenKind::RParen) {
+                    bump(parser);
+                    done = true;
+                } else {}
+            } else if at(parser, lexer::TokenKind::RParen) {
+                bump(parser);
+                done = true;
+            } else if !at(parser, lexer::TokenKind::LBrace) && !at_eof(parser) {
+                report(parser, "expected `,` or `)` after parameter", missing_span(parser));
+                synchronize_function_parameter(parser);
+                if at(parser, lexer::TokenKind::Comma) {
+                    bump(parser);
+                } else if at(parser, lexer::TokenKind::RParen) {
+                    bump(parser);
+                    done = true;
+                } else {}
+            } else {}
+        }
+    }
+    if !done {
+        report(parser, "expected `)` after parameters", missing_span(parser))
+    } else {};
+    parameters
+}
+
+fn parse_arrow_function(
+    parser: Parser,
+    start: int,
+    parameters: Vec[ast::FunctionParameter],
+    asynchronous: bool,
+) -> ast::Expr {
+    let arrow = current_token(parser);
+    if at(parser, lexer::TokenKind::Arrow) {
+        bump(parser);
+        if arrow.line_break_before {
+            report(parser, "line break is not allowed before `=>`", convert_span(arrow.span))
+        } else {}
+    } else {
+        report(parser, "expected `=>`", missing_span(parser))
+    };
+    let body: Vec[ast::Stmt] = Vec::[];
+    let expression_body = !at(parser, lexer::TokenKind::LBrace);
+    let end = if !expression_body {
+        match parse_block_statement(parser) {
+            ast::Stmt::Block { body: statements, span } => {
+                for statement in statements {
+                    body.push(statement)
+                }
+                span.end
+            },
+            _ => current_token(parser).span.start,
+        }
+    } else {
+        let expression = if is_expression_boundary(current_kind(parser)) {
+            error_expr(parser, "expected arrow function body")
+        } else {
+            parse_assignment_expression(parser)
+        };
+        let span = ast::expr_span(expression);
+        body.push(ast::Stmt::Return { argument: Option::Some(Ref::new(expression)), span });
+        span.end
+    };
+    ast::Expr::Arrow {
+        parameters,
+        body,
+        expression_body,
+        asynchronous,
+        span: ast::span(start, end),
+    }
+}
+
+fn block_arrow(expression: ast::Expr) -> bool {
+    match expression {
+        ast::Expr::Arrow { expression_body, .. } => !expression_body,
+        _ => false,
+    }
+}
+
+fn parse_parenthesized_or_arrow(parser: Parser) -> ast::Expr {
+    if parenthesized_arrow_start(parser) {
+        let start = current_token(parser).span.start;
+        let parameters = parse_function_parameters(parser);
+        parse_arrow_function(parser, start, parameters, false)
+    } else {
+        parse_parenthesized(parser)
+    }
+}
+
+fn parse_function_parts(parser: Parser, declaration: bool, asynchronous: bool) -> ParsedFunction {
+    let keyword = bump(parser);
+    let generator = if at(parser, lexer::TokenKind::Star) {
+        bump(parser);
+        true
+    } else {
+        false
+    };
+    let token = current_token(parser);
+    let name = if token.kind == lexer::TokenKind::Identifier {
+        bump(parser);
+        if token.is_reserved {
+            report(
+                parser,
+                "reserved word cannot be used as a function name",
+                convert_span(token.span),
+            )
+        } else {};
+        Option::Some(token.value)
+    } else {
+        if declaration {
+            report(parser, "expected function name", missing_span(parser))
+        } else {};
+        Option::None
+    };
+    let parameters = parse_function_parameters(parser);
+    let mut body: Vec[ast::Stmt] = Vec::[];
+    let mut end = current_token(parser).span.start;
+    if at(parser, lexer::TokenKind::LBrace) {
+        let block = parse_block_statement(parser);
+        match block {
+            ast::Stmt::Block { body: value, span } => {
+                body = value;
+                end = span.end;
+            },
+            _ => (),
+        }
+    } else {
+        report(parser, "expected function body", missing_span(parser))
+    };
+    ParsedFunction {
+        start: keyword.span.start,
+        name,
+        parameters,
+        body,
+        generator,
+        asynchronous,
+        end,
+    }
+}
+
+fn parse_function_expression(parser: Parser, asynchronous: bool) -> ast::Expr {
+    let function = parse_function_parts(parser, false, asynchronous);
+    ast::Expr::Function {
+        name: function.name,
+        parameters: function.parameters,
+        body: function.body,
+        generator: function.generator,
+        asynchronous: function.asynchronous,
+        span: ast::span(function.start, function.end),
+    }
+}
+
+fn parse_yield_expression(parser: Parser) -> ast::Expr {
+    let keyword = bump(parser);
+    let delegate = if at(parser, lexer::TokenKind::Star) {
+        bump(parser);
+        true
+    } else {
+        false
+    };
+    let argument = if current_token(parser).line_break_before
+        || is_expression_boundary(current_kind(parser)) {
+        Option::None
+    } else {
+        Option::Some(Ref::new(parse_assignment_expression(parser)))
+    };
+    let end = match argument {
+        Some(value) => ast::expr_span(value.get()).end,
+        None => keyword.span.end,
+    };
+    ast::Expr::Yield { argument, delegate, span: ast::span(keyword.span.start, end) }
+}
+
+fn synchronize_object_property(parser: Parser) -> unit {
+    let mut parentheses = 0;
+    let mut brackets = 0;
+    let mut braces = 0;
+    let mut done = false;
+    while !done && !at_eof(parser) {
+        match current_kind(parser) {
+            Comma => if parentheses == 0 && brackets == 0 && braces == 0 {
+                done = true;
+            } else {
+                bump(parser);
+            },
+            RBrace => if parentheses == 0 && brackets == 0 && braces == 0 {
+                done = true;
+            } else {
+                if braces > 0 {
+                    braces -= 1;
+                } else {};
+                bump(parser);
+            },
+            LParen => {
+                parentheses += 1;
+                bump(parser);
+            },
+            RParen => {
+                if parentheses > 0 {
+                    parentheses -= 1;
+                } else {};
+                bump(parser);
+            },
+            LBracket => {
+                brackets += 1;
+                bump(parser);
+            },
+            RBracket => {
+                if brackets > 0 {
+                    brackets -= 1;
+                } else {};
+                bump(parser);
+            },
+            LBrace => {
+                braces += 1;
+                bump(parser);
+            },
+            _ => {
+                bump(parser);
+            },
+        }
+    }
+}
+
+fn parse_object_method(parser: Parser, start: int, generator: bool, asynchronous: bool) -> ast::Expr {
+    let parameters = parse_function_parameters(parser);
+    let mut body: Vec[ast::Stmt] = Vec::[];
+    let mut end = current_token(parser).span.start;
+    if at(parser, lexer::TokenKind::LBrace) {
+        match parse_block_statement(parser) {
+            ast::Stmt::Block { body: value, span } => {
+                body = value;
+                end = span.end;
+            },
+            _ => (),
+        }
+    } else {
+        report(parser, "expected object method body", missing_span(parser))
+    };
+    ast::Expr::Function {
+        name: Option::None,
+        parameters,
+        body,
+        generator,
+        asynchronous,
+        span: ast::span(start, end),
+    }
+}
+
+fn parse_computed_object_property(parser: Parser) -> Option[ast::ObjectProperty] {
+    let open = bump(parser);
+    let key = if !at(parser, lexer::TokenKind::RBracket) && !at_eof(parser) {
+        parse_assignment_expression(parser)
+    } else {
+        error_expr(parser, "expected computed property name")
+    };
+    let bracket_end = finish_right_bracket(parser, expr_end(key));
+    let method = at(parser, lexer::TokenKind::LParen);
+    let value = if at(parser, lexer::TokenKind::Colon) {
+        bump(parser);
+        if !at(parser, lexer::TokenKind::Comma) && !at(parser, lexer::TokenKind::RBrace)
+            && !at_eof(parser) {
+            parse_assignment_expression(parser)
+        } else {
+            error_expr(parser, "expected object property value")
+        }
+    } else if at(parser, lexer::TokenKind::LParen) {
+        parse_object_method(parser, open.span.start, false, false)
+    } else {
+        report(parser, "expected `:` after computed property name", missing_span(parser));
+        synchronize_object_property(parser);
+        return Option::None
+    };
+    let end = expr_end(value);
+    Option::Some(
+        ast::ObjectProperty {
+            key: ast::ObjectPropertyKey::Computed(Ref::new(key)),
+            kind: if method {
+                ast::ObjectPropertyKind::Method
+            } else {
+                ast::ObjectPropertyKind::Data
+            },
+            value: Ref::new(value),
+            span: ast::span(
+                open.span.start,
+                if end > bracket_end {
+                    end
+                } else {
+                    bracket_end
+                },
+            ),
+        },
+    )
+}
+
+fn starts_object_accessor(parser: Parser) -> bool {
+    let modifier = current_token(parser);
+    if modifier.kind != lexer::TokenKind::Identifier
+        || modifier.value != "get" && modifier.value != "set" {
+        false
+    } else {
+        let property = lookahead_token(parser, 1);
+        let after = lookahead_token(parser, 2);
+        property.kind == lexer::TokenKind::LBracket
+            || (is_identifier_name(property.kind) || property.kind == lexer::TokenKind::String
+                || property.kind == lexer::TokenKind::Number)
+                && after.kind == lexer::TokenKind::LParen
+    }
+}
+
+fn parse_object_accessor(parser: Parser) -> Option[ast::ObjectProperty] {
+    let modifier = bump(parser);
+    let key = if at(parser, lexer::TokenKind::LBracket) {
+        bump(parser);
+        let value = if !at(parser, lexer::TokenKind::RBracket) && !at_eof(parser) {
+            parse_assignment_expression(parser)
+        } else {
+            error_expr(parser, "expected computed accessor name")
+        };
+        let _ = finish_right_bracket(parser, expr_end(value));
+        ast::ObjectPropertyKey::Computed(Ref::new(value))
+    } else {
+        let token = bump(parser);
+        if is_identifier_name(token.kind) {
+            ast::ObjectPropertyKey::Identifier(token.value)
+        } else if token.kind == lexer::TokenKind::String {
+            ast::ObjectPropertyKey::String(token.value)
+        } else {
+            ast::ObjectPropertyKey::Number(token.value)
+        }
+    };
+    let value = parse_object_method(parser, modifier.span.start, false, false);
+    let kind = if modifier.value == "get" {
+        ast::ObjectPropertyKind::Getter
+    } else {
+        ast::ObjectPropertyKind::Setter
+    };
+    match value {
+        ast::Expr::Function { parameters, .. } => if kind == ast::ObjectPropertyKind::Getter
+            && !parameters.is_empty() {
+            report(parser, "getter must not have parameters", convert_span(modifier.span))
+        } else if kind == ast::ObjectPropertyKind::Setter && parameters.len() != 1 {
+            report(parser, "setter must have exactly one parameter", convert_span(modifier.span))
+        } else {},
+        _ => (),
+    };
+    let end = expr_end(value);
+    Option::Some(
+        ast::ObjectProperty {
+            key,
+            kind,
+            value: Ref::new(value),
+            span: ast::span(modifier.span.start, end),
+        },
+    )
+}
+
+fn starts_object_async_method(parser: Parser) -> bool {
+    let modifier = current_token(parser);
+    let name = lookahead_token(parser, 1);
+    let generator_name = lookahead_token(parser, 2);
+    modifier.kind == lexer::TokenKind::Identifier && modifier.value == "async"
+        && !modifier.has_escape
+        && !name.line_break_before
+        && (name.kind == lexer::TokenKind::Star
+            && (generator_name.kind == lexer::TokenKind::LBracket
+                || is_identifier_name(generator_name.kind)
+                || generator_name.kind == lexer::TokenKind::String
+                || generator_name.kind == lexer::TokenKind::Number)
+            || name.kind == lexer::TokenKind::LBracket
+            || (is_identifier_name(name.kind) || name.kind == lexer::TokenKind::String
+                || name.kind == lexer::TokenKind::Number)
+                && lookahead_token(parser, 2).kind == lexer::TokenKind::LParen)
+}
+
+fn parse_object_async_method(parser: Parser) -> Option[ast::ObjectProperty] {
+    let modifier = bump(parser);
+    let generator = if at(parser, lexer::TokenKind::Star) {
+        bump(parser);
+        true
+    } else {
+        false
+    };
+    let key = if at(parser, lexer::TokenKind::LBracket) {
+        bump(parser);
+        let value = if !at(parser, lexer::TokenKind::RBracket) && !at_eof(parser) {
+            parse_assignment_expression(parser)
+        } else {
+            error_expr(parser, "expected computed async method name")
+        };
+        let _ = finish_right_bracket(parser, expr_end(value));
+        ast::ObjectPropertyKey::Computed(Ref::new(value))
+    } else {
+        let token = bump(parser);
+        if is_identifier_name(token.kind) {
+            ast::ObjectPropertyKey::Identifier(token.value)
+        } else if token.kind == lexer::TokenKind::String {
+            ast::ObjectPropertyKey::String(token.value)
+        } else {
+            ast::ObjectPropertyKey::Number(token.value)
+        }
+    };
+    let value = parse_object_method(parser, modifier.span.start, generator, true);
+    Option::Some(
+        ast::ObjectProperty {
+            key,
+            kind: ast::ObjectPropertyKind::Method,
+            value: Ref::new(value),
+            span: ast::span(modifier.span.start, expr_end(value)),
+        },
+    )
+}
+
+fn parse_object_property(parser: Parser) -> Option[ast::ObjectProperty] {
+    if at(parser, lexer::TokenKind::Ellipsis) {
+        let spread = bump(parser);
+        let value = if !at(parser, lexer::TokenKind::Comma) && !at(parser, lexer::TokenKind::RBrace)
+            && !at_eof(parser) {
+            parse_assignment_expression(parser)
+        } else {
+            error_expr(parser, "expected object spread expression")
+        };
+        let end = expr_end(value);
+        return Option::Some(
+            ast::ObjectProperty {
+                key: ast::ObjectPropertyKey::Spread,
+                kind: ast::ObjectPropertyKind::Data,
+                value: Ref::new(value),
+                span: ast::span(spread.span.start, end),
+            },
+        )
+    } else if at(parser, lexer::TokenKind::Star) {
+        let star = bump(parser);
+        let key = if at(parser, lexer::TokenKind::LBracket) {
+            bump(parser);
+            let value = if !at(parser, lexer::TokenKind::RBracket) && !at_eof(parser) {
+                parse_assignment_expression(parser)
+            } else {
+                error_expr(parser, "expected computed generator method name")
+            };
+            let _ = finish_right_bracket(parser, expr_end(value));
+            ast::ObjectPropertyKey::Computed(Ref::new(value))
+        } else {
+            let token = bump(parser);
+            if is_identifier_name(token.kind) {
+                ast::ObjectPropertyKey::Identifier(token.value)
+            } else if token.kind == lexer::TokenKind::String {
+                ast::ObjectPropertyKey::String(token.value)
+            } else if token.kind == lexer::TokenKind::Number {
+                ast::ObjectPropertyKey::Number(token.value)
+            } else {
+                report(parser, "expected generator method name", convert_span(token.span));
+                synchronize_object_property(parser);
+                return Option::None
+            }
+        };
+        let value = parse_object_method(parser, star.span.start, true, false);
+        return Option::Some(
+            ast::ObjectProperty {
+                key,
+                kind: ast::ObjectPropertyKind::Method,
+                value: Ref::new(value),
+                span: ast::span(star.span.start, expr_end(value)),
+            },
+        )
+    } else if at(parser, lexer::TokenKind::LBracket) {
+        return parse_computed_object_property(parser)
+    } else if starts_object_accessor(parser) {
+        return parse_object_accessor(parser)
+    } else if starts_object_async_method(parser) {
+        return parse_object_async_method(parser)
+    } else {};
+    let token = current_token(parser);
+    let key = if is_identifier_name(token.kind) {
+        bump(parser);
+        Option::Some(ast::ObjectPropertyKey::Identifier(token.value))
+    } else if token.kind == lexer::TokenKind::String {
+        bump(parser);
+        Option::Some(ast::ObjectPropertyKey::String(token.value))
+    } else if token.kind == lexer::TokenKind::Number {
+        bump(parser);
+        Option::Some(ast::ObjectPropertyKey::Number(token.value))
+    } else {
+        report(parser, "expected object property name", convert_span(token.span));
+        synchronize_object_property(parser);
+        Option::None
+    };
+    match key {
+        None => Option::None,
+        Some(property_key) => {
+            let method = at(parser, lexer::TokenKind::LParen);
+            let value = if at(parser, lexer::TokenKind::Colon) {
+                bump(parser);
+                if at(parser, lexer::TokenKind::Comma) || at(parser, lexer::TokenKind::RBrace)
+                    || at_eof(parser) {
+                    error_expr(parser, "expected object property value")
+                } else {
+                    parse_assignment_expression(parser)
+                }
+            } else if at(parser, lexer::TokenKind::LParen) {
+                parse_object_method(parser, token.span.start, false, false)
+            } else if token.kind == lexer::TokenKind::Identifier && !token.is_reserved
+                && (at(parser, lexer::TokenKind::Comma) || at(parser, lexer::TokenKind::RBrace)) {
+                ast::Expr::Identifier { name: token.value, span: convert_span(token.span) }
+            } else {
+                report(parser, "expected `:` after object property name", missing_span(parser));
+                synchronize_object_property(parser);
+                return Option::None
+            };
+            let end = expr_end(value);
+            Option::Some(
+                ast::ObjectProperty {
+                    key: property_key,
+                    kind: if method {
+                        ast::ObjectPropertyKind::Method
+                    } else {
+                        ast::ObjectPropertyKind::Data
+                    },
+                    value: Ref::new(value),
+                    span: ast::span(token.span.start, end),
+                },
+            )
+        },
+    }
+}
+
+fn parse_object_literal(parser: Parser) -> ast::Expr {
+    let open = bump(parser);
+    let properties: Vec[ast::ObjectProperty] = Vec::[];
+    let mut end = open.span.end;
+    let mut done = false;
+    while !done && !at_eof(parser) {
+        if at(parser, lexer::TokenKind::RBrace) {
+            end = bump(parser).span.end;
+            done = true;
+        } else {
+            match parse_object_property(parser) {
+                Some(property) => {
+                    end = property.span.end;
+                    properties.push(property)
+                },
+                None => (),
+            };
+            if at(parser, lexer::TokenKind::Comma) {
+                end = bump(parser).span.end;
+            } else if !at(parser, lexer::TokenKind::RBrace) {
+                report(parser, "expected `,` or `}` after object property", missing_span(parser));
+                synchronize_object_property(parser);
+                if at(parser, lexer::TokenKind::Comma) {
+                    end = bump(parser).span.end;
+                } else {}
+            } else {}
+        }
+    }
+    if !done {
+        report(parser, "expected `}` after object literal", missing_span(parser))
+    } else {};
+    ast::Expr::Object { properties, span: ast::span(open.span.start, end) }
+}
+
+fn parse_array_literal(parser: Parser) -> ast::Expr {
+    let open = bump(parser);
+    let elements: Vec[ast::ArrayElement] = Vec::[];
+    let mut end = open.span.end;
+    let mut done = false;
+    while !done && !at_eof(parser) {
+        if at(parser, lexer::TokenKind::RBracket) {
+            end = bump(parser).span.end;
+            done = true;
+        } else if at(parser, lexer::TokenKind::Comma) {
+            elements.push(ast::ArrayElement::Hole);
+            end = bump(parser).span.end;
+        } else {
+            let spread = if at(parser, lexer::TokenKind::Ellipsis) {
+                bump(parser);
+                true
+            } else {
+                false
+            };
+            let value = if at(parser, lexer::TokenKind::Comma)
+                || at(parser, lexer::TokenKind::RBracket) {
+                error_expr(parser, "expected array element")
+            } else {
+                parse_assignment_expression(parser)
+            };
+            end = expr_end(value);
+            elements.push(
+                if spread {
+                    ast::ArrayElement::Spread(Ref::new(value))
+                } else {
+                    ast::ArrayElement::Value(Ref::new(value))
+                },
+            );
+            if at(parser, lexer::TokenKind::Comma) {
+                end = bump(parser).span.end;
+            } else if !at(parser, lexer::TokenKind::RBracket) {
+                report(parser, "expected `,` or `]` after array element", missing_span(parser));
+                synchronize_right_bracket(parser)
+            } else {}
+        }
+    }
+    if !done {
+        report(parser, "expected `]` after array literal", missing_span(parser))
+    } else {};
+    ast::Expr::Array { elements, span: ast::span(open.span.start, end) }
+}
+
+fn report_template_errors(parser: Parser, token: lexer::Token) -> unit {
+    for error in token.template_errors {
+        report(parser, error.message, convert_span(error.span))
+    }
+}
+
+fn template_string(parser: Parser, token: lexer::Token) -> ast::Expr {
+    report_template_errors(parser, token);
+    ast::Expr::String { value: token.value, raw: token.lexeme, span: convert_span(token.span) }
+}
+
+fn template_raw(token: lexer::Token) -> string {
+    let raw = match token.kind {
+        lexer::TokenKind::NoSubstitutionTemplate => {
+            token.lexeme.byte_slice(1, token.lexeme.byte_len() - 1)
+        },
+        lexer::TokenKind::TemplateHead => {
+            token.lexeme.byte_slice(1, token.lexeme.byte_len() - 2)
+        },
+        lexer::TokenKind::TemplateMiddle => {
+            token.lexeme.byte_slice(1, token.lexeme.byte_len() - 2)
+        },
+        lexer::TokenKind::TemplateTail => {
+            token.lexeme.byte_slice(1, token.lexeme.byte_len() - 1)
+        },
+        _ => "",
+    };
+    text::replace(text::replace(raw, "\r\n", "\n"), "\r", "\n")
+}
+
+fn parse_tagged_template(parser: Parser, tag: ast::Expr) -> ast::Expr {
+    let start = ast::expr_span(tag).start;
+    let first = bump(parser);
+    let cooked: Vec[Option[string]] = Vec::[
+        if first.template_errors.is_empty() {
+            Option::Some(first.value)
+        } else {
+            Option::None
+        },
+    ];
+    let raw: Vec[string] = Vec::[template_raw(first)];
+    let substitutions: Vec[Ref[ast::Expr]] = Vec::[];
+    let mut end = first.span.end;
+    let mut done = first.kind == lexer::TokenKind::NoSubstitutionTemplate;
+    while !done && !at_eof(parser) {
+        let substitution = if at(parser, lexer::TokenKind::TemplateMiddle)
+            || at(parser, lexer::TokenKind::TemplateTail) {
+            error_expr(parser, "expected template substitution expression")
+        } else {
+            parse_expression(parser)
+        };
+        substitutions.push(Ref::new(substitution));
+        if at(parser, lexer::TokenKind::TemplateMiddle)
+            || at(parser, lexer::TokenKind::TemplateTail) {
+            let quasi = bump(parser);
+            cooked.push(
+                if quasi.template_errors.is_empty() {
+                    Option::Some(quasi.value)
+                } else {
+                    Option::None
+                },
+            );
+            raw.push(template_raw(quasi));
+            end = quasi.span.end;
+            done = quasi.kind == lexer::TokenKind::TemplateTail;
+        } else {
+            report(parser, "expected tagged template continuation", missing_span(parser));
+            end = expr_end(substitution);
+            done = true;
+        }
+    }
+    ast::Expr::TaggedTemplate {
+        tag: Ref::new(tag),
+        cooked,
+        raw,
+        substitutions,
+        span: ast::span(start, end),
+    }
+}
+
+fn parse_template_literal(parser: Parser) -> ast::Expr {
+    let head = bump(parser);
+    let start = head.span.start;
+    let mut result = template_string(parser, head);
+    let mut done = false;
+    while !done && !at_eof(parser) {
+        let substitution = if at(parser, lexer::TokenKind::TemplateMiddle)
+            || at(parser, lexer::TokenKind::TemplateTail) {
+            error_expr(parser, "expected template substitution expression")
+        } else {
+            parse_expression(parser)
+        };
+        result = ast::Expr::Binary {
+            operator: ast::BinaryOperator::Add,
+            left: Ref::new(result),
+            right: Ref::new(substitution),
+            span: ast::span(start, expr_end(substitution)),
+        };
+        if at(parser, lexer::TokenKind::TemplateMiddle)
+            || at(parser, lexer::TokenKind::TemplateTail) {
+            let quasi = bump(parser);
+            done = quasi.kind == lexer::TokenKind::TemplateTail;
+            let quasi_end = quasi.span.end;
+            let quasi_expression = template_string(parser, quasi);
+            result = ast::Expr::Binary {
+                operator: ast::BinaryOperator::Add,
+                left: Ref::new(result),
+                right: Ref::new(quasi_expression),
+                span: ast::span(start, quasi_end),
+            };
+        } else {
+            report(parser, "expected template literal continuation", missing_span(parser));
+            done = true;
+        };
+    }
+    result
+}
+
+fn parse_dynamic_import(parser: Parser) -> ast::Expr {
+    let keyword = bump(parser);
+    let start = keyword.span.start;
+    if !at(parser, lexer::TokenKind::LParen) {
+        let expression = error_expr(parser, "expected `(` after `import`");
+        return ast::Expr::DynamicImport {
+            specifier: Ref::new(expression),
+            options: Option::None,
+            span: ast::span(start, expr_end(expression)),
+        }
+    } else {};
+    bump(parser);
+    let specifier = if at(parser, lexer::TokenKind::RParen) {
+        error_expr(parser, "expected module specifier")
+    } else {
+        parse_assignment_expression(parser)
+    };
+    let mut options: Option[Ref[ast::Expr]] = Option::None;
+    if at(parser, lexer::TokenKind::Comma) {
+        bump(parser);
+        if !at(parser, lexer::TokenKind::RParen) {
+            let value = parse_assignment_expression(parser);
+            options = Option::Some(Ref::new(value));
+            if at(parser, lexer::TokenKind::Comma) {
+                bump(parser);
+            } else {}
+        } else {}
+    } else {};
+    let end = finish_right_paren(parser, "expected `)` after dynamic import");
+    ast::Expr::DynamicImport {
+        specifier: Ref::new(specifier),
+        options,
+        span: ast::span(start, end),
+    }
+}
+
+fn parse_import_expression(parser: Parser) -> ast::Expr {
+    if lookahead_token(parser, 1).kind != lexer::TokenKind::Dot {
+        return parse_dynamic_import(parser)
+    } else {};
+    let keyword = bump(parser);
+    bump(parser);
+    let property = current_token(parser);
+    if property.kind == lexer::TokenKind::Identifier && property.value == "meta"
+        && !property.has_escape {
+        bump(parser);
+        ast::Expr::ImportMeta { span: ast::span(keyword.span.start, property.span.end) }
+    } else {
+        let expression = error_expr(parser, "expected `meta` after `import.`");
+        ast::Expr::Error { span: ast::span(keyword.span.start, expr_end(expression)) }
+    }
+}
+
+fn parse_primary(parser: Parser) -> ast::Expr {
+    let token = current_token(parser);
+    match token.kind {
+        ThisKeyword => {
+            bump(parser);
+            ast::Expr::This { span: convert_span(token.span) }
+        },
+        SuperKeyword => {
+            bump(parser);
+            ast::Expr::Super { span: convert_span(token.span) }
+        },
+        ImportKeyword => parse_import_expression(parser),
+        Identifier => {
+            if token.value == "async" && !token.has_escape
+                && !lookahead_token(parser, 1).line_break_before
+                && lookahead_token(parser, 1).kind == lexer::TokenKind::FunctionKeyword {
+                bump(parser);
+                return parse_function_expression(parser, true)
+            } else {};
+            bump(parser);
+            if token.is_reserved {
+                report(
+                    parser,
+                    "reserved word cannot be used as an identifier",
+                    convert_span(token.span),
+                )
+            } else {};
+            ast::Expr::Identifier { name: token.value, span: convert_span(token.span) }
+        },
+        PrivateIdentifier => {
+            bump(parser);
+            ast::Expr::PrivateIdentifier { name: token.value, span: convert_span(token.span) }
+        },
+        Number => {
+            bump(parser);
+            ast::Expr::Number { raw: token.value, span: convert_span(token.span) }
+        },
+        BigInt => {
+            bump(parser);
+            ast::Expr::BigInt { raw: token.value, span: convert_span(token.span) }
+        },
+        String => {
+            bump(parser);
+            ast::Expr::String {
+                value: token.value,
+                raw: token.lexeme,
+                span: convert_span(token.span),
+            }
+        },
+        RegExp => {
+            bump(parser);
+            ast::Expr::RegExp {
+                pattern: token.value,
+                flags: token.regex_flags,
+                span: convert_span(token.span),
+            }
+        },
+        NoSubstitutionTemplate => {
+            bump(parser);
+            template_string(parser, token)
+        },
+        TemplateHead => parse_template_literal(parser),
+        TrueKeyword => {
+            bump(parser);
+            ast::Expr::Bool { value: true, span: convert_span(token.span) }
+        },
+        FalseKeyword => {
+            bump(parser);
+            ast::Expr::Bool { value: false, span: convert_span(token.span) }
+        },
+        NullKeyword => {
+            bump(parser);
+            ast::Expr::Null { span: convert_span(token.span) }
+        },
+        FunctionKeyword => parse_function_expression(parser, false),
+        ClassKeyword => parse_class_expression(parser),
+        LParen => parse_parenthesized_or_arrow(parser),
+        LBrace => parse_object_literal(parser),
+        LBracket => parse_array_literal(parser),
+        _ => error_expr(parser, "expected expression"),
+    }
+}
+
+fn parse_call(parser: Parser, callee: ast::Expr) -> ast::Expr {
+    let start = ast::expr_span(callee).start;
+    let open = bump(parser);
+    let arguments: Vec[ast::Expr] = Vec::[];
+    let mut end = open.span.end;
+    if at(parser, lexer::TokenKind::RParen) {
+        end = bump(parser).span.end;
+    } else {
+        let mut done = false;
+        while !done && !at_eof(parser) {
+            if at(parser, lexer::TokenKind::RParen) {
+                end = bump(parser).span.end;
+                done = true;
+            } else {
+                let argument = if at(parser, lexer::TokenKind::Ellipsis) {
+                    let spread = bump(parser);
+                    let value = if at(parser, lexer::TokenKind::Comma)
+                        || at(parser, lexer::TokenKind::RParen) {
+                        error_expr(parser, "expected spread argument")
+                    } else {
+                        parse_assignment_expression(parser)
+                    };
+                    ast::Expr::Spread {
+                        argument: Ref::new(value),
+                        span: ast::span(spread.span.start, expr_end(value)),
+                    }
+                } else {
+                    parse_assignment_expression(parser)
+                };
+                end = expr_end(argument);
+                arguments.push(argument);
+                if at(parser, lexer::TokenKind::Comma) {
+                    end = bump(parser).span.end;
+                    if at(parser, lexer::TokenKind::RParen) {
+                        end = bump(parser).span.end;
+                        done = true;
+                    } else {}
+                } else if at(parser, lexer::TokenKind::RParen) {
+                    end = bump(parser).span.end;
+                    done = true;
+                } else {
+                    report(parser, "expected `,` or `)`", missing_span(parser));
+                    synchronize_call_argument(parser);
+                    if at(parser, lexer::TokenKind::Comma) {
+                        end = bump(parser).span.end;
+                    } else if at(parser, lexer::TokenKind::RParen) {
+                        end = bump(parser).span.end;
+                        done = true;
+                    } else {
+                        done = true;
+                    }
+                }
+            }
+        }
+        if !done {
+            report(parser, "expected `)`", missing_span(parser))
+        } else {}
+    };
+    ast::Expr::Call { callee: Ref::new(callee), arguments, span: ast::span(start, end) }
+}
+
+fn parse_postfix(parser: Parser, initial: ast::Expr) -> ast::Expr {
+    let mut expression = initial;
+    let mut done = false;
+    while !done {
+        if at(parser, lexer::TokenKind::Dot) {
+            bump(parser);
+            let property_token = current_token(parser);
+            let property = if property_token.kind == lexer::TokenKind::PrivateIdentifier {
+                bump(parser);
+                ast::Expr::PrivateIdentifier {
+                    name: property_token.value,
+                    span: convert_span(property_token.span),
+                }
+            } else if is_identifier_name(property_token.kind) {
+                bump(parser);
+                ast::Expr::Identifier {
+                    name: property_token.value,
+                    span: convert_span(property_token.span),
+                }
+            } else {
+                error_expr(parser, "expected property name")
+            };
+            let start = ast::expr_span(expression).start;
+            let end = expr_end(property);
+            expression = ast::Expr::Member {
+                object: Ref::new(expression),
+                property: Ref::new(property),
+                computed: false,
+                optional: false,
+                span: ast::span(start, end),
+            };
+        } else if at(parser, lexer::TokenKind::LBracket) {
+            let start = ast::expr_span(expression).start;
+            bump(parser);
+            let property = if at(parser, lexer::TokenKind::RBracket) {
+                error_expr(parser, "expected expression")
+            } else {
+                parse_expression(parser)
+            };
+            let end = finish_right_bracket(parser, expr_end(property));
+            expression = ast::Expr::Member {
+                object: Ref::new(expression),
+                property: Ref::new(property),
+                computed: true,
+                optional: false,
+                span: ast::span(start, end),
+            };
+        } else if at(parser, lexer::TokenKind::OptionalChain) {
+            let start = ast::expr_span(expression).start;
+            bump(parser);
+            let computed = at(parser, lexer::TokenKind::LBracket);
+            if computed {
+                let _ = bump(parser);
+            } else {};
+            let property = if computed {
+                if at(parser, lexer::TokenKind::RBracket) {
+                    error_expr(parser, "expected expression")
+                } else {
+                    parse_expression(parser)
+                }
+            } else {
+                let property_token = current_token(parser);
+                if is_identifier_name(property_token.kind) {
+                    bump(parser);
+                    ast::Expr::Identifier {
+                        name: property_token.value,
+                        span: convert_span(property_token.span),
+                    }
+                } else {
+                    error_expr(parser, "expected property name")
+                }
+            };
+            let end = if computed {
+                finish_right_bracket(parser, expr_end(property))
+            } else {
+                expr_end(property)
+            };
+            expression = ast::Expr::Member {
+                object: Ref::new(expression),
+                property: Ref::new(property),
+                computed,
+                optional: true,
+                span: ast::span(start, end),
+            };
+        } else if at(parser, lexer::TokenKind::LParen) {
+            if current_token(parser).line_break_before && block_arrow(expression) {
+                done = true;
+            } else {
+                expression = parse_call(parser, expression);
+            }
+        } else if at(parser, lexer::TokenKind::NoSubstitutionTemplate)
+            || at(parser, lexer::TokenKind::TemplateHead) {
+            expression = parse_tagged_template(parser, expression);
+        } else {
+            done = true;
+        }
+    }
+    match update_operator(current_kind(parser)) {
+        Some(operator) => if !current_token(parser).line_break_before {
+            let token = bump(parser);
+            if !assignment_target(expression) {
+                report(parser, "invalid update target", convert_span(token.span))
+            } else {};
+            expression = ast::Expr::Update {
+                operator,
+                argument: Ref::new(expression),
+                prefix: false,
+                span: ast::span(ast::expr_span(expression).start, token.span.end),
+            };
+        } else {},
+        None => (),
+    };
+    expression
+}
+
+fn parse_new_expression(parser: Parser) -> ast::Expr {
+    let start = bump(parser).span.start;
+    let mut callee = if at(parser, lexer::TokenKind::NewKeyword) {
+        parse_new_expression(parser)
+    } else {
+        parse_primary(parser)
+    };
+    let mut done = false;
+    while !done {
+        if at(parser, lexer::TokenKind::Dot) {
+            bump(parser);
+            let property_token = current_token(parser);
+            let property = if property_token.kind == lexer::TokenKind::PrivateIdentifier {
+                bump(parser);
+                ast::Expr::PrivateIdentifier {
+                    name: property_token.value,
+                    span: convert_span(property_token.span),
+                }
+            } else if is_identifier_name(property_token.kind) {
+                bump(parser);
+                ast::Expr::Identifier {
+                    name: property_token.value,
+                    span: convert_span(property_token.span),
+                }
+            } else {
+                error_expr(parser, "expected property name")
+            };
+            let end = expr_end(property);
+            callee = ast::Expr::Member {
+                object: Ref::new(callee),
+                property: Ref::new(property),
+                computed: false,
+                optional: false,
+                span: ast::span(start, end),
+            };
+        } else if at(parser, lexer::TokenKind::LBracket) {
+            bump(parser);
+            let property = if at(parser, lexer::TokenKind::RBracket) {
+                error_expr(parser, "expected expression")
+            } else {
+                parse_expression(parser)
+            };
+            let end = finish_right_bracket(parser, expr_end(property));
+            callee = ast::Expr::Member {
+                object: Ref::new(callee),
+                property: Ref::new(property),
+                computed: true,
+                optional: false,
+                span: ast::span(start, end),
+            };
+        } else {
+            done = true;
+        }
+    }
+    let mut end = expr_end(callee);
+    let arguments = if at(parser, lexer::TokenKind::LParen) {
+        match parse_call(parser, callee) {
+            ast::Expr::Call { arguments, span, .. } => {
+                end = span.end;
+                arguments
+            },
+            _ => Vec::[],
+        }
+    } else {
+        Vec::[]
+    };
+    parse_postfix(
+        parser,
+        ast::Expr::New { callee: Ref::new(callee), arguments, span: ast::span(start, end) },
+    )
+}
+
+fn parse_prefix(parser: Parser) -> ast::Expr {
+    if at(parser, lexer::TokenKind::AwaitKeyword) {
+        let token = bump(parser);
+        let argument = parse_precedence(parser, 14);
+        return ast::Expr::Await {
+            argument: Ref::new(argument),
+            span: ast::span(token.span.start, expr_end(argument)),
+        }
+    } else {};
+    match update_operator(current_kind(parser)) {
+        Some(operator) => {
+            let token = bump(parser);
+            let argument = parse_prefix(parser);
+            if !assignment_target(argument) {
+                report(parser, "invalid update target", convert_span(token.span))
+            } else {};
+            let end = expr_end(argument);
+            ast::Expr::Update {
+                operator,
+                argument: Ref::new(argument),
+                prefix: true,
+                span: ast::span(token.span.start, end),
+            }
+        },
+        None => if at(parser, lexer::TokenKind::NewKeyword)
+            && lookahead_token(parser, 1).kind == lexer::TokenKind::Dot
+            && lookahead_token(parser, 2).kind == lexer::TokenKind::Identifier
+            && lookahead_token(parser, 2).value == "target" {
+            let start = bump(parser).span.start;
+            bump(parser);
+            let end = bump(parser).span.end;
+            ast::Expr::NewTarget { span: ast::span(start, end) }
+        } else if at(parser, lexer::TokenKind::NewKeyword) {
+            parse_new_expression(parser)
+        } else {
+            match prefix_operator(current_kind(parser)) {
+                Some(operator) => {
+                    let token = bump(parser);
+                    let argument = parse_precedence(parser, 14);
+                    let end = expr_end(argument);
+                    ast::Expr::Unary {
+                        operator,
+                        argument: Ref::new(argument),
+                        span: ast::span(token.span.start, end),
+                    }
+                },
+                None => {
+                    let primary = parse_primary(parser);
+                    parse_postfix(parser, primary)
+                },
+            }
+        },
+    }
+}
+
+fn parse_precedence(parser: Parser, minimum: int) -> ast::Expr {
+    let mut left = parse_prefix(parser);
+    let mut done = false;
+    while !done {
+        if current_token(parser).line_break_before && block_arrow(left) {
+            done = true;
+        } else {
+            match infix_info(current_kind(parser)) {
+                Some(info) => if info.precedence < minimum {
+                    done = true;
+                } else {
+                    let operator_token = bump(parser);
+                    let right_minimum = if info.right_associative {
+                        info.precedence
+                    } else {
+                        info.precedence + 1
+                    };
+                    let right = parse_precedence(parser, right_minimum);
+                    let span = ast::span(ast::expr_span(left).start, expr_end(right));
+                    left = match info.kind {
+                        InfixKind::Binary(operator) => {
+                            if operator == ast::BinaryOperator::Power
+                                && match left {
+                                    ast::Expr::Unary { .. } => true,
+                                    _ => false,
+                                } {
+                                report(
+                                    parser,
+                                    "unary expression cannot be the left operand of `**`",
+                                    convert_span(operator_token.span),
+                                )
+                            } else {};
+                            if mixed_nullish(left, operator, right) {
+                                report(
+                                    parser,
+                                    "cannot mix `??` with `&&` or `||` without parentheses",
+                                    convert_span(operator_token.span),
+                                )
+                            } else {};
+                            ast::Expr::Binary {
+                                operator,
+                                left: Ref::new(left),
+                                right: Ref::new(right),
+                                span,
+                            }
+                        },
+                    };
+                },
+                None => {
+                    done = true;
+                },
+            }
+        }
+    }
+    left
+}
+
+fn parse_conditional_expression(parser: Parser) -> ast::Expr {
+    let test = parse_precedence(parser, 1);
+    if !at(parser, lexer::TokenKind::Question) {
+        test
+    } else {
+        bump(parser);
+        let consequent = if at(parser, lexer::TokenKind::Colon) {
+            error_expr(parser, "expected expression after `?`")
+        } else {
+            parse_assignment_expression(parser)
+        };
+        if at(parser, lexer::TokenKind::Colon) {
+            bump(parser);
+        } else {
+            report(parser, "expected `:` in conditional expression", missing_span(parser))
+        };
+        let alternate = if is_expression_boundary(current_kind(parser)) {
+            error_expr(parser, "expected expression after `:`")
+        } else {
+            parse_assignment_expression(parser)
+        };
+        ast::Expr::Conditional {
+            test: Ref::new(test),
+            consequent: Ref::new(consequent),
+            alternate: Ref::new(alternate),
+            span: ast::span(ast::expr_span(test).start, expr_end(alternate)),
+        }
+    }
+}
+
+fn destructuring_assignment_start(parser: Parser) -> bool {
+    let opening = current_kind(parser);
+    if opening != lexer::TokenKind::LBracket && opening != lexer::TokenKind::LBrace {
+        return false
+    } else {};
+    let mut brackets = 0;
+    let mut braces = 0;
+    let mut parentheses = 0;
+    let mut offset = 0;
+    loop {
+        let token = lookahead_token(parser, offset);
+        match token.kind {
+            lexer::TokenKind::LBracket => {
+                brackets += 1;
+            },
+            lexer::TokenKind::RBracket => {
+                brackets -= 1;
+            },
+            lexer::TokenKind::LBrace => {
+                braces += 1;
+            },
+            lexer::TokenKind::RBrace => {
+                braces -= 1;
+            },
+            lexer::TokenKind::LParen => {
+                parentheses += 1;
+            },
+            lexer::TokenKind::RParen => {
+                parentheses -= 1;
+            },
+            lexer::TokenKind::Eof => return false,
+            _ => (),
+        };
+        if opening == lexer::TokenKind::LBracket && brackets == 0
+            || opening == lexer::TokenKind::LBrace && braces == 0 {
+            return lookahead_token(parser, offset + 1).kind == lexer::TokenKind::Assign
+        } else {};
+        offset += 1;
+    }
+}
+
+fn parse_assignment_pattern_initializer(parser: Parser, rest: bool) -> Option[Ref[ast::Expr]] {
+    if !at(parser, lexer::TokenKind::Assign) {
+        Option::None
+    } else {
+        let assign = bump(parser);
+        if rest {
+            report(
+                parser,
+                "rest assignment target cannot have an initializer",
+                convert_span(assign.span),
+            )
+        } else {};
+        if at(parser, lexer::TokenKind::Comma) || at(parser, lexer::TokenKind::RBracket)
+            || at(parser, lexer::TokenKind::RBrace) {
+            Option::Some(Ref::new(error_expr(parser, "expected assignment initializer")))
+        } else {
+            Option::Some(Ref::new(parse_assignment_expression(parser)))
+        }
+    }
+}
+
+fn parse_assignment_target_pattern(parser: Parser) -> ast::AssignmentPattern {
+    let target = parse_precedence(parser, 1);
+    let span = ast::expr_span(target);
+    if !assignment_target(target) {
+        report(parser, "invalid destructuring assignment target", span)
+    } else {};
+    ast::AssignmentPattern::Target { target: Ref::new(target), span }
+}
+
+fn parse_array_assignment_pattern(parser: Parser) -> ast::AssignmentPattern {
+    let open = bump(parser);
+    let elements: Vec[ast::ArrayAssignmentElement] = Vec::[];
+    let mut end = open.span.end;
+    let mut done = false;
+    while !done && !at_eof(parser) {
+        if at(parser, lexer::TokenKind::RBracket) {
+            end = bump(parser).span.end;
+            done = true;
+        } else if at(parser, lexer::TokenKind::Comma) {
+            elements.push(ast::ArrayAssignmentElement::Hole);
+            end = bump(parser).span.end;
+        } else {
+            let start = current_token(parser).span.start;
+            let rest = if at(parser, lexer::TokenKind::Ellipsis) {
+                bump(parser);
+                true
+            } else {
+                false
+            };
+            let pattern = parse_assignment_pattern(parser);
+            let initializer = parse_assignment_pattern_initializer(parser, rest);
+            end = match initializer {
+                Some(value) => ast::expr_span(value.get()).end,
+                None => ast::assignment_pattern_span(pattern).end,
+            };
+            elements.push(
+                ast::ArrayAssignmentElement::Element {
+                    pattern: Ref::new(pattern),
+                    initializer,
+                    rest,
+                    span: ast::span(start, end),
+                },
+            );
+            if at(parser, lexer::TokenKind::Comma) {
+                if rest {
+                    report(
+                        parser,
+                        "rest assignment target must be last",
+                        convert_span(current_token(parser).span),
+                    )
+                } else {};
+                end = bump(parser).span.end;
+            } else if !at(parser, lexer::TokenKind::RBracket) {
+                report(parser, "expected `,` or `]` after assignment target", missing_span(parser));
+                synchronize_right_bracket(parser)
+            } else {}
+        }
+    }
+    if !done {
+        report(parser, "expected `]` after assignment pattern", missing_span(parser))
+    } else {};
+    ast::AssignmentPattern::Array { elements, span: ast::span(open.span.start, end) }
+}
+
+fn assignment_pattern_is_target(pattern: ast::AssignmentPattern) -> bool {
+    match pattern {
+        ast::AssignmentPattern::Target { .. } => true,
+        _ => false,
+    }
+}
+
+fn parse_object_assignment_property(parser: Parser) -> Option[ast::ObjectAssignmentProperty] {
+    if at(parser, lexer::TokenKind::Ellipsis) {
+        let spread = bump(parser);
+        let pattern = parse_assignment_pattern(parser);
+        if !assignment_pattern_is_target(pattern) {
+            report(
+                parser,
+                "object rest assignment requires a simple target",
+                ast::assignment_pattern_span(pattern),
+            )
+        } else {};
+        let initializer = parse_assignment_pattern_initializer(parser, true);
+        let end = match initializer {
+            Some(value) => ast::expr_span(value.get()).end,
+            None => ast::assignment_pattern_span(pattern).end,
+        };
+        Option::Some(
+            ast::ObjectAssignmentProperty::Rest {
+                pattern: Ref::new(pattern),
+                span: ast::span(spread.span.start, end),
+            },
+        )
+    } else {
+        match parse_binding_property_key(parser) {
+            None => Option::None,
+            Some(parsed) => {
+                let pattern = if at(parser, lexer::TokenKind::Colon) {
+                    bump(parser);
+                    parse_assignment_pattern(parser)
+                } else {
+                    match parsed.shorthand {
+                        Some(name) => {
+                            let span = ast::span(parsed.start, parsed.end);
+                            ast::AssignmentPattern::Target {
+                                target: Ref::new(ast::Expr::Identifier { name, span }),
+                                span,
+                            }
+                        },
+                        None => {
+                            report(
+                                parser,
+                                "assignment property requires `:` and a target",
+                                ast::span(parsed.start, parsed.end),
+                            );
+                            let span = ast::span(parsed.start, parsed.end);
+                            ast::AssignmentPattern::Target {
+                                target: Ref::new(ast::Expr::Error { span }),
+                                span,
+                            }
+                        },
+                    }
+                };
+                let initializer = parse_assignment_pattern_initializer(parser, false);
+                let end = match initializer {
+                    Some(value) => ast::expr_span(value.get()).end,
+                    None => ast::assignment_pattern_span(pattern).end,
+                };
+                Option::Some(
+                    ast::ObjectAssignmentProperty::Property {
+                        key: parsed.key,
+                        pattern: Ref::new(pattern),
+                        initializer,
+                        span: ast::span(parsed.start, end),
+                    },
+                )
+            },
+        }
+    }
+}
+
+fn parse_object_assignment_pattern(parser: Parser) -> ast::AssignmentPattern {
+    let open = bump(parser);
+    let properties: Vec[ast::ObjectAssignmentProperty] = Vec::[];
+    let mut end = open.span.end;
+    let mut done = false;
+    let mut saw_rest = false;
+    while !done && !at_eof(parser) {
+        if at(parser, lexer::TokenKind::RBrace) {
+            end = bump(parser).span.end;
+            done = true;
+        } else {
+            let rest = at(parser, lexer::TokenKind::Ellipsis);
+            match parse_object_assignment_property(parser) {
+                Some(property) => {
+                    end = match property {
+                        ast::ObjectAssignmentProperty::Property { span, .. } | ast::ObjectAssignmentProperty::Rest {
+                            span,
+                            ..,
+                        } => span.end,
+                    };
+                    properties.push(property)
+                },
+                None => (),
+            };
+            if rest {
+                saw_rest = true;
+            } else {};
+            if at(parser, lexer::TokenKind::Comma) {
+                if saw_rest {
+                    report(
+                        parser,
+                        "rest assignment target must be last",
+                        convert_span(current_token(parser).span),
+                    )
+                } else {};
+                end = bump(parser).span.end;
+            } else if !at(parser, lexer::TokenKind::RBrace) {
+                report(parser, "expected `,` or `}` after assignment target", missing_span(parser));
+                synchronize_object_property(parser);
+                if at(parser, lexer::TokenKind::Comma) {
+                    end = bump(parser).span.end;
+                } else {}
+            } else {}
+        }
+    }
+    if !done {
+        report(parser, "expected `}` after assignment pattern", missing_span(parser))
+    } else {};
+    ast::AssignmentPattern::Object { properties, span: ast::span(open.span.start, end) }
+}
+
+fn parse_assignment_pattern(parser: Parser) -> ast::AssignmentPattern {
+    if at(parser, lexer::TokenKind::LBracket) {
+        parse_array_assignment_pattern(parser)
+    } else if at(parser, lexer::TokenKind::LBrace) {
+        parse_object_assignment_pattern(parser)
+    } else {
+        parse_assignment_target_pattern(parser)
+    }
+}
+
+fn parse_destructuring_assignment(parser: Parser) -> ast::Expr {
+    let pattern = parse_assignment_pattern(parser);
+    let start = ast::assignment_pattern_span(pattern).start;
+    if at(parser, lexer::TokenKind::Assign) {
+        bump(parser);
+    } else {
+        report(parser, "expected `=` after assignment pattern", missing_span(parser))
+    };
+    let right = if is_expression_boundary(current_kind(parser)) {
+        error_expr(parser, "expected destructuring assignment value")
+    } else {
+        parse_assignment_expression(parser)
+    };
+    ast::Expr::DestructuringAssignment {
+        pattern: Ref::new(pattern),
+        right: Ref::new(right),
+        span: ast::span(start, expr_end(right)),
+    }
+}
+
+fn parse_assignment_expression(parser: Parser) -> ast::Expr {
+    if at(parser, lexer::TokenKind::Identifier) && current_token(parser).value == "async"
+        && !current_token(parser).has_escape
+        && !lookahead_token(parser, 1).line_break_before {
+        let start = current_token(parser).span.start;
+        if lookahead_token(parser, 1).kind == lexer::TokenKind::Identifier
+            && lookahead_token(parser, 2).kind == lexer::TokenKind::Arrow {
+            bump(parser);
+            let parameter = bump(parser);
+            let span = convert_span(parameter.span);
+            return parse_arrow_function(
+                parser,
+                start,
+                Vec::[
+                    ast::FunctionParameter {
+                        name: parameter.value,
+                        pattern: Ref::new(
+                            ast::BindingPattern::Identifier { name: parameter.value, span },
+                        ),
+                        initializer: Option::None,
+                        rest: false,
+                        span,
+                    },
+                ],
+                true,
+            )
+        } else if lookahead_token(parser, 1).kind == lexer::TokenKind::LParen {
+            let saved = parser.index.get();
+            bump(parser);
+            if parenthesized_arrow_start(parser) {
+                let parameters = parse_function_parameters(parser);
+                return parse_arrow_function(parser, start, parameters, true)
+            } else {
+                parser.index.set(saved)
+            }
+        } else {}
+    } else {};
+    if at(parser, lexer::TokenKind::YieldKeyword) {
+        return parse_yield_expression(parser)
+    } else {};
+    if destructuring_assignment_start(parser) {
+        return parse_destructuring_assignment(parser)
+    } else {};
+    let left = parse_conditional_expression(parser);
+    if at(parser, lexer::TokenKind::Arrow) {
+        return match left {
+            ast::Expr::Identifier { name, span } => parse_arrow_function(
+                parser,
+                span.start,
+                Vec::[
+                    ast::FunctionParameter {
+                        name,
+                        pattern: Ref::new(ast::BindingPattern::Identifier { name, span }),
+                        initializer: Option::None,
+                        rest: false,
+                        span,
+                    },
+                ],
+                false,
+            ),
+            _ => {
+                report(parser, "invalid arrow function parameter", ast::expr_span(left));
+                parse_arrow_function(parser, ast::expr_span(left).start, Vec::[], false)
+            },
+        }
+    } else {};
+    match assignment_operator(current_kind(parser)) {
+        Some(operator) => {
+            let token = bump(parser);
+            if !assignment_target(left) {
+                report(parser, "invalid assignment target", convert_span(token.span))
+            } else {};
+            let right = if is_expression_boundary(current_kind(parser)) {
+                error_expr(parser, "expected assignment value")
+            } else {
+                parse_assignment_expression(parser)
+            };
+            ast::Expr::Assignment {
+                operator,
+                left: Ref::new(left),
+                right: Ref::new(right),
+                span: ast::span(ast::expr_span(left).start, expr_end(right)),
+            }
+        },
+        None => left,
+    }
+}
+
+fn parse_expression(parser: Parser) -> ast::Expr {
+    let first = parse_assignment_expression(parser);
+    if !at(parser, lexer::TokenKind::Comma) {
+        first
+    } else {
+        let expressions: Vec[Ref[ast::Expr]] = Vec::[Ref::new(first)];
+        let mut end = expr_end(first);
+        while at(parser, lexer::TokenKind::Comma) {
+            bump(parser);
+            let expression = if is_expression_boundary(current_kind(parser)) {
+                error_expr(parser, "expected expression after `,`")
+            } else {
+                parse_assignment_expression(parser)
+            };
+            end = expr_end(expression);
+            expressions.push(Ref::new(expression));
+        }
+        ast::Expr::Sequence { expressions, span: ast::span(ast::expr_span(first).start, end) }
+    }
+}
+
+fn variable_kind(token: lexer::TokenKind) -> ast::VariableKind {
+    match token {
+        LetKeyword => ast::VariableKind::Let,
+        ConstKeyword => ast::VariableKind::Const,
+        _ => ast::VariableKind::Var,
+    }
+}
+
+fn parse_variable_declaration(parser: Parser, for_header: bool) -> ast::Stmt {
+    let keyword = bump(parser);
+    let kind = variable_kind(keyword.kind);
+    let declarations: Vec[ast::VariableDeclarator] = Vec::[];
+    let mut fallback_end = keyword.span.end;
+    let mut done = false;
+    while !done {
+        let token = current_token(parser);
+        let declaration_start = token.span.start;
+        let pattern = parse_variable_binding_pattern(parser);
+        let name = match pattern {
+            ast::BindingPattern::Identifier { name, .. } => name,
+            _ => "",
+        };
+        let name_end = ast::binding_pattern_span(pattern).end;
+        let initializer = if at(parser, lexer::TokenKind::Assign) {
+            bump(parser);
+            let value = parse_assignment_expression(parser);
+            fallback_end = expr_end(value);
+            Option::Some(Ref::new(value))
+        } else {
+            if kind == ast::VariableKind::Const || !binding_pattern_is_identifier(pattern) {
+                report(
+                    parser,
+                    if kind == ast::VariableKind::Const {
+                        "const declaration requires an initializer"
+                    } else {
+                        "destructuring declaration requires an initializer"
+                    },
+                    ast::span(name_end, name_end),
+                )
+            } else {};
+            fallback_end = name_end;
+            Option::None
+        };
+        declarations.push(
+            ast::VariableDeclarator {
+                name,
+                pattern: Ref::new(pattern),
+                initializer,
+                span: ast::span(declaration_start, fallback_end),
+            },
+        );
+        if at(parser, lexer::TokenKind::Comma) {
+            bump(parser);
+        } else {
+            done = true;
+        }
+    }
+    let end = if for_header {
+        consume_for_semicolon(parser, fallback_end)
+    } else {
+        consume_statement_terminator(parser, fallback_end)
+    };
+    ast::Stmt::VariableDeclaration { kind, declarations, span: ast::span(keyword.span.start, end) }
+}
+
+fn binding_pattern_is_identifier(pattern: ast::BindingPattern) -> bool {
+    match pattern {
+        ast::BindingPattern::Identifier { .. } => true,
+        _ => false,
+    }
+}
+
+fn parse_variable_statement(parser: Parser) -> ast::Stmt {
+    parse_variable_declaration(parser, false)
+}
+
+fn parse_function_declaration(parser: Parser, asynchronous: bool) -> ast::Stmt {
+    let function = parse_function_parts(parser, true, asynchronous);
+    ast::Stmt::FunctionDeclaration {
+        name: function.name.unwrap_or(""),
+        parameters: function.parameters,
+        body: function.body,
+        generator: function.generator,
+        asynchronous: function.asynchronous,
+        span: ast::span(function.start, function.end),
+    }
+}
+
+fn synchronize_class_element(parser: Parser) -> unit {
+    while !at_eof(parser) && !at(parser, lexer::TokenKind::RBrace)
+        && !at(parser, lexer::TokenKind::Semicolon) {
+        bump(parser);
+    }
+    if at(parser, lexer::TokenKind::Semicolon) {
+        bump(parser);
+    } else {}
+}
+
+fn starts_class_accessor(parser: Parser) -> bool {
+    let modifier = current_token(parser);
+    if modifier.kind != lexer::TokenKind::Identifier
+        || modifier.value != "get" && modifier.value != "set" {
+        false
+    } else {
+        lookahead_token(parser, 1).kind == lexer::TokenKind::LBracket
+            || lookahead_token(parser, 1).kind == lexer::TokenKind::PrivateIdentifier
+            || is_identifier_name(lookahead_token(parser, 1).kind)
+                && lookahead_token(parser, 2).kind == lexer::TokenKind::LParen
+    }
+}
+
+fn starts_async_class_method(parser: Parser) -> bool {
+    let modifier = current_token(parser);
+    let name = lookahead_token(parser, 1);
+    let generator_name = lookahead_token(parser, 2);
+    modifier.kind == lexer::TokenKind::Identifier && modifier.value == "async"
+        && !modifier.has_escape
+        && !name.line_break_before
+        && (name.kind == lexer::TokenKind::Star
+            && (generator_name.kind == lexer::TokenKind::LBracket
+                || generator_name.kind == lexer::TokenKind::PrivateIdentifier
+                || is_identifier_name(generator_name.kind)
+                || generator_name.kind == lexer::TokenKind::String
+                || generator_name.kind == lexer::TokenKind::Number)
+            || name.kind == lexer::TokenKind::LBracket
+            || name.kind == lexer::TokenKind::PrivateIdentifier
+            || (is_identifier_name(name.kind) || name.kind == lexer::TokenKind::String
+                || name.kind == lexer::TokenKind::Number)
+                && lookahead_token(parser, 2).kind == lexer::TokenKind::LParen)
+}
+
+fn report_static_block_return(parser: Parser, statement: ast::Stmt) -> unit {
+    match statement {
+        ast::Stmt::Return { span, .. } => {
+            report(parser, "return is not allowed in a class static block", span)
+        },
+        ast::Stmt::Block { body, .. } => {
+            for child in body {
+                report_static_block_return(parser, child)
+            }
+        },
+        ast::Stmt::If { consequent, alternate, .. } => {
+            report_static_block_return(parser, consequent.get());
+            match alternate {
+                Some(value) => report_static_block_return(parser, value.get()),
+                None => (),
+            }
+        },
+        ast::Stmt::While { body, .. } | ast::Stmt::With { body, .. } | ast::Stmt::For { body, .. } | ast::Stmt::ForOf {
+            body,
+            ..,
+        } | ast::Stmt::ForIn { body, .. } | ast::Stmt::DoWhile { body, .. } => {
+            report_static_block_return(parser, body.get())
+        },
+        ast::Stmt::Switch { cases, .. } => {
+            for clause in cases {
+                for child in clause.consequent {
+                    report_static_block_return(parser, child)
+                }
+            }
+        },
+        ast::Stmt::Try { block, handler, finalizer, .. } => {
+            for child in block {
+                report_static_block_return(parser, child)
+            }
+            match handler {
+                Some(value) => for child in value.body {
+                    report_static_block_return(parser, child)
+                },
+                None => (),
+            };
+            match finalizer {
+                Some(value) => for child in value {
+                    report_static_block_return(parser, child)
+                },
+                None => (),
+            }
+        },
+        ast::Stmt::FunctionDeclaration { .. } | ast::Stmt::ClassDeclaration { .. } => (),
+        _ => (),
+    }
+}
+
+fn parse_class_element(parser: Parser) -> Option[ast::ClassElement] {
+    let start = current_token(parser).span.start;
+    if at(parser, lexer::TokenKind::StaticKeyword)
+        && lookahead_token(parser, 1).kind == lexer::TokenKind::LBrace {
+        bump(parser);
+        let block = parse_block_statement(parser);
+        return match block {
+            ast::Stmt::Block { body, span } => {
+                for statement in body {
+                    report_static_block_return(parser, statement)
+                }
+                Option::Some(
+                    ast::ClassElement {
+                        name: "",
+                        private_member: false,
+                        computed_name: Option::None,
+                        kind: ast::ClassElementKind::StaticBlock,
+                        static_member: true,
+                        generator: false,
+                        asynchronous: false,
+                        initializer: Option::None,
+                        parameters: Vec::[],
+                        body,
+                        span: ast::span(start, span.end),
+                        function_start: start,
+                    },
+                )
+            },
+            _ => Option::None,
+        }
+    } else {};
+    let static_member = if at(parser, lexer::TokenKind::StaticKeyword)
+        && lookahead_token(parser, 1).kind != lexer::TokenKind::LParen
+        && lookahead_token(parser, 1).kind != lexer::TokenKind::Assign
+        && lookahead_token(parser, 1).kind != lexer::TokenKind::Semicolon
+        && lookahead_token(parser, 1).kind != lexer::TokenKind::RBrace {
+        bump(parser);
+        true
+    } else {
+        false
+    };
+    let function_start = current_token(parser).span.start;
+    let asynchronous = if starts_async_class_method(parser) {
+        bump(parser);
+        true
+    } else {
+        false
+    };
+    let generator = if at(parser, lexer::TokenKind::Star) {
+        bump(parser);
+        true
+    } else {
+        false
+    };
+    let kind = if starts_class_accessor(parser) {
+        let modifier = bump(parser);
+        if modifier.value == "get" {
+            ast::ClassElementKind::Getter
+        } else {
+            ast::ClassElementKind::Setter
+        }
+    } else {
+        ast::ClassElementKind::Method
+    };
+    let name_token = current_token(parser);
+    let private_member = name_token.kind == lexer::TokenKind::PrivateIdentifier;
+    let mut name_end = name_token.span.end;
+    let computed_name = if name_token.kind == lexer::TokenKind::LBracket {
+        bump(parser);
+        let expression = if at(parser, lexer::TokenKind::RBracket) {
+            error_expr(parser, "expected computed class element name")
+        } else {
+            parse_assignment_expression(parser)
+        };
+        name_end = finish_right_bracket(parser, expr_end(expression));
+        Option::Some(Ref::new(expression))
+    } else {
+        Option::None
+    };
+    let name = if computed_name.is_some() {
+        ""
+    } else if private_member || is_identifier_name(name_token.kind)
+        || name_token.kind == lexer::TokenKind::String
+        || name_token.kind == lexer::TokenKind::Number {
+        bump(parser);
+        name_token.value
+    } else {
+        report(parser, "expected class element name", convert_span(name_token.span));
+        synchronize_class_element(parser);
+        return Option::None
+    };
+    if !at(parser, lexer::TokenKind::LParen) {
+        if kind != ast::ClassElementKind::Method {
+            report(parser, "class accessor requires a parameter list", missing_span(parser))
+        } else {};
+        if computed_name.is_none() && !private_member && !static_member && name == "constructor" {
+            report(parser, "class field cannot be named constructor", convert_span(name_token.span))
+        } else {};
+        let initializer = if at(parser, lexer::TokenKind::Assign) {
+            bump(parser);
+            if at(parser, lexer::TokenKind::Semicolon) || at(parser, lexer::TokenKind::RBrace) {
+                Option::Some(Ref::new(error_expr(parser, "expected class field initializer")))
+            } else {
+                Option::Some(Ref::new(parse_assignment_expression(parser)))
+            }
+        } else {
+            Option::None
+        };
+        let mut end = match initializer {
+            Some(value) => expr_end(value.get()),
+            None => name_end,
+        };
+        if at(parser, lexer::TokenKind::Semicolon) {
+            end = bump(parser).span.end;
+        } else if at(parser, lexer::TokenKind::RBrace) || current_token(parser).line_break_before {} else {
+            report(parser, "expected `;` after class field", missing_span(parser));
+            synchronize_class_element(parser)
+        };
+        return Option::Some(
+            ast::ClassElement {
+                name,
+                private_member,
+                computed_name,
+                kind: ast::ClassElementKind::Field,
+                static_member,
+                generator: false,
+                asynchronous: false,
+                initializer,
+                parameters: Vec::[],
+                body: Vec::[],
+                span: ast::span(start, end),
+                function_start,
+            },
+        )
+    } else {};
+    if (asynchronous || generator) && computed_name.is_none() && !private_member && !static_member
+        && name == "constructor" {
+        report(
+            parser,
+            if asynchronous {
+                "class constructor cannot be async"
+            } else {
+                "class constructor cannot be a generator"
+            },
+            ast::span(start, name_end),
+        )
+    } else {};
+    let parameters = parse_function_parameters(parser);
+    if kind == ast::ClassElementKind::Getter && !parameters.is_empty() {
+        report(parser, "getter must not have parameters", ast::span(start, name_end))
+    } else if kind == ast::ClassElementKind::Setter && parameters.len() != 1 {
+        report(parser, "setter must have exactly one parameter", ast::span(start, name_end))
+    } else {};
+    let body: Vec[ast::Stmt] = Vec::[];
+    let end = if at(parser, lexer::TokenKind::LBrace) {
+        match parse_block_statement(parser) {
+            ast::Stmt::Block { body: statements, span } => {
+                for statement in statements {
+                    body.push(statement)
+                }
+                span.end
+            },
+            _ => name_end,
+        }
+    } else {
+        report(parser, "expected class method body", missing_span(parser));
+        name_end
+    };
+    Option::Some(
+        ast::ClassElement {
+            name,
+            private_member,
+            computed_name,
+            kind,
+            static_member,
+            generator,
+            asynchronous,
+            initializer: Option::None,
+            parameters,
+            body,
+            span: ast::span(start, end),
+            function_start,
+        },
+    )
+}
+
+fn validate_private_class_element(
+    parser: Parser,
+    elements: Vec[ast::ClassElement],
+    element: ast::ClassElement,
+) -> unit {
+    if !element.private_member {
+        return
+    } else {};
+    for previous in elements {
+        if previous.private_member && previous.name == element.name {
+            let accessor_pair = previous.static_member == element.static_member
+                && (previous.kind == ast::ClassElementKind::Getter
+                    && element.kind == ast::ClassElementKind::Setter
+                    || previous.kind == ast::ClassElementKind::Setter
+                        && element.kind == ast::ClassElementKind::Getter);
+            if !accessor_pair {
+                report(parser, "duplicate private class element", element.span)
+            } else {}
+        } else {}
+    }
+}
+
+fn parse_class_parts(parser: Parser, declaration: bool) -> ParsedClass {
+    let keyword = bump(parser);
+    let name_token = current_token(parser);
+    let name = if name_token.kind == lexer::TokenKind::Identifier {
+        bump(parser);
+        if name_token.is_reserved {
+            report(
+                parser,
+                "reserved word cannot be used as a class name",
+                convert_span(name_token.span),
+            )
+        } else {};
+        Option::Some(name_token.value)
+    } else {
+        if declaration {
+            report(parser, "expected class name", convert_span(name_token.span))
+        } else {};
+        Option::None
+    };
+    let heritage = if at(parser, lexer::TokenKind::ExtendsKeyword) {
+        bump(parser);
+        if at(parser, lexer::TokenKind::LBrace) || at_eof(parser) {
+            Option::Some(Ref::new(error_expr(parser, "expected class heritage expression")))
+        } else {
+            Option::Some(Ref::new(parse_assignment_expression(parser)))
+        }
+    } else {
+        Option::None
+    };
+    let elements: Vec[ast::ClassElement] = Vec::[];
+    let mut end = match name {
+        Some(_) => name_token.span.end,
+        None => keyword.span.end,
+    };
+    let mut constructors = 0;
+    if at(parser, lexer::TokenKind::LBrace) {
+        bump(parser);
+        while !at_eof(parser) && !at(parser, lexer::TokenKind::RBrace) {
+            if at(parser, lexer::TokenKind::Semicolon) {
+                end = bump(parser).span.end;
+            } else {
+                match parse_class_element(parser) {
+                    Some(element) => {
+                        validate_private_class_element(parser, elements, element);
+                        if !element.static_member && element.kind == ast::ClassElementKind::Method
+                            && !element.private_member
+                            && element.name == "constructor" {
+                            constructors += 1;
+                            if constructors > 1 {
+                                report(parser, "duplicate class constructor", element.span)
+                            } else {}
+                        } else {};
+                        end = element.span.end;
+                        elements.push(element);
+                    },
+                    None => (),
+                }
+            }
+        }
+        if at(parser, lexer::TokenKind::RBrace) {
+            end = bump(parser).span.end;
+        } else {
+            report(parser, "expected `}` after class body", missing_span(parser))
+        }
+    } else {
+        report(parser, "expected `{` after class header", missing_span(parser))
+    };
+    ParsedClass { start: keyword.span.start, name, heritage, elements, end }
+}
+
+fn parse_class_declaration(parser: Parser) -> ast::Stmt {
+    let parsed_class = parse_class_parts(parser, true);
+    ast::Stmt::ClassDeclaration {
+        name: parsed_class.name.unwrap_or(""),
+        heritage: parsed_class.heritage,
+        elements: parsed_class.elements,
+        span: ast::span(parsed_class.start, parsed_class.end),
+    }
+}
+
+fn parse_class_expression(parser: Parser) -> ast::Expr {
+    let parsed_class = parse_class_parts(parser, false);
+    ast::Expr::Class {
+        name: parsed_class.name,
+        heritage: parsed_class.heritage,
+        elements: parsed_class.elements,
+        span: ast::span(parsed_class.start, parsed_class.end),
+    }
+}
+
+fn parse_condition(parser: Parser) -> ast::Expr {
+    if at(parser, lexer::TokenKind::LParen) {
+        bump(parser);
+    } else {
+        report(parser, "expected `(`", missing_span(parser));
+    };
+    let test = if at(parser, lexer::TokenKind::RParen) || at(parser, lexer::TokenKind::LBrace) {
+        error_expr(parser, "expected condition")
+    } else {
+        parse_expression(parser)
+    };
+    finish_right_paren(parser, "expected `)` after condition");
+    test
+}
+
+fn parse_required_statement(parser: Parser) -> ast::Stmt {
+    if at_eof(parser) || at(parser, lexer::TokenKind::RBrace)
+        || at(parser, lexer::TokenKind::ElseKeyword) {
+        let span = missing_span(parser);
+        report(parser, "expected statement", span);
+        ast::Stmt::Empty { span }
+    } else {
+        parse_statement(parser)
+    }
+}
+
+fn parse_if_statement(parser: Parser) -> ast::Stmt {
+    let start = bump(parser).span.start;
+    let test = parse_condition(parser);
+    let consequent = parse_required_statement(parser);
+    let mut end = stmt_end(consequent);
+    let alternate = if at(parser, lexer::TokenKind::ElseKeyword) {
+        bump(parser);
+        let value = parse_required_statement(parser);
+        end = stmt_end(value);
+        Option::Some(Ref::new(value))
+    } else {
+        Option::None
+    };
+    ast::Stmt::If {
+        test: Ref::new(test),
+        consequent: Ref::new(consequent),
+        alternate,
+        span: ast::span(start, end),
+    }
+}
+
+fn parse_while_statement(parser: Parser) -> ast::Stmt {
+    let start = bump(parser).span.start;
+    let test = parse_condition(parser);
+    let body = parse_required_statement(parser);
+    let end = stmt_end(body);
+    ast::Stmt::While { test: Ref::new(test), body: Ref::new(body), span: ast::span(start, end) }
+}
+
+fn parse_with_statement(parser: Parser) -> ast::Stmt {
+    let start = bump(parser).span.start;
+    if at(parser, lexer::TokenKind::LParen) {
+        bump(parser);
+    } else {
+        report(parser, "expected `(` after `with`", missing_span(parser));
+    };
+    let object = if at(parser, lexer::TokenKind::RParen) {
+        error_expr(parser, "expected with object")
+    } else {
+        parse_expression(parser)
+    };
+    finish_right_paren(parser, "expected `)` after with object");
+    let body = parse_required_statement(parser);
+    let end = stmt_end(body);
+    ast::Stmt::With { object: Ref::new(object), body: Ref::new(body), span: ast::span(start, end) }
+}
+
+fn parse_for_statement(parser: Parser) -> ast::Stmt {
+    let start = bump(parser).span.start;
+    if at(parser, lexer::TokenKind::LParen) {
+        bump(parser);
+    } else {
+        report(parser, "expected `(` after `for`", missing_span(parser));
+    };
+    if at(parser, lexer::TokenKind::LetKeyword) || at(parser, lexer::TokenKind::ConstKeyword)
+        || at(parser, lexer::TokenKind::VarKeyword) {
+        let saved = parser.index.get();
+        let saved_errors = parser.errors.len();
+        let kind_token = bump(parser);
+        let pattern = parse_variable_binding_pattern(parser);
+        if kind_token.kind == lexer::TokenKind::VarKeyword && binding_pattern_is_identifier(pattern)
+            && at(parser, lexer::TokenKind::Assign) {
+            bump(parser);
+            let initialized = parse_assignment_expression(parser);
+            match initialized {
+                ast::Expr::Binary {
+                    operator: ast::BinaryOperator::In,
+                    left: initializer,
+                    right: object,
+                    ..,
+                } => {
+                    let name = match pattern {
+                        ast::BindingPattern::Identifier { name, .. } => name,
+                        _ => "",
+                    };
+                    let _ = finish_right_paren(parser, "expected `)` after for-in clauses");
+                    let body = parse_required_statement(parser);
+                    let end = stmt_end(body);
+                    return ast::Stmt::ForIn {
+                        kind: ast::VariableKind::Var,
+                        name,
+                        pattern: Ref::new(pattern),
+                        initializer: Option::Some(initializer),
+                        target: Option::None,
+                        object,
+                        body: Ref::new(body),
+                        span: ast::span(start, end),
+                    }
+                },
+                _ => (),
+            }
+        } else {};
+        let separator = current_token(parser);
+        let for_of = separator.kind == lexer::TokenKind::Identifier && separator.value == "of"
+            && !separator.has_escape;
+        let for_in = separator.kind == lexer::TokenKind::InKeyword && !separator.has_escape;
+        if for_of || for_in {
+            let kind = variable_kind(kind_token.kind);
+            let name = match pattern {
+                ast::BindingPattern::Identifier { name, .. } => name,
+                _ => "",
+            };
+            bump(parser);
+            let source = if at(parser, lexer::TokenKind::RParen) || at_eof(parser) {
+                error_expr(
+                    parser,
+                    if for_of {
+                        "expected iterable expression"
+                    } else {
+                        "expected object expression"
+                    },
+                )
+            } else {
+                parse_expression(parser)
+            };
+            let _ = finish_right_paren(
+                parser,
+                if for_of {
+                    "expected `)` after for-of clauses"
+                } else {
+                    "expected `)` after for-in clauses"
+                },
+            );
+            let body = parse_required_statement(parser);
+            let end = stmt_end(body);
+            return if for_of {
+                ast::Stmt::ForOf {
+                    kind,
+                    name,
+                    pattern: Ref::new(pattern),
+                    target: Option::None,
+                    iterable: Ref::new(source),
+                    body: Ref::new(body),
+                    span: ast::span(start, end),
+                }
+            } else {
+                ast::Stmt::ForIn {
+                    kind,
+                    name,
+                    pattern: Ref::new(pattern),
+                    initializer: Option::None,
+                    target: Option::None,
+                    object: Ref::new(source),
+                    body: Ref::new(body),
+                    span: ast::span(start, end),
+                }
+            }
+        } else {
+            parser.index.set(saved);
+            while parser.errors.len() > saved_errors {
+                let _ = parser.errors.pop();
+            }
+        }
+    } else {};
+    let initializer = if at(parser, lexer::TokenKind::Semicolon) {
+        bump(parser);
+        Option::None
+    } else if at(parser, lexer::TokenKind::LetKeyword) || at(parser, lexer::TokenKind::ConstKeyword)
+        || at(parser, lexer::TokenKind::VarKeyword) {
+        Option::Some(Ref::new(parse_variable_declaration(parser, true)))
+    } else {
+        let expression = parse_expression(parser);
+        if current_token(parser).kind == lexer::TokenKind::Identifier
+            && current_token(parser).value == "of"
+            && !current_token(parser).has_escape {
+            if !assignment_target(expression) {
+                report(parser, "invalid for-of assignment target", ast::expr_span(expression))
+            } else {};
+            bump(parser);
+            let iterable = if at(parser, lexer::TokenKind::RParen) || at_eof(parser) {
+                error_expr(parser, "expected iterable expression")
+            } else {
+                parse_expression(parser)
+            };
+            let _ = finish_right_paren(parser, "expected `)` after for-of clauses");
+            let body = parse_required_statement(parser);
+            let end = stmt_end(body);
+            return ast::Stmt::ForOf {
+                kind: ast::VariableKind::Var,
+                name: "",
+                pattern: Ref::new(
+                    ast::BindingPattern::Identifier { name: "", span: ast::expr_span(expression) },
+                ),
+                target: Option::Some(Ref::new(expression)),
+                iterable: Ref::new(iterable),
+                body: Ref::new(body),
+                span: ast::span(start, end),
+            }
+        } else {};
+        match expression {
+            ast::Expr::Binary { operator: ast::BinaryOperator::In, left, right, .. } => {
+                if !assignment_target(left.get()) {
+                    report(parser, "invalid for-in assignment target", ast::expr_span(left.get()))
+                } else {};
+                let _ = finish_right_paren(parser, "expected `)` after for-in clauses");
+                let body = parse_required_statement(parser);
+                let end = stmt_end(body);
+                return ast::Stmt::ForIn {
+                    kind: ast::VariableKind::Var,
+                    name: "",
+                    pattern: Ref::new(
+                        ast::BindingPattern::Identifier {
+                            name: "",
+                            span: ast::expr_span(left.get()),
+                        },
+                    ),
+                    initializer: Option::None,
+                    target: Option::Some(left),
+                    object: right,
+                    body: Ref::new(body),
+                    span: ast::span(start, end),
+                }
+            },
+            _ => (),
+        };
+        let expression_start = ast::expr_span(expression).start;
+        let end = consume_for_semicolon(parser, expr_end(expression));
+        Option::Some(
+            Ref::new(
+                ast::Stmt::Expression {
+                    expression: Ref::new(expression),
+                    span: ast::span(expression_start, end),
+                },
+            ),
+        )
+    };
+    let test = if at(parser, lexer::TokenKind::Semicolon) {
+        bump(parser);
+        Option::None
+    } else if at(parser, lexer::TokenKind::RParen) {
+        report(parser, "expected `;` in for statement", missing_span(parser));
+        Option::None
+    } else {
+        let expression = parse_expression(parser);
+        let _ = consume_for_semicolon(parser, expr_end(expression));
+        Option::Some(Ref::new(expression))
+    };
+    let update = if at(parser, lexer::TokenKind::RParen) {
+        Option::None
+    } else if at_eof(parser) || at(parser, lexer::TokenKind::LBrace) {
+        report(parser, "expected update expression or `)`", missing_span(parser));
+        Option::None
+    } else {
+        Option::Some(Ref::new(parse_expression(parser)))
+    };
+    let _ = finish_right_paren(parser, "expected `)` after for clauses");
+    let body = parse_required_statement(parser);
+    let end = stmt_end(body);
+    ast::Stmt::For { initializer, test, update, body: Ref::new(body), span: ast::span(start, end) }
+}
+
+fn parse_do_while_statement(parser: Parser) -> ast::Stmt {
+    let start = bump(parser).span.start;
+    let body = parse_required_statement(parser);
+    let mut end = stmt_end(body);
+    let test = if at(parser, lexer::TokenKind::WhileKeyword) {
+        bump(parser);
+        let expression = parse_condition(parser);
+        end = consume_statement_terminator(parser, expr_end(expression));
+        expression
+    } else {
+        let span = missing_span(parser);
+        report(parser, "expected `while` after do statement", span);
+        ast::Expr::Error { span }
+    };
+    ast::Stmt::DoWhile { body: Ref::new(body), test: Ref::new(test), span: ast::span(start, end) }
+}
+
+fn parse_switch_case(parser: Parser, seen_default: Ref[bool]) -> ast::SwitchCase {
+    let label = bump(parser);
+    let test = if label.kind == lexer::TokenKind::CaseKeyword {
+        if at(parser, lexer::TokenKind::Colon) {
+            Option::Some(Ref::new(error_expr(parser, "expected expression after `case`")))
+        } else {
+            Option::Some(Ref::new(parse_expression(parser)))
+        }
+    } else {
+        if seen_default.get() {
+            report(parser, "duplicate `default` clause", convert_span(label.span))
+        } else {
+            seen_default.set(true)
+        };
+        Option::None
+    };
+    let mut end = if at(parser, lexer::TokenKind::Colon) {
+        bump(parser).span.end
+    } else {
+        report(parser, "expected `:` after switch clause", missing_span(parser));
+        match test {
+            Some(value) => expr_end(value.get()),
+            None => label.span.end,
+        }
+    };
+    let consequent: Vec[ast::Stmt] = Vec::[];
+    while !at_eof(parser) && !at(parser, lexer::TokenKind::RBrace)
+        && !at(parser, lexer::TokenKind::CaseKeyword)
+        && !at(parser, lexer::TokenKind::DefaultKeyword) {
+        let before = parser.index.get();
+        let statement = parse_statement(parser);
+        end = stmt_end(statement);
+        consequent.push(statement);
+        if parser.index.get() == before {
+            report_current(parser, "unable to recover in switch clause");
+            bump(parser);
+        } else {}
+    }
+    ast::SwitchCase { test, consequent, span: ast::span(label.span.start, end) }
+}
+
+fn parse_switch_statement(parser: Parser) -> ast::Stmt {
+    let start = bump(parser).span.start;
+    let discriminant = parse_condition(parser);
+    let cases: Vec[ast::SwitchCase] = Vec::[];
+    let seen_default = Ref::new(false);
+    let mut end = expr_end(discriminant);
+    if at(parser, lexer::TokenKind::LBrace) {
+        bump(parser);
+        while !at_eof(parser) && !at(parser, lexer::TokenKind::RBrace) {
+            if at(parser, lexer::TokenKind::CaseKeyword)
+                || at(parser, lexer::TokenKind::DefaultKeyword) {
+                let clause = parse_switch_case(parser, seen_default);
+                end = clause.span.end;
+                cases.push(clause);
+            } else {
+                report(
+                    parser,
+                    "expected `case` or `default` in switch statement",
+                    missing_span(parser),
+                );
+                let before = parser.index.get();
+                let statement = parse_statement(parser);
+                end = stmt_end(statement);
+                let span = ast::stmt_span(statement);
+                cases.push(
+                    ast::SwitchCase {
+                        test: Option::Some(Ref::new(ast::Expr::Error { span })),
+                        consequent: Vec::[statement],
+                        span,
+                    },
+                );
+                if parser.index.get() == before {
+                    bump(parser);
+                } else {}
+            }
+        }
+        if at(parser, lexer::TokenKind::RBrace) {
+            end = bump(parser).span.end;
+        } else {
+            report(parser, "expected `}` after switch clauses", missing_span(parser))
+        }
+    } else {
+        report(parser, "expected `{` after switch discriminant", missing_span(parser))
+    };
+    ast::Stmt::Switch { discriminant: Ref::new(discriminant), cases, span: ast::span(start, end) }
+}
+
+fn parse_break_statement(parser: Parser) -> ast::Stmt {
+    let keyword = bump(parser);
+    let label = if !current_token(parser).line_break_before
+        && at(parser, lexer::TokenKind::Identifier) {
+        Option::Some(bump(parser).value)
+    } else {
+        Option::None
+    };
+    let fallback_end = if label.is_some() {
+        lookahead_token(parser, -1).span.end
+    } else {
+        keyword.span.end
+    };
+    let end = consume_statement_terminator(parser, fallback_end);
+    ast::Stmt::Break { label, span: ast::span(keyword.span.start, end) }
+}
+
+fn parse_continue_statement(parser: Parser) -> ast::Stmt {
+    let keyword = bump(parser);
+    let label = if !current_token(parser).line_break_before
+        && at(parser, lexer::TokenKind::Identifier) {
+        Option::Some(bump(parser).value)
+    } else {
+        Option::None
+    };
+    let fallback_end = if label.is_some() {
+        lookahead_token(parser, -1).span.end
+    } else {
+        keyword.span.end
+    };
+    let end = consume_statement_terminator(parser, fallback_end);
+    ast::Stmt::Continue { label, span: ast::span(keyword.span.start, end) }
+}
+
+fn parse_labelled_statement(parser: Parser) -> ast::Stmt {
+    let label = bump(parser);
+    bump(parser);
+    let body = parse_required_statement(parser);
+    ast::Stmt::Labelled {
+        label: label.value,
+        body: Ref::new(body),
+        span: ast::span(label.span.start, stmt_end(body)),
+    }
+}
+
+fn parse_return_statement(parser: Parser) -> ast::Stmt {
+    let keyword = bump(parser);
+    let mut fallback_end = keyword.span.end;
+    let argument = if at(parser, lexer::TokenKind::Semicolon) || at_eof(parser)
+        || at(parser, lexer::TokenKind::RBrace)
+        || current_token(parser).line_break_before {
+        Option::None
+    } else {
+        let value = parse_expression(parser);
+        fallback_end = expr_end(value);
+        Option::Some(Ref::new(value))
+    };
+    let end = consume_statement_terminator(parser, fallback_end);
+    ast::Stmt::Return { argument, span: ast::span(keyword.span.start, end) }
+}
+
+fn parse_throw_statement(parser: Parser) -> ast::Stmt {
+    let keyword = bump(parser);
+    let mut fallback_end = keyword.span.end;
+    let argument = if current_token(parser).line_break_before {
+        let span = missing_span(parser);
+        report(parser, "line terminator is not allowed after `throw`", span);
+        ast::Expr::Error { span }
+    } else if at(parser, lexer::TokenKind::Semicolon) || at_eof(parser)
+        || at(parser, lexer::TokenKind::RBrace) {
+        error_expr(parser, "expected expression after `throw`")
+    } else {
+        let value = parse_expression(parser);
+        fallback_end = expr_end(value);
+        value
+    };
+    let end = consume_statement_terminator(parser, fallback_end);
+    ast::Stmt::Throw { argument: Ref::new(argument), span: ast::span(keyword.span.start, end) }
+}
+
+fn parse_block_statement(parser: Parser) -> ast::Stmt {
+    let open = bump(parser);
+    let body: Vec[ast::Stmt] = Vec::[];
+    while !at_eof(parser) && !at(parser, lexer::TokenKind::RBrace) {
+        let before = parser.index.get();
+        body.push(parse_statement(parser));
+        if parser.index.get() == before {
+            report_current(parser, "unable to recover at statement boundary");
+            bump(parser);
+        } else {}
+    }
+    let end = if at(parser, lexer::TokenKind::RBrace) {
+        bump(parser).span.end
+    } else {
+        report(parser, "expected `}`", missing_span(parser));
+        current_token(parser).span.end
+    };
+    ast::Stmt::Block { body, span: ast::span(open.span.start, end) }
+}
+
+fn parse_try_block(parser: Parser, message: string) -> (Vec[ast::Stmt], ast::Span) {
+    if at(parser, lexer::TokenKind::LBrace) {
+        match parse_block_statement(parser) {
+            ast::Stmt::Block { body, span } => (body, span),
+            _ => (Vec::[], missing_span(parser)),
+        }
+    } else {
+        let span = missing_span(parser);
+        report(parser, message, span);
+        (Vec::[], span)
+    }
+}
+
+fn parse_catch_clause(parser: Parser) -> ast::CatchClause {
+    let keyword = bump(parser);
+    let pattern = if at(parser, lexer::TokenKind::LParen) {
+        bump(parser);
+        let value = if at(parser, lexer::TokenKind::RParen) {
+            report(parser, "expected catch binding", missing_span(parser));
+            Option::None
+        } else {
+            Option::Some(Ref::new(parse_catch_binding_pattern(parser)))
+        };
+        finish_right_paren(parser, "expected `)` after catch binding");
+        value
+    } else {
+        Option::None
+    };
+    let binding = match pattern {
+        Some(value) => match value.get() {
+            ast::BindingPattern::Identifier { name, .. } => Option::Some(name),
+            _ => Option::None,
+        },
+        None => Option::None,
+    };
+    let (body, span) = parse_try_block(parser, "expected `{` after catch clause");
+    ast::CatchClause { binding, pattern, body, span: ast::span(keyword.span.start, span.end) }
+}
+
+fn parse_try_statement(parser: Parser) -> ast::Stmt {
+    let start = bump(parser).span.start;
+    let (block, try_span) = parse_try_block(parser, "expected `{` after `try`");
+    let mut end = try_span.end;
+    let handler = if at(parser, lexer::TokenKind::CatchKeyword) {
+        let value = parse_catch_clause(parser);
+        end = value.span.end;
+        Option::Some(value)
+    } else {
+        Option::None
+    };
+    let finalizer = if at(parser, lexer::TokenKind::FinallyKeyword) {
+        bump(parser);
+        let (body, span) = parse_try_block(parser, "expected `{` after `finally`");
+        end = span.end;
+        Option::Some(body)
+    } else {
+        Option::None
+    };
+    if handler.is_none() && finalizer.is_none() {
+        report(
+            parser,
+            "try statement requires catch or finally",
+            ast::span(try_span.end, try_span.end),
+        )
+    } else {};
+    ast::Stmt::Try { block, handler, finalizer, span: ast::span(start, end) }
+}
+
+fn parse_expression_statement(parser: Parser) -> ast::Stmt {
+    let expression = parse_expression(parser);
+    let start = ast::expr_span(expression).start;
+    let end = consume_statement_terminator(parser, expr_end(expression));
+    ast::Stmt::Expression { expression: Ref::new(expression), span: ast::span(start, end) }
+}
+
+fn parse_debugger_statement(parser: Parser) -> ast::Stmt {
+    let token = bump(parser);
+    let end = consume_statement_terminator(parser, token.span.end);
+    ast::Stmt::Debugger { span: ast::span(token.span.start, end) }
+}
+
+fn parse_module_binding_name(parser: Parser, message: string) -> (string, int) {
+    let token = current_token(parser);
+    if is_identifier_name(token.kind) {
+        bump(parser);
+        (token.value, token.span.end)
+    } else {
+        report(parser, message, missing_span(parser));
+        ("", token.span.start)
+    }
+}
+
+fn parse_module_source(parser: Parser, message: string) -> (string, int) {
+    if at(parser, lexer::TokenKind::String) {
+        let token = bump(parser);
+        (token.value, token.span.end)
+    } else {
+        report(parser, message, missing_span(parser));
+        ("", current_token(parser).span.start)
+    }
+}
+
+fn consume_from(parser: Parser, message: string) -> unit {
+    if at(parser, lexer::TokenKind::Identifier) && current_token(parser).value == "from" {
+        bump(parser);
+    } else {
+        report(parser, message, missing_span(parser))
+    }
+}
+
+fn import_attribute_exists(attributes: Vec[ast::ImportAttribute], key: string) -> bool {
+    for attribute in attributes {
+        if attribute.key == key {
+            return true
+        } else {}
+    }
+    false
+}
+
+fn parse_import_attributes(parser: Parser, initial_end: int) -> (Vec[ast::ImportAttribute], int) {
+    let attributes: Vec[ast::ImportAttribute] = Vec::[];
+    let mut end = initial_end;
+    if !at(parser, lexer::TokenKind::WithKeyword) {
+        return (attributes, end)
+    } else {};
+    end = bump(parser).span.end;
+    if at(parser, lexer::TokenKind::LBrace) {
+        end = bump(parser).span.end;
+    } else {
+        report(parser, "expected `{` after import attributes", missing_span(parser));
+        return (attributes, end)
+    };
+    while !at_eof(parser) && !at(parser, lexer::TokenKind::RBrace) {
+        let token = current_token(parser);
+        let key = if token.kind == lexer::TokenKind::String || is_identifier_name(token.kind) {
+            bump(parser);
+            token.value
+        } else {
+            report(parser, "expected import attribute name", convert_span(token.span));
+            bump(parser);
+            ""
+        };
+        if at(parser, lexer::TokenKind::Colon) {
+            bump(parser);
+        } else {
+            report(parser, "expected `:` after import attribute name", missing_span(parser))
+        };
+        let value_token = current_token(parser);
+        let value = if value_token.kind == lexer::TokenKind::String {
+            end = bump(parser).span.end;
+            value_token.value
+        } else {
+            report(
+                parser,
+                "import attribute value must be a string",
+                convert_span(value_token.span),
+            );
+            if !at_eof(parser) && !at(parser, lexer::TokenKind::Comma)
+                && !at(parser, lexer::TokenKind::RBrace) {
+                end = bump(parser).span.end;
+            } else {};
+            ""
+        };
+        if import_attribute_exists(attributes, key) {
+            report(parser, "duplicate import attribute `" + key + "`", convert_span(token.span))
+        } else {
+            attributes.push(
+                ast::ImportAttribute { key, value, span: ast::span(token.span.start, end) },
+            )
+        };
+        if at(parser, lexer::TokenKind::Comma) {
+            end = bump(parser).span.end;
+        } else {
+            break
+        }
+    }
+    if at(parser, lexer::TokenKind::RBrace) {
+        end = bump(parser).span.end;
+    } else {
+        report(parser, "expected `}` after import attributes", missing_span(parser))
+    };
+    (attributes, end)
+}
+
+fn parse_import_statement(parser: Parser) -> ast::Stmt {
+    let keyword = bump(parser);
+    let mut end = keyword.span.end;
+    if at(parser, lexer::TokenKind::String) {
+        let (source, source_end) = parse_module_source(parser, "expected import module string");
+        let (attributes, attributes_end) = parse_import_attributes(parser, source_end);
+        end = consume_statement_terminator(parser, attributes_end);
+        return ast::Stmt::ImportSideEffect {
+            source,
+            attributes,
+            span: ast::span(keyword.span.start, end),
+        }
+    } else {};
+    if at(parser, lexer::TokenKind::Star) {
+        end = bump(parser).span.end;
+        if at(parser, lexer::TokenKind::Identifier) && current_token(parser).value == "as" {
+            end = bump(parser).span.end;
+        } else {
+            report(parser, "expected `as` after import namespace", missing_span(parser))
+        };
+        let (local, local_end) = parse_module_binding_name(parser, "expected import binding name");
+        end = local_end;
+        consume_from(parser, "expected `from` after import binding");
+        let (source, source_end) = parse_module_source(parser, "expected import module string");
+        let (attributes, attributes_end) = parse_import_attributes(parser, source_end);
+        end = consume_statement_terminator(parser, attributes_end);
+        return ast::Stmt::ImportNamespace {
+            local,
+            source,
+            attributes,
+            span: ast::span(keyword.span.start, end),
+        }
+    } else if at(parser, lexer::TokenKind::LBrace) {
+        bump(parser);
+        let specifiers: Vec[ast::ImportSpecifier] = Vec::[];
+        while !at_eof(parser) && !at(parser, lexer::TokenKind::RBrace) {
+            let start = current_token(parser).span.start;
+            let (imported, imported_end) = parse_module_binding_name(
+                parser,
+                "expected imported name",
+            );
+            let mut local = imported;
+            let mut specifier_end = imported_end;
+            if at(parser, lexer::TokenKind::Identifier) && current_token(parser).value == "as" {
+                bump(parser);
+                let (value, value_end) = parse_module_binding_name(
+                    parser,
+                    "expected local import name",
+                );
+                local = value;
+                specifier_end = value_end;
+            } else {};
+            specifiers.push(
+                ast::ImportSpecifier { imported, local, span: ast::span(start, specifier_end) },
+            );
+            if at(parser, lexer::TokenKind::Comma) {
+                bump(parser);
+            } else {
+                break
+            }
+        }
+        if at(parser, lexer::TokenKind::RBrace) {
+            end = bump(parser).span.end;
+        } else {
+            report(parser, "expected `}` after import specifiers", missing_span(parser))
+        };
+        consume_from(parser, "expected `from` after import specifiers");
+        let (source, source_end) = parse_module_source(parser, "expected import module string");
+        let (attributes, attributes_end) = parse_import_attributes(parser, source_end);
+        end = consume_statement_terminator(parser, attributes_end);
+        return ast::Stmt::ImportNamed {
+            specifiers,
+            source,
+            attributes,
+            span: ast::span(keyword.span.start, end),
+        }
+    } else if at(parser, lexer::TokenKind::Identifier) && !current_token(parser).is_reserved {
+        let start = current_token(parser).span.start;
+        let (local, local_end) = parse_module_binding_name(
+            parser,
+            "expected default import binding",
+        );
+        consume_from(parser, "expected `from` after default import");
+        let (source, source_end) = parse_module_source(parser, "expected import module string");
+        let (attributes, attributes_end) = parse_import_attributes(parser, source_end);
+        end = consume_statement_terminator(parser, attributes_end);
+        return ast::Stmt::ImportNamed {
+            specifiers: Vec::[
+                ast::ImportSpecifier {
+                    imported: "default",
+                    local,
+                    span: ast::span(start, local_end),
+                },
+            ],
+            source,
+            attributes,
+            span: ast::span(keyword.span.start, end),
+        }
+    } else {
+        report(parser, "expected import clause", missing_span(parser))
+    };
+    end = synchronize_statement(parser);
+    ast::Stmt::ImportSideEffect {
+        source: "",
+        attributes: Vec::[],
+        span: ast::span(keyword.span.start, end),
+    }
+}
+
+fn parse_export_specifiers(parser: Parser) -> (Vec[ast::ExportSpecifier], int) {
+    let specifiers: Vec[ast::ExportSpecifier] = Vec::[];
+    let mut end = bump(parser).span.end;
+    while !at_eof(parser) && !at(parser, lexer::TokenKind::RBrace) {
+        let start = current_token(parser).span.start;
+        let (local, local_end) = parse_module_binding_name(parser, "expected exported name");
+        let mut exported = local;
+        let mut specifier_end = local_end;
+        if at(parser, lexer::TokenKind::Identifier) && current_token(parser).value == "as" {
+            bump(parser);
+            let (value, value_end) = parse_module_binding_name(parser, "expected export alias");
+            exported = value;
+            specifier_end = value_end;
+        } else {};
+        specifiers.push(
+            ast::ExportSpecifier { local, exported, span: ast::span(start, specifier_end) },
+        );
+        if at(parser, lexer::TokenKind::Comma) {
+            bump(parser);
+        } else {
+            break
+        }
+    }
+    if at(parser, lexer::TokenKind::RBrace) {
+        end = bump(parser).span.end;
+    } else {
+        report(parser, "expected `}` after export specifiers", missing_span(parser))
+    };
+    (specifiers, end)
+}
+
+fn parse_export_statement(parser: Parser) -> ast::Stmt {
+    let keyword = bump(parser);
+    if at(parser, lexer::TokenKind::DefaultKeyword) {
+        let default_token = bump(parser);
+        let expression = if is_expression_boundary(current_kind(parser)) {
+            error_expr(parser, "expected default export expression")
+        } else {
+            parse_assignment_expression(parser)
+        };
+        let end = consume_statement_terminator(parser, expr_end(expression));
+        ast::Stmt::ExportDefault {
+            expression: Ref::new(expression),
+            local: "$module_default@" + default_token.span.start.to_string(),
+            span: ast::span(keyword.span.start, end),
+        }
+    } else if at(parser, lexer::TokenKind::Star) {
+        bump(parser);
+        consume_from(parser, "expected `from` after export star");
+        let (source, source_end) = parse_module_source(parser, "expected export module string");
+        let (attributes, attributes_end) = parse_import_attributes(parser, source_end);
+        let end = consume_statement_terminator(parser, attributes_end);
+        ast::Stmt::ExportAll { source, attributes, span: ast::span(keyword.span.start, end) }
+    } else if at(parser, lexer::TokenKind::FunctionKeyword) {
+        let declaration = parse_function_declaration(parser, false);
+        let end = ast::stmt_span(declaration).end;
+        ast::Stmt::ExportDeclaration {
+            declaration: Ref::new(declaration),
+            span: ast::span(keyword.span.start, end),
+        }
+    } else if at(parser, lexer::TokenKind::Identifier) && current_token(parser).value == "async"
+        && !current_token(parser).has_escape
+        && !lookahead_token(parser, 1).line_break_before
+        && lookahead_token(parser, 1).kind == lexer::TokenKind::FunctionKeyword {
+        bump(parser);
+        let declaration = parse_function_declaration(parser, true);
+        let end = ast::stmt_span(declaration).end;
+        ast::Stmt::ExportDeclaration {
+            declaration: Ref::new(declaration),
+            span: ast::span(keyword.span.start, end),
+        }
+    } else if at(parser, lexer::TokenKind::ClassKeyword) {
+        let declaration = parse_class_declaration(parser);
+        let end = ast::stmt_span(declaration).end;
+        ast::Stmt::ExportDeclaration {
+            declaration: Ref::new(declaration),
+            span: ast::span(keyword.span.start, end),
+        }
+    } else if at(parser, lexer::TokenKind::LetKeyword) || at(parser, lexer::TokenKind::ConstKeyword)
+        || at(parser, lexer::TokenKind::VarKeyword) {
+        let declaration = parse_variable_statement(parser);
+        let end = ast::stmt_span(declaration).end;
+        ast::Stmt::ExportDeclaration {
+            declaration: Ref::new(declaration),
+            span: ast::span(keyword.span.start, end),
+        }
+    } else if at(parser, lexer::TokenKind::LBrace) {
+        let (specifiers, mut end) = parse_export_specifiers(parser);
+        let source = if at(parser, lexer::TokenKind::Identifier)
+            && current_token(parser).value == "from" {
+            bump(parser);
+            let (value, source_end) = parse_module_source(
+                parser,
+                "expected re-export module string",
+            );
+            end = source_end;
+            Option::Some(value)
+        } else {
+            Option::None
+        };
+        let attributes = match source {
+            Some(_) => {
+                let (values, attributes_end) = parse_import_attributes(parser, end);
+                end = attributes_end;
+                values
+            },
+            None => Vec::[],
+        };
+        end = consume_statement_terminator(parser, end);
+        ast::Stmt::ExportNamed {
+            specifiers,
+            source,
+            attributes,
+            span: ast::span(keyword.span.start, end),
+        }
+    } else {
+        report(parser, "unsupported export clause", missing_span(parser));
+        let end = synchronize_statement(parser);
+        ast::Stmt::ExportNamed {
+            specifiers: Vec::[],
+            source: Option::None,
+            attributes: Vec::[],
+            span: ast::span(keyword.span.start, end),
+        }
+    }
+}
+
+fn parse_statement(parser: Parser) -> ast::Stmt {
+    if at(parser, lexer::TokenKind::Identifier) && current_token(parser).value == "async"
+        && !current_token(parser).has_escape
+        && !lookahead_token(parser, 1).line_break_before
+        && lookahead_token(parser, 1).kind == lexer::TokenKind::FunctionKeyword {
+        bump(parser);
+        return parse_function_declaration(parser, true)
+    } else {};
+    if at(parser, lexer::TokenKind::Identifier)
+        && lookahead_token(parser, 1).kind == lexer::TokenKind::Colon {
+        return parse_labelled_statement(parser)
+    } else {};
+    match current_kind(parser) {
+        Semicolon => {
+            let token = bump(parser);
+            ast::Stmt::Empty { span: convert_span(token.span) }
+        },
+        DebuggerKeyword => parse_debugger_statement(parser),
+        LBrace => parse_block_statement(parser),
+        LetKeyword | ConstKeyword | VarKeyword => parse_variable_statement(parser),
+        ImportKeyword => if lookahead_token(parser, 1).kind == lexer::TokenKind::LParen
+            || lookahead_token(parser, 1).kind == lexer::TokenKind::Dot {
+            parse_expression_statement(parser)
+        } else {
+            parse_import_statement(parser)
+        },
+        ExportKeyword => parse_export_statement(parser),
+        FunctionKeyword => parse_function_declaration(parser, false),
+        ClassKeyword => parse_class_declaration(parser),
+        IfKeyword => parse_if_statement(parser),
+        DoKeyword => parse_do_while_statement(parser),
+        WhileKeyword => parse_while_statement(parser),
+        WithKeyword => parse_with_statement(parser),
+        ForKeyword => parse_for_statement(parser),
+        SwitchKeyword => parse_switch_statement(parser),
+        BreakKeyword => parse_break_statement(parser),
+        ContinueKeyword => parse_continue_statement(parser),
+        ReturnKeyword => parse_return_statement(parser),
+        ThrowKeyword => parse_throw_statement(parser),
+        TryKeyword => parse_try_statement(parser),
+        RParen | RBracket | RBrace => {
+            let token = bump(parser);
+            let span = convert_span(token.span);
+            report(parser, "unexpected closing delimiter", span);
+            ast::Stmt::Empty { span }
+        },
+        _ => parse_expression_statement(parser),
+    }
+}
+
+fn parser_from_lexed(value: lexer::LexResult) -> Parser {
+    let errors: Vec[ParseError] = Vec::[];
+    for error in value.errors {
+        errors.push(ParseError { message: error.message, span: convert_span(error.span) })
+    }
+    Parser { tokens: value.tokens, index: Ref::new(0), errors }
+}
+
+pub fn parse(source: string) -> ParseResult {
+    let parser = parser_from_lexed(lexer::lex(source));
+    let body: Vec[ast::Stmt] = Vec::[];
+    while !at_eof(parser) {
+        let before = parser.index.get();
+        body.push(parse_statement(parser));
+        if parser.index.get() == before {
+            report_current(parser, "unable to recover at statement boundary");
+            bump(parser);
+        } else {}
+    }
+    let end = current_token(parser).span.end;
+    ParseResult { program: ast::Program { body, span: ast::span(0, end) }, errors: parser.errors }
+}

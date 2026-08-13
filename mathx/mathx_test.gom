@@ -1,0 +1,322 @@
+package mathx;
+
+use std::math;
+use std::num;
+use std::testing;
+
+fn parsed(value: string) -> float64 {
+    num::parse_float64(value).unwrap_or(0.0)
+}
+
+fn assert_close(actual: float64, expected: float64, tolerance: float64) -> unit {
+    let difference = absolute(actual - expected);
+    let scale = if absolute(expected) > 1.0 {
+        absolute(expected)
+    } else {
+        1.0
+    };
+    if difference > tolerance * scale {
+        testing::fail("actual=" + actual.to_string() + " expected=" + expected.to_string())
+    } else {}
+}
+
+fn assert_positive_zero(value: float64) -> unit {
+    testing::assert(value == 0.0);
+    testing::assert(!has_negative_sign(value))
+}
+
+fn assert_negative_zero(value: float64) -> unit {
+    testing::assert(value == 0.0);
+    testing::assert(has_negative_sign(value))
+}
+
+#[test]
+fn clz32_applies_ecmascript_uint32_conversion() -> unit {
+    testing::assert_eq(clz32(0.0), 32);
+    testing::assert_eq(clz32(not_a_number()), 32);
+    testing::assert_eq(clz32(positive_infinity()), 32);
+    testing::assert_eq(clz32(-1.0), 0);
+    testing::assert_eq(clz32(1.0), 31);
+    testing::assert_eq(clz32(3.9), 30);
+    testing::assert_eq(clz32(2147483648.0), 0);
+    testing::assert_eq(clz32(4294967296.0), 32);
+    testing::assert_eq(clz32(4294967297.0), 31)
+}
+
+#[test]
+fn imul_multiplies_low_words_with_signed_result() -> unit {
+    testing::assert_eq(imul(4294967295.0, 5.0), (-5).to_int32());
+    testing::assert_eq(imul(2147483647.0, 2.0), (-2).to_int32());
+    testing::assert_eq(imul(4294967299.0, 7.0), 21.to_int32());
+    testing::assert_eq(imul(-1.5, 2.0), (-2).to_int32());
+    testing::assert_eq(imul(not_a_number(), 9.0), 0.to_int32())
+}
+
+#[test]
+fn fround_rounds_ieee_midpoints_subnormals_and_overflow() -> unit {
+    testing::assert_eq(fround(1.337), 1.3370000123977661);
+    testing::assert_eq(fround(1.0000000596046448), 1.0);
+    testing::assert_eq(fround(1.0000001788139343), 1.000000238418579);
+    testing::assert_eq(fround(7.006492321624085e-46), 0.0);
+    testing::assert_eq(fround(2.1019476964872256e-45), 2.802596928649634e-45);
+    testing::assert_eq(fround(3.4028234663852886e38), 3.4028234663852886e38);
+    testing::assert(math::is_infinite(fround(3.4028235677973366e38)))
+}
+
+#[test]
+fn fround_preserves_nan_infinity_and_signed_zero() -> unit {
+    testing::assert(math::is_nan(fround(not_a_number())));
+    testing::assert_eq(fround(positive_infinity()), positive_infinity());
+    testing::assert_eq(fround(-positive_infinity()), -positive_infinity());
+    assert_positive_zero(fround(0.0));
+    assert_negative_zero(fround(copy_sign(0.0, -1.0)))
+}
+
+#[test]
+fn f16round_matches_binary16_midpoints_subnormals_and_overflow() -> unit {
+    testing::assert_eq(f16round(1.337), 1.3369140625);
+    testing::assert_eq(f16round(1.00048828125), 1.0);
+    testing::assert_eq(f16round(1.00146484375), 1.001953125);
+    testing::assert_eq(f16round(2.9802322387695312e-8), 0.0);
+    testing::assert_eq(f16round(8.940696716308594e-8), 1.1920928955078125e-7);
+    testing::assert_eq(f16round(5.9604644775390625e-8), 5.9604644775390625e-8);
+    testing::assert_eq(f16round(65504.0), 65504.0);
+    testing::assert_eq(f16round(65519.0), 65504.0);
+    testing::assert(math::is_infinite(f16round(65520.0)))
+}
+
+#[test]
+fn f16round_preserves_special_values_and_bit_roundtrips() -> unit {
+    testing::assert(math::is_nan(f16round(not_a_number())));
+    testing::assert_eq(f16round(positive_infinity()), positive_infinity());
+    testing::assert_eq(f16round(-positive_infinity()), -positive_infinity());
+    assert_positive_zero(f16round(0.0));
+    assert_negative_zero(f16round(copy_sign(0.0, -1.0)));
+    testing::assert_eq(float16_bits(1.0), 0x3c00);
+    testing::assert_eq(float16_bits(-2.0), 0xc000);
+    testing::assert_eq(float16_from_bits(0x7bff), 65504.0);
+    testing::assert(math::is_nan(float16_from_bits(0x7c01)))
+}
+
+#[test]
+fn float16_codec_roundtrips_every_non_nan_encoding() -> unit {
+    let mut encoded = 0;
+    while encoded < 65536 {
+        let bits = encoded.to_uint16();
+        let magnitude = bits & 0x7fff;
+        let actual = float16_bits(float16_from_bits(bits));
+        if magnitude > 0x7c00 {
+            testing::assert_eq(actual, bits & 0x8000 | 0x7c01)
+        } else {
+            testing::assert_eq(actual, bits)
+        };
+        encoded += 1;
+    }
+}
+
+#[test]
+fn hypot_scales_extremes_and_prioritizes_infinity_over_nan() -> unit {
+    assert_positive_zero(hypot(Vec::[]));
+    assert_positive_zero(hypot(Vec::[copy_sign(0.0, -1.0)]));
+    testing::assert_eq(hypot(Vec::[3.0, 4.0]), 5.0);
+    let large = parsed("1e308");
+    assert_close(hypot(Vec::[large, large]), parsed("1.4142135623730951e308"), 2e-16);
+    testing::assert_eq(
+        hypot(Vec::[4.9406564584124654e-324, 4.9406564584124654e-324]),
+        4.9406564584124654e-324,
+    );
+    testing::assert(math::is_infinite(hypot(Vec::[not_a_number(), positive_infinity()])));
+    testing::assert(math::is_nan(hypot(Vec::[not_a_number(), 3.0])))
+}
+
+#[test]
+fn cbrt_handles_special_values_and_full_exponent_range() -> unit {
+    assert_positive_zero(cbrt(0.0));
+    assert_negative_zero(cbrt(copy_sign(0.0, -1.0)));
+    testing::assert(math::is_nan(cbrt(not_a_number())));
+    testing::assert_eq(cbrt(positive_infinity()), positive_infinity());
+    testing::assert_eq(cbrt(-positive_infinity()), -positive_infinity());
+    testing::assert_eq(cbrt(8.0), 2.0);
+    assert_close(cbrt(-27.0), -3.0, 2e-16);
+    assert_close(cbrt(1e-300), 1e-100, 2e-16);
+    assert_close(cbrt(parsed("1e300")), 1e100, 2e-16);
+    assert_close(cbrt(4.9406564584124654e-324), 1.7031839360032601e-108, 3e-16)
+}
+
+#[test]
+fn log1p_is_stable_near_zero_and_obeys_domain_boundaries() -> unit {
+    assert_positive_zero(log1p(0.0));
+    assert_negative_zero(log1p(copy_sign(0.0, -1.0)));
+    testing::assert_eq(log1p(1e-20), 1e-20);
+    testing::assert_eq(log1p(-1e-20), -1e-20);
+    assert_close(log1p(0.5), 0.4054651081081644, 2e-16);
+    assert_close(log1p(-0.5), -0.6931471805599453, 2e-16);
+    testing::assert(math::is_infinite(log1p(-1.0)) && log1p(-1.0) < 0.0);
+    testing::assert(math::is_nan(log1p(-1.0000000000000002)));
+    testing::assert_eq(log1p(positive_infinity()), positive_infinity());
+    testing::assert(math::is_nan(log1p(not_a_number())))
+}
+
+#[test]
+fn expm1_is_stable_near_zero_and_obeys_infinite_boundaries() -> unit {
+    assert_positive_zero(expm1(0.0));
+    assert_negative_zero(expm1(copy_sign(0.0, -1.0)));
+    testing::assert_eq(expm1(1e-20), 1e-20);
+    testing::assert_eq(expm1(-1e-20), -1e-20);
+    assert_close(expm1(0.5), 0.6487212707001282, 2e-16);
+    assert_close(expm1(-0.5), -0.3934693402873666, 2e-16);
+    assert_close(expm1(10.0), 22025.465794806718, 2e-16);
+    testing::assert_eq(expm1(-positive_infinity()), -1.0);
+    testing::assert_eq(expm1(positive_infinity()), positive_infinity());
+    testing::assert(math::is_nan(expm1(not_a_number())))
+}
+
+#[test]
+fn logarithmic_extensions_match_quickjs_across_reduced_ranges() -> unit {
+    assert_close(log1p(-0.9999999999999999), -36.7368005696771, 3e-16);
+    assert_close(log1p(-0.9), -2.302585092994046, 3e-16);
+    assert_close(log1p(-0.3), -0.35667494393873234, 3e-16);
+    assert_close(log1p(-1e-10), -1.00000000005e-10, 3e-16);
+    assert_close(log1p(1e-10), 9.999999999500001e-11, 3e-16);
+    assert_close(log1p(1e20), 46.051701859880914, 3e-16);
+    assert_close(log1p(parsed("1.7976931348623157e308")), 709.782712893384, 3e-16);
+    assert_close(expm1(-20.0), -0.9999999979388464, 3e-16);
+    assert_close(expm1(-2.0), -0.8646647167633873, 3e-16);
+    assert_close(expm1(-0.1), -0.09516258196404043, 3e-16);
+    assert_close(expm1(0.1), 0.10517091807564763, 3e-16);
+    assert_close(expm1(2.0), 6.38905609893065, 3e-16);
+    assert_close(expm1(20.0), 485165194.4097903, 3e-16);
+    assert_close(expm1(700.0), parsed("1.0142320547350045e304"), 3e-16)
+}
+
+#[test]
+fn hyperbolic_functions_match_quickjs_values_and_signed_zero() -> unit {
+    assert_positive_zero(sinh(0.0));
+    assert_negative_zero(sinh(copy_sign(0.0, -1.0)));
+    assert_positive_zero(tanh(0.0));
+    assert_negative_zero(tanh(copy_sign(0.0, -1.0)));
+    testing::assert_eq(cosh(0.0), 1.0);
+    assert_close(sinh(0.5), 0.5210953054937474, 3e-16);
+    assert_close(cosh(0.5), 1.1276259652063807, 3e-16);
+    assert_close(tanh(0.5), 0.46211715726000974, 3e-16);
+    assert_close(sinh(10.0), 11013.232874703393, 3e-16);
+    assert_close(cosh(10.0), 11013.232920103324, 3e-16);
+    assert_close(tanh(10.0), 0.9999999958776927, 2e-16)
+}
+
+#[test]
+fn hyperbolic_functions_handle_large_and_infinite_values() -> unit {
+    testing::assert(math::is_finite(sinh(710.0)));
+    testing::assert(math::is_finite(cosh(710.0)));
+    assert_close(sinh(710.0), parsed("1.1169973830808557e308"), 3e-16);
+    assert_close(cosh(710.0), parsed("1.1169973830808557e308"), 3e-16);
+    testing::assert_eq(sinh(positive_infinity()), positive_infinity());
+    testing::assert_eq(sinh(-positive_infinity()), -positive_infinity());
+    testing::assert_eq(cosh(-positive_infinity()), positive_infinity());
+    testing::assert_eq(tanh(positive_infinity()), 1.0);
+    testing::assert_eq(tanh(-positive_infinity()), -1.0);
+    testing::assert(math::is_nan(sinh(not_a_number())));
+    testing::assert(math::is_nan(cosh(not_a_number())));
+    testing::assert(math::is_nan(tanh(not_a_number())))
+}
+
+#[test]
+fn inverse_hyperbolic_functions_match_quickjs_values() -> unit {
+    assert_close(asinh(0.5), 0.48121182505960347, 3e-16);
+    assert_close(asinh(1.0), 0.881373587019543, 3e-16);
+    assert_close(asinh(10.0), 2.99822295029797, 3e-16);
+    assert_close(acosh(1.5), 0.9624236501192069, 3e-16);
+    assert_close(acosh(2.0), 1.3169578969248166, 3e-16);
+    assert_close(acosh(10.0), 2.993222846126381, 3e-16);
+    assert_close(atanh(0.5), 0.5493061443340548, 3e-16);
+    assert_close(atanh(0.9), 1.4722194895832204, 3e-16)
+}
+
+#[test]
+fn inverse_hyperbolic_functions_cover_near_domain_and_large_ranges() -> unit {
+    testing::assert_eq(asinh(1e-300), 1e-300);
+    assert_close(asinh(1e10), 23.7189981105004, 3e-16);
+    assert_close(asinh(parsed("1e300")), 691.4686750787736, 3e-16);
+    assert_close(acosh(1.0000000000000002), 2.1073424255447017e-8, 3e-16);
+    assert_close(acosh(1e10), 23.7189981105004, 3e-16);
+    assert_close(acosh(parsed("1e300")), 691.4686750787736, 3e-16)
+}
+
+#[test]
+fn inverse_hyperbolic_functions_obey_domains_and_signed_zero() -> unit {
+    assert_positive_zero(asinh(0.0));
+    assert_negative_zero(asinh(copy_sign(0.0, -1.0)));
+    assert_positive_zero(acosh(1.0));
+    assert_positive_zero(atanh(0.0));
+    assert_negative_zero(atanh(copy_sign(0.0, -1.0)));
+    testing::assert(math::is_nan(acosh(0.9999999999999999)));
+    testing::assert(math::is_nan(atanh(1.0000000000000002)));
+    testing::assert_eq(asinh(positive_infinity()), positive_infinity());
+    testing::assert_eq(acosh(positive_infinity()), positive_infinity());
+    testing::assert_eq(atanh(1.0), positive_infinity());
+    testing::assert_eq(atanh(-1.0), -positive_infinity())
+}
+
+#[test]
+fn atan2_distinguishes_all_zero_and_infinity_quadrants() -> unit {
+    let negative_zero = copy_sign(0.0, -1.0);
+    assert_positive_zero(atan2(0.0, 1.0));
+    assert_negative_zero(atan2(negative_zero, 1.0));
+    testing::assert_eq(atan2(0.0, -1.0), PI);
+    testing::assert_eq(atan2(negative_zero, -1.0), -PI);
+    testing::assert_eq(atan2(1.0, 0.0), PI * 0.5);
+    testing::assert_eq(atan2(-1.0, negative_zero), -PI * 0.5);
+    testing::assert_eq(atan2(positive_infinity(), positive_infinity()), PI * 0.25);
+    testing::assert_eq(atan2(positive_infinity(), -positive_infinity()), PI * 0.75);
+    testing::assert_eq(atan2(-positive_infinity(), positive_infinity()), -PI * 0.25);
+    testing::assert_eq(atan2(-positive_infinity(), -positive_infinity()), -PI * 0.75);
+    assert_positive_zero(atan2(1.0, positive_infinity()));
+    assert_negative_zero(atan2(-1.0, positive_infinity()));
+    testing::assert(math::is_nan(atan2(not_a_number(), 1.0)))
+}
+
+#[test]
+fn atan2_reduces_finite_values_into_correct_quadrants() -> unit {
+    assert_close(atan2(1.0, 1.0), 0.7853981633974483, 2e-16);
+    assert_close(atan2(1.0, -1.0), 2.356194490192345, 2e-16);
+    assert_close(atan2(-1.0, -1.0), -2.356194490192345, 2e-16);
+    assert_close(atan2(-1.0, 1.0), -0.7853981633974483, 2e-16);
+    assert_close(atan2(parsed("1e300"), 1e-300), PI * 0.5, 2e-16)
+}
+
+#[test]
+fn inverse_trigonometric_functions_cover_domains_and_signed_zero() -> unit {
+    assert_positive_zero(atan(0.0));
+    assert_negative_zero(atan(copy_sign(0.0, -1.0)));
+    assert_positive_zero(asin(0.0));
+    assert_negative_zero(asin(copy_sign(0.0, -1.0)));
+    assert_close(atan(1.0), PI * 0.25, 2e-16);
+    assert_close(asin(0.5), PI / 6.0, 2e-16);
+    assert_close(acos(0.5), PI / 3.0, 2e-16);
+    testing::assert_eq(asin(1.0), PI * 0.5);
+    testing::assert_eq(acos(-1.0), PI);
+    testing::assert(math::is_nan(asin(1.0000000000000002)));
+    testing::assert(math::is_nan(acos(-1.0000000000000002)))
+}
+
+#[test]
+fn precise_sum_rounds_once_after_exact_accumulation() -> unit {
+    testing::assert_eq(sum_precise(Vec::[1e16, 1.0, -1e16]), 1.0);
+    testing::assert_eq(
+        sum_precise(Vec::[1.0, 1.1102230246251565e-16, 4.9406564584124654e-324]),
+        1.0000000000000002,
+    );
+    testing::assert_eq(sum_precise(Vec::[1.0, 1.1102230246251565e-16]), 1.0)
+}
+
+#[test]
+fn precise_sum_handles_special_values_and_zero_signs() -> unit {
+    assert_negative_zero(sum_precise(Vec::[]));
+    assert_negative_zero(sum_precise(Vec::[copy_sign(0.0, -1.0)]));
+    assert_positive_zero(sum_precise(Vec::[0.0]));
+    assert_positive_zero(sum_precise(Vec::[1.0, -1.0]));
+    testing::assert_eq(sum_precise(Vec::[positive_infinity(), 1.0]), positive_infinity());
+    testing::assert_eq(sum_precise(Vec::[-positive_infinity(), 1.0]), -positive_infinity());
+    testing::assert(math::is_nan(sum_precise(Vec::[positive_infinity(), -positive_infinity()])));
+    testing::assert(math::is_nan(sum_precise(Vec::[not_a_number(), 1.0])))
+}

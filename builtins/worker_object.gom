@@ -1,0 +1,743 @@
+package builtins;
+
+use gomlang::quickjs::arraybuffer;
+use gomlang::quickjs::runtime;
+use gomlang::quickjs::vm;
+use std::path;
+
+struct WorkerClone {
+    source_context: vm::Context,
+    target_context: vm::Context,
+    source_buffers: ArrayBufferInstall,
+    target_buffers: ArrayBufferInstall,
+    source_objects: Vec[runtime::ObjectId],
+    target_objects: Vec[Ref[Option[runtime::ObjectId]]],
+    depth: int,
+}
+
+struct WorkerEndpoint {
+    context: vm::Context,
+    buffers: ArrayBufferInstall,
+    handler: Ref[runtime::Value],
+    pending: Vec[runtime::Value],
+    peer: Ref[Option[WorkerEndpoint]],
+}
+
+fn worker_new_endpoint(context: vm::Context, buffers: ArrayBufferInstall) -> WorkerEndpoint {
+    WorkerEndpoint {
+        context,
+        buffers,
+        handler: Ref::new(runtime::Value::Undefined),
+        pending: Vec::[],
+        peer: Ref::new(Option::None),
+    }
+}
+
+fn worker_clone_index(clone: WorkerClone, object: runtime::ObjectId) -> Option[int] {
+    let mut index = 0;
+    while index < clone.source_objects.len() {
+        if clone.source_objects[index] == object {
+            return Option::Some(index)
+        } else {};
+        index += 1;
+    }
+    Option::None
+}
+
+fn worker_clone_slot(clone: WorkerClone, object: runtime::ObjectId) -> Ref[
+    Option[runtime::ObjectId],
+] {
+    clone.source_objects.push(object);
+    let slot: Ref[Option[runtime::ObjectId]] = Ref::new(Option::None);
+    clone.target_objects.push(slot);
+    slot
+}
+
+fn worker_clone_existing(clone: WorkerClone, object: runtime::ObjectId) -> Result[
+    Option[runtime::Value],
+    vm::VmError,
+] {
+    match worker_clone_index(clone, object) {
+        Some(index) => match clone.target_objects[index].get() {
+            Some(value) => Result::Ok(Option::Some(runtime::Value::Object(value))),
+            None => Result::Err(function_vm_error("unresolved structured clone reference")),
+        },
+        None => Result::Ok(Option::None),
+    }
+}
+
+fn worker_clone_define(
+    clone: WorkerClone,
+    object: runtime::ObjectId,
+    key: runtime::PropertyKey,
+    value: runtime::Value,
+) -> Result[unit, vm::VmError] {
+    if runtime::define_own_property(
+        clone.target_context.heap(),
+        object,
+        key,
+        runtime::data_descriptor(value, true, true, true),
+    ) {
+        Result::Ok(())
+    } else {
+        Result::Err(function_vm_error("cannot define structured clone property"))
+    }
+}
+
+fn worker_clone_properties(clone: WorkerClone, source: runtime::ObjectId, target: runtime::ObjectId) -> Result[
+    unit,
+    vm::VmError,
+] {
+    let object = match clone.source_context.heap().get(source) {
+        Some(value) => value,
+        None => return Result::Err(function_vm_error("structured clone source is not live")),
+    };
+    for key in runtime::own_property_keys(clone.source_context.heap(), source) {
+        let name = match key {
+            runtime::PropertyKey::String(value) => value,
+            runtime::PropertyKey::Symbol(_) => continue,
+        };
+        let descriptor = match object.own_property(key) {
+            Some(value) => value,
+            None => continue,
+        };
+        if !runtime::descriptor_enumerable(descriptor) {
+            continue
+        } else {};
+        let value = match runtime::descriptor_value(descriptor) {
+            Some(value) => value,
+            None => return Result::Err(
+                function_vm_error("structured clone does not support accessors"),
+            ),
+        };
+        worker_clone_define(
+            clone,
+            target,
+            runtime::js_string_property_key(name),
+            worker_clone_value(clone, value)?,
+        )?
+    }
+    Result::Ok(())
+}
+
+fn worker_clone_ordinary(
+    clone: WorkerClone,
+    source: runtime::ObjectId,
+    slot: Ref[Option[runtime::ObjectId]],
+) -> Result[runtime::Value, vm::VmError] {
+    let target = match runtime::new_ordinary_object(
+        clone.target_context.heap(),
+        clone.target_context.heap().object_prototype(),
+    ) {
+        Ok(value) => value,
+        Err(error) => return Result::Err(function_vm_error(error.message)),
+    };
+    slot.set(Option::Some(target));
+    worker_clone_properties(clone, source, target)?;
+    Result::Ok(runtime::Value::Object(target))
+}
+
+fn worker_clone_array_length(clone: WorkerClone, source: runtime::ObjectId) -> Result[
+    int,
+    vm::VmError,
+] {
+    json_builtin_array_length(clone.source_context, source, clone.depth)
+}
+
+fn worker_clone_array(
+    clone: WorkerClone,
+    source: runtime::ObjectId,
+    slot: Ref[Option[runtime::ObjectId]],
+) -> Result[runtime::Value, vm::VmError] {
+    let length = worker_clone_array_length(clone, source)?;
+    let target = match runtime::new_array(clone.target_context.heap(), length) {
+        Ok(value) => value,
+        Err(error) => return Result::Err(function_vm_error(error.message)),
+    };
+    slot.set(Option::Some(target));
+    let source_object = match clone.source_context.heap().get(source) {
+        Some(value) => value,
+        None => return Result::Err(function_vm_error("structured clone source is not live")),
+    };
+    let mut index = 0;
+    while index < length {
+        let descriptor = source_object.own_property(runtime::string_property_key(index.to_string()));
+        match descriptor {
+            Some(descriptor) => if runtime::descriptor_enumerable(descriptor) {
+                let value = match runtime::descriptor_value(descriptor) {
+                    Some(value) => value,
+                    None => return Result::Err(
+                        function_vm_error("structured clone does not support accessors"),
+                    ),
+                };
+                worker_clone_define(
+                    clone,
+                    target,
+                    runtime::string_property_key(index.to_string()),
+                    worker_clone_value(clone, value)?,
+                )?
+            } else {},
+            None => (),
+        };
+        index += 1;
+    }
+    Result::Ok(runtime::Value::Object(target))
+}
+
+fn worker_clone_buffer(
+    clone: WorkerClone,
+    source: runtime::ObjectId,
+    value: arraybuffer::ArrayBuffer,
+    slot: Ref[Option[runtime::ObjectId]],
+) -> Result[runtime::Value, vm::VmError] {
+    let constructor = if value.is_shared() {
+        clone.target_buffers.shared_array_buffer
+    } else {
+        clone.target_buffers.array_buffer
+    };
+    let target_value = clone.target_context.construct_with_new_target_at_depth(
+        constructor,
+        Vec::[runtime::Value::Int(0)],
+        constructor,
+        clone.depth,
+    )?;
+    let target = match target_value {
+        runtime::Value::Object(value) => value,
+        _ => return Result::Err(function_vm_error("buffer constructor returned no object")),
+    };
+    let target_buffer = if value.is_shared() {
+        value
+    } else {
+        let bytes = match value.to_bytes() {
+            Ok(value) => value,
+            Err(error) => return Result::Err(function_vm_error(error.to_string())),
+        };
+        let result = if value.is_resizable() {
+            arraybuffer::ArrayBuffer::from_bytes_resizable(
+                bytes.slice(0, bytes.len()),
+                value.max_byte_length(),
+            )
+        } else {
+            arraybuffer::ArrayBuffer::from_bytes(bytes.slice(0, bytes.len()))
+        };
+        match result {
+            Ok(value) => value,
+            Err(error) => return Result::Err(function_vm_error(error.to_string())),
+        }
+    };
+    let _ = source;
+    clone.target_buffers.buffer_states[target] = target_buffer;
+    slot.set(Option::Some(target));
+    Result::Ok(runtime::Value::Object(target))
+}
+
+fn worker_typed_constructor(buffers: ArrayBufferInstall, view: runtime::TypedArrayView) -> runtime::Value {
+    match view {
+        runtime::TypedArrayView::Uint8(_) => buffers.uint8_array,
+        runtime::TypedArrayView::Int32(_) => buffers.int32_array,
+        runtime::TypedArrayView::Float64(_) => buffers.float64_array,
+        runtime::TypedArrayView::Numeric(value) => match value.kind() {
+            arraybuffer::NumericArrayKind::Uint8Clamped => buffers.uint8_clamped_array,
+            arraybuffer::NumericArrayKind::Int8 => buffers.int8_array,
+            arraybuffer::NumericArrayKind::Int16 => buffers.int16_array,
+            arraybuffer::NumericArrayKind::Uint16 => buffers.uint16_array,
+            arraybuffer::NumericArrayKind::Uint32 => buffers.uint32_array,
+            arraybuffer::NumericArrayKind::Float16 => buffers.float16_array,
+            arraybuffer::NumericArrayKind::Float32 => buffers.float32_array,
+        },
+        runtime::TypedArrayView::BigInt(value) => match value.kind() {
+            arraybuffer::BigIntArrayKind::Signed => buffers.bigint64_array,
+            arraybuffer::BigIntArrayKind::Unsigned => buffers.biguint64_array,
+        },
+    }
+}
+
+fn worker_typed_offset(view: runtime::TypedArrayView) -> int {
+    match view {
+        runtime::TypedArrayView::Uint8(value) => value.byte_offset(),
+        runtime::TypedArrayView::Int32(value) => value.byte_offset(),
+        runtime::TypedArrayView::Float64(value) => value.byte_offset(),
+        runtime::TypedArrayView::Numeric(value) => value.byte_offset(),
+        runtime::TypedArrayView::BigInt(value) => value.byte_offset(),
+    }
+}
+
+fn worker_clone_typed_array(
+    clone: WorkerClone,
+    source: runtime::ObjectId,
+    view: runtime::TypedArrayView,
+    slot: Ref[Option[runtime::ObjectId]],
+) -> Result[runtime::Value, vm::VmError] {
+    let source_buffer = match runtime::typed_array_buffer_object(
+        clone.source_context.heap(),
+        source,
+    ) {
+        Some(value) => value,
+        None => return Result::Err(function_vm_error("typed array buffer is missing")),
+    };
+    let buffer = worker_clone_value(clone, runtime::Value::Object(source_buffer))?;
+    let length = match runtime::typed_array_element_length(clone.source_context.heap(), source) {
+        Some(value) => value,
+        None => return Result::Err(function_vm_error("typed array length is missing")),
+    };
+    let constructor = worker_typed_constructor(clone.target_buffers, view);
+    let target_value = clone.target_context.construct_with_new_target_at_depth(
+        constructor,
+        Vec::[
+            buffer,
+            runtime::Value::Int(worker_typed_offset(view).to_int32()),
+            runtime::Value::Int(length.to_int32()),
+        ],
+        constructor,
+        clone.depth,
+    )?;
+    let target = match target_value {
+        runtime::Value::Object(value) => value,
+        _ => return Result::Err(function_vm_error("typed array constructor returned no object")),
+    };
+    slot.set(Option::Some(target));
+    Result::Ok(target_value)
+}
+
+fn worker_target_global_value(clone: WorkerClone, name: string) -> Result[
+    runtime::Value,
+    vm::VmError,
+] {
+    let global = match clone.target_context.global_object() {
+        Some(value) => value,
+        None => return Result::Err(function_vm_error("target worker has no global object")),
+    };
+    match runtime::get_property(
+        clone.target_context.heap(),
+        global,
+        runtime::string_property_key(name),
+    ) {
+        Ok(Some(value)) => Result::Ok(value),
+        Ok(None) => Result::Err(function_vm_error("target worker is missing " + name)),
+        Err(error) => Result::Err(function_vm_error(error.message)),
+    }
+}
+
+fn worker_clone_date(
+    clone: WorkerClone,
+    source: runtime::ObjectId,
+    slot: Ref[Option[runtime::ObjectId]],
+) -> Result[runtime::Value, vm::VmError] {
+    let value_of = clone.source_context.read_property_at_depth(
+        runtime::Value::Object(source),
+        runtime::Value::String(js_string("valueOf")),
+        clone.depth,
+    )?;
+    let arguments: Vec[runtime::Value] = Vec::[];
+    let time = clone.source_context.invoke_with_this_at_depth(
+        value_of,
+        arguments,
+        runtime::Value::Object(source),
+        clone.depth,
+    )?;
+    let constructor = worker_target_global_value(clone, "Date")?;
+    let result = clone.target_context.construct_with_new_target_at_depth(
+        constructor,
+        Vec::[time],
+        constructor,
+        clone.depth,
+    )?;
+    let object = match result {
+        runtime::Value::Object(value) => value,
+        _ => return Result::Err(function_vm_error("Date constructor returned no object")),
+    };
+    slot.set(Option::Some(object));
+    Result::Ok(result)
+}
+
+fn worker_clone_boxed(
+    clone: WorkerClone,
+    value: runtime::Value,
+    slot: Ref[Option[runtime::ObjectId]],
+) -> Result[runtime::Value, vm::VmError] {
+    let kind = match value {
+        runtime::Value::Bool(_) => runtime::PrimitivePrototypeKind::Boolean,
+        runtime::Value::Int(_) | runtime::Value::Float(_) => {
+            runtime::PrimitivePrototypeKind::Number
+        },
+        runtime::Value::String(_) => runtime::PrimitivePrototypeKind::String,
+        runtime::Value::BigInt(_) => runtime::PrimitivePrototypeKind::BigInt,
+        _ => return Result::Err(function_vm_error("unsupported boxed primitive")),
+    };
+    let object = match runtime::new_ordinary_object(
+        clone.target_context.heap(),
+        clone.target_context.heap().primitive_prototype(kind),
+    ) {
+        Ok(value) => value,
+        Err(error) => return Result::Err(function_vm_error(error.message)),
+    };
+    if !runtime::set_primitive_value(clone.target_context.heap(), object, value) {
+        return Result::Err(function_vm_error("cannot initialize boxed primitive"))
+    } else {};
+    slot.set(Option::Some(object));
+    Result::Ok(runtime::Value::Object(object))
+}
+
+fn worker_clone_object(clone: WorkerClone, source: runtime::ObjectId) -> Result[
+    runtime::Value,
+    vm::VmError,
+] {
+    match worker_clone_existing(clone, source)? {
+        Some(value) => return Result::Ok(value),
+        None => (),
+    };
+    let slot = worker_clone_slot(clone, source);
+    match runtime::typed_array_view(clone.source_context.heap(), source) {
+        Some(view) => return worker_clone_typed_array(clone, source, view, slot),
+        None => (),
+    };
+    match clone.source_buffers.buffer_states.get(source) {
+        Some(value) => return worker_clone_buffer(clone, source, value, slot),
+        None => (),
+    };
+    match runtime::primitive_value(clone.source_context.heap(), source) {
+        Some(value) => return worker_clone_boxed(clone, value, slot),
+        None => (),
+    };
+    match clone.source_context.object_builtin_tag(source) {
+        Some(value) => match value.to_host_string() {
+            Ok(value) => if value == "Date" {
+                return worker_clone_date(clone, source, slot)
+            } else {},
+            Err(_) => (),
+        },
+        None => (),
+    };
+    let object = match clone.source_context.heap().get(source) {
+        Some(value) => value,
+        None => return Result::Err(function_vm_error("structured clone source is not live")),
+    };
+    match object.kind() {
+        runtime::ObjectKind::Ordinary => worker_clone_ordinary(clone, source, slot),
+        runtime::ObjectKind::Array => worker_clone_array(clone, source, slot),
+        runtime::ObjectKind::Function => Result::Err(
+            function_vm_error("functions cannot be cloned between workers"),
+        ),
+    }
+}
+
+fn worker_clone_value(clone: WorkerClone, value: runtime::Value) -> Result[
+    runtime::Value,
+    vm::VmError,
+] {
+    match value {
+        runtime::Value::Undefined => Result::Ok(runtime::Value::Undefined),
+        runtime::Value::Null => Result::Ok(runtime::Value::Null),
+        runtime::Value::Bool(value) => Result::Ok(runtime::Value::Bool(value)),
+        runtime::Value::Int(value) => Result::Ok(runtime::Value::Int(value)),
+        runtime::Value::Float(value) => Result::Ok(runtime::Value::Float(value)),
+        runtime::Value::String(value) => Result::Ok(runtime::Value::String(value)),
+        runtime::Value::BigInt(value) => Result::Ok(runtime::Value::BigInt(value)),
+        runtime::Value::Symbol(_) => Result::Err(
+            function_vm_error("symbols cannot be cloned between workers"),
+        ),
+        runtime::Value::Object(value) => worker_clone_object(clone, value),
+    }
+}
+
+fn worker_clone_message(
+    source: WorkerEndpoint,
+    target: WorkerEndpoint,
+    value: runtime::Value,
+    depth: int,
+) -> Result[runtime::Value, vm::VmError] {
+    worker_clone_value(
+        WorkerClone {
+            source_context: source.context,
+            target_context: target.context,
+            source_buffers: source.buffers,
+            target_buffers: target.buffers,
+            source_objects: Vec::[],
+            target_objects: Vec::[],
+            depth,
+        },
+        value,
+    )
+}
+
+fn worker_event(endpoint: WorkerEndpoint, value: runtime::Value) -> Result[
+    runtime::Value,
+    vm::VmError,
+] {
+    let object = match runtime::new_ordinary_object(
+        endpoint.context.heap(),
+        endpoint.context.heap().object_prototype(),
+    ) {
+        Ok(value) => value,
+        Err(error) => return Result::Err(function_vm_error(error.message)),
+    };
+    if !runtime::define_own_property(
+        endpoint.context.heap(),
+        object,
+        runtime::string_property_key("data"),
+        runtime::data_descriptor(value, true, true, true),
+    ) {
+        Result::Err(function_vm_error("cannot create Worker message event"))
+    } else {
+        Result::Ok(runtime::Value::Object(object))
+    }
+}
+
+fn worker_handler_callable(endpoint: WorkerEndpoint) -> bool {
+    match endpoint.handler.get() {
+        runtime::Value::Object(object) => object.is_callable()
+            && endpoint.context.heap().contains(object),
+        _ => false,
+    }
+}
+
+fn worker_deliver(endpoint: WorkerEndpoint, value: runtime::Value, depth: int) -> Result[
+    runtime::Value,
+    vm::VmError,
+] {
+    if !worker_handler_callable(endpoint) {
+        endpoint.pending.insert(0, value);
+        return Result::Ok(runtime::Value::Undefined)
+    } else {};
+    endpoint.context.invoke_with_this_at_depth(
+        endpoint.handler.get(),
+        Vec::[worker_event(endpoint, value)?],
+        runtime::Value::Undefined,
+        depth,
+    )
+}
+
+fn worker_schedule(endpoint: WorkerEndpoint) -> Result[unit, vm::VmError] {
+    if !worker_handler_callable(endpoint) {
+        return Result::Ok(())
+    } else {};
+    while !endpoint.pending.is_empty() {
+        let value = endpoint.pending.remove(0);
+        let callback = endpoint.context.new_vm_function(
+            |_, _, depth| {
+                worker_deliver(endpoint, value, depth)
+            },
+        )?;
+        let arguments: Vec[runtime::Value] = Vec::[];
+        endpoint.context.enqueue_host_job(callback, arguments)?
+    }
+    Result::Ok(())
+}
+
+fn worker_post_message(endpoint: WorkerEndpoint, arguments: Vec[runtime::Value], depth: int) -> Result[
+    runtime::Value,
+    vm::VmError,
+] {
+    let peer = match endpoint.peer.get() {
+        Some(value) => value,
+        None => return Result::Err(function_vm_error("Worker port is disconnected")),
+    };
+    let value = worker_clone_message(endpoint, peer, argument(arguments, 0), depth)?;
+    peer.pending.push(value);
+    worker_schedule(peer)?;
+    let _ = peer.context.run_pending_jobs_at_depth(depth)?;
+    Result::Ok(runtime::Value::Undefined)
+}
+
+fn worker_port_object(endpoint: WorkerEndpoint) -> Result[runtime::ObjectId, BuiltinError] {
+    let object = match runtime::new_ordinary_object(
+        endpoint.context.heap(),
+        endpoint.context.heap().object_prototype(),
+    ) {
+        Ok(value) => value,
+        Err(error) => return Result::Err(BuiltinError { message: error.message }),
+    };
+    let post_message = match endpoint.context.new_vm_function(
+        |_, arguments, depth| {
+            worker_post_message(endpoint, arguments, depth)
+        },
+    ) {
+        Ok(value) => value,
+        Err(error) => return Result::Err(BuiltinError { message: error.kind.debug() }),
+    };
+    let getter = match endpoint.context.new_vm_function(
+        |_, _, _| {
+            Result::Ok(endpoint.handler.get())
+        },
+    ) {
+        Ok(value) => value,
+        Err(error) => return Result::Err(BuiltinError { message: error.kind.debug() }),
+    };
+    let setter = match endpoint.context.new_vm_function(
+        |_, arguments, _| {
+            endpoint.handler.set(argument(arguments, 0));
+            worker_schedule(endpoint)?;
+            Result::Ok(runtime::Value::Undefined)
+        },
+    ) {
+        Ok(value) => value,
+        Err(error) => return Result::Err(BuiltinError { message: error.kind.debug() }),
+    };
+    if !runtime::define_own_property(
+        endpoint.context.heap(),
+        object,
+        runtime::string_property_key("postMessage"),
+        runtime::data_descriptor(post_message, true, false, true),
+    )
+        || !runtime::define_own_property(
+            endpoint.context.heap(),
+            object,
+            runtime::string_property_key("onmessage"),
+            runtime::accessor_descriptor(Option::Some(getter), Option::Some(setter), true, true),
+        ) {
+        return Result::Err(BuiltinError { message: "cannot initialize Worker port" })
+    } else {};
+    Result::Ok(object)
+}
+
+fn worker_property(context: vm::Context, object: runtime::ObjectId, name: string) -> Result[
+    runtime::Value,
+    vm::VmError,
+] {
+    match runtime::get_property(context.heap(), object, runtime::string_property_key(name)) {
+        Ok(Some(value)) => Result::Ok(value),
+        Ok(None) => Result::Err(function_vm_error("Worker runtime is missing " + name)),
+        Err(error) => Result::Err(function_vm_error(error.message)),
+    }
+}
+
+fn worker_source_path(context: vm::Context, value: runtime::Value) -> Result[string, vm::VmError] {
+    let source = match value {
+        runtime::Value::String(value) => match value.to_host_string() {
+            Ok(value) => value,
+            Err(error) => return Result::Err(function_vm_error(error.to_string())),
+        },
+        _ => return Result::Err(function_vm_error("Worker script path must be a string")),
+    };
+    if path::is_absolute(source) {
+        return Result::Ok(path::clean(source))
+    } else {};
+    let base = match context.current_module_path() {
+        Some(value) => match path::parent(value) {
+            Some(value) => value,
+            None => ".",
+        },
+        None => ".",
+    };
+    match path::absolute(path::join(base, source)) {
+        Ok(value) => Result::Ok(path::clean(value)),
+        Err(message) => Result::Err(function_vm_error(message)),
+    }
+}
+
+fn worker_install_parent(
+    child_context: vm::Context,
+    child_global: runtime::ObjectId,
+    endpoint: WorkerEndpoint,
+) -> Result[unit, vm::VmError] {
+    let os = match worker_property(child_context, child_global, "os")? {
+        runtime::Value::Object(value) => value,
+        _ => return Result::Err(function_vm_error("child os module is not an object")),
+    };
+    let constructor = match worker_property(child_context, os, "Worker")? {
+        runtime::Value::Object(value) => value,
+        _ => return Result::Err(function_vm_error("child Worker constructor is not an object")),
+    };
+    let parent = match worker_port_object(endpoint) {
+        Ok(value) => value,
+        Err(error) => return Result::Err(function_vm_error(error.message)),
+    };
+    if runtime::define_own_property(
+        child_context.heap(),
+        constructor,
+        runtime::string_property_key("parent"),
+        runtime::data_descriptor(runtime::Value::Object(parent), false, true, false),
+    ) {
+        Result::Ok(())
+    } else {
+        Result::Err(function_vm_error("cannot install Worker.parent"))
+    }
+}
+
+fn worker_initialize_receiver(
+    context: vm::Context,
+    buffers: ArrayBufferInstall,
+    receiver: runtime::ObjectId,
+    arguments: Vec[runtime::Value],
+    depth: int,
+) -> Result[runtime::Value, vm::VmError] {
+    let module_path = worker_source_path(context, argument(arguments, 0))?;
+    let child_context = vm::Context::new(runtime::Heap::new());
+    let child_realm = match install(child_context) {
+        Ok(value) => value,
+        Err(error) => return Result::Err(function_vm_error(error.message)),
+    };
+    let parent_endpoint = worker_new_endpoint(context, buffers);
+    let child_endpoint = worker_new_endpoint(child_context, child_realm.arraybuffer_install());
+    parent_endpoint.peer.set(Option::Some(child_endpoint));
+    child_endpoint.peer.set(Option::Some(parent_endpoint));
+    let parent_port = match worker_port_object(parent_endpoint) {
+        Ok(value) => value,
+        Err(error) => return Result::Err(function_vm_error(error.message)),
+    };
+    worker_install_parent(child_context, child_realm.global_object(), child_endpoint)?;
+    for name in Vec::["postMessage", "onmessage"] {
+        let descriptor = match context.heap().get(parent_port) {
+            Some(value) => value.own_property(runtime::string_property_key(name)),
+            None => Option::None,
+        };
+        let descriptor = match descriptor {
+            Some(value) => value,
+            None => return Result::Err(function_vm_error("Worker port property is missing")),
+        };
+        if !runtime::define_own_property(
+            context.heap(),
+            receiver,
+            runtime::string_property_key(name),
+            descriptor,
+        ) {
+            return Result::Err(function_vm_error("cannot initialize Worker instance"))
+        } else {}
+    }
+    match context.load_worker_module(child_context, child_realm.global_object(), module_path) {
+        Ok(_) => Result::Ok(runtime::Value::Object(receiver)),
+        Err(message) => Result::Err(function_vm_error(message)),
+    }
+}
+
+fn install_worker(context: vm::Context, os_object: runtime::ObjectId, buffers: ArrayBufferInstall) -> Result[
+    runtime::Value,
+    BuiltinError,
+] {
+    let prototype = match runtime::new_ordinary_object(
+        context.heap(),
+        context.heap().object_prototype(),
+    ) {
+        Ok(value) => value,
+        Err(error) => return Result::Err(BuiltinError { message: error.message }),
+    };
+    let constructor = allocate_vm_function_with_length(
+        context,
+        "Worker",
+        1,
+        |_, _, _| Result::Err(function_vm_error("Worker constructor requires new")),
+    )?;
+    match context.set_vm_constructor_callback(
+        constructor,
+        |receiver, arguments, selected_prototype, new_target, depth| {
+            let _ = new_target;
+            constructor_receiver_prototype(context.heap(), receiver, selected_prototype, prototype)?;
+            worker_initialize_receiver(context, buffers, receiver, arguments, depth)
+        },
+    ) {
+        Ok(()) => (),
+        Err(error) => return Result::Err(BuiltinError { message: error.kind.debug() }),
+    };
+    let function = function_object(constructor, "Worker")?;
+    define_value(
+        context.heap(),
+        function,
+        "prototype",
+        runtime::Value::Object(prototype),
+        false,
+        false,
+    )?;
+    define_value(context.heap(), prototype, "constructor", constructor, true, true)?;
+    define_value(context.heap(), os_object, "Worker", constructor, true, true)?;
+    Result::Ok(constructor)
+}

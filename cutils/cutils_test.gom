@@ -1,0 +1,123 @@
+package cutils;
+
+use std::testing;
+
+fn require_unit(result: Result[unit, ByteBufferError]) -> unit {
+    match result {
+        Result::Ok(()) => (),
+        Result::Err(error) => testing::fail(error.to_string()),
+    }
+}
+
+fn require_u16(result: Result[uint16, ByteBufferError]) -> uint16 {
+    match result {
+        Result::Ok(value) => value,
+        Result::Err(error) => {
+            testing::fail(error.to_string());
+            0.to_uint16()
+        },
+    }
+}
+
+fn require_u32(result: Result[uint32, ByteBufferError]) -> uint32 {
+    match result {
+        Result::Ok(value) => value,
+        Result::Err(error) => {
+            testing::fail(error.to_string());
+            0.to_uint32()
+        },
+    }
+}
+
+fn require_u64(result: Result[uint64, ByteBufferError]) -> uint64 {
+    match result {
+        Result::Ok(value) => value,
+        Result::Err(error) => {
+            testing::fail(error.to_string());
+            0.to_uint64()
+        },
+    }
+}
+
+#[test]
+fn cutils_appends_little_endian_fixed_width_values() -> unit {
+    let buffer = ByteBuffer::new();
+    buffer.append_u16_le(0x1234);
+    buffer.append_u32_le(0x89abcdef);
+    buffer.append_u64_le(0x0123456789abcdef);
+    testing::assert(
+        buffer.bytes()
+            == Vec::[
+                0x34,
+                0x12,
+                0xef,
+                0xcd,
+                0xab,
+                0x89,
+                0xef,
+                0xcd,
+                0xab,
+                0x89,
+                0x67,
+                0x45,
+                0x23,
+                0x01,
+            ],
+    );
+    testing::assert_eq(require_u16(buffer.read_u16_le(0)), 0x1234.to_uint16());
+    testing::assert_eq(require_u32(buffer.read_u32_le(2)), 0x89abcdef.to_uint32());
+    testing::assert_eq(require_u64(buffer.read_u64_le(6)), 0x0123456789abcdef.to_uint64())
+}
+
+#[test]
+fn cutils_writes_little_endian_values_at_offsets() -> unit {
+    let values: Vec[byte] = Vec::[0, 0, 0, 0, 0, 0, 0, 0];
+    require_unit(write_u16_le(values, 0, 0x1234));
+    testing::assert(values.slice(0, 2) == Vec::[0x34, 0x12].slice(0, 2));
+    require_unit(write_u32_le(values, 2, 0x89abcdef));
+    testing::assert(values.slice(2, 6) == Vec::[0xef, 0xcd, 0xab, 0x89].slice(0, 4));
+    require_unit(write_u64_le(values, 0, 0x0123456789abcdef));
+    testing::assert(values == Vec::[0xef, 0xcd, 0xab, 0x89, 0x67, 0x45, 0x23, 0x01])
+}
+
+#[test]
+fn cutils_rejects_out_of_bounds_ranges() -> unit {
+    let buffer = ByteBuffer::new();
+    buffer.append_bytes(Vec::[1, 2, 3].slice(0, 3));
+    testing::assert(buffer.read_u16_le(-1).is_err());
+    testing::assert(buffer.read_u16_le(2).is_err());
+    testing::assert(buffer.read_u32_le(0).is_err());
+    testing::assert(buffer.read_u64_le(0).is_err());
+    testing::assert(buffer.write_u16_le(2, 1).is_err());
+    testing::assert(buffer.insert(4, Vec::[9].slice(0, 1)).is_err());
+    testing::assert(buffer.append_self(1, 3).is_err());
+    testing::assert(buffer.copy_within(0, 2, 2).is_err())
+}
+
+#[test]
+fn cutils_inserts_bytes_and_clears_the_buffer() -> unit {
+    let buffer = ByteBuffer::with_capacity(1);
+    buffer.append_byte(1);
+    buffer.append_byte(4);
+    require_unit(buffer.insert(1, Vec::[2, 3].slice(0, 2)));
+    require_unit(buffer.insert(0, Vec::[0].slice(0, 1)));
+    require_unit(buffer.insert(buffer.len(), Vec::[5].slice(0, 1)));
+    testing::assert(buffer.bytes() == Vec::[0, 1, 2, 3, 4, 5]);
+    testing::assert_eq(buffer.len(), 6);
+    buffer.clear();
+    testing::assert(buffer.is_empty());
+    let empty: Vec[byte] = Vec::[];
+    testing::assert(buffer.bytes() == empty)
+}
+
+#[test]
+fn cutils_self_copy_is_overlap_safe() -> unit {
+    let forward = ByteBuffer::from_bytes(Vec::[1, 2, 3, 4, 5].slice(0, 5));
+    require_unit(forward.copy_within(0, 1, 4));
+    testing::assert(forward.bytes() == Vec::[1, 1, 2, 3, 4]);
+    let backward = ByteBuffer::from_bytes(Vec::[1, 2, 3, 4, 5].slice(0, 5));
+    require_unit(backward.copy_within(1, 0, 4));
+    testing::assert(backward.bytes() == Vec::[2, 3, 4, 5, 5]);
+    require_unit(backward.append_self(1, 3));
+    testing::assert(backward.bytes() == Vec::[2, 3, 4, 5, 5, 3, 4, 5])
+}

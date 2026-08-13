@@ -1,0 +1,971 @@
+package builtins;
+
+use gomlang::quickjs::dtoa;
+use gomlang::quickjs::json;
+use gomlang::quickjs::runtime;
+use gomlang::quickjs::vm;
+use std::math;
+use std::num;
+
+fn json_builtin_callable(value: runtime::Value) -> bool {
+    match value {
+        runtime::Value::Object(value) => value.is_callable(),
+        _ => false,
+    }
+}
+
+fn json_builtin_object(value: runtime::Value) -> Result[runtime::ObjectId, vm::VmError] {
+    match value {
+        runtime::Value::Object(value) => Result::Ok(value),
+        _ => Result::Err(function_vm_error("JSON holder is not an object")),
+    }
+}
+
+fn json_builtin_allocate_object(heap: runtime::Heap) -> Result[runtime::ObjectId, vm::VmError] {
+    match runtime::new_ordinary_object(heap, Option::None) {
+        Ok(value) => Result::Ok(value),
+        Err(value) => Result::Err(function_vm_error(value.message)),
+    }
+}
+
+fn json_builtin_define(
+    heap: runtime::Heap,
+    object: runtime::ObjectId,
+    key: runtime::JsString,
+    value: runtime::Value,
+) -> Result[unit, vm::VmError] {
+    if runtime::define_own_property(
+        heap,
+        object,
+        runtime::PropertyKey::String(key),
+        runtime::data_descriptor(value, true, true, true),
+    ) {
+        Result::Ok(())
+    } else {
+        Result::Err(function_vm_error("cannot define JSON property"))
+    }
+}
+
+fn json_builtin_enumerable_keys(heap: runtime::Heap, object: runtime::ObjectId) -> Result[
+    Vec[runtime::JsString],
+    vm::VmError,
+] {
+    let value = match heap.get(object) {
+        Some(value) => value,
+        None => return Result::Err(function_vm_error("JSON object is invalid")),
+    };
+    let keys: Vec[runtime::JsString] = Vec::[];
+    for key in runtime::own_property_keys(heap, object) {
+        match key {
+            runtime::PropertyKey::String(name) => match value.own_property(key) {
+                Some(descriptor) => if runtime::descriptor_enumerable(descriptor) {
+                    keys.push(name)
+                } else {},
+                None => (),
+            },
+            runtime::PropertyKey::Symbol(_) => (),
+        }
+    }
+    Result::Ok(keys)
+}
+
+fn json_builtin_array_length(context: vm::Context, object: runtime::ObjectId, depth: int) -> Result[
+    int,
+    vm::VmError,
+] {
+    let value = context.read_property_at_depth(
+        runtime::Value::Object(object),
+        runtime::Value::String(js_string("length")),
+        depth,
+    )?;
+    match value {
+        runtime::Value::Int(value) => if value >= 0 {
+            Result::Ok(value.to_int())
+        } else {
+            Result::Err(function_vm_error("invalid JSON array length"))
+        },
+        runtime::Value::Float(value) => if math::is_finite(value) && value >= 0.0
+            && value == math::floor(value)
+            && value <= 4294967295.0 {
+            match num::parse_int(dtoa::number_to_string(value)) {
+                Ok(value) => Result::Ok(value),
+                Err(_) => Result::Err(function_vm_error("invalid JSON array length")),
+            }
+        } else {
+            Result::Err(function_vm_error("invalid JSON array length"))
+        },
+        _ => Result::Err(function_vm_error("invalid JSON array length")),
+    }
+}
+
+fn json_builtin_revive(
+    context: vm::Context,
+    sources: json::JsonParseSources,
+    holder: runtime::ObjectId,
+    key: runtime::JsString,
+    reviver: runtime::Value,
+    depth: int,
+) -> Result[runtime::Value, vm::VmError] {
+    let value = context.read_property_at_depth(
+        runtime::Value::Object(holder),
+        runtime::Value::String(key),
+        depth,
+    )?;
+    let reviver_context = json_builtin_allocate_object(context.heap())?;
+    match value {
+        runtime::Value::Object(object) => {
+            let kind = match context.heap().get(object) {
+                Some(value) => value.kind(),
+                None => return Result::Err(function_vm_error("JSON value is invalid")),
+            };
+            match kind {
+                runtime::ObjectKind::Array => {
+                    let length = json_builtin_array_length(context, object, depth)?;
+                    let mut index = 0;
+                    while index < length {
+                        let name = js_string(index.to_string());
+                        let revived = json_builtin_revive(
+                            context,
+                            sources,
+                            object,
+                            name,
+                            reviver,
+                            depth,
+                        )?;
+                        match revived {
+                            runtime::Value::Undefined => {
+                                let _ = runtime::delete_property(
+                                    context.heap(),
+                                    object,
+                                    runtime::PropertyKey::String(name),
+                                );
+                            },
+                            _ => {
+                                let _ = runtime::define_own_property(
+                                    context.heap(),
+                                    object,
+                                    runtime::PropertyKey::String(name),
+                                    runtime::data_descriptor(revived, true, true, true),
+                                );
+                            },
+                        };
+                        index += 1;
+                    }
+                },
+                runtime::ObjectKind::Ordinary | runtime::ObjectKind::Function => {
+                    let keys = json_builtin_enumerable_keys(context.heap(), object)?;
+                    for name in keys {
+                        let revived = json_builtin_revive(
+                            context,
+                            sources,
+                            object,
+                            name,
+                            reviver,
+                            depth,
+                        )?;
+                        match revived {
+                            runtime::Value::Undefined => {
+                                let _ = runtime::delete_property(
+                                    context.heap(),
+                                    object,
+                                    runtime::PropertyKey::String(name),
+                                );
+                            },
+                            _ => {
+                                let _ = runtime::define_own_property(
+                                    context.heap(),
+                                    object,
+                                    runtime::PropertyKey::String(name),
+                                    runtime::data_descriptor(revived, true, true, true),
+                                );
+                            },
+                        }
+                    }
+                },
+            }
+        },
+        _ => (),
+    };
+    match sources.source_for(holder, runtime::PropertyKey::String(key), value) {
+        Some(source) => json_builtin_define(
+            context.heap(),
+            reviver_context,
+            js_string("source"),
+            runtime::Value::String(source),
+        )?,
+        None => (),
+    };
+    context.invoke_with_this_at_depth(
+        reviver,
+        Vec::[runtime::Value::String(key), value, runtime::Value::Object(reviver_context)],
+        runtime::Value::Object(holder),
+        depth,
+    )
+}
+
+fn json_builtin_error_offset(error: json::JsonError) -> int {
+    if error.offset > 0
+        && (error.message == "invalid string escape" || error.message == "invalid Unicode escape"
+            || error.message == "unescaped control character in string") {
+        error.offset - 1
+    } else {
+        error.offset
+    }
+}
+
+fn json_builtin_error_stack(source: runtime::JsString, error: json::JsonError) -> runtime::JsString {
+    let target = json_builtin_error_offset(error);
+    let mut line = 1;
+    let mut column = 1;
+    let mut index = 0;
+    while index < target && index < source.len() {
+        if source.get(index) == 10 {
+            line += 1;
+            column = 1;
+        } else {
+            column += 1;
+        };
+        index += 1;
+    }
+    js_string("    at <input>:" + line.to_string() + ":" + column.to_string())
+}
+
+fn json_builtin_syntax_error(
+    context: vm::Context,
+    source: runtime::JsString,
+    error: json::JsonError,
+    depth: int,
+) -> vm::VmError {
+    let fallback = function_syntax_error(error.to_string());
+    let global = match context.global_object() {
+        Some(value) => value,
+        None => return fallback,
+    };
+    let constructor = match runtime::get_property(
+        context.heap(),
+        global,
+        runtime::string_property_key("SyntaxError"),
+    ) {
+        Ok(Some(value)) => value,
+        _ => return fallback,
+    };
+    let value = match context.invoke_with_this_at_depth(
+        constructor,
+        Vec::[runtime::Value::String(js_string(error.to_string()))],
+        runtime::Value::Undefined,
+        depth,
+    ) {
+        Ok(value) => value,
+        Err(_) => return fallback,
+    };
+    let object = match value {
+        runtime::Value::Object(value) => value,
+        _ => return fallback,
+    };
+    if !runtime::define_own_property(
+        context.heap(),
+        object,
+        runtime::string_property_key("stack"),
+        runtime::data_descriptor(
+            runtime::Value::String(json_builtin_error_stack(source, error)),
+            true,
+            false,
+            true,
+        ),
+    ) {
+        fallback
+    } else {
+        vm::VmError { offset: -1, kind: vm::VmErrorKind::Thrown(value) }
+    }
+}
+
+fn json_builtin_parse(
+    context: vm::Context,
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+    depth: int,
+) -> Result[runtime::Value, vm::VmError] {
+    let _ = this_value;
+    let source = match string_value_at_depth(context, argument(arguments, 0), depth)? {
+        runtime::Value::String(value) => value,
+        _ => return Result::Err(function_vm_error("JSON source is not a string")),
+    };
+    let parsed = match json::parse_with_sources(context.heap(), source) {
+        Ok(value) => value,
+        Err(value) => return Result::Err(json_builtin_syntax_error(context, source, value, depth)),
+    };
+    let value = parsed.value;
+    let reviver = argument(arguments, 1);
+    if !json_builtin_callable(reviver) {
+        return Result::Ok(value)
+    } else {};
+    let root = json_builtin_allocate_object(context.heap())?;
+    let empty = js_string("");
+    json_builtin_define(context.heap(), root, empty, value)?;
+    let sources = parsed.sources();
+    sources.attach_root(root, runtime::PropertyKey::String(empty));
+    json_builtin_revive(context, sources, root, empty, reviver, depth)
+}
+
+fn json_builtin_append_ascii(output: Vec[uint16], value: string) -> unit {
+    let bytes = value.to_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        output.push(bytes[index].to_uint16());
+        index += 1;
+    }
+}
+
+fn json_builtin_append_string(output: Vec[uint16], value: runtime::JsString) -> unit {
+    let mut index = 0;
+    while index < value.len() {
+        output.push(value.get(index));
+        index += 1;
+    }
+}
+
+fn json_builtin_hex(value: uint16) -> uint16 {
+    if value < 10 {
+        48 + value
+    } else {
+        87 + value
+    }
+}
+
+fn json_builtin_append_escape(output: Vec[uint16], value: uint16) -> unit {
+    output.push(92);
+    output.push(117);
+    output.push(json_builtin_hex((value >> 12) & 15));
+    output.push(json_builtin_hex((value >> 8) & 15));
+    output.push(json_builtin_hex((value >> 4) & 15));
+    output.push(json_builtin_hex(value & 15));
+}
+
+fn json_builtin_append_quoted(output: Vec[uint16], value: runtime::JsString) -> unit {
+    output.push(34);
+    let mut index = 0;
+    while index < value.len() {
+        let current = value.get(index);
+        if current == 34 || current == 92 {
+            output.push(92);
+            output.push(current);
+        } else if current == 8 {
+            json_builtin_append_ascii(output, "\\b")
+        } else if current == 9 {
+            json_builtin_append_ascii(output, "\\t")
+        } else if current == 10 {
+            json_builtin_append_ascii(output, "\\n")
+        } else if current == 12 {
+            json_builtin_append_ascii(output, "\\f")
+        } else if current == 13 {
+            json_builtin_append_ascii(output, "\\r")
+        } else if current < 0x20 {
+            json_builtin_append_escape(output, current)
+        } else if runtime::is_high_surrogate(current) {
+            if index + 1 < value.len() && runtime::is_low_surrogate(value.get(index + 1)) {
+                output.push(current);
+                output.push(value.get(index + 1));
+                index += 1;
+            } else {
+                json_builtin_append_escape(output, current)
+            }
+        } else if runtime::is_low_surrogate(current) {
+            json_builtin_append_escape(output, current)
+        } else {
+            output.push(current)
+        };
+        index += 1;
+    }
+    output.push(34);
+}
+
+fn json_builtin_append_indent(output: Vec[uint16], gap: runtime::JsString, nesting: int) -> unit {
+    let mut current = 0;
+    while current < nesting {
+        json_builtin_append_string(output, gap);
+        current += 1;
+    }
+}
+
+fn json_builtin_stack_contains(stack: Vec[runtime::ObjectId], object: runtime::ObjectId) -> bool {
+    for value in stack {
+        if value == object {
+            return true
+        } else {}
+    }
+    false
+}
+
+fn json_builtin_raw_character(value: uint16) -> bool {
+    (value >= 97 && value <= 122) || (value >= 48 && value <= 57) || value == 45 || value == 34
+}
+
+fn json_builtin_is_raw_json(
+    context: vm::Context,
+    raw_values: HashMap[runtime::ObjectId, runtime::JsString],
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+    depth: int,
+) -> Result[runtime::Value, vm::VmError] {
+    let _ = this_value;
+    let _ = depth;
+    let result = match argument(arguments, 0) {
+        runtime::Value::Object(object) => {
+            context.heap().contains(object) && raw_values.get(object).is_some()
+        },
+        _ => false,
+    };
+    Result::Ok(runtime::Value::Bool(result))
+}
+
+fn json_builtin_raw_json(
+    context: vm::Context,
+    raw_values: HashMap[runtime::ObjectId, runtime::JsString],
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+    depth: int,
+) -> Result[runtime::Value, vm::VmError] {
+    let _ = this_value;
+    let source = match string_value_at_depth(context, argument(arguments, 0), depth)? {
+        runtime::Value::String(value) => value,
+        _ => return Result::Err(function_vm_error("raw JSON source is not a string")),
+    };
+    if source.len() == 0 || !json_builtin_raw_character(source.get(0))
+        || !json_builtin_raw_character(source.get(source.len() - 1)) {
+        return Result::Err(function_syntax_error("invalid rawJSON string"))
+    } else {};
+    match json::parse(context.heap(), source) {
+        Ok(runtime::Value::Object(_)) => {
+            return Result::Err(function_syntax_error("invalid rawJSON string"))
+        },
+        Ok(_) => (),
+        Err(_) => return Result::Err(function_syntax_error("invalid rawJSON string")),
+    };
+    let object = match runtime::new_null_prototype_object(context.heap()) {
+        Ok(value) => value,
+        Err(value) => return Result::Err(function_vm_error(value.message)),
+    };
+    if !runtime::define_own_property(
+        context.heap(),
+        object,
+        runtime::string_property_key("rawJSON"),
+        runtime::data_descriptor(runtime::Value::String(source), false, true, false),
+    )
+        || !runtime::prevent_extensions(context.heap(), object) {
+        return Result::Err(function_vm_error("cannot create raw JSON object"))
+    } else {};
+    raw_values[object] = source;
+    Result::Ok(runtime::Value::Object(object))
+}
+
+fn json_builtin_unbox(heap: runtime::Heap, value: runtime::Value) -> runtime::Value {
+    match value {
+        runtime::Value::Object(object) => match runtime::primitive_value(heap, object) {
+            Some(runtime::Value::Bool(value)) => runtime::Value::Bool(value),
+            Some(runtime::Value::Int(value)) => runtime::Value::Int(value),
+            Some(runtime::Value::Float(value)) => runtime::Value::Float(value),
+            Some(runtime::Value::String(value)) => runtime::Value::String(value),
+            Some(runtime::Value::BigInt(value)) => runtime::Value::BigInt(value),
+            _ => runtime::Value::Object(object),
+        },
+        _ => value,
+    }
+}
+
+fn json_builtin_object_keys(
+    heap: runtime::Heap,
+    object: runtime::ObjectId,
+    property_list: Option[Vec[runtime::JsString]],
+) -> Result[Vec[runtime::JsString], vm::VmError] {
+    match property_list {
+        Some(value) => Result::Ok(value),
+        None => json_builtin_enumerable_keys(heap, object),
+    }
+}
+
+fn json_builtin_write_array(
+    context: vm::Context,
+    raw_values: HashMap[runtime::ObjectId, runtime::JsString],
+    object: runtime::ObjectId,
+    replacer: Option[runtime::Value],
+    property_list: Option[Vec[runtime::JsString]],
+    gap: runtime::JsString,
+    nesting: int,
+    stack: Vec[runtime::ObjectId],
+    output: Vec[uint16],
+    depth: int,
+) -> Result[unit, vm::VmError] {
+    let length = json_builtin_array_length(context, object, depth)?;
+    output.push(91);
+    let mut index = 0;
+    while index < length {
+        if index > 0 {
+            output.push(44)
+        } else {};
+        if gap.len() > 0 {
+            output.push(10);
+            json_builtin_append_indent(output, gap, nesting + 1)
+        } else {};
+        let element: Vec[uint16] = Vec::[];
+        if json_builtin_write_property(
+            context,
+            raw_values,
+            js_string(index.to_string()),
+            object,
+            replacer,
+            property_list,
+            gap,
+            nesting + 1,
+            stack,
+            element,
+            depth,
+        )? {
+            for value in element {
+                output.push(value)
+            }
+        } else {
+            json_builtin_append_ascii(output, "null")
+        };
+        index += 1;
+    }
+    if length > 0 && gap.len() > 0 {
+        output.push(10);
+        json_builtin_append_indent(output, gap, nesting)
+    } else {};
+    output.push(93);
+    Result::Ok(())
+}
+
+fn json_builtin_write_object(
+    context: vm::Context,
+    raw_values: HashMap[runtime::ObjectId, runtime::JsString],
+    object: runtime::ObjectId,
+    replacer: Option[runtime::Value],
+    property_list: Option[Vec[runtime::JsString]],
+    gap: runtime::JsString,
+    nesting: int,
+    stack: Vec[runtime::ObjectId],
+    output: Vec[uint16],
+    depth: int,
+) -> Result[unit, vm::VmError] {
+    output.push(123);
+    let keys = json_builtin_object_keys(context.heap(), object, property_list)?;
+    let mut count = 0;
+    for key in keys {
+        let property: Vec[uint16] = Vec::[];
+        if json_builtin_write_property(
+            context,
+            raw_values,
+            key,
+            object,
+            replacer,
+            property_list,
+            gap,
+            nesting + 1,
+            stack,
+            property,
+            depth,
+        )? {
+            if count > 0 {
+                output.push(44)
+            } else {};
+            if gap.len() > 0 {
+                output.push(10);
+                json_builtin_append_indent(output, gap, nesting + 1)
+            } else {};
+            json_builtin_append_quoted(output, key);
+            output.push(58);
+            if gap.len() > 0 {
+                output.push(32)
+            } else {};
+            for value in property {
+                output.push(value)
+            }
+            count += 1;
+        } else {}
+    }
+    if count > 0 && gap.len() > 0 {
+        output.push(10);
+        json_builtin_append_indent(output, gap, nesting)
+    } else {};
+    output.push(125);
+    Result::Ok(())
+}
+
+fn json_builtin_write_value(
+    context: vm::Context,
+    raw_values: HashMap[runtime::ObjectId, runtime::JsString],
+    value: runtime::Value,
+    replacer: Option[runtime::Value],
+    property_list: Option[Vec[runtime::JsString]],
+    gap: runtime::JsString,
+    nesting: int,
+    stack: Vec[runtime::ObjectId],
+    output: Vec[uint16],
+    depth: int,
+) -> Result[bool, vm::VmError] {
+    match value {
+        runtime::Value::Undefined | runtime::Value::Symbol(_) => Result::Ok(false),
+        runtime::Value::Null => {
+            json_builtin_append_ascii(output, "null");
+            Result::Ok(true)
+        },
+        runtime::Value::Bool(value) => {
+            json_builtin_append_ascii(
+                output,
+                if value {
+                    "true"
+                } else {
+                    "false"
+                },
+            );
+            Result::Ok(true)
+        },
+        runtime::Value::Int(value) => {
+            json_builtin_append_ascii(output, value.to_string());
+            Result::Ok(true)
+        },
+        runtime::Value::Float(value) => {
+            json_builtin_append_ascii(
+                output,
+                if math::is_finite(value) {
+                    dtoa::number_to_string(value)
+                } else {
+                    "null"
+                },
+            );
+            Result::Ok(true)
+        },
+        runtime::Value::String(value) => {
+            json_builtin_append_quoted(output, value);
+            Result::Ok(true)
+        },
+        runtime::Value::BigInt(_) => {
+            Result::Err(function_vm_error("cannot serialize BigInt as JSON"))
+        },
+        runtime::Value::Object(object) => {
+            match raw_values.get(object) {
+                Some(value) => {
+                    json_builtin_append_string(output, value);
+                    return Result::Ok(true)
+                },
+                None => (),
+            };
+            let kind = match context.heap().get(object) {
+                Some(value) => value.kind(),
+                None => return Result::Err(function_vm_error("JSON value is invalid")),
+            };
+            match kind {
+                runtime::ObjectKind::Function => Result::Ok(false),
+                runtime::ObjectKind::Ordinary | runtime::ObjectKind::Array => {
+                    if json_builtin_stack_contains(stack, object) {
+                        return Result::Err(function_vm_error("circular reference"))
+                    } else {};
+                    stack.push(object);
+                    match kind {
+                        runtime::ObjectKind::Array => json_builtin_write_array(
+                            context,
+                            raw_values,
+                            object,
+                            replacer,
+                            property_list,
+                            gap,
+                            nesting,
+                            stack,
+                            output,
+                            depth,
+                        )?,
+                        runtime::ObjectKind::Ordinary => json_builtin_write_object(
+                            context,
+                            raw_values,
+                            object,
+                            replacer,
+                            property_list,
+                            gap,
+                            nesting,
+                            stack,
+                            output,
+                            depth,
+                        )?,
+                        runtime::ObjectKind::Function => (),
+                    };
+                    let _ = stack.pop();
+                    Result::Ok(true)
+                },
+            }
+        },
+    }
+}
+
+fn json_builtin_write_property(
+    context: vm::Context,
+    raw_values: HashMap[runtime::ObjectId, runtime::JsString],
+    key: runtime::JsString,
+    holder: runtime::ObjectId,
+    replacer: Option[runtime::Value],
+    property_list: Option[Vec[runtime::JsString]],
+    gap: runtime::JsString,
+    nesting: int,
+    stack: Vec[runtime::ObjectId],
+    output: Vec[uint16],
+    depth: int,
+) -> Result[bool, vm::VmError] {
+    let key_value = runtime::Value::String(key);
+    let mut value = context.read_property_at_depth(runtime::Value::Object(holder), key_value, depth)?;
+    match value {
+        runtime::Value::Object(_) | runtime::Value::BigInt(_) => {
+            let method = context.read_property_at_depth(
+                value,
+                runtime::Value::String(js_string("toJSON")),
+                depth,
+            )?;
+            if json_builtin_callable(method) {
+                value = context.invoke_with_this_at_depth(method, Vec::[key_value], value, depth)?;
+            } else {}
+        },
+        _ => (),
+    };
+    match replacer {
+        Some(callback) => {
+            value = context.invoke_with_this_at_depth(
+                callback,
+                Vec::[key_value, value],
+                runtime::Value::Object(holder),
+                depth,
+            )?;
+        },
+        None => (),
+    };
+    json_builtin_write_value(
+        context,
+        raw_values,
+        json_builtin_unbox(context.heap(), value),
+        replacer,
+        property_list,
+        gap,
+        nesting,
+        stack,
+        output,
+        depth,
+    )
+}
+
+fn json_builtin_property_list(context: vm::Context, value: runtime::Value, depth: int) -> Result[
+    Option[Vec[runtime::JsString]],
+    vm::VmError,
+] {
+    let object = match value {
+        runtime::Value::Object(value) => value,
+        _ => return Result::Ok(Option::None),
+    };
+    let kind = match context.heap().get(object) {
+        Some(value) => value.kind(),
+        None => return Result::Err(function_vm_error("JSON replacer is invalid")),
+    };
+    match kind {
+        runtime::ObjectKind::Array => (),
+        runtime::ObjectKind::Ordinary | runtime::ObjectKind::Function => {
+            return Result::Ok(Option::None)
+        },
+    };
+    let length = json_builtin_array_length(context, object, depth)?;
+    let result: Vec[runtime::JsString] = Vec::[];
+    let mut index = 0;
+    while index < length {
+        let item = context.read_property_at_depth(
+            value,
+            runtime::Value::String(js_string(index.to_string())),
+            depth,
+        )?;
+        let converted = match item {
+            runtime::Value::String(value) => Option::Some(value),
+            runtime::Value::Int(_) | runtime::Value::Float(_) => {
+                match string_value_at_depth(context, item, depth)? {
+                    runtime::Value::String(value) => Option::Some(value),
+                    _ => Option::None,
+                }
+            },
+            runtime::Value::Object(object) => match runtime::primitive_value(context.heap(), object) {
+                Some(runtime::Value::String(_)) | Some(runtime::Value::Int(_)) | Some(runtime::Value::Float(_)) => {
+                    match string_value_at_depth(context, item, depth)? {
+                        runtime::Value::String(value) => Option::Some(value),
+                        _ => Option::None,
+                    }
+                },
+                _ => Option::None,
+            },
+            _ => Option::None,
+        };
+        match converted {
+            Some(name) => {
+                let mut found = false;
+                for existing in result {
+                    if existing == name {
+                        found = true;
+                    } else {}
+                }
+                if !found {
+                    result.push(name)
+                } else {}
+            },
+            None => (),
+        };
+        index += 1;
+    }
+    Result::Ok(Option::Some(result))
+}
+
+fn json_builtin_space(context: vm::Context, value: runtime::Value, depth: int) -> Result[
+    runtime::JsString,
+    vm::VmError,
+] {
+    let converted = match value {
+        runtime::Value::String(value) => runtime::Value::String(value),
+        runtime::Value::Int(_) | runtime::Value::Float(_) => {
+            number_value_at_depth(context, value, depth)?
+        },
+        runtime::Value::Object(object) => match runtime::primitive_value(context.heap(), object) {
+            Some(runtime::Value::String(_)) => string_value_at_depth(context, value, depth)?,
+            Some(runtime::Value::Int(_)) | Some(runtime::Value::Float(_)) => {
+                number_value_at_depth(context, value, depth)?
+            },
+            _ => runtime::Value::Undefined,
+        },
+        _ => runtime::Value::Undefined,
+    };
+    match converted {
+        runtime::Value::String(value) => {
+            Result::Ok(
+                value.slice(
+                    0,
+                    if value.len() < 10 {
+                        value.len()
+                    } else {
+                        10
+                    },
+                ),
+            )
+        },
+        runtime::Value::Float(value) => {
+            let count = if math::is_nan(value) || value <= 0.0 {
+                0
+            } else if value >= 10.0 {
+                10
+            } else {
+                num::parse_int(dtoa::number_to_string(math::floor(value))).unwrap_or(0)
+            };
+            let units: Vec[uint16] = Vec::with_capacity(count);
+            let mut index = 0;
+            while index < count {
+                units.push(32);
+                index += 1;
+            }
+            Result::Ok(runtime::JsString::from_code_units(units))
+        },
+        _ => Result::Ok(js_string("")),
+    }
+}
+
+fn json_builtin_stringify(
+    context: vm::Context,
+    raw_values: HashMap[runtime::ObjectId, runtime::JsString],
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+    depth: int,
+) -> Result[runtime::Value, vm::VmError] {
+    let _ = this_value;
+    let replacer_value = argument(arguments, 1);
+    let replacer = if json_builtin_callable(replacer_value) {
+        Option::Some(replacer_value)
+    } else {
+        Option::None
+    };
+    let property_list = if replacer.is_some() {
+        Option::None
+    } else {
+        json_builtin_property_list(context, replacer_value, depth)?
+    };
+    let gap = json_builtin_space(context, argument(arguments, 2), depth)?;
+    let root = json_builtin_allocate_object(context.heap())?;
+    let empty = js_string("");
+    json_builtin_define(context.heap(), root, empty, argument(arguments, 0))?;
+    let output: Vec[uint16] = Vec::[];
+    let stack: Vec[runtime::ObjectId] = Vec::[];
+    if json_builtin_write_property(
+        context,
+        raw_values,
+        empty,
+        root,
+        replacer,
+        property_list,
+        gap,
+        0,
+        stack,
+        output,
+        depth,
+    )? {
+        Result::Ok(runtime::Value::String(runtime::JsString::from_code_units(output)))
+    } else {
+        Result::Ok(runtime::Value::Undefined)
+    }
+}
+
+fn install_json(context: vm::Context, object: runtime::ObjectId) -> Result[unit, BuiltinError] {
+    let raw_values: HashMap[runtime::ObjectId, runtime::JsString] = HashMap::{};
+    define_value(
+        context.heap(),
+        object,
+        "parse",
+        allocate_vm_function(
+            context,
+            "parse",
+            |this_value, arguments, depth| {
+                json_builtin_parse(context, this_value, arguments, depth)
+            },
+        )?,
+        true,
+        true,
+    )?;
+    define_value(
+        context.heap(),
+        object,
+        "isRawJSON",
+        allocate_vm_function(
+            context,
+            "isRawJSON",
+            |this_value, arguments, depth| {
+                json_builtin_is_raw_json(context, raw_values, this_value, arguments, depth)
+            },
+        )?,
+        true,
+        true,
+    )?;
+    define_value(
+        context.heap(),
+        object,
+        "rawJSON",
+        allocate_vm_function(
+            context,
+            "rawJSON",
+            |this_value, arguments, depth| {
+                json_builtin_raw_json(context, raw_values, this_value, arguments, depth)
+            },
+        )?,
+        true,
+        true,
+    )?;
+    define_value(
+        context.heap(),
+        object,
+        "stringify",
+        allocate_vm_function(
+            context,
+            "stringify",
+            |this_value, arguments, depth| {
+                json_builtin_stringify(context, raw_values, this_value, arguments, depth)
+            },
+        )?,
+        true,
+        true,
+    )
+}

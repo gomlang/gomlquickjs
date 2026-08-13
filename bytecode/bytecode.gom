@@ -1,0 +1,1198 @@
+package bytecode;
+
+use gomlang::quickjs::runtime;
+
+pub struct TemplateConstant {
+    cooked_value: Vec[Option[runtime::JsString]],
+    raw_value: Vec[runtime::JsString],
+}
+
+impl TemplateConstant {
+    pub fn new(cooked: Vec[Option[runtime::JsString]], raw: Vec[runtime::JsString]) -> TemplateConstant {
+        TemplateConstant { cooked_value: cooked, raw_value: raw }
+    }
+
+    pub fn cooked(self: TemplateConstant) -> Vec[Option[runtime::JsString]] {
+        self.cooked_value
+    }
+
+    pub fn raw(self: TemplateConstant) -> Vec[runtime::JsString] {
+        self.raw_value
+    }
+}
+
+pub enum Constant {
+    Float(float64),
+    String(runtime::JsString),
+    BigInt(runtime::BigInt),
+    Function(Ref[Function]),
+    Template(Ref[TemplateConstant]),
+}
+
+#[derive(PartialEq, Eq, Debug)]
+pub enum UpvalueSource {
+    Local(int),
+    Upvalue(int),
+    Closure,
+    This,
+    Arguments,
+}
+
+pub struct EvalBinding {
+    pub name: string,
+    pub source: UpvalueSource,
+    pub variable: bool,
+    pub writable: bool,
+    pub named_function: bool,
+}
+
+#[derive(PartialEq, Eq, Debug)]
+pub struct ExceptionHandler {
+    pub start: int,
+    pub end: int,
+    pub target: int,
+}
+
+#[derive(PartialEq, Eq, Debug)]
+pub struct GeneratorReturnHandler {
+    pub yield_offset: int,
+    pub throw_target: int,
+    pub target: int,
+}
+
+#[derive(PartialEq, Eq, Debug)]
+pub enum Instruction {
+    PushI32(int32),
+    PushConst(int),
+    Undefined,
+    Null,
+    PushFalse,
+    PushTrue,
+    PushThis,
+    PushNewTarget,
+    PushArguments,
+    PushRest(int),
+    NewObject,
+    NewArray(int),
+    NewPrivateName,
+    NewRegExp(int, int),
+    ArrayAppend,
+    ArrayAppendHole,
+    ArrayAppendSpread,
+    CopyDataProperties,
+    CopyDataPropertiesExcluded(int),
+    Enumerate,
+    EnumerableProperty,
+    OwnKeys,
+    GetPrototypeOf,
+    SetPrototypeOf,
+    IsExtensible,
+    PreventExtensions,
+    IteratorStart,
+    AsyncIteratorStart,
+    IteratorNext,
+    IteratorNextValue,
+    IteratorThrow,
+    IteratorReturn,
+    IteratorCallNext,
+    IteratorCallNextValue,
+    IteratorCallThrow,
+    IteratorCallReturn,
+    IteratorResult,
+    IteratorThrowResult,
+    IteratorClose,
+    IteratorCloseThrow,
+    Drop,
+    Dup,
+    GetLoc(int),
+    PutLoc(int),
+    SetLoc(int),
+    CloneLoc(int),
+    GetUpvalue(int),
+    PutUpvalue(int),
+    SetUpvalue(int),
+    GetGlobal(int),
+    SetGlobal(int),
+    DeleteGlobal(int),
+    GetEval(int),
+    GetEvalOrUndefined(int),
+    SetEval(int),
+    DeleteEval(int),
+    InitEval(int),
+    EnterEvalEnvironment,
+    GetField(int),
+    PutField(int),
+    DefineGetter(int),
+    DefineSetter(int),
+    DefineGetterComputed,
+    DefineSetterComputed,
+    DefineClassMethod(int),
+    DefineClassGetter(int),
+    DefineClassSetter(int),
+    DefineClassMethodComputed,
+    DefineClassGetterComputed,
+    DefineClassSetterComputed,
+    DefineThisField(int),
+    DefineThisFieldComputed,
+    DefineThisPrivateField,
+    DefineThisPrivateMethod,
+    DefineThisPrivateGetter,
+    DefineThisPrivateSetter,
+    SetClassInstanceInitializer,
+    SetFunctionHomeObject,
+    SetClassHeritage(bool),
+    GetSuperField(int),
+    PutSuperField(int),
+    GetSuperEl,
+    PutSuperEl,
+    GetArrayEl,
+    PutArrayEl,
+    ReflectGet,
+    ReflectSet,
+    GetPrivate,
+    PutPrivate,
+    HasPrivate,
+    Call(int),
+    CallMethod(int),
+    Construct(int),
+    ConstructWithNewTarget(int),
+    CallArray,
+    CallMethodArray,
+    ConstructArray,
+    CallSuper(int),
+    CallSuperArray,
+    Eval(int, int),
+    DynamicImport,
+    InitializeInstanceFields,
+    Await,
+    Yield,
+    Return,
+    ReturnUndef,
+    Throw,
+    ThrowTypeError,
+    ThrowReferenceError,
+    IfFalse(int),
+    IfTrue(int),
+    Goto(int),
+    Neg,
+    Plus,
+    LNot,
+    Not,
+    TypeOf,
+    ToPrimitiveDefault,
+    ToPrimitiveNumber,
+    ToPrimitiveString,
+    ToPropertyKey,
+    RequireObjectCoercible,
+    Delete,
+    DeleteOptional,
+    Mul,
+    Div,
+    Mod,
+    Add,
+    Sub,
+    Pow,
+    Shl,
+    Sar,
+    Shr,
+    Lt,
+    Lte,
+    Gt,
+    Gte,
+    Eq,
+    Neq,
+    StrictEq,
+    StrictNeq,
+    In,
+    WithHasBinding,
+    InstanceOf,
+    IsPrototypeOf,
+    BitAnd,
+    BitXor,
+    BitOr,
+    IsUndefinedOrNull,
+}
+
+#[derive(PartialEq, Eq, Debug)]
+pub struct SourceLocation {
+    pub line: int,
+    pub column: int,
+}
+
+pub struct SourceError {
+    pub message: string,
+    pub location: SourceLocation,
+}
+
+pub struct Function {
+    name_value: Ref[Option[runtime::JsString]],
+    constants_value: Vec[Constant],
+    code_value: Vec[Instruction],
+    parameter_count_value: int,
+    function_length_value: int,
+    constructable_value: bool,
+    class_constructor_value: bool,
+    derived_constructor_value: bool,
+    inherit_home_object_value: bool,
+    lexical_this_value: bool,
+    generator_value: Ref[bool],
+    asynchronous_value: Ref[bool],
+    eval_bindings_value: Ref[Vec[EvalBinding]],
+    eval_sites_value: Ref[Vec[Vec[EvalBinding]]],
+    strict_value: Ref[bool],
+    mapped_arguments_value: Ref[Vec[int]],
+    local_count_value: int,
+    upvalue_sources_value: Vec[UpvalueSource],
+    exception_handlers_value: Vec[ExceptionHandler],
+    generator_return_handlers_value: Ref[Vec[GeneratorReturnHandler]],
+    source_locations_value: Ref[Vec[SourceLocation]],
+    definition_location_value: Ref[Option[SourceLocation]],
+    source_name_value: Ref[Option[runtime::JsString]],
+    source_text_value: Ref[Option[runtime::JsString]],
+}
+
+impl Function {
+    pub fn new(constants: Vec[Constant], code: Vec[Instruction], local_count: int) -> Function {
+        Function::new_with_parameters(constants, code, 0, local_count)
+    }
+
+    pub fn new_with_parameters(
+        constants: Vec[Constant],
+        code: Vec[Instruction],
+        parameter_count: int,
+        local_count: int,
+    ) -> Function {
+        Function::new_with_parameters_and_upvalues(
+            constants,
+            code,
+            parameter_count,
+            local_count,
+            Vec::[],
+        )
+    }
+
+    pub fn new_with_parameters_and_upvalues(
+        constants: Vec[Constant],
+        code: Vec[Instruction],
+        parameter_count: int,
+        local_count: int,
+        upvalue_sources: Vec[UpvalueSource],
+    ) -> Function {
+        Function::new_with_parameters_upvalues_and_handlers(
+            constants,
+            code,
+            parameter_count,
+            local_count,
+            upvalue_sources,
+            Vec::[],
+        )
+    }
+
+    pub fn new_with_parameters_upvalues_and_handlers(
+        constants: Vec[Constant],
+        code: Vec[Instruction],
+        parameter_count: int,
+        local_count: int,
+        upvalue_sources: Vec[UpvalueSource],
+        exception_handlers: Vec[ExceptionHandler],
+    ) -> Function {
+        Function::new_with_parameters_upvalues_handlers_and_length(
+            constants,
+            code,
+            parameter_count,
+            parameter_count,
+            local_count,
+            upvalue_sources,
+            exception_handlers,
+        )
+    }
+
+    pub fn new_with_parameters_upvalues_handlers_and_length(
+        constants: Vec[Constant],
+        code: Vec[Instruction],
+        parameter_count: int,
+        function_length: int,
+        local_count: int,
+        upvalue_sources: Vec[UpvalueSource],
+        exception_handlers: Vec[ExceptionHandler],
+    ) -> Function {
+        Function::new_with_parameters_upvalues_handlers_length_and_constructable(
+            constants,
+            code,
+            parameter_count,
+            function_length,
+            local_count,
+            upvalue_sources,
+            exception_handlers,
+            true,
+        )
+    }
+
+    pub fn new_with_parameters_upvalues_handlers_length_and_constructable(
+        constants: Vec[Constant],
+        code: Vec[Instruction],
+        parameter_count: int,
+        function_length: int,
+        local_count: int,
+        upvalue_sources: Vec[UpvalueSource],
+        exception_handlers: Vec[ExceptionHandler],
+        constructable: bool,
+    ) -> Function {
+        Function::new_with_parameters_upvalues_handlers_and_function_kind(
+            constants,
+            code,
+            parameter_count,
+            function_length,
+            local_count,
+            upvalue_sources,
+            exception_handlers,
+            constructable,
+            false,
+        )
+    }
+
+    pub fn new_with_parameters_upvalues_handlers_and_function_kind(
+        constants: Vec[Constant],
+        code: Vec[Instruction],
+        parameter_count: int,
+        function_length: int,
+        local_count: int,
+        upvalue_sources: Vec[UpvalueSource],
+        exception_handlers: Vec[ExceptionHandler],
+        constructable: bool,
+        class_constructor: bool,
+    ) -> Function {
+        Function::new_with_parameters_upvalues_handlers_and_function_semantics(
+            constants,
+            code,
+            parameter_count,
+            function_length,
+            local_count,
+            upvalue_sources,
+            exception_handlers,
+            constructable,
+            class_constructor,
+            false,
+            false,
+            false,
+        )
+    }
+
+    pub fn new_with_parameters_upvalues_handlers_and_function_semantics(
+        constants: Vec[Constant],
+        code: Vec[Instruction],
+        parameter_count: int,
+        function_length: int,
+        local_count: int,
+        upvalue_sources: Vec[UpvalueSource],
+        exception_handlers: Vec[ExceptionHandler],
+        constructable: bool,
+        class_constructor: bool,
+        derived_constructor: bool,
+        inherit_home_object: bool,
+        lexical_this: bool,
+    ) -> Function {
+        Function {
+            name_value: Ref::new(Option::None),
+            constants_value: constants,
+            code_value: code,
+            parameter_count_value: parameter_count,
+            function_length_value: function_length,
+            constructable_value: constructable,
+            class_constructor_value: class_constructor,
+            derived_constructor_value: derived_constructor,
+            inherit_home_object_value: inherit_home_object,
+            lexical_this_value: lexical_this,
+            generator_value: Ref::new(false),
+            asynchronous_value: Ref::new(false),
+            eval_bindings_value: Ref::new(Vec::[]),
+            eval_sites_value: Ref::new(Vec::[]),
+            strict_value: Ref::new(false),
+            mapped_arguments_value: Ref::new(Vec::[]),
+            local_count_value: local_count,
+            upvalue_sources_value: upvalue_sources,
+            exception_handlers_value: exception_handlers,
+            generator_return_handlers_value: Ref::new(Vec::[]),
+            source_locations_value: Ref::new(Vec::[]),
+            definition_location_value: Ref::new(Option::None),
+            source_name_value: Ref::new(Option::None),
+            source_text_value: Ref::new(Option::None),
+        }
+    }
+
+    pub fn set_name(self: Function, name: runtime::JsString) -> unit {
+        self.name_value.set(Option::Some(name))
+    }
+
+    pub fn name(self: Function) -> Option[runtime::JsString] {
+        self.name_value.get()
+    }
+
+    pub fn constants(self: Function) -> Vec[Constant] {
+        self.constants_value
+    }
+
+    pub fn constant(self: Function, index: int) -> Option[Constant] {
+        if index < 0 || index >= self.constants_value.len() {
+            Option::None
+        } else {
+            Option::Some(self.constants_value[index])
+        }
+    }
+
+    pub fn code(self: Function) -> Vec[Instruction] {
+        self.code_value
+    }
+
+    pub fn instruction(self: Function, offset: int) -> Option[Instruction] {
+        if offset < 0 || offset >= self.code_value.len() {
+            Option::None
+        } else {
+            Option::Some(self.code_value[offset])
+        }
+    }
+
+    pub fn code_len(self: Function) -> int {
+        self.code_value.len()
+    }
+
+    pub fn local_count(self: Function) -> int {
+        self.local_count_value
+    }
+
+    pub fn parameter_count(self: Function) -> int {
+        self.parameter_count_value
+    }
+
+    pub fn function_length(self: Function) -> int {
+        self.function_length_value
+    }
+
+    pub fn constructable(self: Function) -> bool {
+        self.constructable_value
+    }
+
+    pub fn class_constructor(self: Function) -> bool {
+        self.class_constructor_value
+    }
+
+    pub fn derived_constructor(self: Function) -> bool {
+        self.derived_constructor_value
+    }
+
+    pub fn inherit_home_object(self: Function) -> bool {
+        self.inherit_home_object_value
+    }
+
+    pub fn lexical_this(self: Function) -> bool {
+        self.lexical_this_value
+    }
+
+    pub fn set_generator(self: Function, generator: bool) -> unit {
+        self.generator_value.set(generator)
+    }
+
+    pub fn generator(self: Function) -> bool {
+        self.generator_value.get()
+    }
+
+    pub fn set_asynchronous(self: Function, asynchronous: bool) -> unit {
+        self.asynchronous_value.set(asynchronous)
+    }
+
+    pub fn asynchronous(self: Function) -> bool {
+        self.asynchronous_value.get()
+    }
+
+    pub fn set_eval_bindings(self: Function, bindings: Vec[EvalBinding]) -> unit {
+        self.eval_bindings_value.set(bindings)
+    }
+
+    pub fn eval_bindings(self: Function) -> Vec[EvalBinding] {
+        self.eval_bindings_value.get()
+    }
+
+    pub fn set_eval_sites(self: Function, sites: Vec[Vec[EvalBinding]]) -> unit {
+        self.eval_sites_value.set(sites)
+    }
+
+    pub fn eval_site(self: Function, index: int) -> Option[Vec[EvalBinding]] {
+        let sites = self.eval_sites_value.get();
+        if index < 0 || index >= sites.len() {
+            Option::None
+        } else {
+            Option::Some(sites[index])
+        }
+    }
+
+    pub fn eval_site_count(self: Function) -> int {
+        self.eval_sites_value.get().len()
+    }
+
+    pub fn set_arguments_semantics(self: Function, strict: bool, mapped_arguments: Vec[int]) -> unit {
+        self.strict_value.set(strict);
+        self.mapped_arguments_value.set(mapped_arguments)
+    }
+
+    pub fn strict(self: Function) -> bool {
+        self.strict_value.get()
+    }
+
+    pub fn argument_local(self: Function, index: int) -> Option[int] {
+        let mapped = self.mapped_arguments_value.get();
+        if index < 0 || index >= mapped.len() || mapped[index] < 0 {
+            Option::None
+        } else {
+            Option::Some(mapped[index])
+        }
+    }
+
+    pub fn mapped_arguments(self: Function) -> Vec[int] {
+        self.mapped_arguments_value.get()
+    }
+
+    pub fn upvalue_count(self: Function) -> int {
+        self.upvalue_sources_value.len()
+    }
+
+    pub fn upvalue_source(self: Function, index: int) -> Option[UpvalueSource] {
+        if index < 0 || index >= self.upvalue_sources_value.len() {
+            Option::None
+        } else {
+            Option::Some(self.upvalue_sources_value[index])
+        }
+    }
+
+    pub fn upvalue_sources(self: Function) -> Vec[UpvalueSource] {
+        self.upvalue_sources_value
+    }
+
+    pub fn exception_handlers(self: Function) -> Vec[ExceptionHandler] {
+        self.exception_handlers_value
+    }
+
+    pub fn exception_handler(self: Function, index: int) -> Option[ExceptionHandler] {
+        if index < 0 || index >= self.exception_handlers_value.len() {
+            Option::None
+        } else {
+            Option::Some(self.exception_handlers_value[index])
+        }
+    }
+
+    pub fn set_generator_return_handlers(self: Function, handlers: Vec[GeneratorReturnHandler]) -> unit {
+        self.generator_return_handlers_value.set(handlers)
+    }
+
+    pub fn generator_return_handlers(self: Function) -> Vec[GeneratorReturnHandler] {
+        self.generator_return_handlers_value.get()
+    }
+
+    pub fn generator_return_target(self: Function, yield_offset: int) -> Option[int] {
+        for handler in self.generator_return_handlers_value.get() {
+            if handler.yield_offset == yield_offset {
+                return Option::Some(handler.target)
+            } else {}
+        }
+        Option::None
+    }
+
+    pub fn generator_throw_target(self: Function, yield_offset: int) -> Option[int] {
+        for handler in self.generator_return_handlers_value.get() {
+            if handler.yield_offset == yield_offset && handler.throw_target >= 0 {
+                return Option::Some(handler.throw_target)
+            } else {}
+        }
+        Option::None
+    }
+
+    pub fn set_source_locations(self: Function, locations: Vec[SourceLocation]) -> unit {
+        self.source_locations_value.set(locations)
+    }
+
+    pub fn source_location(self: Function, offset: int) -> Option[SourceLocation] {
+        let locations = self.source_locations_value.get();
+        if offset < 0 || offset >= locations.len() {
+            Option::None
+        } else {
+            Option::Some(locations[offset])
+        }
+    }
+
+    pub fn set_definition_location(self: Function, location: SourceLocation) -> unit {
+        self.definition_location_value.set(Option::Some(location))
+    }
+
+    pub fn definition_location(self: Function) -> Option[SourceLocation] {
+        self.definition_location_value.get()
+    }
+
+    pub fn set_source_name(self: Function, name: runtime::JsString) -> unit {
+        self.source_name_value.set(Option::Some(name))
+    }
+
+    pub fn source_name(self: Function) -> Option[runtime::JsString] {
+        self.source_name_value.get()
+    }
+
+    pub fn set_source_text(self: Function, source: runtime::JsString) -> unit {
+        self.source_text_value.set(Option::Some(source))
+    }
+
+    pub fn source_text(self: Function) -> Option[runtime::JsString] {
+        self.source_text_value.get()
+    }
+}
+
+pub struct Builder {
+    constants_value: Vec[Constant],
+    code_value: Vec[Instruction],
+    parameter_count_value: int,
+    local_count_value: int,
+    exception_handlers_value: Vec[ExceptionHandler],
+    generator_return_handlers_value: Vec[GeneratorReturnHandler],
+}
+
+impl Builder {
+    pub fn new(local_count: int) -> Builder {
+        Builder::new_with_parameters(0, local_count)
+    }
+
+    pub fn new_with_parameters(parameter_count: int, local_count: int) -> Builder {
+        Builder {
+            constants_value: Vec::[],
+            code_value: Vec::[],
+            parameter_count_value: parameter_count,
+            local_count_value: local_count,
+            exception_handlers_value: Vec::[],
+            generator_return_handlers_value: Vec::[],
+        }
+    }
+
+    pub fn add_constant(self: Builder, constant: Constant) -> int {
+        let index = self.constants_value.len();
+        self.constants_value.push(constant);
+        index
+    }
+
+    pub fn emit(self: Builder, instruction: Instruction) -> int {
+        let offset = self.code_value.len();
+        self.code_value.push(instruction);
+        offset
+    }
+
+    pub fn offset(self: Builder) -> int {
+        self.code_value.len()
+    }
+
+    pub fn patch_jump(self: Builder, offset: int, target: int) -> bool {
+        if offset < 0 || offset >= self.code_value.len() {
+            false
+        } else {
+            match self.code_value[offset] {
+                Instruction::IfFalse(_) => {
+                    self.code_value[offset] = Instruction::IfFalse(target);
+                    true
+                },
+                Instruction::IfTrue(_) => {
+                    self.code_value[offset] = Instruction::IfTrue(target);
+                    true
+                },
+                Instruction::Goto(_) => {
+                    self.code_value[offset] = Instruction::Goto(target);
+                    true
+                },
+                _ => false,
+            }
+        }
+    }
+
+    pub fn add_exception_handler(self: Builder, handler: ExceptionHandler) -> unit {
+        self.exception_handlers_value.push(handler)
+    }
+
+    pub fn add_generator_return_handler(self: Builder, handler: GeneratorReturnHandler) -> unit {
+        self.generator_return_handlers_value.push(handler)
+    }
+
+    pub fn finish(self: Builder) -> Function {
+        let function = Function::new_with_parameters_upvalues_and_handlers(
+            self.constants_value,
+            self.code_value,
+            self.parameter_count_value,
+            self.local_count_value,
+            Vec::[],
+            self.exception_handlers_value,
+        );
+        function.set_generator_return_handlers(self.generator_return_handlers_value);
+        function
+    }
+}
+
+#[derive(PartialEq, Eq, Debug)]
+pub enum VerifyError {
+    EmptyFunction,
+    InvalidConstant(int, int),
+    InvalidLocal(int, int),
+    InvalidUpvalue(int, int),
+    InvalidCaptureLocal(int, int, int),
+    InvalidCaptureUpvalue(int, int, int),
+    InvalidJump(int, int),
+    StackUnderflow(int, int, int),
+    InconsistentStackDepth(int, int, int),
+    FallthroughEnd(int),
+    NegativeLocalCount(int),
+    NegativeParameterCount(int),
+    NegativeFunctionLength(int),
+    ParameterCountExceedsLocals(int, int),
+    FunctionLengthExceedsParameters(int, int),
+    InvalidArgumentMapLength(int, int),
+    InvalidMappedArgument(int, int),
+    MappedArgumentsInStrictFunction,
+    InvalidArgumentCount(int, int),
+    InvalidEvalSite(int, int),
+    InvalidRestStart(int, int),
+    InvalidExcludedPropertyCount(int, int),
+    InvalidArrayLength(int, int),
+    InvalidHandlerRange(int, int, int),
+    InvalidHandlerTarget(int, int),
+    HandlerTargetInsideRange(int, int),
+    CrossingHandlerRanges(int, int),
+    InvalidGeneratorReturnYield(int, int),
+    InvalidGeneratorThrowTarget(int, int),
+    InvalidGeneratorReturnTarget(int, int),
+    DuplicateGeneratorReturnYield(int, int),
+}
+
+pub struct VerifyResult {
+    pub max_stack: int,
+    pub errors: Vec[VerifyError],
+}
+
+struct StackEffect {
+    required: int,
+    delta: int,
+}
+
+fn stack_effect(instruction: Instruction) -> StackEffect {
+    match instruction {
+        Instruction::PushI32(_) | Instruction::PushConst(_) | Instruction::Undefined | Instruction::Null | Instruction::PushFalse | Instruction::PushTrue | Instruction::PushThis | Instruction::PushNewTarget | Instruction::PushArguments | Instruction::PushRest(_) | Instruction::NewObject | Instruction::NewArray(_) | Instruction::NewPrivateName | Instruction::NewRegExp(_, _) | Instruction::GetLoc(_) | Instruction::GetUpvalue(_) | Instruction::GetGlobal(_) | Instruction::DeleteGlobal(_) | Instruction::GetEval(_) | Instruction::GetEvalOrUndefined(_) | Instruction::DeleteEval(_) | Instruction::GetSuperField(_) => StackEffect {
+            required: 0,
+            delta: 1,
+        },
+        Instruction::Drop | Instruction::PutLoc(_) | Instruction::PutUpvalue(_) | Instruction::PutSuperField(_) | Instruction::DefineThisField(_) | Instruction::IteratorClose => StackEffect {
+            required: 1,
+            delta: -1,
+        },
+        Instruction::Dup => StackEffect { required: 1, delta: 1 },
+        Instruction::SetLoc(_) | Instruction::SetUpvalue(_) | Instruction::SetGlobal(_) | Instruction::SetEval(_) | Instruction::GetField(_) | Instruction::GetSuperEl | Instruction::ArrayAppendHole | Instruction::Enumerate | Instruction::OwnKeys | Instruction::GetPrototypeOf | Instruction::IsExtensible | Instruction::PreventExtensions | Instruction::Await | Instruction::Yield | Instruction::Neg | Instruction::Plus | Instruction::LNot | Instruction::Not | Instruction::TypeOf | Instruction::ToPrimitiveDefault | Instruction::ToPrimitiveNumber | Instruction::ToPrimitiveString | Instruction::ToPropertyKey | Instruction::RequireObjectCoercible | Instruction::IsUndefinedOrNull => StackEffect {
+            required: 1,
+            delta: 0,
+        },
+        Instruction::IteratorStart | Instruction::AsyncIteratorStart => StackEffect {
+            required: 1,
+            delta: 1,
+        },
+        Instruction::IteratorNext => StackEffect { required: 2, delta: 0 },
+        Instruction::IteratorNextValue => StackEffect { required: 3, delta: -1 },
+        Instruction::IteratorThrow | Instruction::IteratorReturn => StackEffect {
+            required: 2,
+            delta: 0,
+        },
+        Instruction::IteratorCallNext => StackEffect { required: 2, delta: -1 },
+        Instruction::IteratorCallNextValue => StackEffect { required: 3, delta: -2 },
+        Instruction::IteratorCallThrow => StackEffect { required: 2, delta: 0 },
+        Instruction::IteratorCallReturn => StackEffect { required: 2, delta: -1 },
+        Instruction::IteratorResult => StackEffect { required: 1, delta: 1 },
+        Instruction::IteratorThrowResult => StackEffect { required: 2, delta: 0 },
+        Instruction::IteratorCloseThrow => StackEffect { required: 2, delta: -1 },
+        Instruction::PutField(_) | Instruction::DefineGetter(_) | Instruction::DefineSetter(_) | Instruction::DefineClassMethod(_) | Instruction::DefineClassGetter(_) | Instruction::DefineClassSetter(_) => StackEffect {
+            required: 2,
+            delta: -2,
+        },
+        Instruction::DefineGetterComputed | Instruction::DefineSetterComputed => StackEffect {
+            required: 3,
+            delta: -3,
+        },
+        Instruction::DefineClassMethodComputed | Instruction::DefineClassGetterComputed | Instruction::DefineClassSetterComputed => StackEffect {
+            required: 3,
+            delta: -3,
+        },
+        Instruction::DefineThisFieldComputed => StackEffect { required: 2, delta: -2 },
+        Instruction::DefineThisPrivateField | Instruction::DefineThisPrivateMethod | Instruction::DefineThisPrivateGetter | Instruction::DefineThisPrivateSetter => StackEffect {
+            required: 2,
+            delta: -2,
+        },
+        Instruction::GetPrivate | Instruction::HasPrivate => StackEffect { required: 2, delta: -1 },
+        Instruction::PutPrivate => StackEffect { required: 3, delta: -3 },
+        Instruction::SetClassHeritage(_) | Instruction::PutSuperEl => {
+            StackEffect { required: 2, delta: -2 }
+        },
+        Instruction::SetClassInstanceInitializer => StackEffect { required: 3, delta: -3 },
+        Instruction::SetFunctionHomeObject => StackEffect { required: 2, delta: -1 },
+        Instruction::GetArrayEl | Instruction::EnumerableProperty | Instruction::SetPrototypeOf | Instruction::WithHasBinding | Instruction::IsPrototypeOf => {
+            StackEffect { required: 2, delta: -1 }
+        },
+        Instruction::PutArrayEl => StackEffect { required: 3, delta: -3 },
+        Instruction::ReflectGet => StackEffect { required: 3, delta: -2 },
+        Instruction::ReflectSet => StackEffect { required: 4, delta: -3 },
+        Instruction::Call(arguments) | Instruction::Construct(arguments) => {
+            StackEffect { required: arguments + 1, delta: -arguments }
+        },
+        Instruction::ConstructWithNewTarget(arguments) => {
+            StackEffect { required: arguments + 2, delta: -arguments - 1 }
+        },
+        Instruction::CallMethod(arguments) => {
+            StackEffect { required: arguments + 2, delta: -arguments - 1 }
+        },
+        Instruction::CallArray | Instruction::ConstructArray => StackEffect {
+            required: 2,
+            delta: -1,
+        },
+        Instruction::CallMethodArray => StackEffect { required: 3, delta: -2 },
+        Instruction::CallSuper(arguments) => {
+            StackEffect { required: arguments, delta: 1 - arguments }
+        },
+        Instruction::CallSuperArray => StackEffect { required: 1, delta: 0 },
+        Instruction::Eval(arguments, _) => {
+            StackEffect { required: arguments, delta: 1 - arguments }
+        },
+        Instruction::DynamicImport => StackEffect { required: 3, delta: -2 },
+        Instruction::Return | Instruction::Throw => StackEffect { required: 1, delta: -1 },
+        Instruction::CloneLoc(_) | Instruction::ReturnUndef | Instruction::ThrowTypeError | Instruction::ThrowReferenceError | Instruction::Goto(_) | Instruction::InitializeInstanceFields | Instruction::InitEval(_) | Instruction::EnterEvalEnvironment => {
+            StackEffect { required: 0, delta: 0 }
+        },
+        Instruction::IfFalse(_) | Instruction::IfTrue(_) => StackEffect { required: 1, delta: -1 },
+        Instruction::CopyDataPropertiesExcluded(count) => StackEffect {
+            required: count + 2,
+            delta: -count - 1,
+        },
+        Instruction::ArrayAppend | Instruction::ArrayAppendSpread | Instruction::CopyDataProperties | Instruction::Delete | Instruction::DeleteOptional | Instruction::Mul | Instruction::Div | Instruction::Mod | Instruction::Add | Instruction::Sub | Instruction::Pow | Instruction::Shl | Instruction::Sar | Instruction::Shr | Instruction::Lt | Instruction::Lte | Instruction::Gt | Instruction::Gte | Instruction::Eq | Instruction::Neq | Instruction::StrictEq | Instruction::StrictNeq | Instruction::In | Instruction::InstanceOf | Instruction::BitAnd | Instruction::BitXor | Instruction::BitOr => StackEffect {
+            required: 2,
+            delta: -1,
+        },
+    }
+}
+
+fn validate_operand(
+    function: Function,
+    instruction: Instruction,
+    offset: int,
+    errors: Vec[VerifyError],
+) -> unit {
+    match instruction {
+        Instruction::PushConst(index) | Instruction::GetGlobal(index) | Instruction::SetGlobal(index) | Instruction::DeleteGlobal(index) | Instruction::GetEval(index) | Instruction::GetEvalOrUndefined(index) | Instruction::SetEval(index) | Instruction::DeleteEval(index) | Instruction::InitEval(index) | Instruction::GetField(index) | Instruction::PutField(index) | Instruction::DefineGetter(index) | Instruction::DefineSetter(index) | Instruction::DefineClassMethod(index) | Instruction::DefineClassGetter(index) | Instruction::DefineClassSetter(index) | Instruction::DefineThisField(index) | Instruction::GetSuperField(index) | Instruction::PutSuperField(index) => {
+            if index < 0 || index >= function.constants_value.len() {
+                errors.push(VerifyError::InvalidConstant(offset, index))
+            } else {}
+        },
+        Instruction::NewRegExp(pattern, flags) => {
+            if pattern < 0 || pattern >= function.constants_value.len() {
+                errors.push(VerifyError::InvalidConstant(offset, pattern))
+            } else {};
+            if flags < 0 || flags >= function.constants_value.len() {
+                errors.push(VerifyError::InvalidConstant(offset, flags))
+            } else {}
+        },
+        Instruction::GetLoc(index) | Instruction::PutLoc(index) | Instruction::SetLoc(index) | Instruction::CloneLoc(index) => {
+            if index < 0 || index >= function.local_count_value {
+                errors.push(VerifyError::InvalidLocal(offset, index))
+            } else {}
+        },
+        Instruction::GetUpvalue(index) | Instruction::PutUpvalue(index) | Instruction::SetUpvalue(index) => {
+            if index < 0 || index >= function.upvalue_sources_value.len() {
+                errors.push(VerifyError::InvalidUpvalue(offset, index))
+            } else {}
+        },
+        Instruction::Call(arguments) | Instruction::CallMethod(arguments) | Instruction::Construct(arguments) | Instruction::ConstructWithNewTarget(arguments) | Instruction::CallSuper(arguments) => {
+            if arguments < 0 {
+                errors.push(VerifyError::InvalidArgumentCount(offset, arguments))
+            } else {}
+        },
+        Instruction::Eval(arguments, site) => {
+            if arguments < 0 {
+                errors.push(VerifyError::InvalidArgumentCount(offset, arguments))
+            } else {};
+            if site < 0 || site >= function.eval_sites_value.get().len() {
+                errors.push(VerifyError::InvalidEvalSite(offset, site))
+            } else {}
+        },
+        Instruction::NewArray(length) => {
+            if length < 0 || length > 2147483647 {
+                errors.push(VerifyError::InvalidArrayLength(offset, length))
+            } else {}
+        },
+        Instruction::PushRest(start) => {
+            if start < 0 || start > function.parameter_count_value {
+                errors.push(VerifyError::InvalidRestStart(offset, start))
+            } else {}
+        },
+        Instruction::CopyDataPropertiesExcluded(count) => {
+            if count < 0 {
+                errors.push(VerifyError::InvalidExcludedPropertyCount(offset, count))
+            } else {}
+        },
+        _ => (),
+    }
+}
+
+fn validate_captures(function: Function, errors: Vec[VerifyError]) -> unit {
+    let mut constant_index = 0;
+    while constant_index < function.constants_value.len() {
+        match function.constants_value[constant_index] {
+            Constant::Function(child) => {
+                let child = child.get();
+                let mut source_index = 0;
+                while source_index < child.upvalue_sources_value.len() {
+                    match child.upvalue_sources_value[source_index] {
+                        UpvalueSource::Local(index) => {
+                            if index < 0 || index >= function.local_count_value {
+                                errors.push(
+                                    VerifyError::InvalidCaptureLocal(
+                                        constant_index,
+                                        source_index,
+                                        index,
+                                    ),
+                                )
+                            } else {}
+                        },
+                        UpvalueSource::Upvalue(index) => {
+                            if index < 0 || index >= function.upvalue_sources_value.len() {
+                                errors.push(
+                                    VerifyError::InvalidCaptureUpvalue(
+                                        constant_index,
+                                        source_index,
+                                        index,
+                                    ),
+                                )
+                            } else {}
+                        },
+                        UpvalueSource::Closure | UpvalueSource::This | UpvalueSource::Arguments => (),
+                    };
+                    source_index += 1;
+                }
+            },
+            _ => (),
+        };
+        constant_index += 1;
+    }
+}
+
+fn ranges_cross(left: ExceptionHandler, right: ExceptionHandler) -> bool {
+    (left.start < right.start && right.start < left.end && left.end < right.end)
+        || (right.start < left.start && left.start < right.end && right.end < left.end)
+}
+
+fn validate_exception_handlers(function: Function, errors: Vec[VerifyError]) -> unit {
+    let code_length = function.code_value.len();
+    let mut index = 0;
+    while index < function.exception_handlers_value.len() {
+        let handler = function.exception_handlers_value[index];
+        if handler.start < 0 || handler.start >= handler.end || handler.end > code_length {
+            errors.push(VerifyError::InvalidHandlerRange(index, handler.start, handler.end))
+        } else {};
+        if handler.target < 0 || handler.target >= code_length {
+            errors.push(VerifyError::InvalidHandlerTarget(index, handler.target))
+        } else if handler.target >= handler.start && handler.target < handler.end {
+            errors.push(VerifyError::HandlerTargetInsideRange(index, handler.target))
+        } else {};
+        let mut other = index + 1;
+        while other < function.exception_handlers_value.len() {
+            if ranges_cross(handler, function.exception_handlers_value[other]) {
+                errors.push(VerifyError::CrossingHandlerRanges(index, other))
+            } else {};
+            other += 1;
+        }
+        index += 1;
+    }
+}
+
+fn validate_generator_return_handlers(function: Function, errors: Vec[VerifyError]) -> unit {
+    let handlers = function.generator_return_handlers_value.get();
+    let code_length = function.code_value.len();
+    let mut index = 0;
+    while index < handlers.len() {
+        let handler = handlers[index];
+        if handler.yield_offset < 0 || handler.yield_offset >= code_length {
+            errors.push(VerifyError::InvalidGeneratorReturnYield(index, handler.yield_offset))
+        } else {
+            match function.code_value[handler.yield_offset] {
+                Instruction::Await | Instruction::Yield => (),
+                _ => errors.push(
+                    VerifyError::InvalidGeneratorReturnYield(index, handler.yield_offset),
+                ),
+            }
+        };
+        if handler.target < 0 || handler.target >= code_length {
+            errors.push(VerifyError::InvalidGeneratorReturnTarget(index, handler.target))
+        } else {};
+        if handler.throw_target < -1 || handler.throw_target >= code_length {
+            errors.push(VerifyError::InvalidGeneratorThrowTarget(index, handler.throw_target))
+        } else {};
+        let mut other = 0;
+        while other < index {
+            if handlers[other].yield_offset == handler.yield_offset {
+                errors.push(VerifyError::DuplicateGeneratorReturnYield(other, index))
+            } else {};
+            other += 1;
+        }
+        index += 1;
+    }
+}
+
+fn enqueue_target(
+    code_length: int,
+    source: int,
+    target: int,
+    depth: int,
+    work: Vec[(int, int)],
+    errors: Vec[VerifyError],
+) -> unit {
+    if target < 0 || target >= code_length {
+        errors.push(VerifyError::InvalidJump(source, target))
+    } else {
+        work.push((target, depth))
+    }
+}
+
+fn enqueue_fallthrough(
+    code_length: int,
+    source: int,
+    depth: int,
+    work: Vec[(int, int)],
+    errors: Vec[VerifyError],
+) -> unit {
+    if source + 1 >= code_length {
+        errors.push(VerifyError::FallthroughEnd(source))
+    } else {
+        work.push((source + 1, depth))
+    }
+}
+
+fn enqueue_successors(
+    function: Function,
+    offset: int,
+    instruction: Instruction,
+    depth: int,
+    work: Vec[(int, int)],
+    errors: Vec[VerifyError],
+) -> unit {
+    let code_length = function.code_value.len();
+    match instruction {
+        Instruction::Return | Instruction::ReturnUndef | Instruction::Throw | Instruction::ThrowTypeError | Instruction::ThrowReferenceError => (),
+        Instruction::Goto(target) => {
+            enqueue_target(code_length, offset, target, depth, work, errors)
+        },
+        Instruction::IfFalse(target) | Instruction::IfTrue(target) => {
+            enqueue_target(code_length, offset, target, depth, work, errors);
+            enqueue_fallthrough(code_length, offset, depth, work, errors)
+        },
+        _ => enqueue_fallthrough(code_length, offset, depth, work, errors),
+    }
+}
+
+pub fn verify(function: Function) -> VerifyResult {
+    let errors: Vec[VerifyError] = Vec::[];
+    if function.local_count_value < 0 {
+        errors.push(VerifyError::NegativeLocalCount(function.local_count_value))
+    } else {};
+    if function.parameter_count_value < 0 {
+        errors.push(VerifyError::NegativeParameterCount(function.parameter_count_value))
+    } else if function.parameter_count_value > function.local_count_value {
+        errors.push(
+            VerifyError::ParameterCountExceedsLocals(
+                function.parameter_count_value,
+                function.local_count_value,
+            ),
+        )
+    } else {};
+    if function.function_length_value < 0 {
+        errors.push(VerifyError::NegativeFunctionLength(function.function_length_value))
+    } else if function.function_length_value > function.parameter_count_value {
+        errors.push(
+            VerifyError::FunctionLengthExceedsParameters(
+                function.function_length_value,
+                function.parameter_count_value,
+            ),
+        )
+    } else {};
+    let mapped_arguments = function.mapped_arguments_value.get();
+    if !mapped_arguments.is_empty() && mapped_arguments.len() != function.parameter_count_value {
+        errors.push(
+            VerifyError::InvalidArgumentMapLength(
+                mapped_arguments.len(),
+                function.parameter_count_value,
+            ),
+        )
+    } else {};
+    if function.strict_value.get() && !mapped_arguments.is_empty() {
+        errors.push(VerifyError::MappedArgumentsInStrictFunction)
+    } else {};
+    let mut mapped_index = 0;
+    while mapped_index < mapped_arguments.len() {
+        let local = mapped_arguments[mapped_index];
+        if local < -1 || local >= function.local_count_value {
+            errors.push(VerifyError::InvalidMappedArgument(mapped_index, local))
+        } else {};
+        mapped_index += 1;
+    }
+    if function.code_value.is_empty() {
+        errors.push(VerifyError::EmptyFunction);
+        return VerifyResult { max_stack: 0, errors }
+    } else {};
+    for offset in 0..function.code_value.len() {
+        validate_operand(function, function.code_value[offset], offset, errors)
+    }
+    validate_captures(function, errors);
+    validate_exception_handlers(function, errors);
+    validate_generator_return_handlers(function, errors);
+    let depths: Vec[int] = Vec::with_capacity(function.code_value.len());
+    for _ in 0..function.code_value.len() {
+        depths.push(-1)
+    }
+    let work: Vec[(int, int)] = Vec::[(0, 0)];
+    for handler in function.exception_handlers_value {
+        if handler.start >= 0 && handler.start < handler.end
+            && handler.end <= function.code_value.len()
+            && handler.target >= 0
+            && handler.target < function.code_value.len()
+            && (handler.target < handler.start || handler.target >= handler.end) {
+            work.push((handler.target, 1))
+        } else {}
+    }
+    for handler in function.generator_return_handlers_value.get() {
+        if handler.yield_offset >= 0 && handler.yield_offset < function.code_value.len()
+            && handler.target >= 0
+            && handler.target < function.code_value.len() {
+            work.push((handler.target, 1))
+        } else {}
+        if handler.yield_offset >= 0 && handler.yield_offset < function.code_value.len()
+            && handler.throw_target >= 0
+            && handler.throw_target < function.code_value.len() {
+            work.push((handler.throw_target, 1))
+        } else {}
+    }
+    let mut max_stack = 0;
+    while !work.is_empty() {
+        let (offset, depth) = work.pop().unwrap_or((0, 0));
+        let known = depths[offset];
+        if known >= 0 {
+            if known != depth {
+                errors.push(VerifyError::InconsistentStackDepth(offset, known, depth))
+            } else {}
+        } else {
+            depths[offset] = depth;
+            let instruction = function.code_value[offset];
+            let effect = stack_effect(instruction);
+            if depth < effect.required {
+                errors.push(VerifyError::StackUnderflow(offset, effect.required, depth))
+            } else {
+                let next_depth = depth + effect.delta;
+                if next_depth > max_stack {
+                    max_stack = next_depth;
+                } else {};
+                enqueue_successors(function, offset, instruction, next_depth, work, errors)
+            }
+        }
+    }
+    VerifyResult { max_stack, errors }
+}

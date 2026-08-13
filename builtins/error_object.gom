@@ -1,0 +1,362 @@
+package builtins;
+
+use gomlang::quickjs::runtime;
+use gomlang::quickjs::vm;
+
+struct ErrorInstall {
+    error: runtime::Value,
+    internal_error: runtime::Value,
+    eval_error: runtime::Value,
+    range_error: runtime::Value,
+    reference_error: runtime::Value,
+    syntax_error: runtime::Value,
+    type_error: runtime::Value,
+    uri_error: runtime::Value,
+    aggregate_error: runtime::Value,
+}
+
+fn error_property(heap: runtime::Heap, object: runtime::ObjectId, name: string) -> Result[
+    runtime::Value,
+    vm::NativeError,
+] {
+    match runtime::get_property(heap, object, runtime::string_property_key(name)) {
+        Ok(Some(value)) => Result::Ok(value),
+        Ok(None) => Result::Ok(runtime::Value::Undefined),
+        Err(value) => Result::Err(native_error(value.message)),
+    }
+}
+
+fn error_string(heap: runtime::Heap, value: runtime::Value) -> Result[
+    runtime::JsString,
+    vm::NativeError,
+] {
+    value_string(heap, value)
+}
+
+fn error_to_string(heap: runtime::Heap, this_value: runtime::Value, arguments: Vec[runtime::Value]) -> Result[
+    runtime::Value,
+    vm::NativeError,
+] {
+    let _ = arguments;
+    let object = match this_value {
+        runtime::Value::Object(value) => value,
+        _ => return Result::Err(native_error("Error.prototype.toString requires an object")),
+    };
+    let name_value = error_property(heap, object, "name")?;
+    let message_value = error_property(heap, object, "message")?;
+    let name = match name_value {
+        runtime::Value::Undefined => js_string("Error"),
+        value => error_string(heap, value)?,
+    };
+    let message = match message_value {
+        runtime::Value::Undefined => js_string(""),
+        value => error_string(heap, value)?,
+    };
+    if name.len() == 0 {
+        Result::Ok(runtime::Value::String(message))
+    } else if message.len() == 0 {
+        Result::Ok(runtime::Value::String(name))
+    } else {
+        Result::Ok(runtime::Value::String(name.concat(js_string(": ")).concat(message)))
+    }
+}
+
+fn error_is_error(
+    context: vm::Context,
+    heap: runtime::Heap,
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+) -> Result[runtime::Value, vm::NativeError] {
+    let _ = heap;
+    let _ = this_value;
+    let result = match argument(arguments, 0) {
+        runtime::Value::Object(object) => match context.object_builtin_tag(object) {
+            Some(value) => value == js_string("Error"),
+            None => false,
+        },
+        _ => false,
+    };
+    Result::Ok(runtime::Value::Bool(result))
+}
+
+fn install_error_cause(heap: runtime::Heap, object: runtime::ObjectId, options: runtime::Value) -> Result[
+    unit,
+    vm::NativeError,
+] {
+    match options {
+        runtime::Value::Object(value) => match runtime::get_property(
+            heap,
+            value,
+            runtime::string_property_key("cause"),
+        ) {
+            Ok(Some(cause)) => define_data(
+                heap,
+                object,
+                runtime::string_property_key("cause"),
+                cause,
+                true,
+                false,
+                true,
+            ),
+            Ok(None) => Result::Ok(()),
+            Err(value) => Result::Err(native_error(value.message)),
+        },
+        _ => Result::Ok(()),
+    }
+}
+
+fn error_construct(
+    heap: runtime::Heap,
+    prototype: runtime::ObjectId,
+    message_index: int,
+    options_index: int,
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+) -> Result[runtime::Value, vm::NativeError] {
+    let _ = this_value;
+    let object = allocate_ordinary(heap, Option::Some(prototype))?;
+    let message = argument(arguments, message_index);
+    match message {
+        runtime::Value::Undefined => (),
+        value => define_data(
+            heap,
+            object,
+            runtime::string_property_key("message"),
+            runtime::Value::String(error_string(heap, value)?),
+            true,
+            false,
+            true,
+        )?,
+    };
+    install_error_cause(heap, object, argument(arguments, options_index))?;
+    Result::Ok(runtime::Value::Object(object))
+}
+
+fn aggregate_error_construct(
+    heap: runtime::Heap,
+    prototype: runtime::ObjectId,
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+) -> Result[runtime::Value, vm::NativeError] {
+    let result = error_construct(heap, prototype, 1, 2, this_value, arguments)?;
+    let object = match result {
+        runtime::Value::Object(value) => value,
+        _ => return Result::Err(native_error("cannot allocate AggregateError")),
+    };
+    define_data(
+        heap,
+        object,
+        runtime::string_property_key("errors"),
+        argument(arguments, 0),
+        true,
+        false,
+        true,
+    )?;
+    Result::Ok(result)
+}
+
+fn install_error_type(
+    context: vm::Context,
+    name: string,
+    parent_prototype: Option[runtime::ObjectId],
+) -> Result[(runtime::Value, runtime::ObjectId), BuiltinError] {
+    let prototype = match allocate_ordinary(context.heap(), parent_prototype) {
+        Ok(value) => value,
+        Err(value) => return Result::Err(BuiltinError { message: value.message }),
+    };
+    match parent_prototype {
+        Some(_) => (),
+        None => define_function(context, prototype, "toString", error_to_string)?,
+    };
+    define_value(
+        context.heap(),
+        prototype,
+        "name",
+        runtime::Value::String(js_string(name)),
+        true,
+        true,
+    )?;
+    define_value(
+        context.heap(),
+        prototype,
+        "message",
+        runtime::Value::String(js_string("")),
+        true,
+        true,
+    )?;
+    let constructor = allocate_function(
+        context,
+        name,
+        |heap, this_value, arguments| {
+            let result = error_construct(heap, prototype, 0, 1, this_value, arguments)?;
+            match result {
+                runtime::Value::Object(object) => if context.set_object_builtin_tag(
+                    object,
+                    js_string("Error"),
+                ) {
+                    Result::Ok(result)
+                } else {
+                    Result::Err(native_error("cannot register Error instance"))
+                },
+                _ => Result::Ok(result),
+            }
+        },
+    )?;
+    let constructor_object = function_object(constructor, name)?;
+    if name == "Error" {
+        define_value(
+            context.heap(),
+            constructor_object,
+            "isError",
+            allocate_function(
+                context,
+                "Error.isError",
+                |heap, this_value, arguments| {
+                    error_is_error(context, heap, this_value, arguments)
+                },
+            )?,
+            true,
+            true,
+        )?
+    } else {};
+    define_value(
+        context.heap(),
+        constructor_object,
+        "prototype",
+        runtime::Value::Object(prototype),
+        false,
+        false,
+    )?;
+    define_value(context.heap(), prototype, "constructor", constructor, true, true)?;
+    Result::Ok((constructor, prototype))
+}
+
+fn install_aggregate_error(context: vm::Context, parent_prototype: runtime::ObjectId) -> Result[
+    runtime::Value,
+    BuiltinError,
+] {
+    let prototype = match allocate_ordinary(context.heap(), Option::Some(parent_prototype)) {
+        Ok(value) => value,
+        Err(value) => return Result::Err(BuiltinError { message: value.message }),
+    };
+    define_value(
+        context.heap(),
+        prototype,
+        "name",
+        runtime::Value::String(js_string("AggregateError")),
+        true,
+        true,
+    )?;
+    define_value(
+        context.heap(),
+        prototype,
+        "message",
+        runtime::Value::String(js_string("")),
+        true,
+        true,
+    )?;
+    let constructor = allocate_function(
+        context,
+        "AggregateError",
+        |heap, this_value, arguments| {
+            let result = aggregate_error_construct(heap, prototype, this_value, arguments)?;
+            match result {
+                runtime::Value::Object(object) => if context.set_object_builtin_tag(
+                    object,
+                    js_string("Error"),
+                ) {
+                    Result::Ok(result)
+                } else {
+                    Result::Err(native_error("cannot register AggregateError instance"))
+                },
+                _ => Result::Ok(result),
+            }
+        },
+    )?;
+    let constructor_object = function_object(constructor, "AggregateError")?;
+    define_value(
+        context.heap(),
+        constructor_object,
+        "prototype",
+        runtime::Value::Object(prototype),
+        false,
+        false,
+    )?;
+    define_value(context.heap(), prototype, "constructor", constructor, true, true)?;
+    Result::Ok(constructor)
+}
+
+fn register_error_prototype(
+    context: vm::Context,
+    kind: vm::ErrorPrototypeKind,
+    prototype: runtime::ObjectId,
+) -> Result[unit, BuiltinError] {
+    match context.set_error_prototype(kind, prototype) {
+        Ok(_) => Result::Ok(()),
+        Err(value) => Result::Err(BuiltinError { message: value.kind.debug() }),
+    }
+}
+
+fn install_errors(context: vm::Context) -> Result[ErrorInstall, BuiltinError] {
+    let (error, error_prototype) = install_error_type(context, "Error", Option::None)?;
+    let (internal_error, internal_error_prototype) = install_error_type(
+        context,
+        "InternalError",
+        Option::Some(error_prototype),
+    )?;
+    let (eval_error, _) = install_error_type(context, "EvalError", Option::Some(error_prototype))?;
+    let (range_error, range_error_prototype) = install_error_type(
+        context,
+        "RangeError",
+        Option::Some(error_prototype),
+    )?;
+    let (reference_error, reference_error_prototype) = install_error_type(
+        context,
+        "ReferenceError",
+        Option::Some(error_prototype),
+    )?;
+    let (syntax_error, syntax_error_prototype) = install_error_type(
+        context,
+        "SyntaxError",
+        Option::Some(error_prototype),
+    )?;
+    let (type_error, type_error_prototype) = install_error_type(
+        context,
+        "TypeError",
+        Option::Some(error_prototype),
+    )?;
+    let (uri_error, uri_error_prototype) = install_error_type(
+        context,
+        "URIError",
+        Option::Some(error_prototype),
+    )?;
+    let aggregate_error = install_aggregate_error(context, error_prototype)?;
+    register_error_prototype(context, vm::ErrorPrototypeKind::Error, error_prototype)?;
+    register_error_prototype(
+        context,
+        vm::ErrorPrototypeKind::InternalError,
+        internal_error_prototype,
+    )?;
+    register_error_prototype(context, vm::ErrorPrototypeKind::TypeError, type_error_prototype)?;
+    register_error_prototype(context, vm::ErrorPrototypeKind::RangeError, range_error_prototype)?;
+    register_error_prototype(
+        context,
+        vm::ErrorPrototypeKind::ReferenceError,
+        reference_error_prototype,
+    )?;
+    register_error_prototype(context, vm::ErrorPrototypeKind::SyntaxError, syntax_error_prototype)?;
+    register_error_prototype(context, vm::ErrorPrototypeKind::UriError, uri_error_prototype)?;
+    Result::Ok(
+        ErrorInstall {
+            error,
+            internal_error,
+            eval_error,
+            range_error,
+            reference_error,
+            syntax_error,
+            type_error,
+            uri_error,
+            aggregate_error,
+        },
+    )
+}

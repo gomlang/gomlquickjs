@@ -1,0 +1,203 @@
+package builtins;
+
+use gomlang::quickjs::runtime;
+use gomlang::quickjs::vm;
+
+fn symbol_description_at_depth(context: vm::Context, value: runtime::Value, depth: int) -> Result[
+    Option[runtime::JsString],
+    vm::VmError,
+] {
+    match value {
+        runtime::Value::Undefined => Result::Ok(Option::None),
+        runtime::Value::String(value) => Result::Ok(Option::Some(value)),
+        value => match string_value_at_depth(context, value, depth)? {
+            runtime::Value::String(value) => Result::Ok(Option::Some(value)),
+            _ => Result::Err(function_vm_error("symbol description is not a string")),
+        },
+    }
+}
+
+fn fresh_symbol(next_id: Ref[uint64], description: Option[runtime::JsString]) -> Result[
+    runtime::Value,
+    vm::NativeError,
+] {
+    let id = next_id.get();
+    if id == 18446744073709551615 {
+        return Result::Err(native_error("symbol identifier space exhausted"))
+    } else {};
+    next_id.set(id + 1);
+    Result::Ok(runtime::Value::Symbol(runtime::Symbol::from_js_string(id, description)))
+}
+
+fn symbol_constructor_vm(
+    context: vm::Context,
+    next_id: Ref[uint64],
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+    depth: int,
+) -> Result[runtime::Value, vm::VmError] {
+    let _ = this_value;
+    match fresh_symbol(
+        next_id,
+        symbol_description_at_depth(context, argument(arguments, 0), depth)?,
+    ) {
+        Ok(value) => Result::Ok(value),
+        Err(value) => Result::Err(function_native_error(value)),
+    }
+}
+
+fn symbol_for_vm(
+    context: vm::Context,
+    next_id: Ref[uint64],
+    registry: HashMap[runtime::JsString, runtime::Symbol],
+    reverse: HashMap[runtime::Symbol, runtime::JsString],
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+    depth: int,
+) -> Result[runtime::Value, vm::VmError] {
+    let _ = this_value;
+    let key = match string_value_at_depth(context, argument(arguments, 0), depth)? {
+        runtime::Value::String(value) => value,
+        _ => return Result::Err(function_vm_error("symbol registry key is not a string")),
+    };
+    match registry.get(key) {
+        Some(value) => Result::Ok(runtime::Value::Symbol(value)),
+        None => {
+            let symbol = match fresh_symbol(next_id, Option::Some(key)) {
+                Ok(runtime::Value::Symbol(value)) => value,
+                Ok(_) => return Result::Err(function_vm_error("cannot allocate symbol")),
+                Err(value) => return Result::Err(function_native_error(value)),
+            };
+            registry[key] = symbol;
+            reverse[symbol] = key;
+            Result::Ok(runtime::Value::Symbol(symbol))
+        },
+    }
+}
+
+fn symbol_key_for(
+    heap: runtime::Heap,
+    reverse: HashMap[runtime::Symbol, runtime::JsString],
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+) -> Result[runtime::Value, vm::NativeError] {
+    let _ = heap;
+    let _ = this_value;
+    match argument(arguments, 0) {
+        runtime::Value::Symbol(value) => match reverse.get(value) {
+            Some(value) => Result::Ok(runtime::Value::String(value)),
+            None => Result::Ok(runtime::Value::Undefined),
+        },
+        _ => Result::Err(native_error("Symbol.keyFor requires a symbol")),
+    }
+}
+
+fn install_well_known_symbol(
+    heap: runtime::Heap,
+    constructor: runtime::ObjectId,
+    next_id: Ref[uint64],
+    name: string,
+) -> Result[runtime::Symbol, BuiltinError] {
+    let symbol = match fresh_symbol(next_id, Option::Some(js_string("Symbol." + name))) {
+        Ok(runtime::Value::Symbol(value)) => value,
+        Ok(_) => return Result::Err(BuiltinError { message: "invalid well-known symbol" }),
+        Err(value) => return Result::Err(BuiltinError { message: value.message }),
+    };
+    define_value(heap, constructor, name, runtime::Value::Symbol(symbol), false, false)?;
+    Result::Ok(symbol)
+}
+
+fn install_symbol(context: vm::Context) -> Result[runtime::Value, BuiltinError] {
+    let next_id: Ref[uint64] = Ref::new(4096);
+    let registry: HashMap[runtime::JsString, runtime::Symbol] = HashMap::{};
+    let reverse: HashMap[runtime::Symbol, runtime::JsString] = HashMap::{};
+    let function = allocate_vm_function(
+        context,
+        "Symbol",
+        |this_value, arguments, depth| {
+            symbol_constructor_vm(context, next_id, this_value, arguments, depth)
+        },
+    )?;
+    let object = function_object(function, "Symbol")?;
+    define_value(
+        context.heap(),
+        object,
+        "for",
+        allocate_vm_function(
+            context,
+            "Symbol.for",
+            |this_value, arguments, depth| {
+                symbol_for_vm(context, next_id, registry, reverse, this_value, arguments, depth)
+            },
+        )?,
+        true,
+        true,
+    )?;
+    define_value(
+        context.heap(),
+        object,
+        "keyFor",
+        allocate_function(
+            context,
+            "Symbol.keyFor",
+            |heap, this_value, arguments| {
+                symbol_key_for(heap, reverse, this_value, arguments)
+            },
+        )?,
+        true,
+        true,
+    )?;
+    for name in Vec::[
+        "asyncIterator",
+        "hasInstance",
+        "isConcatSpreadable",
+        "match",
+        "matchAll",
+        "replace",
+        "search",
+        "species",
+        "split",
+        "toPrimitive",
+        "toStringTag",
+        "unscopables",
+    ] {
+        let symbol = install_well_known_symbol(context.heap(), object, next_id, name)?;
+        match name {
+            "asyncIterator" => {
+                context.set_well_known_symbol(vm::WellKnownSymbolKind::AsyncIterator, symbol)
+            },
+            "hasInstance" => {
+                context.set_well_known_symbol(vm::WellKnownSymbolKind::HasInstance, symbol)
+            },
+            "isConcatSpreadable" => {
+                context.set_well_known_symbol(vm::WellKnownSymbolKind::IsConcatSpreadable, symbol)
+            },
+            "match" => context.set_well_known_symbol(vm::WellKnownSymbolKind::Match, symbol),
+            "matchAll" => {
+                context.set_well_known_symbol(vm::WellKnownSymbolKind::MatchAll, symbol)
+            },
+            "replace" => context.set_well_known_symbol(vm::WellKnownSymbolKind::Replace, symbol),
+            "search" => context.set_well_known_symbol(vm::WellKnownSymbolKind::Search, symbol),
+            "species" => context.set_well_known_symbol(vm::WellKnownSymbolKind::Species, symbol),
+            "split" => context.set_well_known_symbol(vm::WellKnownSymbolKind::Split, symbol),
+            "toPrimitive" => {
+                context.set_well_known_symbol(vm::WellKnownSymbolKind::ToPrimitive, symbol)
+            },
+            "toStringTag" => {
+                context.set_well_known_symbol(vm::WellKnownSymbolKind::ToStringTag, symbol)
+            },
+            "unscopables" => {
+                context.set_well_known_symbol(vm::WellKnownSymbolKind::Unscopables, symbol)
+            },
+            _ => (),
+        }
+    }
+    let iterator = match fresh_symbol(next_id, Option::Some(js_string("Symbol.iterator"))) {
+        Ok(runtime::Value::Symbol(value)) => value,
+        Ok(_) => return Result::Err(BuiltinError { message: "invalid iterator symbol" }),
+        Err(value) => return Result::Err(BuiltinError { message: value.message }),
+    };
+    define_value(context.heap(), object, "iterator", runtime::Value::Symbol(iterator), false, false)?;
+    context.set_iterator_symbol(iterator);
+    Result::Ok(function)
+}

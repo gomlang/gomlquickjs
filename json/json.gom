@@ -1,0 +1,813 @@
+package json;
+
+use gomlang::quickjs::dtoa;
+use gomlang::quickjs::runtime;
+use std::collections;
+use std::math;
+use std::num;
+
+#[derive(PartialEq, Eq, Debug)]
+pub enum JsonErrorKind {
+    Syntax,
+    Allocation,
+    UnsupportedType,
+    CircularReference,
+    InvalidArrayLength,
+    Accessor,
+}
+
+#[derive(PartialEq, Eq, Debug)]
+pub struct JsonError {
+    pub kind: JsonErrorKind,
+    pub offset: int,
+    pub message: string,
+}
+
+#[derive(PartialEq, Eq, Hash)]
+struct JsonSourceKey {
+    holder: runtime::ObjectId,
+    key: runtime::PropertyKey,
+}
+
+struct JsonSourceEntry {
+    value: runtime::Value,
+    source: runtime::JsString,
+}
+
+pub struct JsonParseSources {
+    values_value: HashMap[JsonSourceKey, JsonSourceEntry],
+    seen_values: collections::HashSet[JsonSourceKey],
+    duplicate_values: collections::HashSet[JsonSourceKey],
+    root_value: Ref[Option[JsonSourceEntry]],
+}
+
+impl JsonParseSources {
+    pub fn attach_root(self: JsonParseSources, holder: runtime::ObjectId, key: runtime::PropertyKey) -> unit {
+        match self.root_value.get() {
+            Some(value) => {
+                self.values_value[JsonSourceKey { holder, key }] = value;
+            },
+            None => (),
+        }
+    }
+
+    pub fn source_for(
+        self: JsonParseSources,
+        holder: runtime::ObjectId,
+        key: runtime::PropertyKey,
+        value: runtime::Value,
+    ) -> Option[runtime::JsString] {
+        match self.values_value.get(JsonSourceKey { holder, key }) {
+            Some(source) => if runtime::same_value(source.value, value) {
+                Option::Some(source.source)
+            } else {
+                Option::None
+            },
+            None => Option::None,
+        }
+    }
+}
+
+pub struct ParsedJson {
+    pub value: runtime::Value,
+    sources_value: JsonParseSources,
+}
+
+impl ParsedJson {
+    pub fn sources(self: ParsedJson) -> JsonParseSources {
+        self.sources_value
+    }
+}
+
+impl ToString for JsonError {
+    fn to_string(self: JsonError) -> string {
+        if self.offset < 0 {
+            self.message
+        } else {
+            self.message + " at UTF-16 offset " + self.offset.to_string()
+        }
+    }
+}
+
+struct Parser {
+    heap: runtime::Heap,
+    input: runtime::JsString,
+    position: Ref[int],
+    sources: JsonParseSources,
+    latest_source: Ref[Option[JsonSourceEntry]],
+}
+
+fn syntax_error(parser: Parser, message: string) -> JsonError {
+    JsonError { kind: JsonErrorKind::Syntax, offset: parser.position.get(), message }
+}
+
+fn allocation_error(parser: Parser, message: string) -> JsonError {
+    JsonError { kind: JsonErrorKind::Allocation, offset: parser.position.get(), message }
+}
+
+fn peek(parser: Parser) -> Option[uint16] {
+    if parser.position.get() < parser.input.len() {
+        Option::Some(parser.input.get(parser.position.get()))
+    } else {
+        Option::None
+    }
+}
+
+fn take(parser: Parser) -> Option[uint16] {
+    match peek(parser) {
+        Some(value) => {
+            parser.position.set(parser.position.get() + 1);
+            Option::Some(value)
+        },
+        None => Option::None,
+    }
+}
+
+fn json_whitespace(value: uint16) -> bool {
+    value == 0x09 || value == 0x0a || value == 0x0d || value == 0x20
+}
+
+fn skip_whitespace(parser: Parser) -> unit {
+    while match peek(parser) {
+        Some(value) => json_whitespace(value),
+        None => false,
+    } {
+        let _ = take(parser);
+    }
+}
+
+fn ascii_literal(parser: Parser, value: string) -> bool {
+    let bytes = value.to_bytes();
+    let start = parser.position.get();
+    let mut index = 0;
+    while index < bytes.len() {
+        if parser.position.get() >= parser.input.len()
+            || parser.input.get(parser.position.get()) != bytes[index].to_uint16() {
+            parser.position.set(start);
+            return false
+        } else {};
+        parser.position.set(parser.position.get() + 1);
+        index += 1;
+    }
+    true
+}
+
+fn hex_value(value: uint16) -> Option[uint16] {
+    if value >= 48 && value <= 57 {
+        Option::Some(value - 48)
+    } else if value >= 65 && value <= 70 {
+        Option::Some(value - 65 + 10)
+    } else if value >= 97 && value <= 102 {
+        Option::Some(value - 97 + 10)
+    } else {
+        Option::None
+    }
+}
+
+fn parse_unicode_escape(parser: Parser) -> Result[uint16, JsonError] {
+    let mut result: uint16 = 0;
+    let mut count = 0;
+    while count < 4 {
+        let current = match take(parser) {
+            Some(value) => value,
+            None => return Result::Err(syntax_error(parser, "incomplete Unicode escape")),
+        };
+        let digit = match hex_value(current) {
+            Some(value) => value,
+            None => return Result::Err(syntax_error(parser, "invalid Unicode escape")),
+        };
+        result = result * 16 + digit;
+        count += 1;
+    }
+    Result::Ok(result)
+}
+
+fn parse_string(parser: Parser) -> Result[runtime::JsString, JsonError] {
+    if take(parser) != Option::Some(34) {
+        return Result::Err(syntax_error(parser, "expected string"))
+    } else {};
+    let output: Vec[uint16] = Vec::[];
+    loop {
+        let current = match take(parser) {
+            Some(value) => value,
+            None => return Result::Err(syntax_error(parser, "unterminated string")),
+        };
+        if current == 34 {
+            return Result::Ok(runtime::JsString::from_code_units(output))
+        } else if current == 92 {
+            let escaped = match take(parser) {
+                Some(value) => value,
+                None => return Result::Err(syntax_error(parser, "unterminated escape")),
+            };
+            match escaped {
+                34 | 47 | 92 => output.push(escaped),
+                98 => output.push(0x08),
+                102 => output.push(0x0c),
+                110 => output.push(0x0a),
+                114 => output.push(0x0d),
+                116 => output.push(0x09),
+                117 => output.push(parse_unicode_escape(parser)?),
+                _ => return Result::Err(syntax_error(parser, "invalid string escape")),
+            }
+        } else if current < 0x20 {
+            return Result::Err(syntax_error(parser, "unescaped control character in string"))
+        } else {
+            output.push(current)
+        }
+    }
+}
+
+fn digit(value: uint16) -> bool {
+    value >= 48 && value <= 57
+}
+
+fn nonzero_digit(value: uint16) -> bool {
+    value >= 49 && value <= 57
+}
+
+fn consume_digits(parser: Parser) -> int {
+    let start = parser.position.get();
+    while match peek(parser) {
+        Some(value) => digit(value),
+        None => false,
+    } {
+        let _ = take(parser);
+    }
+    parser.position.get() - start
+}
+
+fn ascii_slice(input: runtime::JsString, start: int, end: int) -> string {
+    let bytes: Vec[byte] = Vec::with_capacity(end - start);
+    let mut index = start;
+    while index < end {
+        bytes.push(input.get(index).to_uint8());
+        index += 1;
+    }
+    let (_, value) = string_from_utf8(bytes);
+    value
+}
+
+fn parse_number(parser: Parser) -> Result[runtime::Value, JsonError] {
+    let start = parser.position.get();
+    if peek(parser) == Option::Some(45) {
+        let _ = take(parser);
+    } else {};
+    match peek(parser) {
+        Some(48) => {
+            let _ = take(parser);
+            if match peek(parser) {
+                Some(value) => digit(value),
+                None => false,
+            } {
+                return Result::Err(syntax_error(parser, "leading zero in number"))
+            } else {}
+        },
+        Some(value) => if nonzero_digit(value) {
+            let _ = consume_digits(parser);
+        } else {
+            return Result::Err(syntax_error(parser, "expected digit"))
+        },
+        None => return Result::Err(syntax_error(parser, "expected digit")),
+    };
+    if peek(parser) == Option::Some(46) {
+        let _ = take(parser);
+        if consume_digits(parser) == 0 {
+            return Result::Err(syntax_error(parser, "expected digit after decimal point"))
+        } else {}
+    } else {};
+    match peek(parser) {
+        Some(69) | Some(101) => {
+            let _ = take(parser);
+            match peek(parser) {
+                Some(43) | Some(45) => {
+                    let _ = take(parser);
+                },
+                _ => (),
+            };
+            if consume_digits(parser) == 0 {
+                return Result::Err(syntax_error(parser, "expected exponent digits"))
+            } else {}
+        },
+        _ => (),
+    };
+    let text = ascii_slice(parser.input, start, parser.position.get());
+    match dtoa::try_parse_number(text) {
+        Some(value) => Result::Ok(runtime::Value::Float(value)),
+        None => Result::Err(syntax_error(parser, "invalid number")),
+    }
+}
+
+fn define_json_property(
+    parser: Parser,
+    object: runtime::ObjectId,
+    key: runtime::PropertyKey,
+    value: runtime::Value,
+) -> Result[unit, JsonError] {
+    if runtime::define_own_property(
+        parser.heap,
+        object,
+        key,
+        runtime::data_descriptor(value, true, true, true),
+    ) {
+        Result::Ok(())
+    } else {
+        Result::Err(allocation_error(parser, "cannot define JSON property"))
+    }
+}
+
+fn record_json_source(parser: Parser, holder: runtime::ObjectId, key: runtime::PropertyKey) -> unit {
+    let source_key = JsonSourceKey { holder, key };
+    if parser.sources.duplicate_values.contains(source_key) {
+        return
+    } else if parser.sources.seen_values.contains(source_key) {
+        let _ = parser.sources.values_value.remove(source_key);
+        let _ = parser.sources.duplicate_values.insert(source_key);
+        return
+    } else {
+        let _ = parser.sources.seen_values.insert(source_key);
+    };
+    match parser.latest_source.get() {
+        Some(value) => {
+            parser.sources.values_value[source_key] = value;
+        },
+        None => (),
+    }
+}
+
+fn allocate_object(parser: Parser, kind: runtime::ObjectKind) -> Result[
+    runtime::ObjectId,
+    JsonError,
+] {
+    match kind {
+        runtime::ObjectKind::Array => return match runtime::new_array(parser.heap, 0) {
+            Ok(value) => Result::Ok(value),
+            Err(value) => Result::Err(allocation_error(parser, value.message)),
+        },
+        _ => (),
+    };
+    let prototype = match kind {
+        runtime::ObjectKind::Ordinary => parser.heap.object_prototype(),
+        runtime::ObjectKind::Array => parser.heap.array_prototype(),
+        runtime::ObjectKind::Function => parser.heap.object_prototype(),
+    };
+    match runtime::new_object(parser.heap, kind, prototype) {
+        Ok(value) => Result::Ok(value),
+        Err(value) => Result::Err(allocation_error(parser, value.message)),
+    }
+}
+
+fn finish_array(parser: Parser, object: runtime::ObjectId, length: int) -> Result[
+    runtime::Value,
+    JsonError,
+] {
+    if runtime::define_own_property(
+        parser.heap,
+        object,
+        runtime::string_property_key("length"),
+        runtime::data_descriptor(runtime::Value::Int(length.to_int32()), true, false, false),
+    ) {
+        Result::Ok(runtime::Value::Object(object))
+    } else {
+        Result::Err(allocation_error(parser, "cannot define JSON array length"))
+    }
+}
+
+fn parse_array(parser: Parser, depth: int) -> Result[runtime::Value, JsonError] {
+    let _ = take(parser);
+    let object = allocate_object(parser, runtime::ObjectKind::Array)?;
+    skip_whitespace(parser);
+    if peek(parser) == Option::Some(93) {
+        let _ = take(parser);
+        return finish_array(parser, object, 0)
+    } else {};
+    let mut index = 0;
+    loop {
+        let value = parse_value(parser, depth + 1)?;
+        let key = runtime::string_property_key(index.to_string());
+        record_json_source(parser, object, key);
+        define_json_property(parser, object, key, value)?;
+        index += 1;
+        skip_whitespace(parser);
+        match take(parser) {
+            Some(44) => {
+                skip_whitespace(parser);
+                if peek(parser) == Option::Some(93) {
+                    return Result::Err(syntax_error(parser, "trailing comma in array"))
+                } else {}
+            },
+            Some(93) => return finish_array(parser, object, index),
+            Some(_) => return Result::Err(syntax_error(parser, "expected comma or closing bracket")),
+            None => return Result::Err(syntax_error(parser, "unterminated array")),
+        }
+    }
+}
+
+fn parse_object(parser: Parser, depth: int) -> Result[runtime::Value, JsonError] {
+    let _ = take(parser);
+    let object = allocate_object(parser, runtime::ObjectKind::Ordinary)?;
+    skip_whitespace(parser);
+    if peek(parser) == Option::Some(125) {
+        let _ = take(parser);
+        return Result::Ok(runtime::Value::Object(object))
+    } else {};
+    loop {
+        if peek(parser) != Option::Some(34) {
+            return Result::Err(syntax_error(parser, "expected quoted object key"))
+        } else {};
+        let key = parse_string(parser)?;
+        skip_whitespace(parser);
+        if take(parser) != Option::Some(58) {
+            return Result::Err(syntax_error(parser, "expected colon after object key"))
+        } else {};
+        let value = parse_value(parser, depth + 1)?;
+        let property_key = runtime::js_string_property_key(key);
+        record_json_source(parser, object, property_key);
+        define_json_property(parser, object, property_key, value)?;
+        skip_whitespace(parser);
+        match take(parser) {
+            Some(44) => {
+                skip_whitespace(parser);
+                if peek(parser) == Option::Some(125) {
+                    return Result::Err(syntax_error(parser, "trailing comma in object"))
+                } else {}
+            },
+            Some(125) => return Result::Ok(runtime::Value::Object(object)),
+            Some(_) => return Result::Err(syntax_error(parser, "expected comma or closing brace")),
+            None => return Result::Err(syntax_error(parser, "unterminated object")),
+        }
+    }
+}
+
+fn parse_value(parser: Parser, depth: int) -> Result[runtime::Value, JsonError] {
+    if depth > 512 {
+        return Result::Err(syntax_error(parser, "JSON nesting limit exceeded"))
+    } else {};
+    skip_whitespace(parser);
+    let start = parser.position.get();
+    let value = match peek(parser) {
+        Some(34) => Result::Ok(runtime::Value::String(parse_string(parser)?)),
+        Some(45) | Some(48) | Some(49) | Some(50) | Some(51) | Some(52) | Some(53) | Some(54) | Some(55) | Some(56) | Some(57) => parse_number(
+            parser,
+        ),
+        Some(91) => parse_array(parser, depth),
+        Some(123) => parse_object(parser, depth),
+        Some(116) => if ascii_literal(parser, "true") {
+            Result::Ok(runtime::Value::Bool(true))
+        } else {
+            Result::Err(syntax_error(parser, "invalid literal"))
+        },
+        Some(102) => if ascii_literal(parser, "false") {
+            Result::Ok(runtime::Value::Bool(false))
+        } else {
+            Result::Err(syntax_error(parser, "invalid literal"))
+        },
+        Some(110) => if ascii_literal(parser, "null") {
+            Result::Ok(runtime::Value::Null)
+        } else {
+            Result::Err(syntax_error(parser, "invalid literal"))
+        },
+        Some(_) => Result::Err(syntax_error(parser, "unexpected token")),
+        None => Result::Err(syntax_error(parser, "unexpected end of input")),
+    }?;
+    match value {
+        runtime::Value::Object(_) => parser.latest_source.set(Option::None),
+        _ => parser.latest_source.set(
+            Option::Some(
+                JsonSourceEntry { value, source: parser.input.slice(start, parser.position.get()) },
+            ),
+        ),
+    };
+    Result::Ok(value)
+}
+
+pub fn parse_with_sources(heap: runtime::Heap, input: runtime::JsString) -> Result[
+    ParsedJson,
+    JsonError,
+] {
+    let sources = JsonParseSources {
+        values_value: HashMap::{},
+        seen_values: collections::HashSet::new(),
+        duplicate_values: collections::HashSet::new(),
+        root_value: Ref::new(Option::None),
+    };
+    let parser = Parser {
+        heap,
+        input,
+        position: Ref::new(0),
+        sources,
+        latest_source: Ref::new(Option::None),
+    };
+    let value = parse_value(parser, 0)?;
+    sources.root_value.set(parser.latest_source.get());
+    skip_whitespace(parser);
+    if parser.position.get() == parser.input.len() {
+        Result::Ok(ParsedJson { value, sources_value: sources })
+    } else {
+        Result::Err(syntax_error(parser, "trailing characters"))
+    }
+}
+
+pub fn parse(heap: runtime::Heap, input: runtime::JsString) -> Result[runtime::Value, JsonError] {
+    Result::Ok(parse_with_sources(heap, input)?.value)
+}
+
+fn stringify_error(kind: JsonErrorKind, message: string) -> JsonError {
+    JsonError { kind, offset: -1, message }
+}
+
+fn append_ascii(output: Vec[uint16], value: string) -> unit {
+    let bytes = value.to_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        output.push(bytes[index].to_uint16());
+        index += 1;
+    }
+}
+
+fn hex_character(value: uint16) -> uint16 {
+    if value < 10 {
+        48 + value
+    } else {
+        97 + value - 10
+    }
+}
+
+fn append_unicode_escape(output: Vec[uint16], value: uint16) -> unit {
+    output.push(92);
+    output.push(117);
+    output.push(hex_character((value >> 12) & 15));
+    output.push(hex_character((value >> 8) & 15));
+    output.push(hex_character((value >> 4) & 15));
+    output.push(hex_character(value & 15));
+}
+
+fn append_quoted(output: Vec[uint16], value: runtime::JsString) -> unit {
+    output.push(34);
+    let mut index = 0;
+    while index < value.len() {
+        let current = value.get(index);
+        if current == 34 || current == 92 {
+            output.push(92);
+            output.push(current);
+        } else if current == 8 {
+            append_ascii(output, "\\b");
+        } else if current == 9 {
+            append_ascii(output, "\\t");
+        } else if current == 10 {
+            append_ascii(output, "\\n");
+        } else if current == 12 {
+            append_ascii(output, "\\f");
+        } else if current == 13 {
+            append_ascii(output, "\\r");
+        } else if current < 0x20 {
+            append_unicode_escape(output, current);
+        } else if runtime::is_high_surrogate(current) {
+            if index + 1 < value.len() && runtime::is_low_surrogate(value.get(index + 1)) {
+                output.push(current);
+                output.push(value.get(index + 1));
+                index += 1;
+            } else {
+                append_unicode_escape(output, current);
+            }
+        } else if runtime::is_low_surrogate(current) {
+            append_unicode_escape(output, current);
+        } else {
+            output.push(current)
+        };
+        index += 1;
+    }
+    output.push(34);
+}
+
+fn invalid_object_error() -> JsonError {
+    stringify_error(JsonErrorKind::Allocation, "object does not belong to this heap")
+}
+
+fn unsupported_value(heap: runtime::Heap, value: runtime::Value) -> Result[bool, JsonError] {
+    match value {
+        runtime::Value::Undefined | runtime::Value::Symbol(_) => Result::Ok(true),
+        runtime::Value::Object(id) => match heap.get(id) {
+            Some(object) => match object.kind() {
+                runtime::ObjectKind::Function => Result::Ok(true),
+                runtime::ObjectKind::Ordinary | runtime::ObjectKind::Array => Result::Ok(false),
+            },
+            None => Result::Err(invalid_object_error()),
+        },
+        _ => Result::Ok(false),
+    }
+}
+
+fn array_length(heap: runtime::Heap, id: runtime::ObjectId) -> Result[int, JsonError] {
+    let value = match runtime::get_property(heap, id, runtime::string_property_key("length")) {
+        Ok(Some(value)) => value,
+        Ok(None) => return Result::Ok(0),
+        Err(value) => return Result::Err(stringify_error(JsonErrorKind::Accessor, value.message)),
+    };
+    match value {
+        runtime::Value::Undefined | runtime::Value::Null => Result::Ok(0),
+        runtime::Value::Int(value) => if value >= 0 {
+            Result::Ok(value.to_int())
+        } else {
+            Result::Err(stringify_error(JsonErrorKind::InvalidArrayLength, "negative array length"))
+        },
+        runtime::Value::Float(value) => {
+            if math::is_finite(value) && value >= 0.0 && value == math::floor(value)
+                && value <= 2147483647.0 {
+                match num::parse_int(dtoa::number_to_string(value)) {
+                    Ok(value) => Result::Ok(value),
+                    Err(_) => Result::Err(
+                        stringify_error(JsonErrorKind::InvalidArrayLength, "invalid array length"),
+                    ),
+                }
+            } else {
+                Result::Err(
+                    stringify_error(JsonErrorKind::InvalidArrayLength, "invalid array length"),
+                )
+            }
+        },
+        _ => Result::Err(
+            stringify_error(JsonErrorKind::InvalidArrayLength, "non-numeric array length"),
+        ),
+    }
+}
+
+fn array_value(heap: runtime::Heap, id: runtime::ObjectId, index: int) -> Result[
+    runtime::Value,
+    JsonError,
+] {
+    match runtime::get_property(heap, id, runtime::string_property_key(index.to_string())) {
+        Ok(Some(value)) => Result::Ok(value),
+        Ok(None) => Result::Ok(runtime::Value::Undefined),
+        Err(value) => Result::Err(stringify_error(JsonErrorKind::Accessor, value.message)),
+    }
+}
+
+fn enumerable_property_value(heap: runtime::Heap, id: runtime::ObjectId, key: runtime::PropertyKey) -> Result[
+    Option[runtime::Value],
+    JsonError,
+] {
+    let object = match heap.get(id) {
+        Some(value) => value,
+        None => return Result::Err(invalid_object_error()),
+    };
+    match object.own_property(key) {
+        Some(runtime::PropertyDescriptor::Data { value, enumerable, .. }) => if enumerable {
+            Result::Ok(Option::Some(value))
+        } else {
+            Result::Ok(Option::None)
+        },
+        Some(runtime::PropertyDescriptor::Accessor { get, enumerable, .. }) => if !enumerable {
+            Result::Ok(Option::None)
+        } else {
+            match get {
+                None => Result::Ok(Option::Some(runtime::Value::Undefined)),
+                Some(_) => Result::Err(
+                    stringify_error(
+                        JsonErrorKind::Accessor,
+                        "JSON stringify cannot invoke accessor property",
+                    ),
+                ),
+            }
+        },
+        None => Result::Ok(Option::None),
+    }
+}
+
+fn write_array(
+    heap: runtime::Heap,
+    id: runtime::ObjectId,
+    output: Vec[uint16],
+    stack: collections::HashSet[runtime::ObjectId],
+) -> Result[unit, JsonError] {
+    let length = array_length(heap, id)?;
+    output.push(91);
+    let mut index = 0;
+    while index < length {
+        if index > 0 {
+            output.push(44);
+        } else {};
+        let value = array_value(heap, id, index)?;
+        if !write_value(heap, value, output, stack)? {
+            append_ascii(output, "null");
+        } else {};
+        index += 1;
+    }
+    output.push(93);
+    Result::Ok(())
+}
+
+fn write_object(
+    heap: runtime::Heap,
+    id: runtime::ObjectId,
+    output: Vec[uint16],
+    stack: collections::HashSet[runtime::ObjectId],
+) -> Result[unit, JsonError] {
+    output.push(123);
+    let mut first = true;
+    for key in runtime::own_property_keys(heap, id) {
+        let name = match key {
+            runtime::PropertyKey::String(value) => value,
+            runtime::PropertyKey::Symbol(_) => continue,
+        };
+        let value = match enumerable_property_value(heap, id, key)? {
+            Some(value) => value,
+            None => continue,
+        };
+        if unsupported_value(heap, value)? {
+            continue
+        } else {};
+        if first {
+            first = false;
+        } else {
+            output.push(44);
+        };
+        append_quoted(output, name);
+        output.push(58);
+        let _ = write_value(heap, value, output, stack)?;
+    }
+    output.push(125);
+    Result::Ok(())
+}
+
+fn write_value(
+    heap: runtime::Heap,
+    value: runtime::Value,
+    output: Vec[uint16],
+    stack: collections::HashSet[runtime::ObjectId],
+) -> Result[bool, JsonError] {
+    match value {
+        runtime::Value::Undefined | runtime::Value::Symbol(_) => Result::Ok(false),
+        runtime::Value::Null => {
+            append_ascii(output, "null");
+            Result::Ok(true)
+        },
+        runtime::Value::Bool(value) => {
+            append_ascii(
+                output,
+                if value {
+                    "true"
+                } else {
+                    "false"
+                },
+            );
+            Result::Ok(true)
+        },
+        runtime::Value::Int(value) => {
+            append_ascii(output, value.to_string());
+            Result::Ok(true)
+        },
+        runtime::Value::Float(value) => {
+            append_ascii(
+                output,
+                if math::is_finite(value) {
+                    dtoa::number_to_string(value)
+                } else {
+                    "null"
+                },
+            );
+            Result::Ok(true)
+        },
+        runtime::Value::String(value) => {
+            append_quoted(output, value);
+            Result::Ok(true)
+        },
+        runtime::Value::BigInt(_) => Result::Err(
+            stringify_error(JsonErrorKind::UnsupportedType, "cannot serialize BigInt as JSON"),
+        ),
+        runtime::Value::Object(id) => {
+            let object = match heap.get(id) {
+                Some(value) => value,
+                None => return Result::Err(invalid_object_error()),
+            };
+            match object.kind() {
+                runtime::ObjectKind::Function => Result::Ok(false),
+                runtime::ObjectKind::Ordinary | runtime::ObjectKind::Array => {
+                    if !stack.insert(id) {
+                        return Result::Err(
+                            stringify_error(JsonErrorKind::CircularReference, "circular reference"),
+                        )
+                    } else {};
+                    match object.kind() {
+                        runtime::ObjectKind::Array => write_array(heap, id, output, stack)?,
+                        runtime::ObjectKind::Ordinary => write_object(heap, id, output, stack)?,
+                        runtime::ObjectKind::Function => (),
+                    };
+                    let _ = stack.remove(id);
+                    Result::Ok(true)
+                },
+            }
+        },
+    }
+}
+
+pub fn stringify(heap: runtime::Heap, value: runtime::Value) -> Result[runtime::JsString, JsonError] {
+    let output: Vec[uint16] = Vec::[];
+    let stack: collections::HashSet[runtime::ObjectId] = collections::HashSet::new();
+    if write_value(heap, value, output, stack)? {
+        Result::Ok(runtime::JsString::from_code_units(output))
+    } else {
+        Result::Err(
+            stringify_error(JsonErrorKind::UnsupportedType, "top-level value has no JSON form"),
+        )
+    }
+}

@@ -1,0 +1,163 @@
+package test262;
+
+use std::fs;
+use std::testing;
+
+fn empty_harness(name: string) -> Result[string, string] {
+    if name == "sta.js" || name == "assert.js" {
+        Result::Ok("")
+    } else {
+        Result::Err("missing")
+    }
+}
+
+fn sample_harness(name: string) -> Result[string, string] {
+    if name == "sta.js" {
+        Result::Ok("let harness_order = 40;")
+    } else if name == "assert.js" {
+        Result::Ok("harness_order = harness_order + 1;")
+    } else if name == "extra.js" {
+        Result::Ok("harness_order = harness_order + 1;")
+    } else {
+        Result::Err("missing")
+    }
+}
+
+fn case_from(source: string) -> TestCase {
+    match parse(source) {
+        Ok(value) => value,
+        Err(value) => {
+            testing::fail(value.to_string());
+            case_from("/*---\nflags: [raw]\n---*/")
+        },
+    }
+}
+
+#[test]
+fn prepares_default_harnesses_in_test262_order() -> unit {
+    let case = case_from(
+        "/*---\nincludes: [extra.js, assert.js]\nflags: [noStrict]\n---*/\nreturn harness_order;",
+    );
+    match prepare_source(case, SourceVariant::Sloppy, sample_harness) {
+        Ok(value) => testing::assert(
+            value
+                == "let harness_order = 40;\nharness_order = harness_order + 1;\nharness_order = harness_order + 1;\n/*---\nincludes: [extra.js, assert.js]\nflags: [noStrict]\n---*/\nreturn harness_order;\n",
+        ),
+        Err(value) => testing::fail(value),
+    }
+}
+
+#[test]
+fn passes_positive_and_parse_negative_cases() -> unit {
+    let positive = run(case_from("/*---\nflags: [raw]\n---*/\nlet value = 6 * 7;"), empty_harness);
+    testing::assert_eq(positive.len(), 1);
+    testing::assert_eq(positive[0].status, RunStatus::Passed);
+    let negative = run(
+        case_from(
+            "/*---\nflags: [raw]\nnegative:\n  phase: parse\n  type: SyntaxError\n---*/\nlet = ;",
+        ),
+        empty_harness,
+    );
+    testing::assert_eq(negative[0].status, RunStatus::Passed)
+}
+
+#[test]
+fn matches_runtime_type_errors_and_rejects_wrong_types() -> unit {
+    let matching = run(
+        case_from(
+            "/*---\nflags: [raw]\nnegative:\n  phase: runtime\n  type: TypeError\n---*/\nreturn ({ value: 1 }).missing();",
+        ),
+        empty_harness,
+    );
+    testing::assert_eq(matching[0].status, RunStatus::Passed);
+    let wrong = run(
+        case_from(
+            "/*---\nflags: [raw]\nnegative:\n  phase: runtime\n  type: RangeError\n---*/\nreturn ({ value: 1 }).missing();",
+        ),
+        empty_harness,
+    );
+    testing::assert_eq(wrong[0].status, RunStatus::Failed);
+    testing::assert(wrong[0].message.contains("TypeError"));
+    let reference = run(
+        case_from(
+            "/*---\nflags: [raw]\nnegative:\n  phase: runtime\n  type: ReferenceError\n---*/\nclass Base {} class Derived extends Base { constructor() {} } new Derived();",
+        ),
+        empty_harness,
+    );
+    testing::assert_eq(reference[0].status, RunStatus::Passed)
+}
+
+#[test]
+fn skips_in_memory_modules_and_executes_async_variants() -> unit {
+    let module = run(case_from("/*---\nflags: [module]\n---*/\nexport {};"), empty_harness);
+    testing::assert_eq(module[0].status, RunStatus::Skipped);
+    let asynchronous = run(
+        case_from(
+            "/*---\nflags: [async, noStrict]\n---*/\nasync function test() { let value = await Promise.resolve(42); if (value !== 42) throw 'wrong'; } test().then($DONE, $DONE);",
+        ),
+        empty_harness,
+    );
+    testing::assert_eq(asynchronous[0].status, RunStatus::Passed);
+    let failure = run(
+        case_from("/*---\nflags: [async, noStrict]\n---*/\n$DONE('failure');"),
+        empty_harness,
+    );
+    testing::assert_eq(failure[0].status, RunStatus::Failed);
+    testing::assert(failure[0].message.contains("failure"));
+    let missing = run(
+        case_from("/*---\nflags: [async, noStrict]\n---*/\nPromise.resolve(1);"),
+        empty_harness,
+    );
+    testing::assert_eq(missing[0].status, RunStatus::Failed);
+    let duplicate = run(
+        case_from("/*---\nflags: [async, noStrict]\n---*/\n$DONE(); $DONE();"),
+        empty_harness,
+    );
+    testing::assert_eq(duplicate[0].status, RunStatus::Failed)
+}
+
+fn runner_write(path: string, source: string) -> unit {
+    match fs::write_file(path, source) {
+        Ok(()) => (),
+        Err(message) => testing::fail(message),
+    }
+}
+
+#[test]
+fn run_file_executes_module_graphs_and_resolution_negatives() -> unit {
+    let directory = "__gomlquickjs_test262_modules_94c2__";
+    let harness = directory + "/harness";
+    let _ = fs::remove_dir_all(directory);
+    let _ = fs::create_dir_all(harness);
+    runner_write(harness + "/sta.js", "");
+    runner_write(harness + "/assert.js", "");
+    runner_write(directory + "/dependency.js", "export default 42;");
+    runner_write(
+        directory + "/positive.js",
+        "/*---\nflags: [module]\n---*/\nimport answer from './dependency.js'; if (answer !== 42) throw new Error('wrong answer');",
+    );
+    match run_file(directory + "/positive.js", harness) {
+        Ok(results) => {
+            testing::assert_eq(results.len(), 1);
+            testing::assert_eq(results[0].status, RunStatus::Passed)
+        },
+        Err(message) => testing::fail(message),
+    };
+    runner_write(
+        directory + "/negative.js",
+        "/*---\nflags: [module]\nnegative:\n  phase: resolution\n  type: SyntaxError\n---*/\nimport {missing} from './dependency.js';",
+    );
+    match run_file(directory + "/negative.js", harness) {
+        Ok(results) => testing::assert_eq(results[0].status, RunStatus::Passed),
+        Err(message) => testing::fail(message),
+    };
+    runner_write(
+        directory + "/async.js",
+        "/*---\nflags: [module, async]\n---*/\nimport answer from './dependency.js'; async function check() { if (await answer !== 42) throw 'wrong'; } check().then($DONE, $DONE);",
+    );
+    match run_file(directory + "/async.js", harness) {
+        Ok(results) => testing::assert_eq(results[0].status, RunStatus::Passed),
+        Err(message) => testing::fail(message),
+    };
+    let _ = fs::remove_dir_all(directory);
+}

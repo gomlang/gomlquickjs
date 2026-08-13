@@ -1,0 +1,238 @@
+package cutils;
+
+#[derive(PartialEq, Eq)]
+pub enum ByteBufferError {
+    OffsetOutOfBounds(int, int),
+    RangeOutOfBounds(int, int, int),
+}
+
+impl ToString for ByteBufferError {
+    fn to_string(self: ByteBufferError) -> string {
+        match self {
+            ByteBufferError::OffsetOutOfBounds(offset, length) => {
+                "byte offset " + offset.to_string() + " is out of bounds for length "
+                    + length.to_string()
+            },
+            ByteBufferError::RangeOutOfBounds(offset, range_length, length) => {
+                "byte range " + offset.to_string() + ".." + (offset + range_length).to_string()
+                    + " is out of bounds for length "
+                    + length.to_string()
+            },
+        }
+    }
+}
+
+impl Debug for ByteBufferError {
+    fn debug(self: ByteBufferError) -> string {
+        self.to_string()
+    }
+}
+
+fn check_offset(offset: int, length: int) -> Result[unit, ByteBufferError] {
+    if offset < 0 || offset > length {
+        Result::Err(ByteBufferError::OffsetOutOfBounds(offset, length))
+    } else {
+        Result::Ok(())
+    }
+}
+
+fn check_range(offset: int, range_length: int, length: int) -> Result[unit, ByteBufferError] {
+    if offset < 0 || range_length < 0 || offset > length || range_length > length - offset {
+        Result::Err(ByteBufferError::RangeOutOfBounds(offset, range_length, length))
+    } else {
+        Result::Ok(())
+    }
+}
+
+fn copy_slice(values: Slice[byte]) -> Vec[byte] {
+    let output: Vec[byte] = Vec::with_capacity(values.len());
+    for value in values {
+        output.push(value)
+    }
+    output
+}
+
+pub fn read_u16_le(values: Slice[byte], offset: int) -> Result[uint16, ByteBufferError] {
+    check_range(offset, 2, values.len())?;
+    Result::Ok(values.get(offset).to_uint16() | (values.get(offset + 1).to_uint16() << 8))
+}
+
+pub fn read_u32_le(values: Slice[byte], offset: int) -> Result[uint32, ByteBufferError] {
+    check_range(offset, 4, values.len())?;
+    Result::Ok(
+        values.get(offset).to_uint32() | (values.get(offset + 1).to_uint32() << 8)
+            | (values.get(offset + 2).to_uint32() << 16)
+            | (values.get(offset + 3).to_uint32() << 24),
+    )
+}
+
+pub fn read_u64_le(values: Slice[byte], offset: int) -> Result[uint64, ByteBufferError] {
+    check_range(offset, 8, values.len())?;
+    let mut value = 0.to_uint64();
+    for index in 0..8 {
+        value = value | (values.get(offset + index).to_uint64() << (index * 8));
+    }
+    Result::Ok(value)
+}
+
+pub fn write_u16_le(values: Vec[byte], offset: int, value: uint16) -> Result[unit, ByteBufferError] {
+    check_range(offset, 2, values.len())?;
+    values[offset] = (value & 0xff).to_uint8();
+    values[offset + 1] = ((value >> 8) & 0xff).to_uint8();
+    Result::Ok(())
+}
+
+pub fn write_u32_le(values: Vec[byte], offset: int, value: uint32) -> Result[unit, ByteBufferError] {
+    check_range(offset, 4, values.len())?;
+    for index in 0..4 {
+        values[offset + index] = ((value >> (index * 8)) & 0xff).to_uint8();
+    }
+    Result::Ok(())
+}
+
+pub fn write_u64_le(values: Vec[byte], offset: int, value: uint64) -> Result[unit, ByteBufferError] {
+    check_range(offset, 8, values.len())?;
+    for index in 0..8 {
+        values[offset + index] = ((value >> (index * 8)) & 0xff).to_uint8();
+    }
+    Result::Ok(())
+}
+
+pub struct ByteBuffer {
+    values: Vec[byte],
+}
+
+impl ByteBuffer {
+    pub fn new() -> ByteBuffer {
+        ByteBuffer { values: Vec::[] }
+    }
+
+    pub fn with_capacity(capacity: int) -> ByteBuffer {
+        ByteBuffer { values: Vec::with_capacity(capacity) }
+    }
+
+    pub fn from_bytes(values: Slice[byte]) -> ByteBuffer {
+        ByteBuffer { values: copy_slice(values) }
+    }
+
+    pub fn len(self: ByteBuffer) -> int {
+        self.values.len()
+    }
+
+    pub fn is_empty(self: ByteBuffer) -> bool {
+        self.values.is_empty()
+    }
+
+    pub fn bytes(self: ByteBuffer) -> Vec[byte] {
+        copy_slice(self.values.slice(0, self.values.len()))
+    }
+
+    pub fn clear(self: ByteBuffer) -> unit {
+        self.values.clear()
+    }
+
+    pub fn append_byte(self: ByteBuffer, value: byte) -> unit {
+        self.values.push(value)
+    }
+
+    pub fn append_bytes(self: ByteBuffer, values: Slice[byte]) -> unit {
+        let copied = copy_slice(values);
+        self.values.reserve(copied.len());
+        for value in copied {
+            self.values.push(value)
+        }
+    }
+
+    pub fn insert(self: ByteBuffer, offset: int, values: Slice[byte]) -> Result[
+        unit,
+        ByteBufferError,
+    ] {
+        check_offset(offset, self.values.len())?;
+        let copied = copy_slice(values);
+        let inserted_length = copied.len();
+        let previous_length = self.values.len();
+        self.values.reserve(inserted_length);
+        for _ in 0..inserted_length {
+            self.values.push(0)
+        }
+        let mut index = previous_length;
+        while index > offset {
+            self.values[index + inserted_length - 1] = self.values[index - 1];
+            index -= 1;
+        }
+        for copied_index in 0..inserted_length {
+            self.values[offset + copied_index] = copied[copied_index];
+        }
+        Result::Ok(())
+    }
+
+    pub fn append_self(self: ByteBuffer, offset: int, length: int) -> Result[unit, ByteBufferError] {
+        check_range(offset, length, self.values.len())?;
+        let copied = copy_slice(self.values.slice(offset, offset + length));
+        self.append_bytes(copied.slice(0, copied.len()));
+        Result::Ok(())
+    }
+
+    pub fn copy_within(self: ByteBuffer, source: int, destination: int, length: int) -> Result[
+        unit,
+        ByteBufferError,
+    ] {
+        check_range(source, length, self.values.len())?;
+        check_range(destination, length, self.values.len())?;
+        let copied = copy_slice(self.values.slice(source, source + length));
+        for index in 0..length {
+            self.values[destination + index] = copied[index];
+        }
+        Result::Ok(())
+    }
+
+    pub fn append_u16_le(self: ByteBuffer, value: uint16) -> unit {
+        self.append_byte((value & 0xff).to_uint8());
+        self.append_byte(((value >> 8) & 0xff).to_uint8())
+    }
+
+    pub fn append_u32_le(self: ByteBuffer, value: uint32) -> unit {
+        for index in 0..4 {
+            self.append_byte(((value >> (index * 8)) & 0xff).to_uint8());
+        }
+    }
+
+    pub fn append_u64_le(self: ByteBuffer, value: uint64) -> unit {
+        for index in 0..8 {
+            self.append_byte(((value >> (index * 8)) & 0xff).to_uint8());
+        }
+    }
+
+    pub fn read_u16_le(self: ByteBuffer, offset: int) -> Result[uint16, ByteBufferError] {
+        read_u16_le(self.values.slice(0, self.values.len()), offset)
+    }
+
+    pub fn read_u32_le(self: ByteBuffer, offset: int) -> Result[uint32, ByteBufferError] {
+        read_u32_le(self.values.slice(0, self.values.len()), offset)
+    }
+
+    pub fn read_u64_le(self: ByteBuffer, offset: int) -> Result[uint64, ByteBufferError] {
+        read_u64_le(self.values.slice(0, self.values.len()), offset)
+    }
+
+    pub fn write_u16_le(self: ByteBuffer, offset: int, value: uint16) -> Result[
+        unit,
+        ByteBufferError,
+    ] {
+        write_u16_le(self.values, offset, value)
+    }
+
+    pub fn write_u32_le(self: ByteBuffer, offset: int, value: uint32) -> Result[
+        unit,
+        ByteBufferError,
+    ] {
+        write_u32_le(self.values, offset, value)
+    }
+
+    pub fn write_u64_le(self: ByteBuffer, offset: int, value: uint64) -> Result[
+        unit,
+        ByteBufferError,
+    ] {
+        write_u64_le(self.values, offset, value)
+    }
+}

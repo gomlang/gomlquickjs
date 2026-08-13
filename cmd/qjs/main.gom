@@ -1,0 +1,411 @@
+package main;
+
+use gomlang::quickjs::builtins;
+use gomlang::quickjs::compiler;
+use gomlang::quickjs::modules;
+use gomlang::quickjs::runtime;
+use gomlang::quickjs::vm;
+use std::env;
+use std::fs;
+use std::io;
+use std::process;
+use std::text;
+
+const HELP: string = "Usage: qjs [options] [file [args...]]\n  -e, --eval EXPR [args...]  evaluate source text\n  -m, --module               force module evaluation\n      --script               force script evaluation\n      --strict               force strict script evaluation\n  -I, --include FILE         evaluate a script before the main input\n      --std                  expose the std and os host objects\n  -q, --quit                 initialize the runtime and quit\n  -h, --help                 show this help\n  -v, --version              show the compatibility version";
+
+const VERSION: string = "gomlquickjs 2026-06-04";
+
+#[derive(PartialEq, Eq, Debug)]
+enum SourceMode {
+    Auto,
+    Module,
+    Script,
+}
+
+struct ExecutionOptions {
+    mode: SourceMode,
+    strict: bool,
+    includes: Vec[string],
+}
+
+enum Command {
+    Evaluate(string, Vec[string], ExecutionOptions),
+    File(string, Vec[string], ExecutionOptions),
+    Stdin(ExecutionOptions),
+    Quit,
+    Help,
+    Version,
+}
+
+fn default_execution_options() -> ExecutionOptions {
+    ExecutionOptions { mode: SourceMode::Auto, strict: false, includes: Vec::[] }
+}
+
+fn command_arguments(arguments: Vec[string], start: int) -> Vec[string] {
+    let values: Vec[string] = Vec::[];
+    let mut index = start;
+    while index < arguments.len() {
+        values.push(arguments[index]);
+        index += 1;
+    }
+    values
+}
+
+fn parse_command(arguments: Vec[string]) -> Result[Command, string] {
+    let mut mode = SourceMode::Auto;
+    let mut strict = false;
+    let includes: Vec[string] = Vec::[];
+    let mut index = 1;
+    while index < arguments.len() {
+        let argument = arguments[index];
+        if argument == "-h" || argument == "--help" {
+            return Result::Ok(Command::Help)
+        } else if argument == "-v" || argument == "--version" {
+            return Result::Ok(Command::Version)
+        } else if argument == "-q" || argument == "--quit" {
+            return Result::Ok(Command::Quit)
+        } else if argument == "-m" || argument == "--module" {
+            mode = SourceMode::Module;
+            index += 1;
+        } else if argument == "--script" {
+            mode = SourceMode::Script;
+            index += 1;
+        } else if argument == "--strict" {
+            strict = true;
+            index += 1;
+        } else if argument == "--std" {
+            index += 1;
+        } else if argument == "-I" || argument == "--include" {
+            if index + 1 >= arguments.len() {
+                return Result::Err("include requires a file argument")
+            };
+            includes.push(arguments[index + 1]);
+            index += 2;
+        } else if argument == "-e" || argument == "--eval" {
+            if index + 1 >= arguments.len() {
+                return Result::Err("eval requires a source argument")
+            };
+            return Result::Ok(
+                Command::Evaluate(
+                    arguments[index + 1],
+                    command_arguments(arguments, index + 2),
+                    ExecutionOptions { mode, strict, includes },
+                ),
+            )
+        } else if argument == "--" {
+            if index + 1 >= arguments.len() {
+                return Result::Ok(Command::Stdin(ExecutionOptions { mode, strict, includes }))
+            };
+            return Result::Ok(
+                Command::File(
+                    arguments[index + 1],
+                    command_arguments(arguments, index + 1),
+                    ExecutionOptions { mode, strict, includes },
+                ),
+            )
+        } else if argument.byte_len() > 0 && argument.byte_get(0) == b'-' {
+            return Result::Err("unknown option: " + argument)
+        } else {
+            return Result::Ok(
+                Command::File(
+                    argument,
+                    command_arguments(arguments, index),
+                    ExecutionOptions { mode, strict, includes },
+                ),
+            )
+        }
+    }
+    Result::Ok(Command::Stdin(ExecutionOptions { mode, strict, includes }))
+}
+
+fn compile_diagnostics(errors: Vec[compiler::CompileError]) -> string {
+    let builder = text::StringBuilder::new();
+    let mut first = true;
+    for error in errors {
+        if !first {
+            builder.write_char('\n')
+        } else {};
+        builder.write_string(error.span.start.to_string());
+        builder.write_char(':');
+        builder.write_string(error.span.end.to_string());
+        builder.write_string(": ");
+        builder.write_string(error.message);
+        first = false;
+    }
+    builder.finish()
+}
+
+fn execute_source(source: string) -> Result[runtime::Value, string] {
+    execute_source_with_arguments(source, Vec::[])
+}
+
+fn thrown_text(heap: runtime::Heap, value: runtime::Value) -> string {
+    match value {
+        runtime::Value::String(value) => value.to_host_string().unwrap_or("<invalid string>"),
+        runtime::Value::Object(object) => {
+            for name in Vec::["stack", "message", "name"] {
+                match runtime::get_property(heap, object, runtime::string_property_key(name)) {
+                    Ok(Some(runtime::Value::String(value))) => match value.to_host_string() {
+                        Ok(value) => if value.byte_len() > 0 {
+                            return value
+                        } else {},
+                        Err(_) => (),
+                    },
+                    _ => (),
+                }
+            }
+            "<object>"
+        },
+        _ => runtime::type_of(value),
+    }
+}
+
+fn runtime_error_text(context: vm::Context, error: vm::VmError) -> string {
+    let detail = match error.kind {
+        vm::VmErrorKind::Thrown(value) => "Thrown(" + thrown_text(context.heap(), value) + ")",
+        value => value.debug(),
+    };
+    "runtime error at bytecode " + error.offset.to_string() + ": " + detail
+}
+
+struct RuntimeSession {
+    context: vm::Context,
+    realm: builtins::Realm,
+}
+
+fn initialize_runtime(script_arguments: Vec[string]) -> Result[RuntimeSession, string] {
+    let context = vm::Context::new(runtime::Heap::new());
+    compiler::install_dynamic_function_compiler(context);
+    match builtins::install(context) {
+        Err(error) => Result::Err("cannot initialize runtime: " + error.message),
+        Ok(realm) => {
+            modules::install_worker_module_loader(context);
+            modules::install_dynamic_import_loader(context, realm.global_object());
+            match builtins::set_script_args(context, realm, script_arguments) {
+                Err(error) => {
+                    Result::Err("cannot initialize script arguments: " + error.message)
+                },
+                Ok(()) => Result::Ok(RuntimeSession { context, realm }),
+            }
+        },
+    }
+}
+
+fn strict_source(source: string, strict: bool) -> string {
+    if strict {
+        "\"use strict\";\n" + source
+    } else {
+        source
+    }
+}
+
+fn execute_script_in_runtime(
+    session: RuntimeSession,
+    source: string,
+    module_path: Option[string],
+    drain_jobs: bool,
+) -> Result[runtime::Value, string] {
+    let source_name = module_path.unwrap_or("<cmdline>");
+    match compiler::compile_with_source_name(source, source_name) {
+        Err(errors) => Result::Err(compile_diagnostics(errors)),
+        Ok(function) => {
+            session.context.set_current_module_path(module_path);
+            let execution = session.context.execute(function);
+            match execution {
+                Ok(value) => if drain_jobs {
+                    match session.context.run_pending_jobs() {
+                        Ok(_) => {
+                            session.context.set_current_module_path(Option::None);
+                            Result::Ok(value)
+                        },
+                        Err(error) => {
+                            session.context.set_current_module_path(Option::None);
+                            Result::Err(runtime_error_text(session.context, error))
+                        },
+                    }
+                } else {
+                    session.context.set_current_module_path(Option::None);
+                    Result::Ok(value)
+                },
+                Err(error) => {
+                    session.context.set_current_module_path(Option::None);
+                    Result::Err(runtime_error_text(session.context, error))
+                },
+            }
+        },
+    }
+}
+
+fn execute_include_files(session: RuntimeSession, options: ExecutionOptions) -> Result[unit, string] {
+    for path in options.includes {
+        let source = read_file(path)?;
+        match execute_script_in_runtime(
+            session,
+            strict_source(source, options.strict),
+            Option::Some(path),
+            false,
+        ) {
+            Ok(_) => (),
+            Err(error) => return Result::Err(error),
+        }
+    }
+    Result::Ok(())
+}
+
+fn execute_source_with_arguments(source: string, script_arguments: Vec[string]) -> Result[
+    runtime::Value,
+    string,
+] {
+    execute_source_with_arguments_at_path(source, script_arguments, Option::None)
+}
+
+fn execute_source_with_arguments_at_path(
+    source: string,
+    script_arguments: Vec[string],
+    module_path: Option[string],
+) -> Result[runtime::Value, string] {
+    let session = initialize_runtime(script_arguments)?;
+    execute_script_in_runtime(session, source, module_path, true)
+}
+
+fn execute_module_file_in_runtime(session: RuntimeSession, path: string) -> Result[
+    runtime::Value,
+    string,
+] {
+    match modules::execute_file(session.context, session.realm.global_object(), path) {
+        Ok(value) => Result::Ok(value),
+        Err(error) => Result::Err(error.path + ": " + error.message),
+    }
+}
+
+fn execute_module_source_in_runtime(
+    session: RuntimeSession,
+    path: string,
+    source: string,
+    source_name: string,
+) -> Result[runtime::Value, string] {
+    match modules::execute_source_with_source_name(
+        session.context,
+        session.realm.global_object(),
+        path,
+        source,
+        source_name,
+    ) {
+        Ok(value) => Result::Ok(value),
+        Err(error) => Result::Err(error.path + ": " + error.message),
+    }
+}
+
+fn read_file(path: string) -> Result[string, string] {
+    match fs::read_file(path) {
+        Ok(source) => Result::Ok(source),
+        Err(error) => Result::Err("cannot read `" + path + "`: " + error),
+    }
+}
+
+fn read_stdin() -> Result[string, string] {
+    match io::read_stdin_to_string() {
+        Ok(source) => Result::Ok(source),
+        Err(error) => Result::Err(error.to_string()),
+    }
+}
+
+fn fail(message: string) -> unit {
+    io::eprintln("qjs: " + message);
+    process::exit(1)
+}
+
+fn source_uses_module_mode(mode: SourceMode, path: Option[string], source: string) -> bool {
+    match mode {
+        SourceMode::Module => true,
+        SourceMode::Script => false,
+        SourceMode::Auto => match path {
+            Some(path) => path.ends_with(".mjs") || compiler::source_is_module(source),
+            None => compiler::source_is_module(source),
+        },
+    }
+}
+
+fn run(command: Command) -> Result[unit, string] {
+    match command {
+        Command::Help => {
+            io::println(HELP);
+            Result::Ok(())
+        },
+        Command::Version => {
+            io::println(VERSION);
+            Result::Ok(())
+        },
+        Command::Quit => {
+            let _ = initialize_runtime(Vec::[])?;
+            Result::Ok(())
+        },
+        Command::Evaluate(source, arguments, options) => {
+            let session = initialize_runtime(arguments)?;
+            execute_include_files(session, options)?;
+            if source_uses_module_mode(options.mode, Option::None, source) {
+                let _ = execute_module_source_in_runtime(
+                    session,
+                    "qjs-eval.mjs",
+                    source,
+                    "<cmdline>",
+                )?;
+            } else {
+                let _ = execute_script_in_runtime(
+                    session,
+                    strict_source(source, options.strict),
+                    Option::None,
+                    true,
+                )?;
+            };
+            Result::Ok(())
+        },
+        Command::File(path, arguments, options) => {
+            let source = read_file(path)?;
+            let session = initialize_runtime(arguments)?;
+            execute_include_files(session, options)?;
+            if source_uses_module_mode(options.mode, Option::Some(path), source) {
+                let _ = execute_module_file_in_runtime(session, path)?;
+            } else {
+                let _ = execute_script_in_runtime(
+                    session,
+                    strict_source(source, options.strict),
+                    Option::Some(path),
+                    true,
+                )?;
+            };
+            Result::Ok(())
+        },
+        Command::Stdin(options) => {
+            let source = read_stdin()?;
+            let session = initialize_runtime(Vec::[])?;
+            execute_include_files(session, options)?;
+            if source_uses_module_mode(options.mode, Option::None, source) {
+                let _ = execute_module_source_in_runtime(
+                    session,
+                    "qjs-stdin.mjs",
+                    source,
+                    "<stdin>",
+                )?;
+            } else {
+                let _ = execute_script_in_runtime(
+                    session,
+                    strict_source(source, options.strict),
+                    Option::None,
+                    true,
+                )?;
+            };
+            Result::Ok(())
+        },
+    }
+}
+
+fn main() -> unit {
+    match parse_command(env::args()) {
+        Err(error) => fail(error),
+        Ok(command) => match run(command) {
+            Ok(()) => (),
+            Err(error) => fail(error),
+        },
+    }
+}

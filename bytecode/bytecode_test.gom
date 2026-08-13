@@ -1,0 +1,636 @@
+package bytecode;
+
+use gomlang::quickjs::runtime;
+use std::testing;
+
+#[test]
+fn builds_and_patches_control_flow() -> unit {
+    let builder = Builder::new(1);
+    let _ = builder.emit(Instruction::PushTrue);
+    let branch = builder.emit(Instruction::IfFalse(-1));
+    let _ = builder.emit(Instruction::PushI32(10));
+    let jump = builder.emit(Instruction::Goto(-1));
+    let alternative = builder.offset();
+    let _ = builder.emit(Instruction::PushI32(20));
+    let end = builder.offset();
+    let _ = builder.emit(Instruction::Return);
+    testing::assert(builder.patch_jump(branch, alternative));
+    testing::assert(builder.patch_jump(jump, end));
+    let function = builder.finish();
+    let result = verify(function);
+    testing::assert(result.errors.is_empty());
+    testing::assert_eq(result.max_stack, 1)
+}
+
+#[test]
+fn validates_constant_and_local_operands() -> unit {
+    let function = Function::new(
+        Vec::[],
+        Vec::[Instruction::PushConst(0), Instruction::PutLoc(2), Instruction::ReturnUndef],
+        1,
+    );
+    let result = verify(function);
+    testing::assert_eq(result.errors.len(), 2);
+    testing::assert(result.errors[0] == VerifyError::InvalidConstant(0, 0));
+    testing::assert(result.errors[1] == VerifyError::InvalidLocal(1, 2))
+}
+
+#[test]
+fn validates_operands_in_unreachable_code() -> unit {
+    let function = Function::new(
+        Vec::[],
+        Vec::[Instruction::ReturnUndef, Instruction::GetLoc(0), Instruction::Return],
+        0,
+    );
+    let result = verify(function);
+    testing::assert_eq(result.errors.len(), 1);
+    testing::assert(result.errors[0] == VerifyError::InvalidLocal(1, 0))
+}
+
+#[test]
+fn rejects_stack_underflow_and_fallthrough() -> unit {
+    let underflow = verify(Function::new(Vec::[], Vec::[Instruction::Add], 0));
+    testing::assert_eq(underflow.errors.len(), 1);
+    testing::assert(underflow.errors[0] == VerifyError::StackUnderflow(0, 2, 0));
+    let fallthrough = verify(Function::new(Vec::[], Vec::[Instruction::Undefined], 0));
+    testing::assert_eq(fallthrough.errors.len(), 1);
+    testing::assert(fallthrough.errors[0] == VerifyError::FallthroughEnd(0))
+}
+
+#[test]
+fn rejects_inconsistent_branch_stack_depth() -> unit {
+    let function = Function::new(
+        Vec::[],
+        Vec::[
+            Instruction::PushTrue,
+            Instruction::IfFalse(4),
+            Instruction::PushI32(1),
+            Instruction::Goto(5),
+            Instruction::Goto(5),
+            Instruction::Return,
+        ],
+        0,
+    );
+    let result = verify(function);
+    testing::assert_eq(result.errors.len(), 1);
+    testing::assert(
+        result.errors[0] == VerifyError::InconsistentStackDepth(5, 0, 1)
+            || result.errors[0] == VerifyError::InconsistentStackDepth(5, 1, 0),
+    )
+}
+
+#[test]
+fn rejects_invalid_jump_and_argument_count() -> unit {
+    let invalid_jump = verify(Function::new(Vec::[], Vec::[Instruction::Goto(4)], 0));
+    testing::assert_eq(invalid_jump.errors.len(), 1);
+    testing::assert(invalid_jump.errors[0] == VerifyError::InvalidJump(0, 4));
+    let invalid_call = verify(
+        Function::new(Vec::[], Vec::[Instruction::Call(-1), Instruction::Return], 0),
+    );
+    let mut found = false;
+    for error in invalid_call.errors {
+        if error == VerifyError::InvalidArgumentCount(0, -1) {
+            found = true;
+        } else {}
+    }
+    testing::assert(found);
+    let invalid_construct = verify(
+        Function::new(Vec::[], Vec::[Instruction::Construct(-1), Instruction::Return], 0),
+    );
+    found = false;
+    for error in invalid_construct.errors {
+        if error == VerifyError::InvalidArgumentCount(0, -1) {
+            found = true;
+        } else {}
+    }
+    testing::assert(found);
+    let invalid_new_target = verify(
+        Function::new(
+            Vec::[],
+            Vec::[Instruction::ConstructWithNewTarget(-1), Instruction::Return],
+            0,
+        ),
+    );
+    found = false;
+    for error in invalid_new_target.errors {
+        if error == VerifyError::InvalidArgumentCount(0, -1) {
+            found = true;
+        } else {}
+    }
+    testing::assert(found)
+}
+
+#[test]
+fn exposes_parameter_and_function_constant_metadata() -> unit {
+    let child = Function::new_with_parameters(
+        Vec::[],
+        Vec::[Instruction::GetLoc(0), Instruction::Return],
+        1,
+        1,
+    );
+    let parent = Function::new_with_parameters(
+        Vec::[Constant::Function(Ref::new(child))],
+        Vec::[Instruction::PushConst(0), Instruction::Return],
+        2,
+        3,
+    );
+    testing::assert_eq(parent.parameter_count(), 2);
+    testing::assert_eq(parent.local_count(), 3);
+    match parent.constant(0) {
+        Some(Constant::Function(function)) => testing::assert_eq(
+            function.get().parameter_count(),
+            1,
+        ),
+        _ => testing::fail("expected function constant"),
+    };
+    let builder = Builder::new_with_parameters(1, 2);
+    let _ = builder.emit(Instruction::ReturnUndef);
+    let built = builder.finish();
+    testing::assert_eq(built.parameter_count(), 1);
+    testing::assert_eq(built.local_count(), 2)
+}
+
+#[test]
+fn rejects_invalid_parameter_layout() -> unit {
+    let negative = verify(
+        Function::new_with_parameters(Vec::[], Vec::[Instruction::ReturnUndef], -1, 0),
+    );
+    testing::assert(negative.errors[0] == VerifyError::NegativeParameterCount(-1));
+    let excessive = verify(
+        Function::new_with_parameters(Vec::[], Vec::[Instruction::ReturnUndef], 2, 1),
+    );
+    testing::assert(excessive.errors[0] == VerifyError::ParameterCountExceedsLocals(2, 1))
+}
+
+#[test]
+fn validates_function_length_and_rest_operands() -> unit {
+    let valid = Function::new_with_parameters_upvalues_handlers_and_length(
+        Vec::[],
+        Vec::[Instruction::PushRest(2), Instruction::Return],
+        3,
+        1,
+        3,
+        Vec::[],
+        Vec::[],
+    );
+    testing::assert_eq(valid.function_length(), 1);
+    testing::assert(verify(valid).errors.is_empty());
+    let negative = verify(
+        Function::new_with_parameters_upvalues_handlers_and_length(
+            Vec::[],
+            Vec::[Instruction::ReturnUndef],
+            1,
+            -1,
+            1,
+            Vec::[],
+            Vec::[],
+        ),
+    );
+    testing::assert(negative.errors[0] == VerifyError::NegativeFunctionLength(-1));
+    let excessive = verify(
+        Function::new_with_parameters_upvalues_handlers_and_length(
+            Vec::[],
+            Vec::[Instruction::ReturnUndef],
+            1,
+            2,
+            1,
+            Vec::[],
+            Vec::[],
+        ),
+    );
+    testing::assert(excessive.errors[0] == VerifyError::FunctionLengthExceedsParameters(2, 1));
+    let rest = verify(
+        Function::new_with_parameters(
+            Vec::[],
+            Vec::[Instruction::PushRest(2), Instruction::Return],
+            1,
+            1,
+        ),
+    );
+    testing::assert(rest.errors[0] == VerifyError::InvalidRestStart(0, 2))
+}
+
+#[test]
+fn validates_excluded_property_copy_operands_and_stack_effect() -> unit {
+    let key = runtime::JsString::from_utf8(Vec::[b'x'].slice(0, 1));
+    let valid = Function::new(
+        Vec::[Constant::String(key)],
+        Vec::[
+            Instruction::NewObject,
+            Instruction::NewObject,
+            Instruction::PushConst(0),
+            Instruction::CopyDataPropertiesExcluded(1),
+            Instruction::Return,
+        ],
+        0,
+    );
+    testing::assert(verify(valid).errors.is_empty());
+    let invalid = Function::new(
+        Vec::[],
+        Vec::[Instruction::CopyDataPropertiesExcluded(-1), Instruction::ReturnUndef],
+        0,
+    );
+    let result = verify(invalid);
+    let mut found = false;
+    for error in result.errors {
+        match error {
+            VerifyError::InvalidExcludedPropertyCount(0, - 1) => {
+                found = true;
+            },
+            _ => (),
+        }
+    }
+    testing::assert(found)
+}
+
+#[test]
+fn validates_lexical_capture_sources_and_constructability() -> unit {
+    let arrow = Function::new_with_parameters_upvalues_handlers_length_and_constructable(
+        Vec::[],
+        Vec::[Instruction::GetUpvalue(0), Instruction::Return],
+        0,
+        0,
+        0,
+        Vec::[UpvalueSource::This, UpvalueSource::Arguments],
+        Vec::[],
+        false,
+    );
+    testing::assert(!arrow.constructable());
+    testing::assert(verify(arrow).errors.is_empty())
+}
+
+#[test]
+fn validates_class_function_kind_and_definition_instructions() -> unit {
+    let constructor = Function::new_with_parameters_upvalues_handlers_and_function_kind(
+        Vec::[],
+        Vec::[Instruction::ReturnUndef],
+        0,
+        0,
+        0,
+        Vec::[],
+        Vec::[],
+        true,
+        true,
+    );
+    testing::assert(constructor.constructable());
+    testing::assert(constructor.class_constructor());
+    let derived = Function::new_with_parameters_upvalues_handlers_and_function_semantics(
+        Vec::[Constant::String(runtime::JsString::from_code_units(Vec::[120]))],
+        Vec::[
+            Instruction::CallSuper(0),
+            Instruction::Drop,
+            Instruction::GetSuperField(0),
+            Instruction::Return,
+        ],
+        0,
+        0,
+        0,
+        Vec::[],
+        Vec::[],
+        true,
+        true,
+        true,
+        true,
+        false,
+    );
+    testing::assert(derived.derived_constructor());
+    testing::assert(derived.inherit_home_object());
+    testing::assert(!derived.lexical_this());
+    testing::assert(verify(derived).errors.is_empty());
+    let definitions = verify(
+        Function::new(
+            Vec::[Constant::String(runtime::JsString::from_code_units(Vec::[120]))],
+            Vec::[
+                Instruction::NewObject,
+                Instruction::Undefined,
+                Instruction::SetClassHeritage(false),
+                Instruction::NewObject,
+                Instruction::Undefined,
+                Instruction::DefineClassMethod(0),
+                Instruction::ReturnUndef,
+            ],
+            0,
+        ),
+    );
+    testing::assert(definitions.errors.is_empty());
+    testing::assert_eq(definitions.max_stack, 2)
+}
+
+#[test]
+fn validates_global_name_constants() -> unit {
+    let valid = verify(
+        Function::new(
+            Vec::[Constant::String(runtime::JsString::from_code_units(Vec::[120]))],
+            Vec::[Instruction::GetGlobal(0), Instruction::SetGlobal(0), Instruction::Return],
+            0,
+        ),
+    );
+    testing::assert(valid.errors.is_empty());
+    let invalid = verify(
+        Function::new(Vec::[], Vec::[Instruction::GetGlobal(0), Instruction::Return], 0),
+    );
+    testing::assert(invalid.errors[0] == VerifyError::InvalidConstant(0, 0))
+}
+
+#[test]
+fn validates_upvalue_operands_and_capture_sources() -> unit {
+    let child = Function::new_with_parameters_and_upvalues(
+        Vec::[],
+        Vec::[Instruction::GetUpvalue(0), Instruction::SetUpvalue(0), Instruction::Return],
+        0,
+        0,
+        Vec::[UpvalueSource::Local(0)],
+    );
+    let valid = Function::new(
+        Vec::[Constant::Function(Ref::new(child))],
+        Vec::[Instruction::PushConst(0), Instruction::Return],
+        1,
+    );
+    testing::assert(verify(valid).errors.is_empty());
+    let invalid_operand = verify(
+        Function::new_with_parameters_and_upvalues(
+            Vec::[],
+            Vec::[Instruction::GetUpvalue(1), Instruction::Return],
+            0,
+            0,
+            Vec::[UpvalueSource::Closure],
+        ),
+    );
+    testing::assert(invalid_operand.errors[0] == VerifyError::InvalidUpvalue(0, 1));
+    let invalid_child = Function::new_with_parameters_and_upvalues(
+        Vec::[],
+        Vec::[Instruction::ReturnUndef],
+        0,
+        0,
+        Vec::[UpvalueSource::Local(2), UpvalueSource::Upvalue(3)],
+    );
+    let invalid_parent = verify(
+        Function::new(
+            Vec::[Constant::Function(Ref::new(invalid_child))],
+            Vec::[Instruction::ReturnUndef],
+            1,
+        ),
+    );
+    testing::assert_eq(invalid_parent.errors.len(), 2);
+    testing::assert(invalid_parent.errors[0] == VerifyError::InvalidCaptureLocal(0, 0, 2));
+    testing::assert(invalid_parent.errors[1] == VerifyError::InvalidCaptureUpvalue(0, 1, 3))
+}
+
+#[test]
+fn verifies_object_and_array_allocation_instructions() -> unit {
+    let object = verify(
+        Function::new(Vec::[], Vec::[Instruction::NewObject, Instruction::Return], 0),
+    );
+    testing::assert(object.errors.is_empty());
+    testing::assert_eq(object.max_stack, 1);
+    let array = verify(
+        Function::new(Vec::[], Vec::[Instruction::NewArray(3), Instruction::Return], 0),
+    );
+    testing::assert(array.errors.is_empty());
+    testing::assert_eq(array.max_stack, 1);
+    let negative = verify(
+        Function::new(Vec::[], Vec::[Instruction::NewArray(-1), Instruction::Return], 0),
+    );
+    testing::assert_eq(negative.errors.len(), 1);
+    testing::assert(negative.errors[0] == VerifyError::InvalidArrayLength(0, -1));
+    let excessive = verify(
+        Function::new(Vec::[], Vec::[Instruction::NewArray(2147483647 + 1), Instruction::Return], 0),
+    );
+    testing::assert_eq(excessive.errors.len(), 1);
+    testing::assert(excessive.errors[0] == VerifyError::InvalidArrayLength(0, 2147483647 + 1))
+}
+
+#[test]
+fn verifies_regexp_literal_constant_operands() -> unit {
+    let valid = verify(
+        Function::new(
+            Vec::[
+                Constant::String(runtime::JsString::from_code_units(Vec::[97])),
+                Constant::String(runtime::JsString::from_code_units(Vec::[103])),
+            ],
+            Vec::[Instruction::NewRegExp(0, 1), Instruction::Return],
+            0,
+        ),
+    );
+    testing::assert(valid.errors.is_empty());
+    testing::assert_eq(valid.max_stack, 1);
+    let invalid = verify(
+        Function::new(Vec::[], Vec::[Instruction::NewRegExp(0, 1), Instruction::Return], 0),
+    );
+    testing::assert_eq(invalid.errors.len(), 2);
+    testing::assert(invalid.errors[0] == VerifyError::InvalidConstant(0, 0));
+    testing::assert(invalid.errors[1] == VerifyError::InvalidConstant(0, 1))
+}
+
+#[test]
+fn verifies_array_backed_call_and_construct_instructions() -> unit {
+    let call = verify(
+        Function::new(
+            Vec::[],
+            Vec::[
+                Instruction::Undefined,
+                Instruction::NewArray(0),
+                Instruction::CallArray,
+                Instruction::Return,
+            ],
+            0,
+        ),
+    );
+    testing::assert(call.errors.is_empty());
+    testing::assert_eq(call.max_stack, 2);
+    let method = verify(
+        Function::new(
+            Vec::[],
+            Vec::[
+                Instruction::NewObject,
+                Instruction::Undefined,
+                Instruction::NewArray(0),
+                Instruction::CallMethodArray,
+                Instruction::Return,
+            ],
+            0,
+        ),
+    );
+    testing::assert(method.errors.is_empty());
+    testing::assert_eq(method.max_stack, 3);
+    let construct = verify(
+        Function::new(
+            Vec::[],
+            Vec::[
+                Instruction::Undefined,
+                Instruction::NewArray(0),
+                Instruction::ConstructArray,
+                Instruction::Return,
+            ],
+            0,
+        ),
+    );
+    testing::assert(construct.errors.is_empty())
+}
+
+#[test]
+fn verifies_exception_handler_ranges_targets_and_stack_entry() -> unit {
+    let valid = Function::new_with_parameters_upvalues_and_handlers(
+        Vec::[],
+        Vec::[
+            Instruction::PushI32(1),
+            Instruction::Throw,
+            Instruction::GetLoc(0),
+            Instruction::Return,
+        ],
+        0,
+        1,
+        Vec::[],
+        Vec::[ExceptionHandler { start: 0, end: 2, target: 2 }],
+    );
+    testing::assert_eq(verify(valid).errors.len(), 0);
+    let invalid = Function::new_with_parameters_upvalues_and_handlers(
+        Vec::[],
+        Vec::[Instruction::ReturnUndef],
+        0,
+        0,
+        Vec::[],
+        Vec::[
+            ExceptionHandler { start: 0, end: 0, target: 0 },
+            ExceptionHandler { start: 0, end: 1, target: 0 },
+            ExceptionHandler { start: 0, end: 1, target: 2 },
+        ],
+    );
+    let errors = verify(invalid).errors;
+    testing::assert(errors.len() >= 3)
+}
+
+#[test]
+fn rejects_crossing_exception_handler_ranges() -> unit {
+    let function = Function::new_with_parameters_upvalues_and_handlers(
+        Vec::[],
+        Vec::[
+            Instruction::Undefined,
+            Instruction::Drop,
+            Instruction::Undefined,
+            Instruction::Drop,
+            Instruction::ReturnUndef,
+        ],
+        0,
+        0,
+        Vec::[],
+        Vec::[
+            ExceptionHandler { start: 0, end: 3, target: 4 },
+            ExceptionHandler { start: 2, end: 4, target: 0 },
+        ],
+    );
+    let mut found = false;
+    for value in verify(function).errors {
+        match value {
+            VerifyError::CrossingHandlerRanges(0, 1) => {
+                found = true;
+            },
+            _ => (),
+        }
+    }
+    testing::assert(found)
+}
+
+#[test]
+fn verifies_generator_return_handlers_and_stack_entry() -> unit {
+    let valid = Function::new(
+        Vec::[],
+        Vec::[
+            Instruction::Undefined,
+            Instruction::Yield,
+            Instruction::Goto(6),
+            Instruction::PutLoc(0),
+            Instruction::GetLoc(0),
+            Instruction::Return,
+            Instruction::Return,
+        ],
+        1,
+    );
+    valid.set_generator_return_handlers(
+        Vec::[GeneratorReturnHandler { yield_offset: 1, throw_target: -1, target: 3 }],
+    );
+    testing::assert(verify(valid).errors.is_empty());
+    let invalid = Function::new(Vec::[], Vec::[Instruction::ReturnUndef], 0);
+    invalid.set_generator_return_handlers(
+        Vec::[
+            GeneratorReturnHandler { yield_offset: 0, throw_target: -2, target: 2 },
+            GeneratorReturnHandler { yield_offset: 0, throw_target: 0, target: 0 },
+        ],
+    );
+    let mut invalid_yield = false;
+    let mut invalid_target = false;
+    let mut invalid_throw_target = false;
+    let mut duplicate = false;
+    for value in verify(invalid).errors {
+        match value {
+            VerifyError::InvalidGeneratorReturnYield(_, 0) => {
+                invalid_yield = true;
+            },
+            VerifyError::InvalidGeneratorReturnTarget(0, 2) => {
+                invalid_target = true;
+            },
+            VerifyError::InvalidGeneratorThrowTarget(0, - 2) => {
+                invalid_throw_target = true;
+            },
+            VerifyError::DuplicateGeneratorReturnYield(0, 1) => {
+                duplicate = true;
+            },
+            _ => (),
+        }
+    }
+    testing::assert(invalid_yield && invalid_target && invalid_throw_target && duplicate)
+}
+
+#[test]
+fn verifies_mapped_argument_metadata() -> unit {
+    let valid = Function::new_with_parameters(Vec::[], Vec::[Instruction::ReturnUndef], 2, 3);
+    valid.set_arguments_semantics(false, Vec::[-1, 2]);
+    testing::assert(verify(valid).errors.is_empty());
+    let invalid = Function::new_with_parameters(Vec::[], Vec::[Instruction::ReturnUndef], 2, 3);
+    invalid.set_arguments_semantics(true, Vec::[1, 4]);
+    let mut strict = false;
+    let mut mapped = false;
+    for value in verify(invalid).errors {
+        match value {
+            VerifyError::MappedArgumentsInStrictFunction => {
+                strict = true;
+            },
+            VerifyError::InvalidMappedArgument(1, 4) => {
+                mapped = true;
+            },
+            _ => (),
+        }
+    }
+    testing::assert(strict && mapped)
+}
+
+#[test]
+fn verifies_eval_sites_and_local_cell_cloning() -> unit {
+    let valid = Function::new(
+        Vec::[],
+        Vec::[Instruction::CloneLoc(0), Instruction::Eval(0, 0), Instruction::Return],
+        1,
+    );
+    let sites: Vec[Vec[EvalBinding]] = Vec::[Vec::[]];
+    valid.set_eval_sites(sites);
+    testing::assert(verify(valid).errors.is_empty());
+    let invalid = Function::new(
+        Vec::[],
+        Vec::[Instruction::CloneLoc(1), Instruction::Eval(0, 1), Instruction::Return],
+        1,
+    );
+    let mut local = false;
+    let mut site = false;
+    for value in verify(invalid).errors {
+        match value {
+            VerifyError::InvalidLocal(0, 1) => {
+                local = true;
+            },
+            VerifyError::InvalidEvalSite(1, 1) => {
+                site = true;
+            },
+            _ => (),
+        }
+    }
+    testing::assert(local && site)
+}

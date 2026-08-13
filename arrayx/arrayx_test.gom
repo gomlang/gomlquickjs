@@ -1,0 +1,448 @@
+package arrayx;
+
+use gomlang::quickjs::runtime;
+use std::num;
+use std::testing;
+
+fn arrayx_string(value: string) -> runtime::JsString {
+    let bytes = value.to_bytes();
+    runtime::JsString::from_utf8(bytes.slice(0, bytes.len()))
+}
+
+fn arrayx_expect_array(value: Result[runtime::ObjectId, runtime::TypeError]) -> runtime::ObjectId {
+    match value {
+        Ok(value) => value,
+        Err(error) => {
+            testing::fail(error.message);
+            arrayx_expect_array(runtime::new_array(runtime::Heap::new(), 0))
+        },
+    }
+}
+
+fn arrayx_expect_result(value: Result[runtime::ObjectId, ArrayError]) -> runtime::ObjectId {
+    match value {
+        Ok(value) => value,
+        Err(error) => {
+            testing::fail(error.to_string());
+            arrayx_expect_array(runtime::new_array(runtime::Heap::new(), 0))
+        },
+    }
+}
+
+fn arrayx_define(heap: runtime::Heap, array: runtime::ObjectId, index: int, value: runtime::Value) -> unit {
+    testing::assert(
+        runtime::define_own_property(
+            heap,
+            array,
+            runtime::string_property_key(index.to_string()),
+            runtime::data_descriptor(value, true, true, true),
+        ),
+    )
+}
+
+fn arrayx_define_fixed(
+    heap: runtime::Heap,
+    array: runtime::ObjectId,
+    index: int,
+    value: runtime::Value,
+) -> unit {
+    testing::assert(
+        runtime::define_own_property(
+            heap,
+            array,
+            runtime::string_property_key(index.to_string()),
+            runtime::data_descriptor(value, true, true, false),
+        ),
+    )
+}
+
+fn arrayx_assert_value(slot: ArraySlot, expected: runtime::Value) -> unit {
+    match slot {
+        ArraySlot::Value(value) => testing::assert(runtime::same_value(value, expected)),
+        ArraySlot::Hole => testing::fail("expected present array slot"),
+    }
+}
+
+fn arrayx_assert_hole(slot: ArraySlot) -> unit {
+    match slot {
+        ArraySlot::Hole => (),
+        ArraySlot::Value(_) => testing::fail("expected array hole"),
+    }
+}
+
+fn arrayx_own_slot(heap: runtime::Heap, array: runtime::ObjectId, index: int) -> ArraySlot {
+    match heap.get(array) {
+        Some(object) => match object.own_property(runtime::string_property_key(index.to_string())) {
+            Some(descriptor) => match runtime::descriptor_value(descriptor) {
+                Some(value) => ArraySlot::Value(value),
+                None => ArraySlot::Value(runtime::Value::Undefined),
+            },
+            None => ArraySlot::Hole,
+        },
+        None => {
+            testing::fail("expected live Array");
+            ArraySlot::Hole
+        },
+    }
+}
+
+fn arrayx_expect_length(heap: runtime::Heap, array: runtime::ObjectId) -> int {
+    match length(heap, array) {
+        Ok(value) => value,
+        Err(error) => {
+            testing::fail(error.to_string());
+            0
+        },
+    }
+}
+
+#[test]
+fn length_and_at_distinguish_holes_undefined_and_inherited_values() -> unit {
+    let heap = runtime::Heap::new();
+    let prototype = match runtime::new_ordinary_object(heap, Option::None) {
+        Ok(value) => value,
+        Err(error) => {
+            testing::fail(error.message);
+            arrayx_expect_array(runtime::new_array(heap, 0))
+        },
+    };
+    testing::assert(
+        runtime::define_own_property(
+            heap,
+            prototype,
+            runtime::string_property_key("2"),
+            runtime::data_descriptor(runtime::Value::Int(22), true, true, true),
+        ),
+    );
+    let array = arrayx_expect_array(runtime::new_array(heap, 4));
+    testing::assert(runtime::set_prototype_of(heap, array, Option::Some(prototype)));
+    arrayx_define(heap, array, 1, runtime::Value::Undefined);
+    testing::assert_eq(arrayx_expect_length(heap, array), 4);
+    arrayx_assert_hole(at(heap, array, 0).unwrap_or(ArraySlot::Value(runtime::Value::Null)));
+    arrayx_assert_value(at(heap, array, 1).unwrap_or(ArraySlot::Hole), runtime::Value::Undefined);
+    arrayx_assert_value(at(heap, array, 2).unwrap_or(ArraySlot::Hole), runtime::Value::Int(22));
+    arrayx_assert_value(at(heap, array, -2).unwrap_or(ArraySlot::Hole), runtime::Value::Int(22));
+    arrayx_assert_hole(at(heap, array, -5).unwrap_or(ArraySlot::Value(runtime::Value::Null)));
+    arrayx_assert_hole(at(heap, array, 4).unwrap_or(ArraySlot::Value(runtime::Value::Null)))
+}
+
+#[test]
+fn join_uses_empty_fields_for_holes_null_and_undefined() -> unit {
+    let heap = runtime::Heap::new();
+    let array = arrayx_expect_array(runtime::new_array(heap, 6));
+    arrayx_define(heap, array, 1, runtime::Value::Undefined);
+    arrayx_define(heap, array, 2, runtime::Value::Null);
+    arrayx_define(heap, array, 3, runtime::Value::Int(7));
+    arrayx_define(heap, array, 4, runtime::Value::String(arrayx_string("x")));
+    arrayx_define(heap, array, 5, runtime::Value::Bool(true));
+    match join(heap, array, arrayx_string(",")) {
+        Ok(value) => testing::assert(value == arrayx_string(",,,7,x,true")),
+        Err(error) => testing::fail(error.to_string()),
+    };
+    arrayx_define(heap, array, 0, runtime::Value::Symbol(runtime::Symbol::new(1, Option::None)));
+    match join(heap, array, arrayx_string(",")) {
+        Err(ArrayError::CannotStringify { index, kind }) => {
+            testing::assert_eq(index, 0);
+            testing::assert_eq(kind, "symbol")
+        },
+        _ => testing::fail("expected symbol join error"),
+    }
+}
+
+#[test]
+fn reverse_reads_inherited_values_and_preserves_the_middle_hole() -> unit {
+    let heap = runtime::Heap::new();
+    let prototype = match runtime::new_ordinary_object(heap, Option::None) {
+        Ok(value) => value,
+        Err(error) => {
+            testing::fail(error.message);
+            arrayx_expect_array(runtime::new_array(heap, 0))
+        },
+    };
+    testing::assert(
+        runtime::define_own_property(
+            heap,
+            prototype,
+            runtime::string_property_key("3"),
+            runtime::data_descriptor(runtime::Value::String(arrayx_string("p")), true, true, true),
+        ),
+    );
+    let array = arrayx_expect_array(runtime::new_array(heap, 5));
+    testing::assert(runtime::set_prototype_of(heap, array, Option::Some(prototype)));
+    arrayx_define(heap, array, 0, runtime::Value::String(arrayx_string("a")));
+    arrayx_define(heap, array, 1, runtime::Value::Undefined);
+    arrayx_define(heap, array, 4, runtime::Value::String(arrayx_string("e")));
+    match reverse(heap, array) {
+        Ok(()) => (),
+        Err(error) => testing::fail(error.to_string()),
+    };
+    arrayx_assert_value(arrayx_own_slot(heap, array, 0), runtime::Value::String(arrayx_string("e")));
+    arrayx_assert_value(arrayx_own_slot(heap, array, 1), runtime::Value::String(arrayx_string("p")));
+    arrayx_assert_hole(arrayx_own_slot(heap, array, 2));
+    arrayx_assert_value(arrayx_own_slot(heap, array, 3), runtime::Value::Undefined);
+    arrayx_assert_value(arrayx_own_slot(heap, array, 4), runtime::Value::String(arrayx_string("a")))
+}
+
+#[test]
+fn slice_and_concat_copy_inherited_values_without_materializing_holes() -> unit {
+    let heap = runtime::Heap::new();
+    let prototype = match runtime::new_ordinary_object(heap, Option::None) {
+        Ok(value) => value,
+        Err(error) => {
+            testing::fail(error.message);
+            arrayx_expect_array(runtime::new_array(heap, 0))
+        },
+    };
+    testing::assert(
+        runtime::define_own_property(
+            heap,
+            prototype,
+            runtime::string_property_key("2"),
+            runtime::data_descriptor(runtime::Value::Int(12), true, true, true),
+        ),
+    );
+    let source = arrayx_expect_array(runtime::new_array(heap, 4));
+    testing::assert(runtime::set_prototype_of(heap, source, Option::Some(prototype)));
+    arrayx_define(heap, source, 0, runtime::Value::Int(10));
+    arrayx_define(heap, source, 3, runtime::Value::Undefined);
+    let sliced = arrayx_expect_result(slice(heap, source, -4, Option::Some(-0)));
+    testing::assert_eq(arrayx_expect_length(heap, sliced), 0);
+    let sliced = arrayx_expect_result(slice(heap, source, 0, Option::Some(4)));
+    testing::assert_eq(arrayx_expect_length(heap, sliced), 4);
+    arrayx_assert_value(arrayx_own_slot(heap, sliced, 0), runtime::Value::Int(10));
+    arrayx_assert_hole(arrayx_own_slot(heap, sliced, 1));
+    arrayx_assert_value(arrayx_own_slot(heap, sliced, 2), runtime::Value::Int(12));
+    arrayx_assert_value(arrayx_own_slot(heap, sliced, 3), runtime::Value::Undefined);
+    let tail = arrayx_expect_array(runtime::new_array(heap, 2));
+    arrayx_define(heap, tail, 1, runtime::Value::Undefined);
+    let combined = arrayx_expect_result(
+        concat(
+            heap,
+            source,
+            Vec::[ConcatItem::Value(runtime::Value::Int(20)), ConcatItem::Spread(tail)],
+        ),
+    );
+    testing::assert_eq(arrayx_expect_length(heap, combined), 7);
+    arrayx_assert_value(arrayx_own_slot(heap, combined, 0), runtime::Value::Int(10));
+    arrayx_assert_hole(arrayx_own_slot(heap, combined, 1));
+    arrayx_assert_value(arrayx_own_slot(heap, combined, 2), runtime::Value::Int(12));
+    arrayx_assert_value(arrayx_own_slot(heap, combined, 3), runtime::Value::Undefined);
+    arrayx_assert_value(arrayx_own_slot(heap, combined, 4), runtime::Value::Int(20));
+    arrayx_assert_hole(arrayx_own_slot(heap, combined, 5));
+    arrayx_assert_value(arrayx_own_slot(heap, combined, 6), runtime::Value::Undefined)
+}
+
+#[test]
+fn index_searches_skip_holes_but_includes_treats_them_as_undefined() -> unit {
+    let heap = runtime::Heap::new();
+    let array = arrayx_expect_array(runtime::new_array(heap, 4));
+    let nan = num::parse_float64("NaN").unwrap_or(0.0);
+    arrayx_define(heap, array, 1, runtime::Value::Undefined);
+    arrayx_define(heap, array, 2, runtime::Value::Float(nan));
+    arrayx_define(heap, array, 3, runtime::Value::Int(9));
+    testing::assert_eq(index_of(heap, array, runtime::Value::Undefined, 0).unwrap_or(-2), 1);
+    testing::assert_eq(
+        last_index_of(heap, array, runtime::Value::Undefined, Option::None).unwrap_or(-2),
+        1,
+    );
+    testing::assert_eq(index_of(heap, array, runtime::Value::Float(nan), 0).unwrap_or(-2), -1);
+    testing::assert(includes(heap, array, runtime::Value::Float(nan), 0).unwrap_or(false));
+    testing::assert(includes(heap, array, runtime::Value::Undefined, 0).unwrap_or(false));
+    let holes = arrayx_expect_array(runtime::new_array(heap, 2));
+    testing::assert_eq(index_of(heap, holes, runtime::Value::Undefined, 0).unwrap_or(-2), -1);
+    testing::assert(includes(heap, holes, runtime::Value::Undefined, 0).unwrap_or(false));
+    testing::assert_eq(index_of(heap, array, runtime::Value::Int(9), -1).unwrap_or(-2), 3);
+    testing::assert_eq(
+        last_index_of(heap, array, runtime::Value::Int(9), Option::Some(-2)).unwrap_or(-2),
+        -1,
+    )
+}
+
+#[test]
+fn push_and_pop_preserve_hole_results_and_update_length() -> unit {
+    let heap = runtime::Heap::new();
+    let array = arrayx_expect_array(runtime::new_array(heap, 2));
+    arrayx_define(heap, array, 1, runtime::Value::Undefined);
+    testing::assert_eq(
+        push(heap, array, Vec::[runtime::Value::Int(3), runtime::Value::Int(4)]).unwrap_or(-1),
+        4,
+    );
+    testing::assert_eq(arrayx_expect_length(heap, array), 4);
+    arrayx_assert_value(pop(heap, array).unwrap_or(ArraySlot::Hole), runtime::Value::Int(4));
+    arrayx_assert_value(pop(heap, array).unwrap_or(ArraySlot::Hole), runtime::Value::Int(3));
+    arrayx_assert_value(pop(heap, array).unwrap_or(ArraySlot::Hole), runtime::Value::Undefined);
+    arrayx_assert_hole(pop(heap, array).unwrap_or(ArraySlot::Value(runtime::Value::Null)));
+    testing::assert_eq(arrayx_expect_length(heap, array), 0)
+}
+
+#[test]
+fn shift_and_unshift_move_sparse_slots_without_filling_holes() -> unit {
+    let heap = runtime::Heap::new();
+    let array = arrayx_expect_array(runtime::new_array(heap, 3));
+    arrayx_define(heap, array, 1, runtime::Value::String(arrayx_string("b")));
+    arrayx_assert_hole(shift(heap, array).unwrap_or(ArraySlot::Value(runtime::Value::Null)));
+    testing::assert_eq(arrayx_expect_length(heap, array), 2);
+    arrayx_assert_value(arrayx_own_slot(heap, array, 0), runtime::Value::String(arrayx_string("b")));
+    arrayx_assert_hole(arrayx_own_slot(heap, array, 1));
+    testing::assert_eq(
+        unshift(
+            heap,
+            array,
+            Vec::[
+                runtime::Value::String(arrayx_string("x")),
+                runtime::Value::String(arrayx_string("y")),
+            ],
+        ).unwrap_or(-1),
+        4,
+    );
+    arrayx_assert_value(arrayx_own_slot(heap, array, 0), runtime::Value::String(arrayx_string("x")));
+    arrayx_assert_value(arrayx_own_slot(heap, array, 1), runtime::Value::String(arrayx_string("y")));
+    arrayx_assert_value(arrayx_own_slot(heap, array, 2), runtime::Value::String(arrayx_string("b")));
+    arrayx_assert_hole(arrayx_own_slot(heap, array, 3))
+}
+
+#[test]
+fn splice_returns_sparse_removed_array_and_compacts_the_source() -> unit {
+    let heap = runtime::Heap::new();
+    let prototype = match runtime::new_ordinary_object(heap, Option::None) {
+        Ok(value) => value,
+        Err(error) => {
+            testing::fail(error.message);
+            arrayx_expect_array(runtime::new_array(heap, 0))
+        },
+    };
+    testing::assert(
+        runtime::define_own_property(
+            heap,
+            prototype,
+            runtime::string_property_key("2"),
+            runtime::data_descriptor(runtime::Value::String(arrayx_string("p")), true, true, true),
+        ),
+    );
+    let array = arrayx_expect_array(runtime::new_array(heap, 6));
+    testing::assert(runtime::set_prototype_of(heap, array, Option::Some(prototype)));
+    arrayx_define(heap, array, 0, runtime::Value::String(arrayx_string("a")));
+    arrayx_define(heap, array, 3, runtime::Value::String(arrayx_string("d")));
+    arrayx_define(heap, array, 4, runtime::Value::Undefined);
+    arrayx_define(heap, array, 5, runtime::Value::String(arrayx_string("f")));
+    let removed = arrayx_expect_result(
+        splice(
+            heap,
+            array,
+            1,
+            3,
+            Vec::[
+                runtime::Value::String(arrayx_string("x")),
+                runtime::Value::String(arrayx_string("y")),
+            ],
+        ),
+    );
+    testing::assert_eq(arrayx_expect_length(heap, removed), 3);
+    arrayx_assert_hole(arrayx_own_slot(heap, removed, 0));
+    arrayx_assert_value(
+        arrayx_own_slot(heap, removed, 1),
+        runtime::Value::String(arrayx_string("p")),
+    );
+    arrayx_assert_value(
+        arrayx_own_slot(heap, removed, 2),
+        runtime::Value::String(arrayx_string("d")),
+    );
+    testing::assert_eq(arrayx_expect_length(heap, array), 5);
+    arrayx_assert_value(arrayx_own_slot(heap, array, 0), runtime::Value::String(arrayx_string("a")));
+    arrayx_assert_value(arrayx_own_slot(heap, array, 1), runtime::Value::String(arrayx_string("x")));
+    arrayx_assert_value(arrayx_own_slot(heap, array, 2), runtime::Value::String(arrayx_string("y")));
+    arrayx_assert_value(arrayx_own_slot(heap, array, 3), runtime::Value::Undefined);
+    arrayx_assert_value(arrayx_own_slot(heap, array, 4), runtime::Value::String(arrayx_string("f")));
+    arrayx_assert_hole(arrayx_own_slot(heap, array, 5))
+}
+
+#[test]
+fn splice_growth_moves_the_tail_backwards_and_keeps_source_holes() -> unit {
+    let heap = runtime::Heap::new();
+    let array = arrayx_expect_array(runtime::new_array(heap, 3));
+    arrayx_define(heap, array, 0, runtime::Value::String(arrayx_string("a")));
+    arrayx_define(heap, array, 2, runtime::Value::String(arrayx_string("c")));
+    let removed = arrayx_expect_result(
+        splice(
+            heap,
+            array,
+            -2,
+            0,
+            Vec::[
+                runtime::Value::String(arrayx_string("x")),
+                runtime::Value::String(arrayx_string("y")),
+            ],
+        ),
+    );
+    testing::assert_eq(arrayx_expect_length(heap, removed), 0);
+    testing::assert_eq(arrayx_expect_length(heap, array), 5);
+    arrayx_assert_value(arrayx_own_slot(heap, array, 0), runtime::Value::String(arrayx_string("a")));
+    arrayx_assert_value(arrayx_own_slot(heap, array, 1), runtime::Value::String(arrayx_string("x")));
+    arrayx_assert_value(arrayx_own_slot(heap, array, 2), runtime::Value::String(arrayx_string("y")));
+    arrayx_assert_hole(arrayx_own_slot(heap, array, 3));
+    arrayx_assert_value(arrayx_own_slot(heap, array, 4), runtime::Value::String(arrayx_string("c")))
+}
+
+#[test]
+fn mutation_errors_preserve_length_and_report_the_failing_operation() -> unit {
+    let heap = runtime::Heap::new();
+    let ordinary = match runtime::new_ordinary_object(heap, Option::None) {
+        Ok(value) => value,
+        Err(error) => {
+            testing::fail(error.message);
+            arrayx_expect_array(runtime::new_array(heap, 0))
+        },
+    };
+    match length(heap, ordinary) {
+        Err(ArrayError::NotArray) => (),
+        _ => testing::fail("expected non-Array error"),
+    };
+    let numeric_length = arrayx_expect_array(runtime::new_array(heap, 3));
+    testing::assert(
+        runtime::define_own_property(
+            heap,
+            numeric_length,
+            runtime::string_property_key("length"),
+            runtime::data_descriptor(runtime::Value::Float(3.0), true, false, false),
+        ),
+    );
+    testing::assert_eq(arrayx_expect_length(heap, numeric_length), 3);
+    testing::assert(
+        !runtime::define_own_property(
+            heap,
+            numeric_length,
+            runtime::string_property_key("length"),
+            runtime::data_descriptor(runtime::Value::Float(1.5), true, false, false),
+        ),
+    );
+    testing::assert_eq(arrayx_expect_length(heap, numeric_length), 3);
+    let fixed_length = arrayx_expect_array(runtime::new_array(heap, 1));
+    testing::assert(
+        runtime::define_own_property(
+            heap,
+            fixed_length,
+            runtime::string_property_key("length"),
+            runtime::data_descriptor(runtime::Value::Int(1), false, false, false),
+        ),
+    );
+    match push(heap, fixed_length, Vec::[runtime::Value::Int(2)]) {
+        Err(ArrayError::LengthNotWritable) => (),
+        _ => testing::fail("expected non-writable length error"),
+    };
+    testing::assert_eq(arrayx_expect_length(heap, fixed_length), 1);
+    arrayx_assert_hole(arrayx_own_slot(heap, fixed_length, 1));
+    let fixed_element = arrayx_expect_array(runtime::new_array(heap, 1));
+    arrayx_define_fixed(heap, fixed_element, 0, runtime::Value::Int(1));
+    match pop(heap, fixed_element) {
+        Err(ArrayError::CannotDelete(0)) => (),
+        _ => testing::fail("expected non-configurable delete error"),
+    };
+    testing::assert_eq(arrayx_expect_length(heap, fixed_element), 1);
+    arrayx_assert_value(arrayx_own_slot(heap, fixed_element, 0), runtime::Value::Int(1));
+    let maximum = arrayx_expect_result(new_array(heap, 4294967295));
+    testing::assert_eq(arrayx_expect_length(heap, maximum), 4294967295);
+    match push(heap, maximum, Vec::[runtime::Value::Int(1)]) {
+        Err(ArrayError::LengthOutOfRange(_)) => (),
+        _ => testing::fail("expected supported length bound error"),
+    }
+}

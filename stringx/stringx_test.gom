@@ -1,0 +1,80 @@
+package stringx;
+
+use gomlang::quickjs::runtime;
+use std::testing;
+
+fn text(value: string) -> runtime::JsString {
+    let bytes = value.to_bytes();
+    runtime::JsString::from_utf8(bytes.slice(0, bytes.len()))
+}
+
+#[test]
+fn search_operations_use_utf16_offsets_and_empty_search_rules() -> unit {
+    let value = runtime::JsString::from_code_units(Vec::[65, 0xd83d, 0xde00, 66, 65]);
+    testing::assert_eq(index_of(value, text("A"), 1), 4);
+    testing::assert_eq(last_index_of(value, text("A"), 99), 4);
+    testing::assert_eq(index_of(value, text(""), -5), 0);
+    testing::assert_eq(last_index_of(value, text(""), 99), 5);
+    testing::assert(starts_with(value, runtime::JsString::from_code_units(Vec::[0xd83d]), 1));
+    testing::assert(ends_with(value, text("BA"), 5));
+    testing::assert(includes(value, runtime::JsString::from_code_units(Vec::[0xde00]), 0))
+}
+
+#[test]
+fn slice_substring_and_at_follow_code_unit_indexing() -> unit {
+    let value = runtime::JsString::from_code_units(Vec::[65, 0xd83d, 0xde00, 66]);
+    testing::assert(
+        slice(value, -3, -1) == runtime::JsString::from_code_units(Vec::[0xd83d, 0xde00]),
+    );
+    testing::assert(
+        substring(value, 3, 1) == runtime::JsString::from_code_units(Vec::[0xd83d, 0xde00]),
+    );
+    testing::assert(at(value, -1) == Option::Some(text("B")));
+    testing::assert(at(value, 4).is_none());
+    testing::assert(char_at(value, 99) == text(""));
+    testing::assert(char_code_at(value, 1) == Option::Some(0xd83d));
+    testing::assert(code_point_at(value, 1) == Option::Some(0x1f600));
+    testing::assert(code_point_at(value, 2) == Option::Some(0xde00))
+}
+
+#[test]
+fn repeat_and_padding_validate_lengths_and_cycle_fill_code_units() -> unit {
+    testing::assert(repeat(text("ab"), 3).unwrap_or(text("")) == text("ababab"));
+    testing::assert(repeat(text("x"), -1) == Result::Err(StringError::InvalidCount));
+    testing::assert(repeat(text("xx"), 10000000) == Result::Err(StringError::LengthLimit));
+    testing::assert(pad_start(text("x"), 6, text("ab")).unwrap_or(text("")) == text("ababa" + "x"));
+    testing::assert(pad_end(text("x"), 6, text("ab")).unwrap_or(text("")) == text("x" + "ababa"));
+    testing::assert(pad_start(text("x"), 3, text("")).unwrap_or(text("bad")) == text("x"))
+}
+
+#[test]
+fn trim_uses_the_ecmascript_whitespace_and_line_terminator_set() -> unit {
+    let value = runtime::JsString::from_code_units(Vec::[0xfeff, 0x2007, 65, 0x2028, 66, 0x3000]);
+    testing::assert(trim(value) == runtime::JsString::from_code_units(Vec::[65, 0x2028, 66]));
+    testing::assert(
+        trim_start(value) == runtime::JsString::from_code_units(Vec::[65, 0x2028, 66, 0x3000]),
+    );
+    testing::assert(
+        trim_end(value) == runtime::JsString::from_code_units(Vec::[0xfeff, 0x2007, 65, 0x2028, 66]),
+    )
+}
+
+#[test]
+fn replace_all_and_split_handle_empty_and_repeated_separators() -> unit {
+    testing::assert(
+        replace_all(text("aba"), text("a"), text("xy")).unwrap_or(text("")) == text("xybxy"),
+    );
+    testing::assert(
+        replace_all(text("ab"), text(""), text("-")).unwrap_or(text("")) == text("-a-b-"),
+    );
+    let values = split(text("a,,b,"), text(","), 10);
+    testing::assert_eq(values.len(), 4);
+    testing::assert(values[0] == text("a"));
+    testing::assert(values[1] == text(""));
+    testing::assert(values[2] == text("b"));
+    testing::assert(values[3] == text(""));
+    let units = split(runtime::JsString::from_code_units(Vec::[0xd83d, 0xde00]), text(""), 10);
+    testing::assert_eq(units.len(), 2);
+    testing::assert_eq(units[0].get(0), 0xd83d);
+    testing::assert_eq(units[1].get(0), 0xde00)
+}

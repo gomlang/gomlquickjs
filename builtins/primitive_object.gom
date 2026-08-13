@@ -1,0 +1,717 @@
+package builtins;
+
+use gomlang::quickjs::dtoa;
+use gomlang::quickjs::runtime;
+use gomlang::quickjs::vm;
+use std::math;
+use std::num;
+
+fn primitive_number_receiver(
+    heap: runtime::Heap,
+    value: runtime::Value,
+    prototype: runtime::ObjectId,
+) -> Result[float64, vm::NativeError] {
+    match value {
+        runtime::Value::Int(value) => {
+            Result::Ok(num::parse_float64(value.to_string()).unwrap_or(0.0))
+        },
+        runtime::Value::Float(value) => Result::Ok(value),
+        runtime::Value::Object(value) => match runtime::primitive_value(heap, value) {
+            Some(runtime::Value::Int(value)) => {
+                Result::Ok(num::parse_float64(value.to_string()).unwrap_or(0.0))
+            },
+            Some(runtime::Value::Float(value)) => Result::Ok(value),
+            _ => if value == prototype {
+                Result::Ok(0.0)
+            } else {
+                Result::Err(native_error("Number method requires a number receiver"))
+            },
+        },
+        _ => Result::Err(native_error("Number method requires a number receiver")),
+    }
+}
+
+fn primitive_boolean_receiver(
+    heap: runtime::Heap,
+    value: runtime::Value,
+    prototype: runtime::ObjectId,
+) -> Result[bool, vm::NativeError] {
+    match value {
+        runtime::Value::Bool(value) => Result::Ok(value),
+        runtime::Value::Object(value) => match runtime::primitive_value(heap, value) {
+            Some(runtime::Value::Bool(value)) => Result::Ok(value),
+            _ => if value == prototype {
+                Result::Ok(false)
+            } else {
+                Result::Err(native_error("Boolean method requires a boolean receiver"))
+            },
+        },
+        _ => Result::Err(native_error("Boolean method requires a boolean receiver")),
+    }
+}
+
+fn primitive_bigint_receiver(heap: runtime::Heap, value: runtime::Value) -> Result[
+    runtime::BigInt,
+    vm::NativeError,
+] {
+    match value {
+        runtime::Value::BigInt(value) => Result::Ok(value),
+        runtime::Value::Object(object) => match runtime::primitive_value(heap, object) {
+            Some(runtime::Value::BigInt(value)) => Result::Ok(value),
+            _ => Result::Err(native_error("BigInt method requires a BigInt receiver")),
+        },
+        _ => Result::Err(native_error("BigInt method requires a BigInt receiver")),
+    }
+}
+
+fn primitive_symbol_receiver(heap: runtime::Heap, value: runtime::Value) -> Result[
+    runtime::Symbol,
+    vm::NativeError,
+] {
+    match value {
+        runtime::Value::Symbol(value) => Result::Ok(value),
+        runtime::Value::Object(object) => match runtime::primitive_value(heap, object) {
+            Some(runtime::Value::Symbol(value)) => Result::Ok(value),
+            _ => Result::Err(native_error("Symbol method requires a Symbol receiver")),
+        },
+        _ => Result::Err(native_error("Symbol method requires a Symbol receiver")),
+    }
+}
+
+fn primitive_radix(arguments: Vec[runtime::Value]) -> Result[int, vm::NativeError] {
+    match argument(arguments, 0) {
+        runtime::Value::Undefined => Result::Ok(10),
+        value => {
+            let number = match runtime::primitive_to_number(value) {
+                Ok(value) => value,
+                Err(value) => return Result::Err(native_error(value.message)),
+            };
+            let radix = string_truncated_int(number, 0);
+            if !math::is_finite(number) || radix < 2 || radix > 36 {
+                Result::Err(native_error("RangeError: radix must be an integer between 2 and 36"))
+            } else {
+                Result::Ok(radix)
+            }
+        },
+    }
+}
+
+fn primitive_number_text(value: float64, radix: int) -> Result[string, vm::NativeError] {
+    match dtoa::number_to_string_radix(value, radix) {
+        Ok(value) => Result::Ok(value),
+        Err(_) => Result::Err(native_error("RangeError: invalid number radix")),
+    }
+}
+
+fn primitive_format_digits(arguments: Vec[runtime::Value], minimum: int, maximum: int) -> Result[
+    Option[int],
+    vm::NativeError,
+] {
+    match argument(arguments, 0) {
+        runtime::Value::Undefined => Result::Ok(Option::None),
+        _ => {
+            let number = number_argument(arguments, 0)?;
+            let digits = string_truncated_int(number, 0);
+            if !math::is_finite(number) || digits < minimum || digits > maximum {
+                Result::Err(native_error("RangeError: precision is outside the supported range"))
+            } else {
+                Result::Ok(Option::Some(digits))
+            }
+        },
+    }
+}
+
+fn primitive_number_value_of(
+    heap: runtime::Heap,
+    prototype: runtime::ObjectId,
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+) -> Result[runtime::Value, vm::NativeError] {
+    let _ = arguments;
+    Result::Ok(runtime::Value::Float(primitive_number_receiver(heap, this_value, prototype)?))
+}
+
+fn primitive_number_to_string(
+    heap: runtime::Heap,
+    prototype: runtime::ObjectId,
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+) -> Result[runtime::Value, vm::NativeError] {
+    let value = primitive_number_receiver(heap, this_value, prototype)?;
+    let text = primitive_number_text(value, primitive_radix(arguments)?)?;
+    Result::Ok(runtime::Value::String(js_string(text)))
+}
+
+fn primitive_number_to_fixed(
+    heap: runtime::Heap,
+    prototype: runtime::ObjectId,
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+) -> Result[runtime::Value, vm::NativeError] {
+    let value = primitive_number_receiver(heap, this_value, prototype)?;
+    let digits = primitive_format_digits(arguments, 0, 100)?.unwrap_or(0);
+    Result::Ok(runtime::Value::String(js_string(dtoa::number_to_fixed(value, digits))))
+}
+
+fn primitive_number_to_exponential(
+    heap: runtime::Heap,
+    prototype: runtime::ObjectId,
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+) -> Result[runtime::Value, vm::NativeError] {
+    let value = primitive_number_receiver(heap, this_value, prototype)?;
+    let digits = primitive_format_digits(arguments, 0, 100)?;
+    Result::Ok(runtime::Value::String(js_string(dtoa::number_to_exponential(value, digits))))
+}
+
+fn primitive_number_to_precision(
+    heap: runtime::Heap,
+    prototype: runtime::ObjectId,
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+) -> Result[runtime::Value, vm::NativeError] {
+    let value = primitive_number_receiver(heap, this_value, prototype)?;
+    let digits = primitive_format_digits(arguments, 1, 100)?;
+    Result::Ok(runtime::Value::String(js_string(dtoa::number_to_precision(value, digits))))
+}
+
+fn primitive_number_to_locale_string(
+    heap: runtime::Heap,
+    prototype: runtime::ObjectId,
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+) -> Result[runtime::Value, vm::NativeError] {
+    let _ = arguments;
+    primitive_number_to_string(heap, prototype, this_value, Vec::[])
+}
+
+fn primitive_boolean_value_of(
+    heap: runtime::Heap,
+    prototype: runtime::ObjectId,
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+) -> Result[runtime::Value, vm::NativeError] {
+    let _ = arguments;
+    Result::Ok(runtime::Value::Bool(primitive_boolean_receiver(heap, this_value, prototype)?))
+}
+
+fn primitive_boolean_to_string(
+    heap: runtime::Heap,
+    prototype: runtime::ObjectId,
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+) -> Result[runtime::Value, vm::NativeError] {
+    let _ = arguments;
+    Result::Ok(
+        runtime::Value::String(
+            js_string(primitive_boolean_receiver(heap, this_value, prototype)?.to_string()),
+        ),
+    )
+}
+
+fn primitive_boolean_constructor(
+    heap: runtime::Heap,
+    receiver: runtime::ObjectId,
+    arguments: Vec[runtime::Value],
+) -> Result[runtime::Value, vm::NativeError] {
+    let value = boolean_constructor(heap, runtime::Value::Undefined, arguments)?;
+    if runtime::set_primitive_value(heap, receiver, value) {
+        Result::Ok(runtime::Value::Object(receiver))
+    } else {
+        Result::Err(native_error("cannot initialize Boolean wrapper"))
+    }
+}
+
+fn initialize_primitive_wrapper(
+    heap: runtime::Heap,
+    receiver: runtime::ObjectId,
+    value: runtime::Value,
+) -> Result[runtime::Value, vm::NativeError] {
+    if !runtime::set_primitive_value(heap, receiver, value) {
+        return Result::Err(native_error("cannot initialize primitive wrapper"))
+    } else {};
+    match value {
+        runtime::Value::String(value) => {
+            if !runtime::define_own_property(
+                heap,
+                receiver,
+                runtime::string_property_key("length"),
+                runtime::data_descriptor(
+                    runtime::Value::Int(value.len().to_int32()),
+                    false,
+                    false,
+                    false,
+                ),
+            ) {
+                return Result::Err(native_error("cannot initialize String wrapper"))
+            } else {};
+            let mut index = 0;
+            while index < value.len() {
+                if !runtime::define_own_property(
+                    heap,
+                    receiver,
+                    runtime::string_property_key(index.to_string()),
+                    runtime::data_descriptor(
+                        runtime::Value::String(value.slice(index, index + 1)),
+                        false,
+                        true,
+                        false,
+                    ),
+                ) {
+                    return Result::Err(native_error("cannot initialize String wrapper index"))
+                } else {};
+                index += 1;
+            }
+        },
+        _ => (),
+    };
+    Result::Ok(runtime::Value::Object(receiver))
+}
+
+fn primitive_wrapper_kind(value: runtime::Value) -> Option[runtime::PrimitivePrototypeKind] {
+    match value {
+        runtime::Value::Bool(_) => Option::Some(runtime::PrimitivePrototypeKind::Boolean),
+        runtime::Value::Int(_) | runtime::Value::Float(_) => {
+            Option::Some(runtime::PrimitivePrototypeKind::Number)
+        },
+        runtime::Value::String(_) => Option::Some(runtime::PrimitivePrototypeKind::String),
+        runtime::Value::BigInt(_) => Option::Some(runtime::PrimitivePrototypeKind::BigInt),
+        runtime::Value::Symbol(_) => Option::Some(runtime::PrimitivePrototypeKind::Symbol),
+        _ => Option::None,
+    }
+}
+
+fn box_primitive(heap: runtime::Heap, value: runtime::Value) -> Result[
+    runtime::Value,
+    vm::NativeError,
+] {
+    let kind = match primitive_wrapper_kind(value) {
+        Some(value) => value,
+        None => return Result::Err(native_error("value cannot be boxed")),
+    };
+    let prototype = match heap.primitive_prototype(kind) {
+        Some(value) => value,
+        None => return Result::Err(native_error("primitive prototype is not installed")),
+    };
+    let wrapper = match runtime::new_ordinary_object(heap, Option::Some(prototype)) {
+        Ok(value) => value,
+        Err(value) => return Result::Err(native_error(value.message)),
+    };
+    initialize_primitive_wrapper(heap, wrapper, value)
+}
+
+fn primitive_wrapper_vm_result(value: Result[runtime::Value, vm::NativeError]) -> Result[
+    runtime::Value,
+    vm::VmError,
+] {
+    match value {
+        Ok(value) => Result::Ok(value),
+        Err(value) => Result::Err(function_vm_error(value.message)),
+    }
+}
+
+fn primitive_number_constructor_vm(
+    context: vm::Context,
+    receiver: runtime::ObjectId,
+    arguments: Vec[runtime::Value],
+    depth: int,
+) -> Result[runtime::Value, vm::VmError] {
+    let _ = depth;
+    let value = argument(arguments, 0);
+    primitive_wrapper_vm_result(initialize_primitive_wrapper(context.heap(), receiver, value))
+}
+
+fn primitive_number_prepare(context: vm::Context, arguments: Vec[runtime::Value], depth: int) -> Result[
+    Vec[runtime::Value],
+    vm::VmError,
+] {
+    Result::Ok(Vec::[number_constructor_vm(context, runtime::Value::Undefined, arguments, depth)?])
+}
+
+fn primitive_string_prepare(context: vm::Context, arguments: Vec[runtime::Value], depth: int) -> Result[
+    Vec[runtime::Value],
+    vm::VmError,
+] {
+    let value = if arguments.is_empty() {
+        runtime::Value::String(js_string(""))
+    } else {
+        let primitive = context.to_primitive_string_at_depth(arguments[0], depth)?;
+        match primitive {
+            runtime::Value::Symbol(_) => {
+                return Result::Err(function_vm_error("cannot convert symbol to string"))
+            },
+            _ => match string_constructor(
+                context.heap(),
+                runtime::Value::Undefined,
+                Vec::[primitive],
+            ) {
+                Ok(value) => value,
+                Err(value) => return Result::Err(function_vm_error(value.message)),
+            },
+        }
+    };
+    Result::Ok(Vec::[value])
+}
+
+fn primitive_string_constructor_vm(
+    context: vm::Context,
+    receiver: runtime::ObjectId,
+    arguments: Vec[runtime::Value],
+    depth: int,
+) -> Result[runtime::Value, vm::VmError] {
+    let _ = depth;
+    primitive_wrapper_vm_result(
+        initialize_primitive_wrapper(context.heap(), receiver, argument(arguments, 0)),
+    )
+}
+
+fn primitive_bigint_value_of(
+    heap: runtime::Heap,
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+) -> Result[runtime::Value, vm::NativeError] {
+    let _ = arguments;
+    Result::Ok(runtime::Value::BigInt(primitive_bigint_receiver(heap, this_value)?))
+}
+
+fn primitive_bigint_to_string(
+    heap: runtime::Heap,
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+) -> Result[runtime::Value, vm::NativeError] {
+    let value = primitive_bigint_receiver(heap, this_value)?;
+    let text = match value.integer().to_string_radix(primitive_radix(arguments)?) {
+        Ok(value) => value,
+        Err(value) => return Result::Err(native_error(value.to_string())),
+    };
+    Result::Ok(runtime::Value::String(js_string(text)))
+}
+
+fn primitive_symbol_value_of(
+    heap: runtime::Heap,
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+) -> Result[runtime::Value, vm::NativeError] {
+    let _ = arguments;
+    Result::Ok(runtime::Value::Symbol(primitive_symbol_receiver(heap, this_value)?))
+}
+
+fn primitive_symbol_to_string(
+    heap: runtime::Heap,
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+) -> Result[runtime::Value, vm::NativeError] {
+    let _ = arguments;
+    let symbol = primitive_symbol_receiver(heap, this_value)?;
+    let text = match symbol.description() {
+        Some(value) => js_string("Symbol(").concat(value).concat(js_string(")")),
+        None => js_string("Symbol()"),
+    };
+    Result::Ok(runtime::Value::String(text))
+}
+
+fn primitive_symbol_description(
+    heap: runtime::Heap,
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+) -> Result[runtime::Value, vm::NativeError] {
+    let _ = arguments;
+    match primitive_symbol_receiver(heap, this_value)?.description() {
+        Some(value) => Result::Ok(runtime::Value::String(value)),
+        None => Result::Ok(runtime::Value::Undefined),
+    }
+}
+
+fn primitive_prototype(context: vm::Context, constructor: runtime::Value, name: string) -> Result[
+    runtime::ObjectId,
+    BuiltinError,
+] {
+    let prototype = match runtime::new_ordinary_object(context.heap(), Option::None) {
+        Ok(value) => value,
+        Err(value) => return Result::Err(BuiltinError { message: value.message }),
+    };
+    let object = function_object(constructor, name)?;
+    define_value(
+        context.heap(),
+        object,
+        "prototype",
+        runtime::Value::Object(prototype),
+        false,
+        false,
+    )?;
+    define_value(context.heap(), prototype, "constructor", constructor, true, true)?;
+    Result::Ok(prototype)
+}
+
+fn primitive_method(
+    context: vm::Context,
+    prototype: runtime::ObjectId,
+    name: string,
+    callback: (runtime::Heap, runtime::Value, Vec[runtime::Value]) -> Result[
+        runtime::Value,
+        vm::NativeError,
+    ],
+) -> Result[unit, BuiltinError] {
+    define_value(
+        context.heap(),
+        prototype,
+        name,
+        allocate_function(context, name, callback)?,
+        true,
+        true,
+    )
+}
+
+fn primitive_number_coercing_method(
+    context: vm::Context,
+    prototype: runtime::ObjectId,
+    name: string,
+    callback: (runtime::Heap, runtime::Value, Vec[runtime::Value]) -> Result[
+        runtime::Value,
+        vm::NativeError,
+    ],
+) -> Result[unit, BuiltinError] {
+    define_value(
+        context.heap(),
+        prototype,
+        name,
+        allocate_vm_function_with_length(
+            context,
+            name,
+            1,
+            |this_value, arguments, depth| {
+                match primitive_number_receiver(context.heap(), this_value, prototype) {
+                    Ok(_) => (),
+                    Err(value) => return Result::Err(function_native_error(value)),
+                };
+                if !arguments.is_empty() {
+                    match arguments[0] {
+                        runtime::Value::Undefined => (),
+                        value => {
+                            arguments[0] = number_value_at_depth(context, value, depth)?;
+                        },
+                    }
+                } else {};
+                match callback(context.heap(), this_value, arguments) {
+                    Ok(value) => Result::Ok(value),
+                    Err(value) => Result::Err(function_native_error(value)),
+                }
+            },
+        )?,
+        true,
+        true,
+    )
+}
+
+fn install_primitive_prototypes(
+    context: vm::Context,
+    number: runtime::Value,
+    bigint: runtime::Value,
+    boolean: runtime::Value,
+    symbol: runtime::Value,
+    string_constructor_value: runtime::Value,
+    string_prototype: runtime::ObjectId,
+) -> Result[unit, BuiltinError] {
+    let number_prototype = primitive_prototype(context, number, "Number")?;
+    primitive_method(
+        context,
+        number_prototype,
+        "valueOf",
+        |heap, this_value, arguments| {
+            primitive_number_value_of(heap, number_prototype, this_value, arguments)
+        },
+    )?;
+    primitive_number_coercing_method(
+        context,
+        number_prototype,
+        "toString",
+        |heap, this_value, arguments| {
+            primitive_number_to_string(heap, number_prototype, this_value, arguments)
+        },
+    )?;
+    primitive_number_coercing_method(
+        context,
+        number_prototype,
+        "toFixed",
+        |heap, this_value, arguments| {
+            primitive_number_to_fixed(heap, number_prototype, this_value, arguments)
+        },
+    )?;
+    primitive_number_coercing_method(
+        context,
+        number_prototype,
+        "toExponential",
+        |heap, this_value, arguments| {
+            primitive_number_to_exponential(heap, number_prototype, this_value, arguments)
+        },
+    )?;
+    primitive_number_coercing_method(
+        context,
+        number_prototype,
+        "toPrecision",
+        |heap, this_value, arguments| {
+            primitive_number_to_precision(heap, number_prototype, this_value, arguments)
+        },
+    )?;
+    primitive_method(
+        context,
+        number_prototype,
+        "toLocaleString",
+        |heap, this_value, arguments| {
+            primitive_number_to_locale_string(heap, number_prototype, this_value, arguments)
+        },
+    )?;
+    let boolean_prototype = primitive_prototype(context, boolean, "Boolean")?;
+    primitive_method(
+        context,
+        boolean_prototype,
+        "valueOf",
+        |heap, this_value, arguments| {
+            primitive_boolean_value_of(heap, boolean_prototype, this_value, arguments)
+        },
+    )?;
+    primitive_method(
+        context,
+        boolean_prototype,
+        "toString",
+        |heap, this_value, arguments| {
+            primitive_boolean_to_string(heap, boolean_prototype, this_value, arguments)
+        },
+    )?;
+    let bigint_prototype = primitive_prototype(context, bigint, "BigInt")?;
+    define_to_string_tag(context, bigint_prototype, "BigInt")?;
+    primitive_method(context, bigint_prototype, "valueOf", primitive_bigint_value_of)?;
+    primitive_method(context, bigint_prototype, "toString", primitive_bigint_to_string)?;
+    let symbol_prototype = primitive_prototype(context, symbol, "Symbol")?;
+    if !runtime::delete_property(
+        context.heap(),
+        symbol_prototype,
+        runtime::string_property_key("constructor"),
+    ) {
+        return Result::Err(BuiltinError { message: "cannot reorder Symbol prototype" })
+    } else {};
+    primitive_method(context, symbol_prototype, "toString", primitive_symbol_to_string)?;
+    let symbol_value_of = allocate_function(context, "valueOf", primitive_symbol_value_of)?;
+    define_value(context.heap(), symbol_prototype, "valueOf", symbol_value_of, true, true)?;
+    let symbol_description = allocate_function_with_length(
+        context,
+        "get description",
+        0,
+        primitive_symbol_description,
+    )?;
+    if !runtime::define_own_property(
+        context.heap(),
+        symbol_prototype,
+        runtime::string_property_key("description"),
+        runtime::accessor_descriptor(Option::Some(symbol_description), Option::None, false, true),
+    ) {
+        return Result::Err(BuiltinError { message: "cannot define Symbol description" })
+    } else {};
+    define_value(context.heap(), symbol_prototype, "constructor", symbol, true, true)?;
+    let to_primitive = match context.well_known_symbol(vm::WellKnownSymbolKind::ToPrimitive) {
+        Some(value) => value,
+        None => return Result::Err(BuiltinError { message: "Symbol.toPrimitive is not installed" }),
+    };
+    let symbol_to_primitive = allocate_function_with_length(
+        context,
+        "[Symbol.toPrimitive]",
+        1,
+        primitive_symbol_value_of,
+    )?;
+    if !runtime::define_own_property(
+        context.heap(),
+        symbol_prototype,
+        runtime::PropertyKey::Symbol(to_primitive),
+        runtime::data_descriptor(symbol_to_primitive, false, false, true),
+    ) {
+        return Result::Err(BuiltinError { message: "cannot define Symbol.toPrimitive" })
+    } else {};
+    define_to_string_tag(context, symbol_prototype, "Symbol")?;
+    for (kind, prototype) in Vec::[
+        (vm::PrimitiveKind::Number, number_prototype),
+        (vm::PrimitiveKind::Boolean, boolean_prototype),
+        (vm::PrimitiveKind::BigInt, bigint_prototype),
+        (vm::PrimitiveKind::Symbol, symbol_prototype),
+    ] {
+        match context.set_primitive_prototype(kind, prototype) {
+            Ok(()) => (),
+            Err(value) => return Result::Err(BuiltinError { message: value.kind.debug() }),
+        }
+    }
+    match context.set_vm_constructor_callback(
+        number,
+        |receiver, arguments, selected_prototype, new_target, depth| {
+            let _ = new_target;
+            constructor_receiver_prototype(
+                context.heap(),
+                receiver,
+                selected_prototype,
+                number_prototype,
+            )?;
+            primitive_number_constructor_vm(context, receiver, arguments, depth)
+        },
+    ) {
+        Ok(()) => (),
+        Err(value) => return Result::Err(BuiltinError { message: value.kind.debug() }),
+    };
+    match context.set_vm_constructor_prepare_callback(
+        number,
+        |arguments, depth| primitive_number_prepare(context, arguments, depth),
+    ) {
+        Ok(()) => (),
+        Err(value) => return Result::Err(BuiltinError { message: value.kind.debug() }),
+    };
+    match context.set_vm_constructor_callback(
+        boolean,
+        |receiver, arguments, selected_prototype, new_target, depth| {
+            let _ = depth;
+            let _ = new_target;
+            constructor_receiver_prototype(
+                context.heap(),
+                receiver,
+                selected_prototype,
+                boolean_prototype,
+            )?;
+            primitive_wrapper_vm_result(
+                primitive_boolean_constructor(context.heap(), receiver, arguments),
+            )
+        },
+    ) {
+        Ok(()) => (),
+        Err(value) => return Result::Err(BuiltinError { message: value.kind.debug() }),
+    };
+    match context.set_vm_constructor_prepare_callback(
+        boolean,
+        |arguments, depth| {
+            let _ = depth;
+            Result::Ok(Vec::[runtime::Value::Bool(runtime::to_boolean(argument(arguments, 0)))])
+        },
+    ) {
+        Ok(()) => (),
+        Err(value) => return Result::Err(BuiltinError { message: value.kind.debug() }),
+    };
+    match context.set_vm_constructor_callback(
+        string_constructor_value,
+        |receiver, arguments, selected_prototype, new_target, depth| {
+            let _ = new_target;
+            constructor_receiver_prototype(
+                context.heap(),
+                receiver,
+                selected_prototype,
+                string_prototype,
+            )?;
+            primitive_string_constructor_vm(context, receiver, arguments, depth)
+        },
+    ) {
+        Ok(()) => (),
+        Err(value) => return Result::Err(BuiltinError { message: value.kind.debug() }),
+    };
+    match context.set_vm_constructor_prepare_callback(
+        string_constructor_value,
+        |arguments, depth| primitive_string_prepare(context, arguments, depth),
+    ) {
+        Ok(()) => (),
+        Err(value) => return Result::Err(BuiltinError { message: value.kind.debug() }),
+    }
+    Result::Ok(())
+}

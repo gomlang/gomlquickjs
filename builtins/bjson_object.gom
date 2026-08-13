@@ -1,0 +1,1046 @@
+package builtins;
+
+use gomlang::quickjs::arraybuffer;
+use gomlang::quickjs::bigint;
+use gomlang::quickjs::cutils;
+use gomlang::quickjs::runtime;
+use gomlang::quickjs::vm;
+use std::bincode;
+
+const BJSON_VERSION: byte = 5;
+
+const BJSON_TAG_NULL: byte = 1;
+
+const BJSON_TAG_UNDEFINED: byte = 2;
+
+const BJSON_TAG_FALSE: byte = 3;
+
+const BJSON_TAG_TRUE: byte = 4;
+
+const BJSON_TAG_INT32: byte = 5;
+
+const BJSON_TAG_FLOAT64: byte = 6;
+
+const BJSON_TAG_STRING: byte = 7;
+
+const BJSON_TAG_OBJECT: byte = 8;
+
+const BJSON_TAG_ARRAY: byte = 9;
+
+const BJSON_TAG_BIG_INT: byte = 10;
+
+const BJSON_TAG_TYPED_ARRAY: byte = 14;
+
+const BJSON_TAG_ARRAY_BUFFER: byte = 15;
+
+const BJSON_TAG_SHARED_ARRAY_BUFFER: byte = 16;
+
+const BJSON_TAG_DATE: byte = 17;
+
+const BJSON_TAG_OBJECT_VALUE: byte = 18;
+
+const BJSON_TAG_OBJECT_REFERENCE: byte = 19;
+
+struct BjsonWriter {
+    context: vm::Context,
+    buffers: ArrayBufferInstall,
+    data: cutils::ByteBuffer,
+    atoms: Vec[runtime::JsString],
+    objects: Vec[runtime::ObjectId],
+    active: Vec[runtime::ObjectId],
+    allow_reference: bool,
+    depth: int,
+}
+
+struct BjsonReader {
+    context: vm::Context,
+    buffers: ArrayBufferInstall,
+    date_constructor: runtime::Value,
+    data: Vec[byte],
+    offset: Ref[int],
+    limit: int,
+    atoms: Vec[runtime::JsString],
+    objects: Vec[Ref[Option[runtime::ObjectId]]],
+    allow_reference: bool,
+    depth: int,
+}
+
+fn bjson_float_config() -> bincode::Config {
+    bincode::with_little_endian(bincode::legacy())
+}
+
+fn bjson_append_leb128(output: cutils::ByteBuffer, value: uint32) -> unit {
+    let mut remaining = value;
+    while remaining >= 0x80 {
+        output.append_byte(((remaining & 0x7f) | 0x80).to_uint8());
+        remaining >>= 7;
+    }
+    output.append_byte(remaining.to_uint8())
+}
+
+fn bjson_append_sleb128(output: cutils::ByteBuffer, value: int32) -> unit {
+    let encoded = if value < 0 {
+        ((-value.to_int64()) * 2 - 1).to_uint32()
+    } else {
+        value.to_uint32() * 2
+    };
+    bjson_append_leb128(output, encoded)
+}
+
+fn bjson_write_string(output: cutils::ByteBuffer, value: runtime::JsString) -> unit {
+    let mut wide = false;
+    let mut index = 0;
+    while index < value.len() {
+        if value.get(index) > 0xff {
+            wide = true;
+        } else {};
+        index += 1;
+    }
+    bjson_append_leb128(
+        output,
+        (value.len().to_uint32() << 1)
+            | if wide {
+                1
+            } else {
+                0
+            },
+    );
+    index = 0;
+    while index < value.len() {
+        if wide {
+            output.append_u16_le(value.get(index))
+        } else {
+            output.append_byte(value.get(index).to_uint8())
+        };
+        index += 1;
+    }
+}
+
+fn bjson_writer_atom(writer: BjsonWriter, value: runtime::JsString) -> uint32 {
+    let mut index = 0;
+    while index < writer.atoms.len() {
+        if writer.atoms[index] == value {
+            return (index + 1).to_uint32()
+        } else {};
+        index += 1;
+    }
+    writer.atoms.push(value);
+    writer.atoms.len().to_uint32()
+}
+
+fn bjson_write_atom(writer: BjsonWriter, value: runtime::JsString) -> unit {
+    bjson_append_leb128(writer.data, bjson_writer_atom(writer, value) << 1)
+}
+
+fn bjson_object_index(values: Vec[runtime::ObjectId], object: runtime::ObjectId) -> Option[int] {
+    let mut index = 0;
+    while index < values.len() {
+        if values[index] == object {
+            return Option::Some(index)
+        } else {};
+        index += 1;
+    }
+    Option::None
+}
+
+fn bjson_write_float(writer: BjsonWriter, value: float64) -> Result[unit, vm::VmError] {
+    writer.data.append_byte(BJSON_TAG_FLOAT64);
+    match bincode::encode_to_vec(value, bjson_float_config()) {
+        Ok(bytes) => {
+            writer.data.append_bytes(bytes.slice(0, bytes.len()));
+            Result::Ok(())
+        },
+        Err(message) => Result::Err(function_vm_error("cannot encode number: " + message)),
+    }
+}
+
+fn bjson_bigint_bytes(value: bigint::BigInteger) -> Vec[byte] {
+    if value.is_zero() {
+        return Vec::[]
+    } else {};
+    let limbs = value.abs().limbs();
+    let bytes: Vec[byte] = Vec::with_capacity(limbs.len() * 4 + 1);
+    for limb in limbs {
+        let mut offset = 0;
+        while offset < 4 {
+            bytes.push(((limb >> (offset * 8)) & 0xff).to_uint8());
+            offset += 1;
+        }
+    }
+    while bytes.len() > 1 && bytes[bytes.len() - 1] == 0 {
+        let _ = bytes.pop();
+    }
+    if value.is_negative() {
+        let mut carry = 1.to_uint16();
+        let mut index = 0;
+        while index < bytes.len() {
+            let next = ((~bytes[index]).to_uint16() & 0xff) + carry;
+            bytes[index] = (next & 0xff).to_uint8();
+            carry = next >> 8;
+            index += 1;
+        }
+        if bytes[bytes.len() - 1] & 0x80 == 0 {
+            bytes.push(0xff)
+        } else {};
+        while bytes.len() > 1 && bytes[bytes.len() - 1] == 0xff
+            && bytes[bytes.len() - 2] & 0x80 != 0 {
+            let _ = bytes.pop();
+        }
+    } else if bytes[bytes.len() - 1] & 0x80 != 0 {
+        bytes.push(0)
+    } else {};
+    bytes
+}
+
+fn bjson_write_bigint(writer: BjsonWriter, value: runtime::BigInt) -> unit {
+    writer.data.append_byte(BJSON_TAG_BIG_INT);
+    let bytes = bjson_bigint_bytes(value.integer());
+    bjson_append_leb128(writer.data, bytes.len().to_uint32());
+    writer.data.append_bytes(bytes.slice(0, bytes.len()))
+}
+
+fn bjson_array_length(writer: BjsonWriter, object: runtime::ObjectId) -> Result[int, vm::VmError] {
+    json_builtin_array_length(writer.context, object, writer.depth)
+}
+
+fn bjson_write_array(writer: BjsonWriter, object: runtime::ObjectId) -> Result[unit, vm::VmError] {
+    writer.data.append_byte(BJSON_TAG_ARRAY);
+    let length = bjson_array_length(writer, object)?;
+    bjson_append_leb128(writer.data, length.to_uint32());
+    let target = match writer.context.heap().get(object) {
+        Some(value) => value,
+        None => return Result::Err(function_vm_error("array object is no longer live")),
+    };
+    let mut index = 0;
+    while index < length {
+        let descriptor = target.own_property(runtime::string_property_key(index.to_string()));
+        let value = match descriptor {
+            Some(descriptor) => if runtime::descriptor_enumerable(descriptor) {
+                match runtime::descriptor_value(descriptor) {
+                    Some(value) => value,
+                    None => return Result::Err(
+                        function_vm_error("only value properties are supported"),
+                    ),
+                }
+            } else {
+                runtime::Value::Undefined
+            },
+            None => runtime::Value::Undefined,
+        };
+        bjson_write_value(writer, value)?;
+        index += 1;
+    }
+    Result::Ok(())
+}
+
+fn bjson_object_entries(writer: BjsonWriter, object: runtime::ObjectId) -> Result[
+    Vec[(runtime::JsString, runtime::Value)],
+    vm::VmError,
+] {
+    let target = match writer.context.heap().get(object) {
+        Some(value) => value,
+        None => return Result::Err(function_vm_error("object is no longer live")),
+    };
+    let entries: Vec[(runtime::JsString, runtime::Value)] = Vec::[];
+    for key in runtime::own_property_keys(writer.context.heap(), object) {
+        let name = match key {
+            runtime::PropertyKey::String(value) => value,
+            runtime::PropertyKey::Symbol(_) => continue,
+        };
+        let descriptor = match target.own_property(key) {
+            Some(value) => value,
+            None => continue,
+        };
+        if !runtime::descriptor_enumerable(descriptor) {
+            continue
+        } else {};
+        match runtime::descriptor_value(descriptor) {
+            Some(value) => entries.push((name, value)),
+            None => return Result::Err(function_vm_error("only value properties are supported")),
+        }
+    }
+    Result::Ok(entries)
+}
+
+fn bjson_write_object_properties(writer: BjsonWriter, object: runtime::ObjectId) -> Result[
+    unit,
+    vm::VmError,
+] {
+    writer.data.append_byte(BJSON_TAG_OBJECT);
+    let entries = bjson_object_entries(writer, object)?;
+    bjson_append_leb128(writer.data, entries.len().to_uint32());
+    for (name, value) in entries {
+        bjson_write_atom(writer, name);
+        bjson_write_value(writer, value)?
+    }
+    Result::Ok(())
+}
+
+fn bjson_typed_array_tag(view: runtime::TypedArrayView) -> byte {
+    match view {
+        runtime::TypedArrayView::Uint8(_) => 2,
+        runtime::TypedArrayView::Int32(_) => 5,
+        runtime::TypedArrayView::Float64(_) => 11,
+        runtime::TypedArrayView::Numeric(value) => match value.kind() {
+            arraybuffer::NumericArrayKind::Uint8Clamped => 0,
+            arraybuffer::NumericArrayKind::Int8 => 1,
+            arraybuffer::NumericArrayKind::Int16 => 3,
+            arraybuffer::NumericArrayKind::Uint16 => 4,
+            arraybuffer::NumericArrayKind::Uint32 => 6,
+            arraybuffer::NumericArrayKind::Float16 => 9,
+            arraybuffer::NumericArrayKind::Float32 => 10,
+        },
+        runtime::TypedArrayView::BigInt(value) => match value.kind() {
+            arraybuffer::BigIntArrayKind::Signed => 7,
+            arraybuffer::BigIntArrayKind::Unsigned => 8,
+        },
+    }
+}
+
+fn bjson_typed_array_offset(view: runtime::TypedArrayView) -> int {
+    match view {
+        runtime::TypedArrayView::Uint8(value) => value.byte_offset(),
+        runtime::TypedArrayView::Int32(value) => value.byte_offset(),
+        runtime::TypedArrayView::Float64(value) => value.byte_offset(),
+        runtime::TypedArrayView::Numeric(value) => value.byte_offset(),
+        runtime::TypedArrayView::BigInt(value) => value.byte_offset(),
+    }
+}
+
+fn bjson_write_typed_array(
+    writer: BjsonWriter,
+    object: runtime::ObjectId,
+    view: runtime::TypedArrayView,
+) -> Result[unit, vm::VmError] {
+    writer.data.append_byte(BJSON_TAG_TYPED_ARRAY);
+    writer.data.append_byte(bjson_typed_array_tag(view));
+    let length = match runtime::typed_array_element_length(writer.context.heap(), object) {
+        Some(value) => value,
+        None => return Result::Err(function_vm_error("invalid typed array length")),
+    };
+    bjson_append_leb128(writer.data, length.to_uint32());
+    bjson_append_leb128(writer.data, bjson_typed_array_offset(view).to_uint32());
+    let buffer = match runtime::typed_array_buffer_object(writer.context.heap(), object) {
+        Some(value) => value,
+        None => return Result::Err(function_vm_error("typed array has no buffer")),
+    };
+    bjson_write_value(writer, runtime::Value::Object(buffer))
+}
+
+fn bjson_write_array_buffer(writer: BjsonWriter, value: arraybuffer::ArrayBuffer) -> Result[
+    unit,
+    vm::VmError,
+] {
+    if value.is_shared() {
+        writer.data.append_byte(BJSON_TAG_SHARED_ARRAY_BUFFER);
+        return Result::Err(function_vm_error("shared array buffers are not supported"))
+    } else {};
+    let bytes = match value.to_bytes() {
+        Ok(value) => value,
+        Err(error) => return Result::Err(function_vm_error(error.to_string())),
+    };
+    writer.data.append_byte(BJSON_TAG_ARRAY_BUFFER);
+    bjson_append_leb128(writer.data, bytes.len().to_uint32());
+    bjson_append_leb128(
+        writer.data,
+        if value.is_resizable() {
+            value.max_byte_length().to_uint32()
+        } else {
+            0xffffffff
+        },
+    );
+    writer.data.append_bytes(bytes.slice(0, bytes.len()));
+    Result::Ok(())
+}
+
+fn bjson_write_date(writer: BjsonWriter, object: runtime::ObjectId) -> Result[unit, vm::VmError] {
+    let value_of = writer.context.read_property_at_depth(
+        runtime::Value::Object(object),
+        runtime::Value::String(js_string("valueOf")),
+        writer.depth,
+    )?;
+    let arguments: Vec[runtime::Value] = Vec::[];
+    let value = writer.context.invoke_with_this_at_depth(
+        value_of,
+        arguments,
+        runtime::Value::Object(object),
+        writer.depth,
+    )?;
+    writer.data.append_byte(BJSON_TAG_DATE);
+    bjson_write_value(writer, value)
+}
+
+fn bjson_write_object_value(writer: BjsonWriter, value: runtime::Value) -> Result[unit, vm::VmError] {
+    writer.data.append_byte(BJSON_TAG_OBJECT_VALUE);
+    bjson_write_value(writer, value)
+}
+
+fn bjson_write_object_body(writer: BjsonWriter, object: runtime::ObjectId) -> Result[
+    unit,
+    vm::VmError,
+] {
+    match runtime::typed_array_view(writer.context.heap(), object) {
+        Some(view) => return bjson_write_typed_array(writer, object, view),
+        None => (),
+    };
+    match writer.buffers.buffer_states.get(object) {
+        Some(value) => return bjson_write_array_buffer(writer, value),
+        None => (),
+    };
+    match runtime::primitive_value(writer.context.heap(), object) {
+        Some(value) => return bjson_write_object_value(writer, value),
+        None => (),
+    };
+    match writer.context.object_builtin_tag(object) {
+        Some(value) => match value.to_host_string() {
+            Ok(value) => if value == "Date" {
+                return bjson_write_date(writer, object)
+            } else {},
+            Err(_) => (),
+        },
+        None => (),
+    };
+    let target = match writer.context.heap().get(object) {
+        Some(value) => value,
+        None => return Result::Err(function_vm_error("object is no longer live")),
+    };
+    match target.kind() {
+        runtime::ObjectKind::Array => bjson_write_array(writer, object),
+        runtime::ObjectKind::Ordinary => bjson_write_object_properties(writer, object),
+        runtime::ObjectKind::Function => Result::Err(function_vm_error("unsupported object class")),
+    }
+}
+
+fn bjson_write_object(writer: BjsonWriter, object: runtime::ObjectId) -> Result[unit, vm::VmError] {
+    if writer.allow_reference {
+        match bjson_object_index(writer.objects, object) {
+            Some(index) => {
+                writer.data.append_byte(BJSON_TAG_OBJECT_REFERENCE);
+                bjson_append_leb128(writer.data, index.to_uint32());
+                return Result::Ok(())
+            },
+            None => writer.objects.push(object),
+        }
+    } else {
+        if bjson_object_index(writer.active, object).is_some() {
+            return Result::Err(function_vm_error("circular reference"))
+        } else {};
+        writer.active.push(object);
+    };
+    let result = bjson_write_object_body(writer, object);
+    if !writer.allow_reference {
+        let _ = writer.active.pop();
+    } else {};
+    result
+}
+
+fn bjson_write_value(writer: BjsonWriter, value: runtime::Value) -> Result[unit, vm::VmError] {
+    match value {
+        runtime::Value::Undefined => {
+            writer.data.append_byte(BJSON_TAG_UNDEFINED);
+            Result::Ok(())
+        },
+        runtime::Value::Null => {
+            writer.data.append_byte(BJSON_TAG_NULL);
+            Result::Ok(())
+        },
+        runtime::Value::Bool(value) => {
+            writer.data.append_byte(
+                if value {
+                    BJSON_TAG_TRUE
+                } else {
+                    BJSON_TAG_FALSE
+                },
+            );
+            Result::Ok(())
+        },
+        runtime::Value::Int(value) => {
+            writer.data.append_byte(BJSON_TAG_INT32);
+            bjson_append_sleb128(writer.data, value);
+            Result::Ok(())
+        },
+        runtime::Value::Float(value) => bjson_write_float(writer, value),
+        runtime::Value::String(value) => {
+            writer.data.append_byte(BJSON_TAG_STRING);
+            bjson_write_string(writer.data, value);
+            Result::Ok(())
+        },
+        runtime::Value::BigInt(value) => {
+            bjson_write_bigint(writer, value);
+            Result::Ok(())
+        },
+        runtime::Value::Object(value) => bjson_write_object(writer, value),
+        runtime::Value::Symbol(_) => Result::Err(function_vm_error("unsupported value tag")),
+    }
+}
+
+fn bjson_finish_writer(writer: BjsonWriter) -> Result[Vec[byte], vm::VmError] {
+    let header = cutils::ByteBuffer::new();
+    header.append_byte(BJSON_VERSION);
+    bjson_append_leb128(header, writer.atoms.len().to_uint32());
+    for atom in writer.atoms {
+        bjson_write_string(header, atom)
+    }
+    let data = writer.data.bytes();
+    header.append_bytes(data.slice(0, data.len()));
+    Result::Ok(header.bytes())
+}
+
+fn bjson_reader_error(reader: BjsonReader, message: string) -> vm::VmError {
+    function_syntax_error(message + " at byte " + (reader.offset.get() - 1).to_string())
+}
+
+fn bjson_read_byte(reader: BjsonReader) -> Result[byte, vm::VmError] {
+    if reader.offset.get() < 0 || reader.offset.get() >= reader.limit {
+        Result::Err(bjson_reader_error(reader, "read after the end of the buffer"))
+    } else {
+        let value = reader.data[reader.offset.get()];
+        reader.offset.set(reader.offset.get() + 1);
+        Result::Ok(value)
+    }
+}
+
+fn bjson_read_leb128(reader: BjsonReader) -> Result[uint32, vm::VmError] {
+    let mut value = 0.to_uint32();
+    let mut index = 0;
+    while index < 5 {
+        let current = bjson_read_byte(reader)?;
+        value |= (current & 0x7f).to_uint32() << (index * 7);
+        if current & 0x80 == 0 {
+            return Result::Ok(value)
+        } else {};
+        index += 1;
+    }
+    Result::Err(bjson_reader_error(reader, "invalid LEB128 value"))
+}
+
+fn bjson_read_sleb128(reader: BjsonReader) -> Result[int32, vm::VmError] {
+    let value = bjson_read_leb128(reader)?;
+    if value & 1 == 0 {
+        Result::Ok((value >> 1).to_int32())
+    } else {
+        Result::Ok(-((value >> 1).to_int32()) - 1)
+    }
+}
+
+fn bjson_read_bytes(reader: BjsonReader, length: int) -> Result[Vec[byte], vm::VmError] {
+    if length < 0 || reader.offset.get() < 0 || length > reader.limit - reader.offset.get() {
+        return Result::Err(bjson_reader_error(reader, "read after the end of the buffer"))
+    } else {};
+    let values: Vec[byte] = Vec::with_capacity(length);
+    let end = reader.offset.get() + length;
+    while reader.offset.get() < end {
+        values.push(reader.data[reader.offset.get()]);
+        reader.offset.set(reader.offset.get() + 1);
+    }
+    Result::Ok(values)
+}
+
+fn bjson_read_string(reader: BjsonReader) -> Result[runtime::JsString, vm::VmError] {
+    let encoded = bjson_read_leb128(reader)?;
+    let wide = encoded & 1 != 0;
+    let length = (encoded >> 1).to_int();
+    let units: Vec[uint16] = Vec::with_capacity(length);
+    let mut index = 0;
+    while index < length {
+        if wide {
+            let low = bjson_read_byte(reader)?.to_uint16();
+            let high = bjson_read_byte(reader)?.to_uint16();
+            units.push(low | (high << 8))
+        } else {
+            units.push(bjson_read_byte(reader)?.to_uint16())
+        };
+        index += 1;
+    }
+    Result::Ok(runtime::JsString::from_code_units(units))
+}
+
+fn bjson_read_atom(reader: BjsonReader) -> Result[runtime::JsString, vm::VmError] {
+    let encoded = bjson_read_leb128(reader)?;
+    if encoded & 1 != 0 {
+        return Result::Ok(js_string((encoded >> 1).to_string()))
+    } else {};
+    let index = (encoded >> 1).to_int();
+    if index < 1 || index > reader.atoms.len() {
+        Result::Err(bjson_reader_error(reader, "invalid atom index"))
+    } else {
+        Result::Ok(reader.atoms[index - 1])
+    }
+}
+
+fn bjson_read_float(reader: BjsonReader) -> Result[runtime::Value, vm::VmError] {
+    let bytes = bjson_read_bytes(reader, 8)?;
+    let decoded: Result[(float64, int), string] = bincode::decode_from_slice(
+        bytes.slice(0, bytes.len()),
+        bjson_float_config(),
+    );
+    match decoded {
+        Ok((value, consumed)) => if consumed == 8 {
+            Result::Ok(runtime::Value::Float(value))
+        } else {
+            Result::Err(bjson_reader_error(reader, "invalid float encoding"))
+        },
+        Err(_) => Result::Err(bjson_reader_error(reader, "invalid float encoding")),
+    }
+}
+
+fn bjson_bigint_from_bytes(bytes: Vec[byte]) -> bigint::BigInteger {
+    if bytes.is_empty() {
+        return bigint::BigInteger::zero()
+    } else {};
+    let negative = bytes[bytes.len() - 1] & 0x80 != 0;
+    let magnitude: Vec[byte] = Vec::with_capacity(bytes.len());
+    for value in bytes {
+        magnitude.push(value)
+    }
+    if negative {
+        let mut carry = 1.to_uint16();
+        let mut index = 0;
+        while index < magnitude.len() {
+            let next = ((~magnitude[index]).to_uint16() & 0xff) + carry;
+            magnitude[index] = (next & 0xff).to_uint8();
+            carry = next >> 8;
+            index += 1;
+        }
+    } else {};
+    while magnitude.len() > 1 && magnitude[magnitude.len() - 1] == 0 {
+        let _ = magnitude.pop();
+    }
+    let limbs: Vec[uint32] = Vec::with_capacity((magnitude.len() + 3) / 4);
+    let mut index = 0;
+    while index < magnitude.len() {
+        let mut limb = 0.to_uint32();
+        let mut offset = 0;
+        while offset < 4 && index + offset < magnitude.len() {
+            limb |= magnitude[index + offset].to_uint32() << (offset * 8);
+            offset += 1;
+        }
+        limbs.push(limb);
+        index += 4;
+    }
+    bigint::BigInteger::from_parts(negative, limbs)
+}
+
+fn bjson_read_bigint(reader: BjsonReader) -> Result[runtime::Value, vm::VmError] {
+    let length = bjson_read_leb128(reader)?.to_int();
+    let bytes = bjson_read_bytes(reader, length)?;
+    Result::Ok(
+        runtime::Value::BigInt(runtime::BigInt::from_integer(bjson_bigint_from_bytes(bytes))),
+    )
+}
+
+fn bjson_reader_slot(reader: BjsonReader) -> Ref[Option[runtime::ObjectId]] {
+    let slot: Ref[Option[runtime::ObjectId]] = Ref::new(Option::None);
+    if reader.allow_reference {
+        reader.objects.push(slot)
+    } else {};
+    slot
+}
+
+fn bjson_finish_slot(slot: Ref[Option[runtime::ObjectId]], object: runtime::ObjectId) -> unit {
+    slot.set(Option::Some(object))
+}
+
+fn bjson_define_data(
+    reader: BjsonReader,
+    object: runtime::ObjectId,
+    key: runtime::PropertyKey,
+    value: runtime::Value,
+) -> Result[unit, vm::VmError] {
+    if runtime::define_own_property(
+        reader.context.heap(),
+        object,
+        key,
+        runtime::data_descriptor(value, true, true, true),
+    ) {
+        Result::Ok(())
+    } else {
+        Result::Err(bjson_reader_error(reader, "cannot define decoded property"))
+    }
+}
+
+fn bjson_read_object(reader: BjsonReader) -> Result[runtime::Value, vm::VmError] {
+    let object = match runtime::new_ordinary_object(
+        reader.context.heap(),
+        reader.context.heap().object_prototype(),
+    ) {
+        Ok(value) => value,
+        Err(error) => return Result::Err(function_vm_error(error.message)),
+    };
+    let slot = bjson_reader_slot(reader);
+    bjson_finish_slot(slot, object);
+    let count = bjson_read_leb128(reader)?.to_int();
+    let mut index = 0;
+    while index < count {
+        let name = bjson_read_atom(reader)?;
+        let value = bjson_read_value(reader)?;
+        bjson_define_data(reader, object, runtime::js_string_property_key(name), value)?;
+        index += 1;
+    }
+    Result::Ok(runtime::Value::Object(object))
+}
+
+fn bjson_read_array(reader: BjsonReader) -> Result[runtime::Value, vm::VmError] {
+    let length = bjson_read_leb128(reader)?.to_int();
+    let object = match runtime::new_array(reader.context.heap(), length) {
+        Ok(value) => value,
+        Err(error) => return Result::Err(function_vm_error(error.message)),
+    };
+    let slot = bjson_reader_slot(reader);
+    bjson_finish_slot(slot, object);
+    let mut index = 0;
+    while index < length {
+        let value = bjson_read_value(reader)?;
+        bjson_define_data(reader, object, runtime::string_property_key(index.to_string()), value)?;
+        index += 1;
+    }
+    Result::Ok(runtime::Value::Object(object))
+}
+
+fn bjson_buffer_from_bytes(bytes: Vec[byte], max_byte_length: uint32) -> Result[
+    arraybuffer::ArrayBuffer,
+    vm::VmError,
+] {
+    let result = if max_byte_length == 0xffffffff {
+        arraybuffer::ArrayBuffer::from_bytes(bytes.slice(0, bytes.len()))
+    } else if max_byte_length.to_uint64() < bytes.len().to_uint64() {
+        return Result::Err(function_syntax_error("invalid array buffer maximum length"))
+    } else {
+        arraybuffer::ArrayBuffer::from_bytes_resizable(
+            bytes.slice(0, bytes.len()),
+            max_byte_length.to_int(),
+        )
+    };
+    match result {
+        Ok(value) => Result::Ok(value),
+        Err(error) => Result::Err(function_syntax_error(error.to_string())),
+    }
+}
+
+fn bjson_read_array_buffer(reader: BjsonReader) -> Result[runtime::Value, vm::VmError] {
+    let byte_length = bjson_read_leb128(reader)?.to_int();
+    let max_byte_length = bjson_read_leb128(reader)?;
+    let bytes = bjson_read_bytes(reader, byte_length)?;
+    let buffer = bjson_buffer_from_bytes(bytes, max_byte_length)?;
+    let object = match reader.context.construct_with_new_target_at_depth(
+        reader.buffers.array_buffer,
+        Vec::[runtime::Value::Int(0)],
+        reader.buffers.array_buffer,
+        reader.depth,
+    )? {
+        runtime::Value::Object(value) => value,
+        _ => return Result::Err(function_vm_error("ArrayBuffer constructor returned no object")),
+    };
+    reader.buffers.buffer_states[object] = buffer;
+    let slot = bjson_reader_slot(reader);
+    bjson_finish_slot(slot, object);
+    Result::Ok(runtime::Value::Object(object))
+}
+
+fn bjson_typed_constructor(install: ArrayBufferInstall, tag: byte) -> Option[runtime::Value] {
+    match tag {
+        0 => Option::Some(install.uint8_clamped_array),
+        1 => Option::Some(install.int8_array),
+        2 => Option::Some(install.uint8_array),
+        3 => Option::Some(install.int16_array),
+        4 => Option::Some(install.uint16_array),
+        5 => Option::Some(install.int32_array),
+        6 => Option::Some(install.uint32_array),
+        7 => Option::Some(install.bigint64_array),
+        8 => Option::Some(install.biguint64_array),
+        9 => Option::Some(install.float16_array),
+        10 => Option::Some(install.float32_array),
+        11 => Option::Some(install.float64_array),
+        _ => Option::None,
+    }
+}
+
+fn bjson_read_typed_array(reader: BjsonReader) -> Result[runtime::Value, vm::VmError] {
+    let tag = bjson_read_byte(reader)?;
+    let constructor = match bjson_typed_constructor(reader.buffers, tag) {
+        Some(value) => value,
+        None => return Result::Err(bjson_reader_error(reader, "invalid typed array tag")),
+    };
+    let length = bjson_read_leb128(reader)?.to_int();
+    let offset = bjson_read_leb128(reader)?.to_int();
+    let slot = bjson_reader_slot(reader);
+    let buffer = bjson_read_value(reader)?;
+    let result = reader.context.construct_with_new_target_at_depth(
+        constructor,
+        Vec::[
+            buffer,
+            runtime::Value::Int(offset.to_int32()),
+            runtime::Value::Int(length.to_int32()),
+        ],
+        constructor,
+        reader.depth,
+    )?;
+    let object = match result {
+        runtime::Value::Object(value) => value,
+        _ => return Result::Err(function_vm_error("TypedArray constructor returned no object")),
+    };
+    bjson_finish_slot(slot, object);
+    Result::Ok(result)
+}
+
+fn bjson_read_date(reader: BjsonReader) -> Result[runtime::Value, vm::VmError] {
+    let slot = bjson_reader_slot(reader);
+    let value = bjson_read_value(reader)?;
+    let result = reader.context.construct_with_new_target_at_depth(
+        reader.date_constructor,
+        Vec::[value],
+        reader.date_constructor,
+        reader.depth,
+    )?;
+    let object = match result {
+        runtime::Value::Object(value) => value,
+        _ => return Result::Err(function_vm_error("Date constructor returned no object")),
+    };
+    bjson_finish_slot(slot, object);
+    Result::Ok(result)
+}
+
+fn bjson_primitive_kind(value: runtime::Value) -> Option[runtime::PrimitivePrototypeKind] {
+    match value {
+        runtime::Value::Bool(_) => Option::Some(runtime::PrimitivePrototypeKind::Boolean),
+        runtime::Value::Int(_) | runtime::Value::Float(_) => {
+            Option::Some(runtime::PrimitivePrototypeKind::Number)
+        },
+        runtime::Value::String(_) => Option::Some(runtime::PrimitivePrototypeKind::String),
+        runtime::Value::BigInt(_) => Option::Some(runtime::PrimitivePrototypeKind::BigInt),
+        _ => Option::None,
+    }
+}
+
+fn bjson_read_object_value(reader: BjsonReader) -> Result[runtime::Value, vm::VmError] {
+    let slot = bjson_reader_slot(reader);
+    let value = bjson_read_value(reader)?;
+    let kind = match bjson_primitive_kind(value) {
+        Some(value) => value,
+        None => return Result::Err(bjson_reader_error(reader, "invalid boxed primitive")),
+    };
+    let object = match runtime::new_ordinary_object(
+        reader.context.heap(),
+        reader.context.heap().primitive_prototype(kind),
+    ) {
+        Ok(value) => value,
+        Err(error) => return Result::Err(function_vm_error(error.message)),
+    };
+    if !runtime::set_primitive_value(reader.context.heap(), object, value) {
+        return Result::Err(function_vm_error("cannot initialize boxed primitive"))
+    } else {};
+    bjson_finish_slot(slot, object);
+    Result::Ok(runtime::Value::Object(object))
+}
+
+fn bjson_read_reference(reader: BjsonReader) -> Result[runtime::Value, vm::VmError] {
+    if !reader.allow_reference {
+        return Result::Err(bjson_reader_error(reader, "object references are not allowed"))
+    } else {};
+    let index = bjson_read_leb128(reader)?.to_int();
+    if index < 0 || index >= reader.objects.len() {
+        return Result::Err(bjson_reader_error(reader, "invalid object reference"))
+    } else {};
+    match reader.objects[index].get() {
+        Some(value) => Result::Ok(runtime::Value::Object(value)),
+        None => Result::Err(bjson_reader_error(reader, "unresolved object reference")),
+    }
+}
+
+fn bjson_read_value(reader: BjsonReader) -> Result[runtime::Value, vm::VmError] {
+    let tag = bjson_read_byte(reader)?;
+    match tag {
+        BJSON_TAG_NULL => Result::Ok(runtime::Value::Null),
+        BJSON_TAG_UNDEFINED => Result::Ok(runtime::Value::Undefined),
+        BJSON_TAG_FALSE => Result::Ok(runtime::Value::Bool(false)),
+        BJSON_TAG_TRUE => Result::Ok(runtime::Value::Bool(true)),
+        BJSON_TAG_INT32 => Result::Ok(runtime::Value::Int(bjson_read_sleb128(reader)?)),
+        BJSON_TAG_FLOAT64 => bjson_read_float(reader),
+        BJSON_TAG_STRING => Result::Ok(runtime::Value::String(bjson_read_string(reader)?)),
+        BJSON_TAG_OBJECT => bjson_read_object(reader),
+        BJSON_TAG_ARRAY => bjson_read_array(reader),
+        BJSON_TAG_BIG_INT => bjson_read_bigint(reader),
+        BJSON_TAG_TYPED_ARRAY => bjson_read_typed_array(reader),
+        BJSON_TAG_ARRAY_BUFFER => bjson_read_array_buffer(reader),
+        BJSON_TAG_SHARED_ARRAY_BUFFER => Result::Err(
+            bjson_reader_error(reader, "shared array buffers are not supported"),
+        ),
+        BJSON_TAG_DATE => bjson_read_date(reader),
+        BJSON_TAG_OBJECT_VALUE => bjson_read_object_value(reader),
+        BJSON_TAG_OBJECT_REFERENCE => bjson_read_reference(reader),
+        _ => Result::Err(bjson_reader_error(reader, "invalid object tag")),
+    }
+}
+
+fn bjson_read_header(reader: BjsonReader) -> Result[unit, vm::VmError] {
+    let version = bjson_read_byte(reader)?;
+    if version != BJSON_VERSION {
+        return Result::Err(bjson_reader_error(reader, "invalid BJSON version"))
+    } else {};
+    let count = bjson_read_leb128(reader)?.to_int();
+    let mut index = 0;
+    while index < count {
+        reader.atoms.push(bjson_read_string(reader)?);
+        index += 1;
+    }
+    Result::Ok(())
+}
+
+fn bjson_materialize_bytes(
+    context: vm::Context,
+    buffers: ArrayBufferInstall,
+    bytes: Vec[byte],
+    depth: int,
+) -> Result[runtime::Value, vm::VmError] {
+    let result = context.construct_with_new_target_at_depth(
+        buffers.array_buffer,
+        Vec::[runtime::Value::Int(bytes.len().to_int32())],
+        buffers.array_buffer,
+        depth,
+    )?;
+    let object = match result {
+        runtime::Value::Object(value) => value,
+        _ => return Result::Err(function_vm_error("ArrayBuffer constructor returned no object")),
+    };
+    let buffer = match buffers.buffer_states.get(object) {
+        Some(value) => value,
+        None => return Result::Err(function_vm_error("ArrayBuffer state is missing")),
+    };
+    match buffer.write_bytes(0, bytes.slice(0, bytes.len())) {
+        Ok(()) => Result::Ok(result),
+        Err(error) => Result::Err(function_vm_error(error.to_string())),
+    }
+}
+
+fn bjson_write_builtin(
+    context: vm::Context,
+    buffers: ArrayBufferInstall,
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+    depth: int,
+) -> Result[runtime::Value, vm::VmError] {
+    let _ = this_value;
+    let allow_reference = runtime::to_boolean(argument(arguments, 1));
+    let writer = BjsonWriter {
+        context,
+        buffers,
+        data: cutils::ByteBuffer::new(),
+        atoms: Vec::[],
+        objects: Vec::[],
+        active: Vec::[],
+        allow_reference,
+        depth,
+    };
+    bjson_write_value(writer, argument(arguments, 0))?;
+    bjson_materialize_bytes(context, buffers, bjson_finish_writer(writer)?, depth)
+}
+
+fn bjson_read_range(
+    context: vm::Context,
+    buffer: arraybuffer::ArrayBuffer,
+    arguments: Vec[runtime::Value],
+    depth: int,
+) -> Result[(Vec[byte], int, int), vm::VmError] {
+    let bytes = match buffer.to_bytes() {
+        Ok(value) => value,
+        Err(error) => return Result::Err(function_vm_error(error.to_string())),
+    };
+    let offset = if arguments.len() > 1 {
+        arraybuffer_index_at_depth(context, arguments[1], depth)?
+    } else {
+        0
+    };
+    if offset > bytes.len() {
+        return Result::Err(function_vm_error("BJSON offset exceeds buffer length"))
+    } else {};
+    let length = if arguments.len() > 2 {
+        arraybuffer_index_at_depth(context, arguments[2], depth)?
+    } else {
+        bytes.len() - offset
+    };
+    if length > bytes.len() - offset {
+        return Result::Err(function_vm_error("BJSON length exceeds buffer length"))
+    } else {};
+    Result::Ok((bytes, offset, offset + length))
+}
+
+fn bjson_read_builtin(
+    context: vm::Context,
+    buffers: ArrayBufferInstall,
+    date_constructor: runtime::Value,
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+    depth: int,
+) -> Result[runtime::Value, vm::VmError] {
+    let _ = this_value;
+    let object = match argument(arguments, 0) {
+        runtime::Value::Object(value) => value,
+        _ => return Result::Err(function_vm_error("BJSON input must be an ArrayBuffer")),
+    };
+    let buffer = match buffers.buffer_states.get(object) {
+        Some(value) => value,
+        None => return Result::Err(function_vm_error("BJSON input must be an ArrayBuffer")),
+    };
+    let (bytes, offset, limit) = bjson_read_range(context, buffer, arguments, depth)?;
+    let reader = BjsonReader {
+        context,
+        buffers,
+        date_constructor,
+        data: bytes,
+        offset: Ref::new(offset),
+        limit,
+        atoms: Vec::[],
+        objects: Vec::[],
+        allow_reference: runtime::to_boolean(argument(arguments, 3)),
+        depth,
+    };
+    bjson_read_header(reader)?;
+    bjson_read_value(reader)
+}
+
+fn install_bjson(
+    context: vm::Context,
+    buffers: ArrayBufferInstall,
+    date_constructor: runtime::Value,
+) -> Result[runtime::Value, BuiltinError] {
+    let object = match runtime::new_ordinary_object(
+        context.heap(),
+        context.heap().object_prototype(),
+    ) {
+        Ok(value) => value,
+        Err(error) => return Result::Err(BuiltinError { message: error.message }),
+    };
+    define_value(
+        context.heap(),
+        object,
+        "write",
+        allocate_vm_function_with_length(
+            context,
+            "bjson.write",
+            1,
+            |this_value, arguments, depth| {
+                bjson_write_builtin(context, buffers, this_value, arguments, depth)
+            },
+        )?,
+        true,
+        true,
+    )?;
+    define_value(
+        context.heap(),
+        object,
+        "read",
+        allocate_vm_function_with_length(
+            context,
+            "bjson.read",
+            3,
+            |this_value, arguments, depth| {
+                bjson_read_builtin(context, buffers, date_constructor, this_value, arguments, depth)
+            },
+        )?,
+        true,
+        true,
+    )?;
+    let value = runtime::Value::Object(object);
+    context.register_virtual_module("./bjson.so", value);
+    Result::Ok(value)
+}

@@ -1,0 +1,687 @@
+package arrayx;
+
+use gomlang::quickjs::dtoa;
+use gomlang::quickjs::runtime;
+use std::math;
+use std::num;
+
+const MAX_ARRAY_LENGTH: int = 4294967295;
+
+pub enum ArrayError {
+    InvalidObject,
+    NotArray,
+    InvalidLength,
+    LengthNotWritable,
+    LengthOutOfRange(int),
+    CannotRead {
+        index: int,
+        message: string,
+    },
+    CannotWrite(int),
+    CannotDelete(int),
+    CannotAllocate(string),
+    CannotStringify {
+        index: int,
+        kind: string,
+    },
+}
+
+impl ToString for ArrayError {
+    fn to_string(self: ArrayError) -> string {
+        match self {
+            ArrayError::InvalidObject => "array object is not live",
+            ArrayError::NotArray => "object is not an Array",
+            ArrayError::InvalidLength => "array length is not a non-negative int32",
+            ArrayError::LengthNotWritable => "array length is not writable",
+            ArrayError::LengthOutOfRange(value) => {
+                "array length is outside the supported range: " + value.to_string()
+            },
+            ArrayError::CannotRead { index, message } => {
+                "cannot read array index " + index.to_string() + ": " + message
+            },
+            ArrayError::CannotWrite(index) => {
+                "cannot define array index " + index.to_string()
+            },
+            ArrayError::CannotDelete(index) => {
+                "cannot delete array index " + index.to_string()
+            },
+            ArrayError::CannotAllocate(message) => "cannot allocate Array: " + message,
+            ArrayError::CannotStringify { index, kind } => {
+                "cannot stringify " + kind + " at array index " + index.to_string()
+            },
+        }
+    }
+}
+
+impl Debug for ArrayError {
+    fn debug(self: ArrayError) -> string {
+        self.to_string()
+    }
+}
+
+pub enum ArraySlot {
+    Hole,
+    Value(runtime::Value),
+}
+
+pub enum ConcatItem {
+    Value(runtime::Value),
+    Spread(runtime::ObjectId),
+}
+
+fn index_key(index: int) -> runtime::PropertyKey {
+    runtime::string_property_key(index.to_string())
+}
+
+fn checked_array(heap: runtime::Heap, array: runtime::ObjectId) -> Result[
+    runtime::Object,
+    ArrayError,
+] {
+    match heap.get(array) {
+        Some(object) => match object.kind() {
+            runtime::ObjectKind::Array => Result::Ok(object),
+            _ => Result::Err(ArrayError::NotArray),
+        },
+        None => Result::Err(ArrayError::InvalidObject),
+    }
+}
+
+fn length_descriptor(heap: runtime::Heap, array: runtime::ObjectId) -> Result[
+    runtime::PropertyDescriptor,
+    ArrayError,
+] {
+    let object = checked_array(heap, array)?;
+    match object.own_property(runtime::string_property_key("length")) {
+        Some(descriptor) => Result::Ok(descriptor),
+        None => Result::Err(ArrayError::InvalidLength),
+    }
+}
+
+pub fn length(heap: runtime::Heap, array: runtime::ObjectId) -> Result[int, ArrayError] {
+    match runtime::descriptor_value(length_descriptor(heap, array)?) {
+        Some(runtime::Value::Int(value)) => if value >= 0 {
+            Result::Ok(value.to_int())
+        } else {
+            Result::Err(ArrayError::InvalidLength)
+        },
+        Some(runtime::Value::Float(value)) => if math::is_finite(value) && value >= 0.0
+            && value <= 4294967295.0
+            && math::trunc(value) == value {
+            Result::Ok(num::parse_int(dtoa::number_to_string(value)).unwrap_or(-1))
+        } else {
+            Result::Err(ArrayError::InvalidLength)
+        },
+        _ => Result::Err(ArrayError::InvalidLength),
+    }
+}
+
+fn require_writable_length(heap: runtime::Heap, array: runtime::ObjectId) -> Result[
+    unit,
+    ArrayError,
+] {
+    if runtime::descriptor_writable(length_descriptor(heap, array)?) {
+        Result::Ok(())
+    } else {
+        Result::Err(ArrayError::LengthNotWritable)
+    }
+}
+
+fn set_length(heap: runtime::Heap, array: runtime::ObjectId, value: int) -> Result[unit, ArrayError] {
+    if value < 0 || value > MAX_ARRAY_LENGTH {
+        Result::Err(ArrayError::LengthOutOfRange(value))
+    } else if runtime::set_existing_data_property(
+        heap,
+        array,
+        runtime::string_property_key("length"),
+        length_value(value),
+    ) {
+        Result::Ok(())
+    } else {
+        Result::Err(ArrayError::LengthNotWritable)
+    }
+}
+
+fn new_array(heap: runtime::Heap, value: int) -> Result[runtime::ObjectId, ArrayError] {
+    if value < 0 || value > MAX_ARRAY_LENGTH {
+        return Result::Err(ArrayError::LengthOutOfRange(value))
+    } else {};
+    let array = match runtime::new_object(heap, runtime::ObjectKind::Array, heap.array_prototype()) {
+        Ok(array) => array,
+        Err(error) => return Result::Err(ArrayError::CannotAllocate(error.message)),
+    };
+    if runtime::define_own_property(
+        heap,
+        array,
+        runtime::string_property_key("length"),
+        runtime::data_descriptor(length_value(value), true, false, false),
+    ) {
+        Result::Ok(array)
+    } else {
+        let _ = heap.free(array);
+        Result::Err(ArrayError::CannotAllocate("cannot define array length"))
+    }
+}
+
+fn length_value(value: int) -> runtime::Value {
+    if value <= 2147483647 {
+        runtime::Value::Int(value.to_int32())
+    } else {
+        runtime::Value::Float(num::parse_float64(value.to_string()).unwrap_or(0.0))
+    }
+}
+
+fn read_index(heap: runtime::Heap, array: runtime::ObjectId, index: int) -> Result[
+    ArraySlot,
+    ArrayError,
+] {
+    match runtime::get_property(heap, array, index_key(index)) {
+        Ok(Some(value)) => Result::Ok(ArraySlot::Value(value)),
+        Ok(None) => Result::Ok(ArraySlot::Hole),
+        Err(error) => Result::Err(ArrayError::CannotRead { index, message: error.message }),
+    }
+}
+
+fn write_index(heap: runtime::Heap, array: runtime::ObjectId, index: int, value: runtime::Value) -> Result[
+    unit,
+    ArrayError,
+] {
+    let object = checked_array(heap, array)?;
+    let key = index_key(index);
+    let descriptor = match object.own_property(key) {
+        Some(runtime::PropertyDescriptor::Data { value: _, writable, enumerable, configurable }) => if writable {
+            runtime::data_descriptor(value, writable, enumerable, configurable)
+        } else {
+            return Result::Err(ArrayError::CannotWrite(index))
+        },
+        Some(runtime::PropertyDescriptor::Accessor { .. }) => {
+            return Result::Err(ArrayError::CannotWrite(index))
+        },
+        None => runtime::data_descriptor(value, true, true, true),
+    };
+    if runtime::define_own_property(heap, array, key, descriptor) {
+        Result::Ok(())
+    } else {
+        Result::Err(ArrayError::CannotWrite(index))
+    }
+}
+
+fn delete_index(heap: runtime::Heap, array: runtime::ObjectId, index: int) -> Result[
+    unit,
+    ArrayError,
+] {
+    if runtime::delete_property(heap, array, index_key(index)) {
+        Result::Ok(())
+    } else {
+        Result::Err(ArrayError::CannotDelete(index))
+    }
+}
+
+fn relative_index(value: int, size: int) -> int {
+    if value < 0 {
+        let offset = size + value;
+        if offset < 0 {
+            0
+        } else {
+            offset
+        }
+    } else if value > size {
+        size
+    } else {
+        value
+    }
+}
+
+pub fn at(heap: runtime::Heap, array: runtime::ObjectId, index: int) -> Result[
+    ArraySlot,
+    ArrayError,
+] {
+    let size = length(heap, array)?;
+    let actual = if index < 0 {
+        size + index
+    } else {
+        index
+    };
+    if actual < 0 || actual >= size {
+        Result::Ok(ArraySlot::Hole)
+    } else {
+        read_index(heap, array, actual)
+    }
+}
+
+fn host_string(value: string) -> runtime::JsString {
+    let bytes = value.to_bytes();
+    runtime::JsString::from_utf8(bytes.slice(0, bytes.len()))
+}
+
+fn join_value(value: runtime::Value, index: int) -> Result[runtime::JsString, ArrayError] {
+    match value {
+        runtime::Value::Undefined | runtime::Value::Null => Result::Ok(host_string("")),
+        runtime::Value::Bool(value) => Result::Ok(host_string(value.to_string())),
+        runtime::Value::Int(value) => Result::Ok(host_string(value.to_string())),
+        runtime::Value::Float(value) => Result::Ok(host_string(dtoa::number_to_string(value))),
+        runtime::Value::String(value) => Result::Ok(value),
+        runtime::Value::BigInt(value) => Result::Ok(host_string(value.to_string())),
+        runtime::Value::Symbol(_) => {
+            Result::Err(ArrayError::CannotStringify { index, kind: "symbol" })
+        },
+        runtime::Value::Object(_) => {
+            Result::Err(ArrayError::CannotStringify { index, kind: "object" })
+        },
+    }
+}
+
+pub fn join(heap: runtime::Heap, array: runtime::ObjectId, separator: runtime::JsString) -> Result[
+    runtime::JsString,
+    ArrayError,
+] {
+    let size = length(heap, array)?;
+    let mut output = host_string("");
+    let mut index = 0;
+    while index < size {
+        if index > 0 {
+            output = output.concat(separator);
+        } else {};
+        match read_index(heap, array, index)? {
+            ArraySlot::Hole => (),
+            ArraySlot::Value(value) => {
+                output = output.concat(join_value(value, index)?);
+            },
+        };
+        index += 1;
+    }
+    Result::Ok(output)
+}
+
+pub fn reverse(heap: runtime::Heap, array: runtime::ObjectId) -> Result[unit, ArrayError] {
+    let size = length(heap, array)?;
+    let middle = size / 2;
+    let mut lower = 0;
+    while lower < middle {
+        let upper = size - lower - 1;
+        let lower_value = read_index(heap, array, lower)?;
+        let upper_value = read_index(heap, array, upper)?;
+        match (lower_value, upper_value) {
+            (ArraySlot::Value(lower_value), ArraySlot::Value(upper_value)) => {
+                write_index(heap, array, lower, upper_value)?;
+                write_index(heap, array, upper, lower_value)?
+            },
+            (ArraySlot::Hole, ArraySlot::Value(upper_value)) => {
+                write_index(heap, array, lower, upper_value)?;
+                delete_index(heap, array, upper)?
+            },
+            (ArraySlot::Value(lower_value), ArraySlot::Hole) => {
+                delete_index(heap, array, lower)?;
+                write_index(heap, array, upper, lower_value)?
+            },
+            (ArraySlot::Hole, ArraySlot::Hole) => (),
+        };
+        lower += 1;
+    }
+    Result::Ok(())
+}
+
+pub fn slice(heap: runtime::Heap, array: runtime::ObjectId, start: int, end: Option[int]) -> Result[
+    runtime::ObjectId,
+    ArrayError,
+] {
+    let size = length(heap, array)?;
+    let from = relative_index(start, size);
+    let to = match end {
+        Some(value) => relative_index(value, size),
+        None => size,
+    };
+    let count = if to > from {
+        to - from
+    } else {
+        0
+    };
+    let result = new_array(heap, count)?;
+    let mut target = 0;
+    while target < count {
+        match read_index(heap, array, from + target)? {
+            ArraySlot::Value(value) => write_index(heap, result, target, value)?,
+            ArraySlot::Hole => (),
+        };
+        target += 1;
+    }
+    Result::Ok(result)
+}
+
+fn checked_total(left: int, right: int) -> Result[int, ArrayError] {
+    if right < 0 || left > MAX_ARRAY_LENGTH - right {
+        Result::Err(ArrayError::LengthOutOfRange(MAX_ARRAY_LENGTH + 1))
+    } else {
+        Result::Ok(left + right)
+    }
+}
+
+pub fn concat(heap: runtime::Heap, array: runtime::ObjectId, items: Vec[ConcatItem]) -> Result[
+    runtime::ObjectId,
+    ArrayError,
+] {
+    let source_length = length(heap, array)?;
+    let mut total = source_length;
+    for item in items {
+        total = match item {
+            ConcatItem::Value(_) => checked_total(total, 1)?,
+            ConcatItem::Spread(value) => checked_total(total, length(heap, value)?)?,
+        };
+    }
+    let result = new_array(heap, total)?;
+    let mut target = 0;
+    let mut source_index = 0;
+    while source_index < source_length {
+        match read_index(heap, array, source_index)? {
+            ArraySlot::Value(value) => write_index(heap, result, target, value)?,
+            ArraySlot::Hole => (),
+        };
+        target += 1;
+        source_index += 1;
+    }
+    for item in items {
+        match item {
+            ConcatItem::Value(value) => {
+                write_index(heap, result, target, value)?;
+                target += 1;
+            },
+            ConcatItem::Spread(value) => {
+                let item_length = length(heap, value)?;
+                let mut item_index = 0;
+                while item_index < item_length {
+                    match read_index(heap, value, item_index)? {
+                        ArraySlot::Value(value) => write_index(heap, result, target, value)?,
+                        ArraySlot::Hole => (),
+                    };
+                    target += 1;
+                    item_index += 1;
+                }
+            },
+        }
+    }
+    Result::Ok(result)
+}
+
+pub fn index_of(
+    heap: runtime::Heap,
+    array: runtime::ObjectId,
+    search: runtime::Value,
+    from_index: int,
+) -> Result[int, ArrayError] {
+    let size = length(heap, array)?;
+    let mut index = if from_index >= 0 {
+        if from_index > size {
+            size
+        } else {
+            from_index
+        }
+    } else {
+        let value = size + from_index;
+        if value < 0 {
+            0
+        } else {
+            value
+        }
+    };
+    while index < size {
+        match read_index(heap, array, index)? {
+            ArraySlot::Value(value) => if runtime::strict_equal(value, search) {
+                return Result::Ok(index)
+            } else {},
+            ArraySlot::Hole => (),
+        };
+        index += 1;
+    }
+    Result::Ok(-1)
+}
+
+pub fn last_index_of(
+    heap: runtime::Heap,
+    array: runtime::ObjectId,
+    search: runtime::Value,
+    from_index: Option[int],
+) -> Result[int, ArrayError] {
+    let size = length(heap, array)?;
+    if size == 0 {
+        return Result::Ok(-1)
+    } else {};
+    let mut index = match from_index {
+        Some(value) => if value >= 0 {
+            if value >= size {
+                size - 1
+            } else {
+                value
+            }
+        } else {
+            size + value
+        },
+        None => size - 1,
+    };
+    while index >= 0 {
+        match read_index(heap, array, index)? {
+            ArraySlot::Value(value) => if runtime::strict_equal(value, search) {
+                return Result::Ok(index)
+            } else {},
+            ArraySlot::Hole => (),
+        };
+        index -= 1;
+    }
+    Result::Ok(-1)
+}
+
+pub fn includes(
+    heap: runtime::Heap,
+    array: runtime::ObjectId,
+    search: runtime::Value,
+    from_index: int,
+) -> Result[bool, ArrayError] {
+    let size = length(heap, array)?;
+    let mut index = if from_index >= 0 {
+        if from_index > size {
+            size
+        } else {
+            from_index
+        }
+    } else {
+        let value = size + from_index;
+        if value < 0 {
+            0
+        } else {
+            value
+        }
+    };
+    while index < size {
+        let value = match read_index(heap, array, index)? {
+            ArraySlot::Value(value) => value,
+            ArraySlot::Hole => runtime::Value::Undefined,
+        };
+        if runtime::same_value_zero(value, search) {
+            return Result::Ok(true)
+        } else {};
+        index += 1;
+    }
+    Result::Ok(false)
+}
+
+pub fn push(heap: runtime::Heap, array: runtime::ObjectId, values: Vec[runtime::Value]) -> Result[
+    int,
+    ArrayError,
+] {
+    let mut size = length(heap, array)?;
+    if values.is_empty() {
+        return Result::Ok(size)
+    } else {};
+    require_writable_length(heap, array)?;
+    let final_length = checked_total(size, values.len())?;
+    for value in values {
+        write_index(heap, array, size, value)?;
+        size += 1;
+        set_length(heap, array, size)?
+    }
+    Result::Ok(final_length)
+}
+
+pub fn pop(heap: runtime::Heap, array: runtime::ObjectId) -> Result[ArraySlot, ArrayError] {
+    let size = length(heap, array)?;
+    require_writable_length(heap, array)?;
+    if size == 0 {
+        set_length(heap, array, 0)?;
+        Result::Ok(ArraySlot::Hole)
+    } else {
+        let index = size - 1;
+        let value = read_index(heap, array, index)?;
+        delete_index(heap, array, index)?;
+        set_length(heap, array, index)?;
+        Result::Ok(value)
+    }
+}
+
+pub fn shift(heap: runtime::Heap, array: runtime::ObjectId) -> Result[ArraySlot, ArrayError] {
+    let size = length(heap, array)?;
+    require_writable_length(heap, array)?;
+    if size == 0 {
+        set_length(heap, array, 0)?;
+        return Result::Ok(ArraySlot::Hole)
+    } else {};
+    let first = read_index(heap, array, 0)?;
+    let mut index = 1;
+    while index < size {
+        match read_index(heap, array, index)? {
+            ArraySlot::Value(value) => write_index(heap, array, index - 1, value)?,
+            ArraySlot::Hole => delete_index(heap, array, index - 1)?,
+        };
+        index += 1;
+    }
+    delete_index(heap, array, size - 1)?;
+    set_length(heap, array, size - 1)?;
+    Result::Ok(first)
+}
+
+pub fn unshift(heap: runtime::Heap, array: runtime::ObjectId, values: Vec[runtime::Value]) -> Result[
+    int,
+    ArrayError,
+] {
+    let size = length(heap, array)?;
+    if values.is_empty() {
+        return Result::Ok(size)
+    } else {};
+    require_writable_length(heap, array)?;
+    let count = values.len();
+    let new_length = checked_total(size, count)?;
+    let mut index = size;
+    while index > 0 {
+        let from = index - 1;
+        let to = from + count;
+        match read_index(heap, array, from)? {
+            ArraySlot::Value(value) => write_index(heap, array, to, value)?,
+            ArraySlot::Hole => delete_index(heap, array, to)?,
+        };
+        index -= 1;
+    }
+    let mut item = 0;
+    while item < count {
+        write_index(heap, array, item, values[item])?;
+        item += 1;
+    }
+    set_length(heap, array, new_length)?;
+    Result::Ok(new_length)
+}
+
+fn copy_removed(heap: runtime::Heap, array: runtime::ObjectId, start: int, count: int) -> Result[
+    runtime::ObjectId,
+    ArrayError,
+] {
+    let removed = new_array(heap, count)?;
+    let mut index = 0;
+    while index < count {
+        match read_index(heap, array, start + index)? {
+            ArraySlot::Value(value) => write_index(heap, removed, index, value)?,
+            ArraySlot::Hole => (),
+        };
+        index += 1;
+    }
+    Result::Ok(removed)
+}
+
+fn splice_shrink(
+    heap: runtime::Heap,
+    array: runtime::ObjectId,
+    size: int,
+    start: int,
+    delete_count: int,
+    item_count: int,
+) -> Result[unit, ArrayError] {
+    let mut index = start;
+    while index < size - delete_count {
+        let from = index + delete_count;
+        let to = index + item_count;
+        match read_index(heap, array, from)? {
+            ArraySlot::Value(value) => write_index(heap, array, to, value)?,
+            ArraySlot::Hole => delete_index(heap, array, to)?,
+        };
+        index += 1;
+    }
+    let new_length = size - delete_count + item_count;
+    let mut tail = size;
+    while tail > new_length {
+        tail -= 1;
+        delete_index(heap, array, tail)?
+    }
+    Result::Ok(())
+}
+
+fn splice_grow(
+    heap: runtime::Heap,
+    array: runtime::ObjectId,
+    size: int,
+    start: int,
+    delete_count: int,
+    item_count: int,
+) -> Result[unit, ArrayError] {
+    let mut index = size - delete_count;
+    while index > start {
+        let from = index + delete_count - 1;
+        let to = index + item_count - 1;
+        match read_index(heap, array, from)? {
+            ArraySlot::Value(value) => write_index(heap, array, to, value)?,
+            ArraySlot::Hole => delete_index(heap, array, to)?,
+        };
+        index -= 1;
+    }
+    Result::Ok(())
+}
+
+pub fn splice(
+    heap: runtime::Heap,
+    array: runtime::ObjectId,
+    start: int,
+    delete_count: int,
+    items: Vec[runtime::Value],
+) -> Result[runtime::ObjectId, ArrayError] {
+    let size = length(heap, array)?;
+    let actual_start = relative_index(start, size);
+    let available = size - actual_start;
+    let actual_delete = if delete_count < 0 {
+        0
+    } else if delete_count > available {
+        available
+    } else {
+        delete_count
+    };
+    let item_count = items.len();
+    let base = size - actual_delete;
+    let new_length = checked_total(base, item_count)?;
+    require_writable_length(heap, array)?;
+    let removed = copy_removed(heap, array, actual_start, actual_delete)?;
+    if item_count < actual_delete {
+        splice_shrink(heap, array, size, actual_start, actual_delete, item_count)?
+    } else if item_count > actual_delete {
+        splice_grow(heap, array, size, actual_start, actual_delete, item_count)?
+    } else {};
+    let mut index = 0;
+    while index < item_count {
+        write_index(heap, array, actual_start + index, items[index])?;
+        index += 1;
+    }
+    set_length(heap, array, new_length)?;
+    Result::Ok(removed)
+}

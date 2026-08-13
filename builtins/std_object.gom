@@ -1,0 +1,1758 @@
+package builtins;
+
+use gomlang::quickjs::arraybuffer;
+use gomlang::quickjs::bigint;
+use gomlang::quickjs::dtoa;
+use gomlang::quickjs::mathx;
+use gomlang::quickjs::runtime;
+use gomlang::quickjs::vm;
+use std::bytes;
+use std::env;
+use std::fs;
+use std::io;
+use std::math;
+use std::num;
+use std::process;
+use std::text;
+
+struct StdFileState {
+    contents: Ref[Vec[byte]],
+    position: Ref[int],
+    path: Option[string],
+    writable: bool,
+    closed: Ref[bool],
+    stream: int,
+    loaded: Ref[bool],
+}
+
+fn std_file_error(message: string) -> vm::VmError {
+    function_vm_error("std file: " + message)
+}
+
+fn std_truncated_int(value: float64) -> int {
+    num::parse_int(dtoa::number_to_string(math::trunc(value))).unwrap_or(0)
+}
+
+fn std_truncated_int64(value: float64) -> int64 {
+    if !math::is_finite(value) || value == 0.0 {
+        return 0
+    } else {};
+    let negative = value < 0.0;
+    let mut remaining = if negative {
+        -math::trunc(value)
+    } else {
+        math::trunc(value)
+    };
+    let mut place = 4503599627370496.0;
+    let mut bit: int64 = 4503599627370496;
+    let mut result: int64 = 0;
+    while bit != 0 {
+        if remaining >= place {
+            result += bit;
+            remaining -= place;
+        } else {};
+        place /= 2.0;
+        bit /= 2;
+    }
+    if negative {
+        -result
+    } else {
+        result
+    }
+}
+
+fn std_format_integer_value(context: vm::Context, value: runtime::Value, long: bool, depth: int) -> Result[
+    bigint::BigInteger,
+    vm::VmError,
+] {
+    match value {
+        runtime::Value::BigInt(value) => Result::Ok(value.integer()),
+        runtime::Value::Int(value) => Result::Ok(bigint::BigInteger::from_int64(value.to_int64())),
+        _ => match number_value_at_depth(context, value, depth)? {
+            runtime::Value::Float(value) => Result::Ok(
+                bigint::BigInteger::from_int64(
+                    if long {
+                        std_truncated_int64(value)
+                    } else {
+                        mathx::to_uint32(value).to_int32().to_int64()
+                    },
+                ),
+            ),
+            _ => Result::Ok(bigint::BigInteger::zero()),
+        },
+    }
+}
+
+fn std_unsigned_integer(value: bigint::BigInteger, long: bool) -> bigint::BigInteger {
+    let mask = bigint::parse_radix(
+        if long {
+            "ffffffffffffffff"
+        } else {
+            "ffffffff"
+        },
+        16,
+    ).unwrap_or(bigint::BigInteger::zero());
+    value.bit_and(mask)
+}
+
+fn std_format_padding(value: string, width: int, left: bool, zero: bool, prefix: string) -> string {
+    if width <= value.byte_len() {
+        value
+    } else {
+        let padding = text::repeat(
+            if zero {
+                "0"
+            } else {
+                " "
+            },
+            width - value.byte_len(),
+        );
+        if left {
+            value + padding
+        } else if zero && prefix.byte_len() > 0 {
+            prefix + padding + value.byte_slice(prefix.byte_len(), value.byte_len())
+        } else {
+            padding + value
+        }
+    }
+}
+
+fn std_format_integer(
+    value: bigint::BigInteger,
+    conversion: byte,
+    long: bool,
+    alternate: bool,
+    plus: bool,
+    space: bool,
+    left: bool,
+    zero: bool,
+    width: int,
+    precision: Option[int],
+) -> string {
+    let signed = conversion == b'd' || conversion == b'i';
+    let radix = if conversion == b'o' {
+        8
+    } else if conversion == b'x' || conversion == b'X' {
+        16
+    } else {
+        10
+    };
+    let normalized = if signed {
+        value
+    } else {
+        std_unsigned_integer(value, long)
+    };
+    let negative = signed && normalized.is_negative();
+    let magnitude = if negative {
+        normalized.abs()
+    } else {
+        normalized
+    };
+    let mut digits = magnitude.to_string_radix(radix).unwrap_or("0");
+    match precision {
+        Some(value) => if digits.byte_len() < value {
+            digits = text::repeat("0", value - digits.byte_len()) + digits;
+        } else {},
+        None => (),
+    };
+    let sign = if negative {
+        "-"
+    } else if signed && plus {
+        "+"
+    } else if signed && space {
+        " "
+    } else {
+        ""
+    };
+    let radix_prefix = if alternate && !magnitude.is_zero() && radix == 16 {
+        if conversion == b'X' {
+            "0X"
+        } else {
+            "0x"
+        }
+    } else if alternate && radix == 8 && (digits.byte_len() == 0 || digits.byte_get(0) != b'0') {
+        "0"
+    } else {
+        ""
+    };
+    let prefix = sign + radix_prefix;
+    let formatted = prefix + digits;
+    std_format_padding(formatted, width, left, zero && precision.is_none() && !left, prefix)
+}
+
+fn std_format_float(
+    value: float64,
+    conversion: byte,
+    plus: bool,
+    space: bool,
+    left: bool,
+    zero: bool,
+    width: int,
+    precision: Option[int],
+) -> string {
+    let digits = precision.unwrap_or(6);
+    let mut formatted = if conversion == b'f' || conversion == b'F' {
+        dtoa::number_to_fixed(value, digits)
+    } else if conversion == b'e' || conversion == b'E' {
+        dtoa::number_to_exponential(value, Option::Some(digits))
+    } else {
+        dtoa::number_to_precision(value, Option::Some(digits))
+    };
+    if value >= 0.0 {
+        if plus {
+            formatted = "+" + formatted;
+        } else if space {
+            formatted = " " + formatted;
+        } else {}
+    } else {};
+    let prefix = if formatted.byte_len() > 0
+        && (formatted.byte_get(0) == b'-' || formatted.byte_get(0) == b'+'
+            || formatted.byte_get(0) == b' ') {
+        formatted.byte_slice(0, 1)
+    } else {
+        ""
+    };
+    std_format_padding(formatted, width, left, zero && !left, prefix)
+}
+
+fn std_format_argument(
+    context: vm::Context,
+    arguments: Vec[runtime::Value],
+    argument_index: Ref[int],
+    conversion: byte,
+    long: bool,
+    alternate: bool,
+    plus: bool,
+    space: bool,
+    left: bool,
+    zero: bool,
+    width: int,
+    precision: Option[int],
+    depth: int,
+) -> Result[string, vm::VmError] {
+    if argument_index.get() >= arguments.len() {
+        return Result::Err(std_file_error("missing argument for conversion specifier"))
+    } else {};
+    let value = arguments[argument_index.get()];
+    argument_index.set(argument_index.get() + 1);
+    if conversion == b's' {
+        let text_value = std_value_host_string(context, value, depth)?;
+        let truncated = match precision {
+            Some(limit) => if limit < text_value.byte_len() {
+                text_value.byte_slice(0, limit)
+            } else {
+                text_value
+            },
+            None => text_value,
+        };
+        return Result::Ok(std_format_padding(truncated, width, left, false, ""))
+    } else if conversion == b'd' || conversion == b'i' || conversion == b'o' || conversion == b'u'
+        || conversion == b'x'
+        || conversion == b'X' {
+        return Result::Ok(
+            std_format_integer(
+                std_format_integer_value(context, value, long, depth)?,
+                conversion,
+                long,
+                alternate,
+                plus,
+                space,
+                left,
+                zero,
+                width,
+                precision,
+            ),
+        )
+    } else if conversion == b'f' || conversion == b'F' || conversion == b'e' || conversion == b'E'
+        || conversion == b'g'
+        || conversion == b'G' {
+        let number = match number_value_at_depth(context, value, depth)? {
+            runtime::Value::Float(value) => value,
+            _ => 0.0,
+        };
+        return Result::Ok(
+            std_format_float(number, conversion, plus, space, left, zero, width, precision),
+        )
+    } else {};
+    Result::Err(std_file_error("invalid conversion specifier in format string"))
+}
+
+fn std_format(context: vm::Context, arguments: Vec[runtime::Value], depth: int) -> Result[
+    string,
+    vm::VmError,
+] {
+    let format = std_value_host_string(context, argument(arguments, 0), depth)?;
+    let argument_index = Ref::new(1);
+    let mut output = "";
+    let mut index = 0;
+    while index < format.byte_len() {
+        if format.byte_get(index) != b'%' {
+            let start = index;
+            while index < format.byte_len() && format.byte_get(index) != b'%' {
+                index += 1;
+            }
+            output += format.byte_slice(start, index);
+            continue
+        } else {};
+        index += 1;
+        if index < format.byte_len() && format.byte_get(index) == b'%' {
+            output += "%";
+            index += 1;
+            continue
+        } else {};
+        let mut alternate = false;
+        let mut plus = false;
+        let mut space = false;
+        let mut left = false;
+        let mut zero = false;
+        let mut scanning_flags = true;
+        while scanning_flags && index < format.byte_len() {
+            match format.byte_get(index) {
+                b'#' => {
+                    alternate = true;
+                },
+                b'+' => {
+                    plus = true;
+                },
+                b' ' => {
+                    space = true;
+                },
+                b'-' => {
+                    left = true;
+                },
+                b'0' => {
+                    zero = true;
+                },
+                b'\'' => (),
+                _ => {
+                    scanning_flags = false;
+                },
+            };
+            if scanning_flags {
+                index += 1;
+            } else {}
+        }
+        let mut width = 0;
+        if index < format.byte_len() && format.byte_get(index) == b'*' {
+            if argument_index.get() >= arguments.len() {
+                return Result::Err(std_file_error("missing argument for conversion specifier"))
+            } else {};
+            let number = number_value_at_depth(context, arguments[argument_index.get()], depth)?;
+            argument_index.set(argument_index.get() + 1);
+            width = match number {
+                runtime::Value::Float(value) => mathx::to_uint32(value).to_int32().to_int(),
+                _ => 0,
+            };
+            if width < 0 {
+                left = true;
+                width = -width;
+            } else {};
+            index += 1;
+        } else {
+            while index < format.byte_len() && format.byte_get(index) >= b'0'
+                && format.byte_get(index) <= b'9' {
+                width = width * 10 + (format.byte_get(index) - b'0').to_int();
+                index += 1;
+            }
+        };
+        let mut precision: Option[int] = Option::None;
+        if index < format.byte_len() && format.byte_get(index) == b'.' {
+            index += 1;
+            let mut digits = 0;
+            if index < format.byte_len() && format.byte_get(index) == b'*' {
+                if argument_index.get() >= arguments.len() {
+                    return Result::Err(std_file_error("missing argument for conversion specifier"))
+                } else {};
+                let number = number_value_at_depth(context, arguments[argument_index.get()], depth)?;
+                argument_index.set(argument_index.get() + 1);
+                digits = match number {
+                    runtime::Value::Float(value) => mathx::to_uint32(value).to_int32().to_int(),
+                    _ => 0,
+                };
+                index += 1;
+            } else {
+                while index < format.byte_len() && format.byte_get(index) >= b'0'
+                    && format.byte_get(index) <= b'9' {
+                    digits = digits * 10 + (format.byte_get(index) - b'0').to_int();
+                    index += 1;
+                }
+            };
+            if digits >= 0 {
+                precision = Option::Some(digits);
+            } else {}
+        } else {};
+        let long = index < format.byte_len() && format.byte_get(index) == b'l';
+        if long {
+            index += 1;
+        } else {};
+        if index >= format.byte_len() {
+            return Result::Err(std_file_error("invalid conversion specifier in format string"))
+        } else {};
+        let conversion = format.byte_get(index);
+        index += 1;
+        output += std_format_argument(
+            context,
+            arguments,
+            argument_index,
+            conversion,
+            long,
+            alternate,
+            plus,
+            space,
+            left,
+            zero,
+            width,
+            precision,
+            depth,
+        )?;
+    }
+    Result::Ok(output)
+}
+
+fn std_file_require_open(state: StdFileState) -> Result[unit, vm::VmError] {
+    if state.closed.get() {
+        Result::Err(std_file_error("file is closed"))
+    } else {
+        Result::Ok(())
+    }
+}
+
+fn std_file_contents(state: StdFileState) -> Result[Vec[byte], vm::VmError] {
+    std_file_require_open(state)?;
+    if state.stream == 0 && !state.loaded.get() {
+        let contents = match io::read_stdin() {
+            Ok(value) => value.to_vec(),
+            Err(value) => return Result::Err(std_file_error(value)),
+        };
+        state.contents.set(contents);
+        state.loaded.set(true);
+    } else {};
+    Result::Ok(state.contents.get())
+}
+
+fn std_file_flush(state: StdFileState) -> Result[unit, vm::VmError] {
+    std_file_require_open(state)?;
+    match state.path {
+        Some(path) => if state.writable {
+            match fs::write_bytes(path, bytes::Bytes::from_vec(state.contents.get())) {
+                Ok(()) => Result::Ok(()),
+                Err(value) => Result::Err(std_file_error(value)),
+            }
+        } else {
+            Result::Ok(())
+        },
+        None => Result::Ok(()),
+    }
+}
+
+fn std_file_index(context: vm::Context, value: runtime::Value, depth: int) -> Result[
+    int,
+    vm::VmError,
+] {
+    let number = match number_value_at_depth(context, value, depth)? {
+        runtime::Value::Float(value) => value,
+        _ => 0.0,
+    };
+    if math::is_nan(number) || number == 0.0 {
+        Result::Ok(0)
+    } else if !math::is_finite(number) || number < 0.0 || number > 2147483647.0 {
+        Result::Err(function_range_error("file buffer index is out of range"))
+    } else {
+        Result::Ok(std_truncated_int(number))
+    }
+}
+
+fn std_file_buffer(
+    states: HashMap[runtime::ObjectId, arraybuffer::ArrayBuffer],
+    value: runtime::Value,
+) -> Result[arraybuffer::ArrayBuffer, vm::VmError] {
+    match value {
+        runtime::Value::Object(object) => match states.get(object) {
+            Some(value) => Result::Ok(value),
+            None => Result::Err(std_file_error("expected ArrayBuffer")),
+        },
+        _ => Result::Err(std_file_error("expected ArrayBuffer")),
+    }
+}
+
+fn std_file_write(state: StdFileState, input: Vec[byte]) -> Result[unit, vm::VmError] {
+    std_file_require_open(state)?;
+    if !state.writable {
+        return Result::Err(std_file_error("file is not writable"))
+    } else {};
+    if state.stream == 1 || state.stream == 2 {
+        let result = if state.stream == 1 {
+            io::write_stdout(bytes::Bytes::from_vec(input))
+        } else {
+            io::write_stderr(bytes::Bytes::from_vec(input))
+        };
+        match result {
+            Ok(()) => {
+                state.position.set(state.position.get() + input.len());
+                return Result::Ok(())
+            },
+            Err(value) => return Result::Err(std_file_error(value)),
+        }
+    } else {};
+    let values = state.contents.get();
+    let mut position = state.position.get();
+    while values.len() < position {
+        values.push(0)
+    }
+    for value in input {
+        if position < values.len() {
+            values[position] = value;
+        } else {
+            values.push(value);
+        };
+        position += 1;
+    }
+    state.contents.set(values);
+    state.position.set(position);
+    Result::Ok(())
+}
+
+fn std_file_define_method(
+    context: vm::Context,
+    object: runtime::ObjectId,
+    name: string,
+    length: int,
+    callback: (runtime::Value, Vec[runtime::Value], int) -> Result[runtime::Value, vm::VmError],
+) -> Result[unit, vm::VmError] {
+    let function = context.new_vm_function(callback)?;
+    if !initialize_builtin_function(context.heap(), function, name, length)
+        || !runtime::define_own_property(
+            context.heap(),
+            object,
+            runtime::string_property_key(name),
+            runtime::data_descriptor(function, true, false, true),
+        ) {
+        Result::Err(std_file_error("cannot define " + name))
+    } else {
+        Result::Ok(())
+    }
+}
+
+fn std_file_object(
+    context: vm::Context,
+    state: StdFileState,
+    buffer_states: HashMap[runtime::ObjectId, arraybuffer::ArrayBuffer],
+) -> Result[runtime::Value, vm::VmError] {
+    let object = match runtime::new_ordinary_object(
+        context.heap(),
+        context.heap().object_prototype(),
+    ) {
+        Ok(value) => value,
+        Err(value) => return Result::Err(std_file_error(value.message)),
+    };
+    std_file_define_method(
+        context,
+        object,
+        "readAsString",
+        0,
+        |this_value, arguments, depth| {
+            let _ = this_value;
+            let _ = arguments;
+            let _ = depth;
+            let values = std_file_contents(state)?;
+            let position = state.position.get();
+            let start = if position < values.len() {
+                position
+            } else {
+                values.len()
+            };
+            let output: Vec[byte] = Vec::with_capacity(values.len() - start);
+            let mut index = start;
+            while index < values.len() {
+                output.push(values[index]);
+                index += 1;
+            }
+            state.position.set(values.len());
+            Result::Ok(
+                runtime::Value::String(runtime::JsString::from_utf8(output.slice(0, output.len()))),
+            )
+        },
+    )?;
+    std_file_define_method(
+        context,
+        object,
+        "read",
+        3,
+        |this_value, arguments, depth| {
+            let _ = this_value;
+            let contents = std_file_contents(state)?;
+            let buffer = std_file_buffer(buffer_states, argument(arguments, 0))?;
+            let offset = std_file_index(context, argument(arguments, 1), depth)?;
+            let length = std_file_index(context, argument(arguments, 2), depth)?;
+            let buffer_length = buffer.byte_length();
+            if offset > buffer_length || length > buffer_length - offset {
+                return Result::Err(function_range_error("read array buffer overflow"))
+            } else {};
+            let position = state.position.get();
+            let remaining = if position < contents.len() {
+                contents.len() - position
+            } else {
+                0
+            };
+            let start = if position < contents.len() {
+                position
+            } else {
+                contents.len()
+            };
+            let count = if length < remaining {
+                length
+            } else {
+                remaining
+            };
+            match buffer.write_bytes(offset, contents.slice(start, start + count)) {
+                Ok(()) => (),
+                Err(value) => return Result::Err(std_file_error(value.to_string())),
+            };
+            state.position.set(position + count);
+            Result::Ok(runtime::Value::Int(count.to_int32()))
+        },
+    )?;
+    std_file_define_method(
+        context,
+        object,
+        "write",
+        3,
+        |this_value, arguments, depth| {
+            let _ = this_value;
+            std_file_require_open(state)?;
+            let buffer = std_file_buffer(buffer_states, argument(arguments, 0))?;
+            let offset = std_file_index(context, argument(arguments, 1), depth)?;
+            let length = std_file_index(context, argument(arguments, 2), depth)?;
+            let values = match buffer.to_bytes() {
+                Ok(value) => value,
+                Err(value) => return Result::Err(std_file_error(value.to_string())),
+            };
+            if offset > values.len() || length > values.len() - offset {
+                return Result::Err(function_range_error("write array buffer overflow"))
+            } else {};
+            let copied: Vec[byte] = Vec::with_capacity(length);
+            let mut index = 0;
+            while index < length {
+                copied.push(values[offset + index]);
+                index += 1;
+            }
+            std_file_write(state, copied)?;
+            Result::Ok(runtime::Value::Int(length.to_int32()))
+        },
+    )?;
+    std_file_define_method(
+        context,
+        object,
+        "puts",
+        1,
+        |this_value, arguments, depth| {
+            let _ = this_value;
+            for argument in arguments {
+                let converted = string_value_at_depth(context, argument, depth)?;
+                let text = match converted {
+                    runtime::Value::String(value) => value,
+                    _ => return Result::Err(std_file_error("string conversion failed")),
+                };
+                std_file_write(state, text.to_utf8())?;
+            }
+            Result::Ok(runtime::Value::Undefined)
+        },
+    )?;
+    std_file_define_method(
+        context,
+        object,
+        "printf",
+        1,
+        |this_value, arguments, depth| {
+            let _ = this_value;
+            let formatted = std_format(context, arguments, depth)?;
+            std_file_write(state, formatted.to_bytes())?;
+            Result::Ok(runtime::Value::Undefined)
+        },
+    )?;
+    std_file_define_method(
+        context,
+        object,
+        "putByte",
+        1,
+        |this_value, arguments, depth| {
+            let _ = this_value;
+            let number = number_value_at_depth(context, argument(arguments, 0), depth)?;
+            let value = match number {
+                runtime::Value::Float(value) => mathx::to_uint32(value) & 0xff,
+                _ => 0,
+            };
+            std_file_write(state, Vec::[value.to_uint8()])?;
+            Result::Ok(runtime::Value::Int(value.to_int32()))
+        },
+    )?;
+    std_file_define_method(
+        context,
+        object,
+        "getByte",
+        0,
+        |this_value, arguments, depth| {
+            let _ = this_value;
+            let _ = arguments;
+            let _ = depth;
+            let values = std_file_contents(state)?;
+            let position = state.position.get();
+            if position >= values.len() {
+                Result::Ok(runtime::Value::Int(-1))
+            } else {
+                state.position.set(position + 1);
+                Result::Ok(runtime::Value::Int(values[position].to_int32()))
+            }
+        },
+    )?;
+    std_file_define_method(
+        context,
+        object,
+        "getline",
+        0,
+        |this_value, arguments, depth| {
+            let _ = this_value;
+            let _ = arguments;
+            let _ = depth;
+            let values = std_file_contents(state)?;
+            let mut position = state.position.get();
+            if position >= values.len() {
+                return Result::Ok(runtime::Value::Null)
+            } else {};
+            let output: Vec[byte] = Vec::[];
+            while position < values.len() && values[position] != b'\n' {
+                output.push(values[position]);
+                position += 1;
+            }
+            if position < values.len() {
+                position += 1;
+            } else {};
+            if !output.is_empty() && output[output.len() - 1] == b'\r' {
+                let _ = output.pop();
+            } else {};
+            state.position.set(position);
+            Result::Ok(
+                runtime::Value::String(runtime::JsString::from_utf8(output.slice(0, output.len()))),
+            )
+        },
+    )?;
+    std_file_define_method(
+        context,
+        object,
+        "eof",
+        0,
+        |this_value, arguments, depth| {
+            let _ = this_value;
+            let _ = arguments;
+            let _ = depth;
+            let values = std_file_contents(state)?;
+            Result::Ok(runtime::Value::Bool(state.position.get() >= values.len()))
+        },
+    )?;
+    std_file_define_method(
+        context,
+        object,
+        "flush",
+        0,
+        |this_value, arguments, depth| {
+            let _ = this_value;
+            let _ = arguments;
+            let _ = depth;
+            std_file_flush(state)?;
+            Result::Ok(runtime::Value::Undefined)
+        },
+    )?;
+    std_file_define_method(
+        context,
+        object,
+        "tell",
+        0,
+        |this_value, arguments, depth| {
+            let _ = this_value;
+            let _ = arguments;
+            let _ = depth;
+            std_file_require_open(state)?;
+            Result::Ok(
+                runtime::Value::Int(
+                    if state.stream >= 0 && state.stream <= 2 {
+                        -1
+                    } else {
+                        state.position.get().to_int32()
+                    },
+                ),
+            )
+        },
+    )?;
+    std_file_define_method(
+        context,
+        object,
+        "tello",
+        0,
+        |this_value, arguments, depth| {
+            let _ = this_value;
+            let _ = arguments;
+            let _ = depth;
+            std_file_require_open(state)?;
+            Result::Ok(
+                runtime::Value::BigInt(
+                    runtime::BigInt::from_int64(
+                        if state.stream >= 0 && state.stream <= 2 {
+                            -1
+                        } else {
+                            state.position.get().to_int64()
+                        },
+                    ),
+                ),
+            )
+        },
+    )?;
+    std_file_define_method(
+        context,
+        object,
+        "fileno",
+        0,
+        |this_value, arguments, depth| {
+            let _ = this_value;
+            let _ = arguments;
+            let _ = depth;
+            std_file_require_open(state)?;
+            Result::Ok(runtime::Value::Int(state.stream.to_int32()))
+        },
+    )?;
+    std_file_define_method(
+        context,
+        object,
+        "error",
+        0,
+        |this_value, arguments, depth| {
+            let _ = this_value;
+            let _ = arguments;
+            let _ = depth;
+            Result::Ok(runtime::Value::Bool(false))
+        },
+    )?;
+    std_file_define_method(
+        context,
+        object,
+        "clearerr",
+        0,
+        |this_value, arguments, depth| {
+            let _ = this_value;
+            let _ = arguments;
+            let _ = depth;
+            Result::Ok(runtime::Value::Undefined)
+        },
+    )?;
+    std_file_define_method(
+        context,
+        object,
+        "seek",
+        2,
+        |this_value, arguments, depth| {
+            let _ = this_value;
+            let contents = std_file_contents(state)?;
+            if state.stream >= 0 && state.stream <= 2 {
+                return Result::Ok(runtime::Value::Int(-1))
+            } else {};
+            let offset_value = number_value_at_depth(context, argument(arguments, 0), depth)?;
+            let whence_value = number_value_at_depth(context, argument(arguments, 1), depth)?;
+            let offset = match offset_value {
+                runtime::Value::Float(value) => std_truncated_int(value),
+                _ => 0,
+            };
+            let whence = match whence_value {
+                runtime::Value::Float(value) => std_truncated_int(value),
+                _ => 0,
+            };
+            let base = if whence == 0 {
+                0
+            } else if whence == 1 {
+                state.position.get()
+            } else if whence == 2 {
+                contents.len()
+            } else {
+                return Result::Err(std_file_error("invalid seek origin"))
+            };
+            if offset < -base {
+                return Result::Err(std_file_error("invalid seek offset"))
+            } else {};
+            state.position.set(base + offset);
+            Result::Ok(runtime::Value::Int(0))
+        },
+    )?;
+    std_file_define_method(
+        context,
+        object,
+        "close",
+        0,
+        |this_value, arguments, depth| {
+            let _ = this_value;
+            let _ = arguments;
+            let _ = depth;
+            if !state.closed.get() {
+                std_file_flush(state)?;
+                state.closed.set(true);
+            } else {};
+            Result::Ok(runtime::Value::Int(0))
+        },
+    )?;
+    Result::Ok(runtime::Value::Object(object))
+}
+
+fn std_open_file(
+    context: vm::Context,
+    path: Option[string],
+    mode: string,
+    buffer_states: HashMap[runtime::ObjectId, arraybuffer::ArrayBuffer],
+) -> Result[runtime::Value, vm::VmError] {
+    let readable = mode == "r" || mode == "r+" || mode == "a" || mode == "a+";
+    let writable = mode == "r+" || mode == "w" || mode == "w+" || mode == "a" || mode == "a+";
+    if !readable && !writable {
+        return Result::Err(std_file_error("invalid open mode"))
+    } else {};
+    let contents: Vec[byte] = match path {
+        Some(value) => if mode == "w" || mode == "w+" {
+            Vec::[]
+        } else {
+            match fs::read_bytes(value) {
+                Ok(value) => value.to_vec(),
+                Err(_) => if mode == "a" || mode == "a+" {
+                    Vec::[]
+                } else {
+                    return Result::Ok(runtime::Value::Null)
+                },
+            }
+        },
+        None => Vec::[],
+    };
+    let position = if mode == "a" || mode == "a+" {
+        contents.len()
+    } else {
+        0
+    };
+    std_file_object(
+        context,
+        StdFileState {
+            contents: Ref::new(contents),
+            position: Ref::new(position),
+            path,
+            writable,
+            closed: Ref::new(false),
+            stream: -1,
+            loaded: Ref::new(true),
+        },
+        buffer_states,
+    )
+}
+
+fn std_value_host_string(context: vm::Context, value: runtime::Value, depth: int) -> Result[
+    string,
+    vm::VmError,
+] {
+    let converted = string_value_at_depth(context, value, depth)?;
+    match converted {
+        runtime::Value::String(value) => match value.to_host_string() {
+            Ok(value) => Result::Ok(value),
+            Err(_) => Result::Err(std_file_error("string contains an unpaired surrogate")),
+        },
+        _ => Result::Err(std_file_error("string conversion failed")),
+    }
+}
+
+fn std_environment_entries(state: OsState) -> Vec[(string, string)] {
+    let result: Vec[(string, string)] = Vec::with_capacity(state.environment.len());
+    for (name, value) in state.environment.entries() {
+        result.push((name, value))
+    }
+    result
+}
+
+fn std_environment_object(context: vm::Context, state: OsState) -> Result[
+    runtime::Value,
+    vm::VmError,
+] {
+    let object = match runtime::new_ordinary_object(
+        context.heap(),
+        context.heap().object_prototype(),
+    ) {
+        Ok(value) => value,
+        Err(value) => return Result::Err(std_file_error(value.message)),
+    };
+    for (name, value) in state.environment.entries() {
+        if !runtime::define_own_property(
+            context.heap(),
+            object,
+            runtime::string_property_key(name),
+            runtime::data_descriptor(runtime::Value::String(js_string(value)), true, true, true),
+        ) {
+            return Result::Err(std_file_error("cannot define environment entry"))
+        } else {}
+    }
+    Result::Ok(runtime::Value::Object(object))
+}
+
+fn std_error_constants(context: vm::Context) -> Result[runtime::Value, vm::VmError] {
+    let object = match runtime::new_ordinary_object(
+        context.heap(),
+        context.heap().object_prototype(),
+    ) {
+        Ok(value) => value,
+        Err(value) => return Result::Err(std_file_error(value.message)),
+    };
+    for (name, value) in Vec::[
+        ("EINVAL", 22),
+        ("EIO", 5),
+        ("EACCES", 13),
+        ("EEXIST", 17),
+        ("ENOSPC", 28),
+        ("ENOSYS", 38),
+        ("EBUSY", 16),
+        ("ENOENT", 2),
+        ("EPERM", 1),
+        ("EPIPE", 32),
+        ("EBADF", 9),
+    ] {
+        if !runtime::define_own_property(
+            context.heap(),
+            object,
+            runtime::string_property_key(name),
+            runtime::data_descriptor(runtime::Value::Int(value.to_int32()), true, false, false),
+        ) {
+            return Result::Err(std_file_error("cannot define error constant"))
+        } else {}
+    }
+    Result::Ok(runtime::Value::Object(object))
+}
+
+fn std_error_message(value: int) -> string {
+    match value {
+        1 => "Operation not permitted",
+        2 => "No such file or directory",
+        5 => "Input/output error",
+        9 => "Bad file descriptor",
+        13 => "Permission denied",
+        16 => "Device or resource busy",
+        17 => "File exists",
+        22 => "Invalid argument",
+        28 => "No space left on device",
+        32 => "Broken pipe",
+        38 => "Function not implemented",
+        _ => "Unknown error " + value.to_string(),
+    }
+}
+
+fn std_stream_object(
+    context: vm::Context,
+    stream: int,
+    buffer_states: HashMap[runtime::ObjectId, arraybuffer::ArrayBuffer],
+) -> Result[runtime::Value, vm::VmError] {
+    std_file_object(
+        context,
+        StdFileState {
+            contents: Ref::new(Vec::[]),
+            position: Ref::new(0),
+            path: Option::None,
+            writable: stream != 0,
+            closed: Ref::new(false),
+            stream,
+            loaded: Ref::new(stream != 0),
+        },
+        buffer_states,
+    )
+}
+
+fn std_url_option(context: vm::Context, arguments: Vec[runtime::Value], name: string, depth: int) -> Result[
+    bool,
+    vm::VmError,
+] {
+    if arguments.len() < 2 {
+        return Result::Ok(false)
+    } else {};
+    match arguments[1] {
+        runtime::Value::Undefined => Result::Ok(false),
+        value => Result::Ok(
+            runtime::to_boolean(
+                context.read_property_at_depth(
+                    value,
+                    runtime::Value::String(js_string(name)),
+                    depth,
+                )?,
+            ),
+        ),
+    }
+}
+
+fn std_url_line_end(values: Vec[byte], start: int) -> int {
+    let mut index = start;
+    while index < values.len() {
+        if values[index] == b'\n' {
+            return index
+        } else {};
+        index += 1;
+    }
+    0 - 1
+}
+
+fn std_url_status(values: Vec[byte], end: int) -> int {
+    let mut index = 0;
+    while index < end && values[index] != b' ' {
+        index += 1;
+    }
+    while index < end && values[index] == b' ' {
+        index += 1;
+    }
+    let mut status = 0;
+    let mut digits = 0;
+    while index < end && values[index] >= b'0' && values[index] <= b'9' {
+        status = status * 10 + (values[index] - b'0').to_int();
+        digits += 1;
+        index += 1;
+    }
+    if digits == 0 {
+        0
+    } else {
+        status
+    }
+}
+
+fn std_url_array_buffer(
+    context: vm::Context,
+    buffer_states: HashMap[runtime::ObjectId, arraybuffer::ArrayBuffer],
+    constructor: runtime::Value,
+    values: Vec[byte],
+    depth: int,
+) -> Result[runtime::Value, vm::VmError] {
+    let result = context.construct_with_new_target_at_depth(
+        constructor,
+        Vec::[runtime::Value::Int(values.len().to_int32())],
+        constructor,
+        depth,
+    )?;
+    let buffer = std_file_buffer(buffer_states, result)?;
+    match buffer.write_bytes(0, values.slice(0, values.len())) {
+        Ok(()) => Result::Ok(result),
+        Err(value) => Result::Err(std_file_error(value.to_string())),
+    }
+}
+
+fn std_url_response(
+    context: vm::Context,
+    buffer_states: HashMap[runtime::ObjectId, arraybuffer::ArrayBuffer],
+    array_buffer: runtime::Value,
+    values: Vec[byte],
+    binary: bool,
+    depth: int,
+) -> Result[runtime::Value, vm::VmError] {
+    if binary {
+        std_url_array_buffer(context, buffer_states, array_buffer, values, depth)
+    } else {
+        Result::Ok(
+            runtime::Value::String(runtime::JsString::from_utf8(values.slice(0, values.len()))),
+        )
+    }
+}
+
+fn std_url_full_response(
+    context: vm::Context,
+    response: runtime::Value,
+    headers: Vec[byte],
+    status: int,
+) -> Result[runtime::Value, vm::VmError] {
+    let object = match runtime::new_ordinary_object(
+        context.heap(),
+        context.heap().object_prototype(),
+    ) {
+        Ok(value) => value,
+        Err(value) => return Result::Err(std_file_error(value.message)),
+    };
+    if !runtime::define_own_property(
+        context.heap(),
+        object,
+        runtime::string_property_key("response"),
+        runtime::data_descriptor(response, true, true, true),
+    ) {
+        return Result::Err(std_file_error("cannot define URL response"))
+    } else {};
+    match response {
+        runtime::Value::Null => (),
+        _ => {
+            if !runtime::define_own_property(
+                context.heap(),
+                object,
+                runtime::string_property_key("responseHeaders"),
+                runtime::data_descriptor(
+                    runtime::Value::String(
+                        runtime::JsString::from_utf8(headers.slice(0, headers.len())),
+                    ),
+                    true,
+                    true,
+                    true,
+                ),
+            )
+                || !runtime::define_own_property(
+                    context.heap(),
+                    object,
+                    runtime::string_property_key("status"),
+                    runtime::data_descriptor(
+                        runtime::Value::Int(status.to_int32()),
+                        true,
+                        true,
+                        true,
+                    ),
+                ) {
+                return Result::Err(std_file_error("cannot define URL response metadata"))
+            } else {}
+        },
+    };
+    Result::Ok(runtime::Value::Object(object))
+}
+
+fn std_url_get(
+    context: vm::Context,
+    os_state: OsState,
+    buffer_states: HashMap[runtime::ObjectId, arraybuffer::ArrayBuffer],
+    array_buffer: runtime::Value,
+    arguments: Vec[runtime::Value],
+    depth: int,
+) -> Result[runtime::Value, vm::VmError] {
+    let url = std_value_host_string(context, argument(arguments, 0), depth)?;
+    let binary = std_url_option(context, arguments, "binary", depth)?;
+    let full = std_url_option(context, arguments, "full", depth)?;
+    let output = match process::Command::new("/bin/sh").args(
+        Vec::["-c", "curl -s -i -- \"$1\"", "urlGet", url],
+    ).current_dir(os_state.directory.get()).env_clear().envs(std_environment_entries(os_state)).output() {
+        Ok(value) => value.stdout().to_vec(),
+        Err(value) => return Result::Err(std_file_error("could not start curl: " + value)),
+    };
+    let status_end = std_url_line_end(output, 0);
+    let status = if status_end < 0 {
+        0
+    } else {
+        std_url_status(output, status_end)
+    };
+    let headers: Vec[byte] = Vec::[];
+    let body: Vec[byte] = Vec::[];
+    let mut valid = status_end >= 0;
+    let mut index = status_end + 1;
+    while valid && index < output.len() {
+        let end = std_url_line_end(output, index);
+        if end < 0 {
+            valid = false;
+        } else if end == index || (end == index + 1 && output[index] == b'\r') {
+            index = end + 1;
+            break
+        } else {
+            let mut header_index = index;
+            while header_index <= end {
+                headers.push(output[header_index]);
+                header_index += 1;
+            }
+            index = end + 1;
+        }
+    }
+    if index > output.len() {
+        valid = false;
+    } else {};
+    if valid {
+        while index < output.len() {
+            body.push(output[index]);
+            index += 1;
+        }
+    } else {};
+    let response = if !valid || (!full && (status < 200 || status > 299)) {
+        runtime::Value::Null
+    } else {
+        std_url_response(context, buffer_states, array_buffer, body, binary, depth)?
+    };
+    if full {
+        std_url_full_response(context, response, headers, status)
+    } else {
+        Result::Ok(response)
+    }
+}
+
+fn std_print_object_text(context: vm::Context, value: runtime::Value, depth: int) -> Result[
+    string,
+    vm::VmError,
+] {
+    let rendered = match context.global_object() {
+        Some(global) => match context.read_property_at_depth(
+            runtime::Value::Object(global),
+            runtime::Value::String(js_string("JSON")),
+            depth,
+        ) {
+            Ok(json) => match context.read_property_at_depth(
+                json,
+                runtime::Value::String(js_string("stringify")),
+                depth,
+            ) {
+                Ok(stringify) => match context.invoke_with_this_at_depth(
+                    stringify,
+                    Vec::[value],
+                    json,
+                    depth,
+                ) {
+                    Ok(value) => Option::Some(value),
+                    Err(_) => Option::None,
+                },
+                Err(_) => Option::None,
+            },
+            Err(_) => Option::None,
+        },
+        None => Option::None,
+    };
+    match rendered {
+        Some(runtime::Value::String(value)) => match value.to_host_string() {
+            Ok(value) => Result::Ok(value),
+            Err(_) => Result::Err(std_file_error("string contains an unpaired surrogate")),
+        },
+        _ => match display_string(context.heap(), value) {
+            Ok(value) => Result::Ok(value),
+            Err(value) => Result::Err(function_native_error(value)),
+        },
+    }
+}
+
+pub fn install_std(
+    context: vm::Context,
+    object: runtime::ObjectId,
+    buffer_states: HashMap[runtime::ObjectId, arraybuffer::ArrayBuffer],
+    array_buffer: runtime::Value,
+    os_state: OsState,
+) -> Result[unit, BuiltinError] {
+    define_value(context.heap(), object, "SEEK_SET", runtime::Value::Int(0), false, false)?;
+    define_value(context.heap(), object, "SEEK_CUR", runtime::Value::Int(1), false, false)?;
+    define_value(context.heap(), object, "SEEK_END", runtime::Value::Int(2), false, false)?;
+    let error_constants = match std_error_constants(context) {
+        Ok(value) => value,
+        Err(value) => return Result::Err(BuiltinError { message: value.kind.debug() }),
+    };
+    define_value(context.heap(), object, "Error", error_constants, true, true)?;
+    for (name, stream) in Vec::[("in", 0), ("out", 1), ("err", 2)] {
+        let file = match std_stream_object(context, stream, buffer_states) {
+            Ok(value) => value,
+            Err(value) => return Result::Err(BuiltinError { message: value.kind.debug() }),
+        };
+        define_value(context.heap(), object, name, file, true, true)?
+    }
+    define_value(
+        context.heap(),
+        object,
+        "getenv",
+        allocate_vm_function_with_length(
+            context,
+            "std.getenv",
+            1,
+            |this_value, arguments, depth| {
+                let _ = this_value;
+                let name = std_value_host_string(context, argument(arguments, 0), depth)?;
+                match os_state.environment.get(name) {
+                    Some(value) => Result::Ok(runtime::Value::String(js_string(value))),
+                    None => Result::Ok(runtime::Value::Undefined),
+                }
+            },
+        )?,
+        true,
+        true,
+    )?;
+    define_value(
+        context.heap(),
+        object,
+        "setenv",
+        allocate_vm_function_with_length(
+            context,
+            "std.setenv",
+            1,
+            |this_value, arguments, depth| {
+                let _ = this_value;
+                let name = std_value_host_string(context, argument(arguments, 0), depth)?;
+                let value = std_value_host_string(context, argument(arguments, 1), depth)?;
+                os_state.environment.set(name, value);
+                Result::Ok(runtime::Value::Undefined)
+            },
+        )?,
+        true,
+        true,
+    )?;
+    define_value(
+        context.heap(),
+        object,
+        "unsetenv",
+        allocate_vm_function_with_length(
+            context,
+            "std.unsetenv",
+            1,
+            |this_value, arguments, depth| {
+                let _ = this_value;
+                let name = std_value_host_string(context, argument(arguments, 0), depth)?;
+                let _ = os_state.environment.remove(name);
+                Result::Ok(runtime::Value::Undefined)
+            },
+        )?,
+        true,
+        true,
+    )?;
+    define_value(
+        context.heap(),
+        object,
+        "getenviron",
+        allocate_vm_function_with_length(
+            context,
+            "std.getenviron",
+            1,
+            |this_value, arguments, depth| {
+                let _ = this_value;
+                let _ = arguments;
+                let _ = depth;
+                std_environment_object(context, os_state)
+            },
+        )?,
+        true,
+        true,
+    )?;
+    define_value(
+        context.heap(),
+        object,
+        "__printObject",
+        allocate_vm_function_with_length(
+            context,
+            "std.__printObject",
+            1,
+            |this_value, arguments, depth| {
+                let _ = this_value;
+                io::print(std_print_object_text(context, argument(arguments, 0), depth)?);
+                Result::Ok(runtime::Value::Undefined)
+            },
+        )?,
+        true,
+        true,
+    )?;
+    define_value(
+        context.heap(),
+        object,
+        "urlGet",
+        allocate_vm_function_with_length(
+            context,
+            "std.urlGet",
+            1,
+            |this_value, arguments, depth| {
+                let _ = this_value;
+                std_url_get(context, os_state, buffer_states, array_buffer, arguments, depth)
+            },
+        )?,
+        true,
+        true,
+    )?;
+    define_value(
+        context.heap(),
+        object,
+        "puts",
+        allocate_vm_function_with_length(
+            context,
+            "std.puts",
+            1,
+            |this_value, arguments, depth| {
+                let _ = this_value;
+                for value in arguments {
+                    let converted = string_value_at_depth(context, value, depth)?;
+                    match converted {
+                        runtime::Value::String(value) => match io::write_stdout(
+                            bytes::Bytes::from_vec(value.to_utf8()),
+                        ) {
+                            Ok(()) => (),
+                            Err(value) => return Result::Err(std_file_error(value)),
+                        },
+                        _ => return Result::Err(std_file_error("string conversion failed")),
+                    }
+                }
+                Result::Ok(runtime::Value::Undefined)
+            },
+        )?,
+        true,
+        true,
+    )?;
+    define_value(
+        context.heap(),
+        object,
+        "evalScript",
+        allocate_vm_function_with_length(
+            context,
+            "std.evalScript",
+            1,
+            |this_value, arguments, depth| {
+                global_eval(context, this_value, arguments, depth)
+            },
+        )?,
+        true,
+        true,
+    )?;
+    define_value(
+        context.heap(),
+        object,
+        "strerror",
+        allocate_vm_function_with_length(
+            context,
+            "std.strerror",
+            1,
+            |this_value, arguments, depth| {
+                let _ = this_value;
+                let value = std_file_index(context, argument(arguments, 0), depth)?;
+                Result::Ok(runtime::Value::String(js_string(std_error_message(value))))
+            },
+        )?,
+        true,
+        true,
+    )?;
+    define_value(
+        context.heap(),
+        object,
+        "exit",
+        allocate_vm_function_with_length(
+            context,
+            "std.exit",
+            1,
+            |this_value, arguments, depth| {
+                let _ = this_value;
+                let converted = number_value_at_depth(context, argument(arguments, 0), depth)?;
+                let code = match converted {
+                    runtime::Value::Float(value) => mathx::to_uint32(value).to_int32().to_int(),
+                    _ => 0,
+                };
+                process::exit(code);
+                Result::Ok(runtime::Value::Undefined)
+            },
+        )?,
+        true,
+        true,
+    )?;
+    define_value(
+        context.heap(),
+        object,
+        "sprintf",
+        allocate_vm_function_with_length(
+            context,
+            "std.sprintf",
+            1,
+            |this_value, arguments, depth| {
+                let _ = this_value;
+                let formatted = std_format(context, arguments, depth)?;
+                Result::Ok(
+                    runtime::Value::String(
+                        runtime::JsString::from_utf8(
+                            formatted.to_bytes().slice(0, formatted.byte_len()),
+                        ),
+                    ),
+                )
+            },
+        )?,
+        true,
+        true,
+    )?;
+    define_value(
+        context.heap(),
+        object,
+        "printf",
+        allocate_vm_function_with_length(
+            context,
+            "std.printf",
+            1,
+            |this_value, arguments, depth| {
+                let _ = this_value;
+                io::print(std_format(context, arguments, depth)?);
+                Result::Ok(runtime::Value::Undefined)
+            },
+        )?,
+        true,
+        true,
+    )?;
+    define_value(
+        context.heap(),
+        object,
+        "popen",
+        allocate_vm_function_with_length(
+            context,
+            "std.popen",
+            2,
+            |this_value, arguments, depth| {
+                let _ = this_value;
+                let command = std_value_host_string(context, argument(arguments, 0), depth)?;
+                let mode = std_value_host_string(context, argument(arguments, 1), depth)?;
+                if mode != "r" {
+                    return Result::Err(std_file_error("only read popen mode is supported"))
+                } else {};
+                let output = match process::Command::new("/bin/sh").args(Vec::["-c", command]).current_dir(
+                    os_state.directory.get(),
+                ).env_clear().envs(std_environment_entries(os_state)).output() {
+                    Ok(value) => value,
+                    Err(value) => return Result::Err(std_file_error(value)),
+                };
+                std_file_object(
+                    context,
+                    StdFileState {
+                        contents: Ref::new(output.stdout().to_vec()),
+                        position: Ref::new(0),
+                        path: Option::None,
+                        writable: false,
+                        closed: Ref::new(false),
+                        stream: -1,
+                        loaded: Ref::new(true),
+                    },
+                    buffer_states,
+                )
+            },
+        )?,
+        true,
+        true,
+    )?;
+    define_value(
+        context.heap(),
+        object,
+        "fdopen",
+        allocate_vm_function_with_length(
+            context,
+            "std.fdopen",
+            2,
+            |this_value, arguments, depth| {
+                let _ = this_value;
+                let descriptor = os_file_descriptor(context, argument(arguments, 0), depth)?;
+                let file = match os_state.files.get(descriptor) {
+                    Some(value) => value,
+                    None => return Result::Ok(runtime::Value::Null),
+                };
+                std_file_object(
+                    context,
+                    StdFileState {
+                        contents: file.contents,
+                        position: file.position,
+                        path: Option::None,
+                        writable: file.writable,
+                        closed: Ref::new(false),
+                        stream: descriptor,
+                        loaded: Ref::new(true),
+                    },
+                    buffer_states,
+                )
+            },
+        )?,
+        true,
+        true,
+    )?;
+    define_value(
+        context.heap(),
+        object,
+        "parseExtJSON",
+        allocate_vm_function_with_length(
+            context,
+            "std.parseExtJSON",
+            1,
+            |this_value, arguments, depth| {
+                let source = std_value_host_string(context, argument(arguments, 0), depth)?;
+                global_eval(
+                    context,
+                    this_value,
+                    Vec::[runtime::Value::String(js_string("return (" + source + ");"))],
+                    depth,
+                )
+            },
+        )?,
+        true,
+        true,
+    )?;
+    define_value(
+        context.heap(),
+        object,
+        "open",
+        allocate_vm_function_with_length(
+            context,
+            "std.open",
+            2,
+            |this_value, arguments, depth| {
+                let _ = this_value;
+                let path = os_resolve_path(
+                    os_state,
+                    std_value_host_string(context, argument(arguments, 0), depth)?,
+                );
+                let mode = if arguments.len() > 1 {
+                    std_value_host_string(context, arguments[1], depth)?
+                } else {
+                    "r"
+                };
+                std_open_file(context, Option::Some(path), mode, buffer_states)
+            },
+        )?,
+        true,
+        true,
+    )?;
+    define_value(
+        context.heap(),
+        object,
+        "tmpfile",
+        allocate_vm_function_with_length(
+            context,
+            "std.tmpfile",
+            0,
+            |this_value, arguments, depth| {
+                let _ = this_value;
+                let _ = arguments;
+                let _ = depth;
+                std_open_file(context, Option::None, "w+", buffer_states)
+            },
+        )?,
+        true,
+        true,
+    )?;
+    define_value(
+        context.heap(),
+        object,
+        "loadScript",
+        allocate_vm_function_with_length(
+            context,
+            "std.loadScript",
+            1,
+            |this_value, arguments, depth| {
+                let path = os_resolve_path(
+                    os_state,
+                    std_value_host_string(context, argument(arguments, 0), depth)?,
+                );
+                global_load_script(
+                    context,
+                    this_value,
+                    Vec::[runtime::Value::String(js_string(path))],
+                    depth,
+                )
+            },
+        )?,
+        true,
+        true,
+    )?;
+    define_value(
+        context.heap(),
+        object,
+        "loadFile",
+        allocate_vm_function_with_length(
+            context,
+            "std.loadFile",
+            1,
+            |this_value, arguments, depth| {
+                let _ = this_value;
+                let path = os_resolve_path(
+                    os_state,
+                    std_value_host_string(context, argument(arguments, 0), depth)?,
+                );
+                match fs::read_bytes(path) {
+                    Ok(value) => {
+                        let bytes = value.to_vec();
+                        Result::Ok(
+                            runtime::Value::String(
+                                runtime::JsString::from_utf8(bytes.slice(0, bytes.len())),
+                            ),
+                        )
+                    },
+                    Err(_) => Result::Ok(runtime::Value::Null),
+                }
+            },
+        )?,
+        true,
+        true,
+    )
+}

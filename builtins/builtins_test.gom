@@ -1,0 +1,1237 @@
+package builtins;
+
+use gomlang::quickjs::bytecode;
+use gomlang::quickjs::runtime;
+use gomlang::quickjs::vm;
+use std::math;
+use std::num;
+use std::testing;
+
+fn expect_realm(value: Result[Realm, BuiltinError]) -> Realm {
+    match value {
+        Ok(value) => value,
+        Err(value) => {
+            testing::fail(value.message);
+            expect_realm(install(vm::Context::new(runtime::Heap::new())))
+        },
+    }
+}
+
+fn property(heap: runtime::Heap, object: runtime::ObjectId, name: string) -> runtime::Value {
+    match runtime::get_property(heap, object, runtime::string_property_key(name)) {
+        Ok(Some(value)) => value,
+        Ok(None) => {
+            testing::fail("missing property " + name);
+            runtime::Value::Undefined
+        },
+        Err(value) => {
+            testing::fail(value.message);
+            runtime::Value::Undefined
+        },
+    }
+}
+
+fn invoke(context: vm::Context, callable: runtime::Value, arguments: Vec[runtime::Value]) -> Result[
+    runtime::Value,
+    vm::VmError,
+] {
+    let code: Vec[bytecode::Instruction] = Vec::[bytecode::Instruction::GetLoc(0)];
+    let mut index = 0;
+    while index < arguments.len() {
+        code.push(bytecode::Instruction::GetLoc(index + 1));
+        index += 1;
+    }
+    code.push(bytecode::Instruction::Call(arguments.len()));
+    code.push(bytecode::Instruction::Return);
+    let locals = Vec::with_capacity(arguments.len() + 1);
+    locals.push(callable);
+    for argument in arguments {
+        locals.push(argument)
+    }
+    context.execute_with_locals(bytecode::Function::new(Vec::[], code, locals.len()), locals)
+}
+
+fn expect_value(value: Result[runtime::Value, vm::VmError]) -> runtime::Value {
+    match value {
+        Ok(value) => value,
+        Err(value) => {
+            testing::fail(value.kind.debug());
+            runtime::Value::Undefined
+        },
+    }
+}
+
+fn assert_value(actual: runtime::Value, expected: runtime::Value) -> unit {
+    testing::assert(runtime::same_value(actual, expected))
+}
+
+fn expect_number(value: runtime::Value) -> float64 {
+    match value {
+        runtime::Value::Int(value) => runtime::primitive_to_number(runtime::Value::Int(value)).unwrap_or(
+            0.0,
+        ),
+        runtime::Value::Float(value) => value,
+        _ => {
+            testing::fail("expected number");
+            0.0
+        },
+    }
+}
+
+#[test]
+fn installs_global_constants_and_math_object() -> unit {
+    let context = vm::Context::new(runtime::Heap::new());
+    let realm = expect_realm(install(context));
+    match property(context.heap(), realm.global_object(), "undefined") {
+        runtime::Value::Undefined => (),
+        _ => testing::fail("expected undefined global"),
+    };
+    testing::assert(
+        math::is_nan(expect_number(property(context.heap(), realm.global_object(), "NaN"))),
+    );
+    testing::assert(
+        math::is_infinite(
+            expect_number(property(context.heap(), realm.global_object(), "Infinity")),
+        ),
+    );
+    match property(context.heap(), realm.global_object(), "Math") {
+        runtime::Value::Object(value) => testing::assert(value == realm.math_object()),
+        _ => testing::fail("expected Math object"),
+    };
+    match property(context.heap(), realm.global_object(), "globalThis") {
+        runtime::Value::Object(value) => testing::assert(value == realm.global_object()),
+        _ => testing::fail("expected globalThis object"),
+    };
+    testing::assert_eq(
+        expect_number(property(context.heap(), realm.math_object(), "PI")),
+        3.141592653589793,
+    )
+}
+
+#[test]
+fn global_number_predicates_apply_to_number() -> unit {
+    let context = vm::Context::new(runtime::Heap::new());
+    let realm = expect_realm(install(context));
+    let is_nan = property(context.heap(), realm.global_object(), "isNaN");
+    let bytes = "not a number".to_bytes();
+    match expect_value(
+        invoke(
+            context,
+            is_nan,
+            Vec::[runtime::Value::String(runtime::JsString::from_utf8(bytes.slice(0, bytes.len())))],
+        ),
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected isNaN result"),
+    };
+    let is_finite = property(context.heap(), realm.global_object(), "isFinite");
+    match expect_value(invoke(context, is_finite, Vec::[runtime::Value::Int(42)])) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected isFinite result"),
+    }
+}
+
+#[test]
+fn math_functions_execute_through_native_callables() -> unit {
+    let context = vm::Context::new(runtime::Heap::new());
+    let realm = expect_realm(install(context));
+    let math_object = realm.math_object();
+    let abs = property(context.heap(), math_object, "abs");
+    testing::assert_eq(
+        expect_number(expect_value(invoke(context, abs, Vec::[runtime::Value::Int(-7)]))),
+        7.0,
+    );
+    let pow = property(context.heap(), math_object, "pow");
+    testing::assert_eq(
+        expect_number(
+            expect_value(
+                invoke(context, pow, Vec::[runtime::Value::Int(2), runtime::Value::Int(5)]),
+            ),
+        ),
+        32.0,
+    );
+    let max = property(context.heap(), math_object, "max");
+    testing::assert_eq(
+        expect_number(
+            expect_value(
+                invoke(
+                    context,
+                    max,
+                    Vec::[runtime::Value::Int(-3), runtime::Value::Int(9), runtime::Value::Int(4)],
+                ),
+            ),
+        ),
+        9.0,
+    )
+}
+
+#[test]
+fn math_min_and_max_preserve_signed_zero() -> unit {
+    let context = vm::Context::new(runtime::Heap::new());
+    let realm = expect_realm(install(context));
+    let negative_zero = num::parse_float64("-0").unwrap_or(0.0);
+    let max = property(context.heap(), realm.math_object(), "max");
+    let max_zero = expect_number(
+        expect_value(
+            invoke(
+                context,
+                max,
+                Vec::[runtime::Value::Float(negative_zero), runtime::Value::Float(0.0)],
+            ),
+        ),
+    );
+    testing::assert(1.0 / max_zero > 0.0);
+    let min = property(context.heap(), realm.math_object(), "min");
+    let min_zero = expect_number(
+        expect_value(
+            invoke(
+                context,
+                min,
+                Vec::[runtime::Value::Float(0.0), runtime::Value::Float(negative_zero)],
+            ),
+        ),
+    );
+    testing::assert(1.0 / min_zero < 0.0)
+}
+
+#[test]
+fn primitive_constructors_apply_ecmascript_coercions() -> unit {
+    let context = vm::Context::new(runtime::Heap::new());
+    let realm = expect_realm(install(context));
+    let global = realm.global_object();
+    let number = property(context.heap(), global, "Number");
+    testing::assert_eq(
+        expect_number(
+            expect_value(
+                invoke(context, number, Vec::[runtime::Value::String(js_string(" 0x2a "))]),
+            ),
+        ),
+        42.0,
+    );
+    let boolean = property(context.heap(), global, "Boolean");
+    match expect_value(invoke(context, boolean, Vec::[runtime::Value::Int(0)])) {
+        runtime::Value::Bool(value) => testing::assert(!value),
+        _ => testing::fail("expected Boolean result"),
+    };
+    let string_function = property(context.heap(), global, "String");
+    match expect_value(invoke(context, string_function, Vec::[runtime::Value::Float(1e21)])) {
+        runtime::Value::String(value) => testing::assert(value == js_string("1e+21")),
+        _ => testing::fail("expected String result"),
+    }
+}
+
+#[test]
+fn number_static_predicates_do_not_coerce() -> unit {
+    let context = vm::Context::new(runtime::Heap::new());
+    let realm = expect_realm(install(context));
+    let number = match property(context.heap(), realm.global_object(), "Number") {
+        runtime::Value::Object(value) => value,
+        _ => {
+            testing::fail("expected Number object");
+            realm.global_object()
+        },
+    };
+    let is_nan = property(context.heap(), number, "isNaN");
+    match expect_value(
+        invoke(context, is_nan, Vec::[runtime::Value::String(js_string("not a number"))]),
+    ) {
+        runtime::Value::Bool(value) => testing::assert(!value),
+        _ => testing::fail("expected Number.isNaN result"),
+    };
+    match expect_value(invoke(context, is_nan, Vec::[runtime::Value::Float(nan())])) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected Number.isNaN NaN result"),
+    };
+    let is_safe = property(context.heap(), number, "isSafeInteger");
+    match expect_value(invoke(context, is_safe, Vec::[runtime::Value::Float(9007199254740991.0)])) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected safe integer result"),
+    };
+    match expect_value(invoke(context, is_safe, Vec::[runtime::Value::Float(9007199254740992.0)])) {
+        runtime::Value::Bool(value) => testing::assert(!value),
+        _ => testing::fail("expected unsafe integer result"),
+    }
+}
+
+#[test]
+fn math_transcendentals_and_round_follow_number_semantics() -> unit {
+    let context = vm::Context::new(runtime::Heap::new());
+    let realm = expect_realm(install(context));
+    let math_object = realm.math_object();
+    let log = property(context.heap(), math_object, "log");
+    let exp = property(context.heap(), math_object, "exp");
+    let logged = expect_number(expect_value(invoke(context, log, Vec::[runtime::Value::Int(8)])));
+    let restored = expect_number(
+        expect_value(invoke(context, exp, Vec::[runtime::Value::Float(logged)])),
+    );
+    testing::assert(restored > 7.999999999999 && restored < 8.000000000001);
+    let round = property(context.heap(), math_object, "round");
+    testing::assert_eq(
+        expect_number(expect_value(invoke(context, round, Vec::[runtime::Value::Float(-1.5)]))),
+        -1.0,
+    );
+    let negative_zero = expect_number(
+        expect_value(invoke(context, round, Vec::[runtime::Value::Float(-0.5)])),
+    );
+    testing::assert(1.0 / negative_zero < 0.0);
+    let sign = property(context.heap(), math_object, "sign");
+    let signed_zero = expect_number(
+        expect_value(invoke(context, sign, Vec::[runtime::Value::Float(negative_zero)])),
+    );
+    testing::assert(1.0 / signed_zero < 0.0)
+}
+
+#[test]
+fn installs_qjs_print_and_console_log_callables() -> unit {
+    let context = vm::Context::new(runtime::Heap::new());
+    let realm = expect_realm(install(context));
+    match property(context.heap(), realm.global_object(), "print") {
+        runtime::Value::Object(value) => testing::assert(value.is_callable()),
+        _ => testing::fail("expected print function"),
+    };
+    let console = match property(context.heap(), realm.global_object(), "console") {
+        runtime::Value::Object(value) => value,
+        _ => {
+            testing::fail("expected console object");
+            realm.global_object()
+        },
+    };
+    match property(context.heap(), console, "log") {
+        runtime::Value::Object(value) => testing::assert(value.is_callable()),
+        _ => testing::fail("expected console.log function"),
+    }
+}
+
+#[test]
+fn qjs_display_formats_bigint_with_literal_suffix() -> unit {
+    let heap = runtime::Heap::new();
+    match display_string(heap, runtime::Value::BigInt(runtime::BigInt::from_int64(-7))) {
+        Ok(value) => testing::assert_eq(value, "-7n"),
+        Err(_) => testing::fail("expected BigInt display text"),
+    };
+    match display_string(heap, runtime::Value::Int(7)) {
+        Ok(value) => testing::assert_eq(value, "7"),
+        Err(_) => testing::fail("expected number display text"),
+    }
+}
+
+#[test]
+fn parse_int_uses_radix_and_longest_valid_prefix() -> unit {
+    let context = vm::Context::new(runtime::Heap::new());
+    let realm = expect_realm(install(context));
+    let parse_int = property(context.heap(), realm.global_object(), "parseInt");
+    testing::assert_eq(
+        expect_number(
+            expect_value(
+                invoke(context, parse_int, Vec::[runtime::Value::String(js_string("  -0x10tail"))]),
+            ),
+        ),
+        -16.0,
+    );
+    testing::assert_eq(
+        expect_number(
+            expect_value(
+                invoke(
+                    context,
+                    parse_int,
+                    Vec::[runtime::Value::String(js_string("101rest")), runtime::Value::Int(2)],
+                ),
+            ),
+        ),
+        5.0,
+    );
+    testing::assert(
+        math::is_nan(
+            expect_number(
+                expect_value(
+                    invoke(
+                        context,
+                        parse_int,
+                        Vec::[runtime::Value::String(js_string("10")), runtime::Value::Int(1)],
+                    ),
+                ),
+            ),
+        ),
+    )
+}
+
+#[test]
+fn parse_float_uses_longest_decimal_prefix() -> unit {
+    let context = vm::Context::new(runtime::Heap::new());
+    let realm = expect_realm(install(context));
+    let parse_float = property(context.heap(), realm.global_object(), "parseFloat");
+    testing::assert_eq(
+        expect_number(
+            expect_value(
+                invoke(
+                    context,
+                    parse_float,
+                    Vec::[runtime::Value::String(js_string("  -12.5e2tail"))],
+                ),
+            ),
+        ),
+        -1250.0,
+    );
+    testing::assert_eq(
+        expect_number(
+            expect_value(
+                invoke(context, parse_float, Vec::[runtime::Value::String(js_string("1e+tail"))]),
+            ),
+        ),
+        1.0,
+    );
+    testing::assert(
+        math::is_infinite(
+            expect_number(
+                expect_value(
+                    invoke(
+                        context,
+                        parse_float,
+                        Vec::[runtime::Value::String(js_string("Infinity rest"))],
+                    ),
+                ),
+            ),
+        ),
+    );
+    testing::assert(
+        math::is_nan(
+            expect_number(
+                expect_value(
+                    invoke(context, parse_float, Vec::[runtime::Value::String(js_string("xyz"))]),
+                ),
+            ),
+        ),
+    )
+}
+
+#[test]
+fn json_builtins_parse_and_stringify_heap_values() -> unit {
+    let context = vm::Context::new(runtime::Heap::new());
+    let realm = expect_realm(install(context));
+    match property(context.heap(), realm.global_object(), "JSON") {
+        runtime::Value::Object(value) => testing::assert(value == realm.json_object()),
+        _ => testing::fail("expected JSON object"),
+    };
+    let parse = property(context.heap(), realm.json_object(), "parse");
+    let parsed = expect_value(
+        invoke(
+            context,
+            parse,
+            Vec::[runtime::Value::String(js_string("{\"answer\":42,\"ok\":true}"))],
+        ),
+    );
+    let object = match parsed {
+        runtime::Value::Object(value) => value,
+        _ => {
+            testing::fail("expected parsed object");
+            realm.global_object()
+        },
+    };
+    testing::assert_eq(expect_number(property(context.heap(), object, "answer")), 42.0);
+    let stringify = property(context.heap(), realm.json_object(), "stringify");
+    match expect_value(invoke(context, stringify, Vec::[parsed])) {
+        runtime::Value::String(value) => {
+            testing::assert(value == js_string("{\"answer\":42,\"ok\":true}"))
+        },
+        _ => testing::fail("expected JSON string"),
+    }
+}
+
+#[test]
+fn json_stringify_returns_undefined_or_raises_type_errors() -> unit {
+    let context = vm::Context::new(runtime::Heap::new());
+    let realm = expect_realm(install(context));
+    let stringify = property(context.heap(), realm.json_object(), "stringify");
+    match expect_value(invoke(context, stringify, Vec::[runtime::Value::Undefined])) {
+        runtime::Value::Undefined => (),
+        _ => testing::fail("expected undefined JSON result"),
+    };
+    match invoke(
+        context,
+        stringify,
+        Vec::[runtime::Value::BigInt(runtime::BigInt::new(false, "1"))],
+    ) {
+        Err(vm::VmError { offset, kind: vm::VmErrorKind::TypeError(_) }) => {
+            testing::assert_eq(offset, 2)
+        },
+        _ => testing::fail("expected JSON BigInt type error"),
+    }
+}
+
+fn expect_bigint(value: runtime::Value, expected: string) -> unit {
+    match value {
+        runtime::Value::BigInt(value) => testing::assert_eq(value.to_string(), expected),
+        _ => testing::fail("expected BigInt"),
+    }
+}
+
+#[test]
+fn bigint_constructor_converts_exact_integral_primitives() -> unit {
+    let context = vm::Context::new(runtime::Heap::new());
+    let realm = expect_realm(install(context));
+    let constructor = property(context.heap(), realm.global_object(), "BigInt");
+    expect_bigint(
+        expect_value(
+            invoke(
+                context,
+                constructor,
+                Vec::[runtime::Value::String(js_string("0xffffffffffffffff"))],
+            ),
+        ),
+        "18446744073709551615",
+    );
+    expect_bigint(
+        expect_value(invoke(context, constructor, Vec::[runtime::Value::Float(9007199254740992.0)])),
+        "9007199254740992",
+    );
+    expect_bigint(
+        expect_value(invoke(context, constructor, Vec::[runtime::Value::Bool(true)])),
+        "1",
+    );
+    match invoke(context, constructor, Vec::[runtime::Value::Float(1.5)]) {
+        Err(vm::VmError { kind: vm::VmErrorKind::RangeError(_), .. }) => (),
+        _ => testing::fail("expected non-integral BigInt conversion error"),
+    }
+}
+
+#[test]
+fn object_constructor_and_prototype_functions_use_heap_objects() -> unit {
+    let context = vm::Context::new(runtime::Heap::new());
+    let realm = expect_realm(install(context));
+    let object_function = property(context.heap(), realm.global_object(), "Object");
+    let parent = match expect_value(invoke(context, object_function, Vec::[])) {
+        runtime::Value::Object(value) => value,
+        _ => {
+            testing::fail("expected Object result");
+            realm.global_object()
+        },
+    };
+    match expect_value(invoke(context, object_function, Vec::[runtime::Value::Object(parent)])) {
+        runtime::Value::Object(value) => testing::assert(value == parent),
+        _ => testing::fail("expected Object identity"),
+    };
+    let object = match object_function {
+        runtime::Value::Object(value) => value,
+        _ => realm.global_object(),
+    };
+    let create = property(context.heap(), object, "create");
+    let child = match expect_value(invoke(context, create, Vec::[runtime::Value::Object(parent)])) {
+        runtime::Value::Object(value) => value,
+        _ => {
+            testing::fail("expected Object.create result");
+            realm.global_object()
+        },
+    };
+    let get_prototype = property(context.heap(), object, "getPrototypeOf");
+    match expect_value(invoke(context, get_prototype, Vec::[runtime::Value::Object(child)])) {
+        runtime::Value::Object(value) => testing::assert(value == parent),
+        _ => testing::fail("expected parent prototype"),
+    };
+    let prevent_extensions = property(context.heap(), object, "preventExtensions");
+    let _ = expect_value(invoke(context, prevent_extensions, Vec::[runtime::Value::Object(child)]));
+    match runtime::set_property(
+        context.heap(),
+        child,
+        runtime::string_property_key("newValue"),
+        runtime::Value::Int(1),
+    ) {
+        Ok(value) => testing::assert(!value),
+        Err(value) => testing::fail(value.message),
+    }
+}
+
+#[test]
+fn object_reflection_reports_own_descriptors_and_extensibility() -> unit {
+    let context = vm::Context::new(runtime::Heap::new());
+    let realm = expect_realm(install(context));
+    let object = match property(context.heap(), realm.global_object(), "Object") {
+        runtime::Value::Object(value) => value,
+        _ => {
+            testing::fail("expected Object constructor");
+            realm.global_object()
+        },
+    };
+    let parent = match runtime::new_ordinary_object(context.heap(), Option::None) {
+        Ok(value) => value,
+        Err(value) => {
+            testing::fail(value.message);
+            realm.global_object()
+        },
+    };
+    let target = match runtime::new_ordinary_object(context.heap(), Option::Some(parent)) {
+        Ok(value) => value,
+        Err(value) => {
+            testing::fail(value.message);
+            realm.global_object()
+        },
+    };
+    testing::assert(
+        runtime::define_own_property(
+            context.heap(),
+            parent,
+            runtime::string_property_key("inherited"),
+            runtime::data_descriptor(runtime::Value::Int(1), true, true, true),
+        ),
+    );
+    testing::assert(
+        runtime::define_own_property(
+            context.heap(),
+            target,
+            runtime::string_property_key("value"),
+            runtime::data_descriptor(runtime::Value::Int(7), false, true, false),
+        ),
+    );
+    let has_own = property(context.heap(), object, "hasOwn");
+    assert_value(
+        expect_value(
+            invoke(
+                context,
+                has_own,
+                Vec::[runtime::Value::Object(target), runtime::Value::String(js_string("value"))],
+            ),
+        ),
+        runtime::Value::Bool(true),
+    );
+    assert_value(
+        expect_value(
+            invoke(
+                context,
+                has_own,
+                Vec::[
+                    runtime::Value::Object(target),
+                    runtime::Value::String(js_string("inherited")),
+                ],
+            ),
+        ),
+        runtime::Value::Bool(false),
+    );
+    let get_descriptor = property(context.heap(), object, "getOwnPropertyDescriptor");
+    let descriptor = match expect_value(
+        invoke(
+            context,
+            get_descriptor,
+            Vec::[runtime::Value::Object(target), runtime::Value::String(js_string("value"))],
+        ),
+    ) {
+        runtime::Value::Object(value) => value,
+        _ => {
+            testing::fail("expected property descriptor object");
+            realm.global_object()
+        },
+    };
+    assert_value(property(context.heap(), descriptor, "value"), runtime::Value::Int(7));
+    assert_value(property(context.heap(), descriptor, "writable"), runtime::Value::Bool(false));
+    assert_value(property(context.heap(), descriptor, "enumerable"), runtime::Value::Bool(true));
+    assert_value(property(context.heap(), descriptor, "configurable"), runtime::Value::Bool(false));
+    let is_extensible = property(context.heap(), object, "isExtensible");
+    assert_value(
+        expect_value(invoke(context, is_extensible, Vec::[runtime::Value::Object(target)])),
+        runtime::Value::Bool(true),
+    );
+    let prevent_extensions = property(context.heap(), object, "preventExtensions");
+    let _ = expect_value(invoke(context, prevent_extensions, Vec::[runtime::Value::Object(target)]));
+    assert_value(
+        expect_value(invoke(context, is_extensible, Vec::[runtime::Value::Object(target)])),
+        runtime::Value::Bool(false),
+    )
+}
+
+#[test]
+fn object_definition_enumeration_assignment_and_freezing_compose() -> unit {
+    let context = vm::Context::new(runtime::Heap::new());
+    let realm = expect_realm(install(context));
+    let object = match property(context.heap(), realm.global_object(), "Object") {
+        runtime::Value::Object(value) => value,
+        _ => {
+            testing::fail("expected Object constructor");
+            realm.global_object()
+        },
+    };
+    let target = match runtime::new_ordinary_object(context.heap(), Option::None) {
+        Ok(value) => value,
+        Err(value) => {
+            testing::fail(value.message);
+            realm.global_object()
+        },
+    };
+    let descriptor = match runtime::new_ordinary_object(context.heap(), Option::None) {
+        Ok(value) => value,
+        Err(value) => {
+            testing::fail(value.message);
+            realm.global_object()
+        },
+    };
+    testing::assert(
+        runtime::define_own_property(
+            context.heap(),
+            descriptor,
+            runtime::string_property_key("value"),
+            runtime::data_descriptor(runtime::Value::Int(9), true, true, true),
+        ),
+    );
+    testing::assert(
+        runtime::define_own_property(
+            context.heap(),
+            descriptor,
+            runtime::string_property_key("writable"),
+            runtime::data_descriptor(runtime::Value::Bool(true), true, true, true),
+        ),
+    );
+    testing::assert(
+        runtime::define_own_property(
+            context.heap(),
+            descriptor,
+            runtime::string_property_key("enumerable"),
+            runtime::data_descriptor(runtime::Value::Bool(true), true, true, true),
+        ),
+    );
+    testing::assert(
+        runtime::define_own_property(
+            context.heap(),
+            descriptor,
+            runtime::string_property_key("configurable"),
+            runtime::data_descriptor(runtime::Value::Bool(true), true, true, true),
+        ),
+    );
+    let define_property = property(context.heap(), object, "defineProperty");
+    let _ = expect_value(
+        invoke(
+            context,
+            define_property,
+            Vec::[
+                runtime::Value::Object(target),
+                runtime::Value::String(js_string("answer")),
+                runtime::Value::Object(descriptor),
+            ],
+        ),
+    );
+    assert_value(property(context.heap(), target, "answer"), runtime::Value::Int(9));
+    let names = match expect_value(
+        invoke(
+            context,
+            property(context.heap(), object, "getOwnPropertyNames"),
+            Vec::[runtime::Value::Object(target)],
+        ),
+    ) {
+        runtime::Value::Object(value) => value,
+        _ => {
+            testing::fail("expected property names array");
+            realm.global_object()
+        },
+    };
+    assert_value(property(context.heap(), names, "0"), runtime::Value::String(js_string("answer")));
+    let values = match expect_value(
+        invoke(
+            context,
+            property(context.heap(), object, "values"),
+            Vec::[runtime::Value::Object(target)],
+        ),
+    ) {
+        runtime::Value::Object(value) => value,
+        _ => {
+            testing::fail("expected Object.values array");
+            realm.global_object()
+        },
+    };
+    assert_value(property(context.heap(), values, "0"), runtime::Value::Int(9));
+    let entries = match expect_value(
+        invoke(
+            context,
+            property(context.heap(), object, "entries"),
+            Vec::[runtime::Value::Object(target)],
+        ),
+    ) {
+        runtime::Value::Object(value) => value,
+        _ => {
+            testing::fail("expected Object.entries array");
+            realm.global_object()
+        },
+    };
+    let first_entry = match property(context.heap(), entries, "0") {
+        runtime::Value::Object(value) => value,
+        _ => {
+            testing::fail("expected Object.entries pair");
+            realm.global_object()
+        },
+    };
+    assert_value(
+        property(context.heap(), first_entry, "0"),
+        runtime::Value::String(js_string("answer")),
+    );
+    assert_value(property(context.heap(), first_entry, "1"), runtime::Value::Int(9));
+    let assigned = match runtime::new_ordinary_object(context.heap(), Option::None) {
+        Ok(value) => value,
+        Err(value) => {
+            testing::fail(value.message);
+            realm.global_object()
+        },
+    };
+    let _ = expect_value(
+        invoke(
+            context,
+            property(context.heap(), object, "assign"),
+            Vec::[runtime::Value::Object(assigned), runtime::Value::Object(target)],
+        ),
+    );
+    assert_value(property(context.heap(), assigned, "answer"), runtime::Value::Int(9));
+    let symbol = runtime::Symbol::new(701, Option::Some("test"));
+    testing::assert(
+        runtime::define_own_property(
+            context.heap(),
+            target,
+            runtime::PropertyKey::Symbol(symbol),
+            runtime::data_descriptor(runtime::Value::Int(3), true, false, true),
+        ),
+    );
+    let symbols = match expect_value(
+        invoke(
+            context,
+            property(context.heap(), object, "getOwnPropertySymbols"),
+            Vec::[runtime::Value::Object(target)],
+        ),
+    ) {
+        runtime::Value::Object(value) => value,
+        _ => {
+            testing::fail("expected property symbols array");
+            realm.global_object()
+        },
+    };
+    assert_value(property(context.heap(), symbols, "0"), runtime::Value::Symbol(symbol));
+    let _ = expect_value(
+        invoke(
+            context,
+            property(context.heap(), object, "freeze"),
+            Vec::[runtime::Value::Object(target)],
+        ),
+    );
+    assert_value(
+        expect_value(
+            invoke(
+                context,
+                property(context.heap(), object, "isFrozen"),
+                Vec::[runtime::Value::Object(target)],
+            ),
+        ),
+        runtime::Value::Bool(true),
+    );
+    match runtime::set_property(
+        context.heap(),
+        target,
+        runtime::string_property_key("answer"),
+        runtime::Value::Int(10),
+    ) {
+        Ok(value) => testing::assert(!value),
+        Err(value) => testing::fail(value.message),
+    };
+    testing::assert(
+        !runtime::delete_property(context.heap(), target, runtime::string_property_key("answer")),
+    )
+}
+
+#[test]
+fn object_keys_returns_enumerable_string_keys_in_order() -> unit {
+    let context = vm::Context::new(runtime::Heap::new());
+    let realm = expect_realm(install(context));
+    let target = match runtime::new_ordinary_object(context.heap(), Option::None) {
+        Ok(value) => value,
+        Err(value) => {
+            testing::fail(value.message);
+            realm.global_object()
+        },
+    };
+    testing::assert(
+        runtime::define_own_property(
+            context.heap(),
+            target,
+            runtime::string_property_key("later"),
+            runtime::data_descriptor(runtime::Value::Int(1), true, true, true),
+        ),
+    );
+    testing::assert(
+        runtime::define_own_property(
+            context.heap(),
+            target,
+            runtime::string_property_key("2"),
+            runtime::data_descriptor(runtime::Value::Int(2), true, true, true),
+        ),
+    );
+    testing::assert(
+        runtime::define_own_property(
+            context.heap(),
+            target,
+            runtime::string_property_key("hidden"),
+            runtime::data_descriptor(runtime::Value::Int(3), true, false, true),
+        ),
+    );
+    let object = match property(context.heap(), realm.global_object(), "Object") {
+        runtime::Value::Object(value) => value,
+        _ => realm.global_object(),
+    };
+    let keys = match expect_value(
+        invoke(
+            context,
+            property(context.heap(), object, "keys"),
+            Vec::[runtime::Value::Object(target)],
+        ),
+    ) {
+        runtime::Value::Object(value) => value,
+        _ => {
+            testing::fail("expected Object.keys array");
+            realm.global_object()
+        },
+    };
+    match property(context.heap(), keys, "0") {
+        runtime::Value::String(value) => testing::assert(value == js_string("2")),
+        _ => testing::fail("expected indexed key first"),
+    };
+    match property(context.heap(), keys, "1") {
+        runtime::Value::String(value) => testing::assert(value == js_string("later")),
+        _ => testing::fail("expected insertion key second"),
+    };
+    testing::assert_eq(expect_number(property(context.heap(), keys, "length")), 2.0)
+}
+
+#[test]
+fn array_constructor_and_is_array_distinguish_length_and_elements() -> unit {
+    let context = vm::Context::new(runtime::Heap::new());
+    let realm = expect_realm(install(context));
+    let array_function = property(context.heap(), realm.global_object(), "Array");
+    let sparse = match expect_value(invoke(context, array_function, Vec::[runtime::Value::Int(3)])) {
+        runtime::Value::Object(value) => value,
+        _ => {
+            testing::fail("expected sparse array");
+            realm.global_object()
+        },
+    };
+    testing::assert_eq(expect_number(property(context.heap(), sparse, "length")), 3.0);
+    match runtime::get_property(context.heap(), sparse, runtime::string_property_key("0")) {
+        Ok(None) => (),
+        _ => testing::fail("expected array hole"),
+    };
+    let values = match expect_value(
+        invoke(context, array_function, Vec::[runtime::Value::Int(3), runtime::Value::Int(4)]),
+    ) {
+        runtime::Value::Object(value) => value,
+        _ => {
+            testing::fail("expected values array");
+            realm.global_object()
+        },
+    };
+    testing::assert_eq(expect_number(property(context.heap(), values, "0")), 3.0);
+    testing::assert_eq(expect_number(property(context.heap(), values, "length")), 2.0);
+    let array = match array_function {
+        runtime::Value::Object(value) => value,
+        _ => realm.global_object(),
+    };
+    let is_array = property(context.heap(), array, "isArray");
+    match expect_value(invoke(context, is_array, Vec::[runtime::Value::Object(values)])) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected Array.isArray result"),
+    }
+}
+
+#[test]
+fn object_is_uses_same_value_number_semantics() -> unit {
+    let context = vm::Context::new(runtime::Heap::new());
+    let realm = expect_realm(install(context));
+    let object = match property(context.heap(), realm.global_object(), "Object") {
+        runtime::Value::Object(value) => value,
+        _ => realm.global_object(),
+    };
+    let is = property(context.heap(), object, "is");
+    match expect_value(
+        invoke(context, is, Vec::[runtime::Value::Float(nan()), runtime::Value::Float(nan())]),
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected Object.is NaN result"),
+    };
+    let negative_zero = num::parse_float64("-0").unwrap_or(0.0);
+    match expect_value(
+        invoke(context, is, Vec::[runtime::Value::Float(negative_zero), runtime::Value::Float(0.0)]),
+    ) {
+        runtime::Value::Bool(value) => testing::assert(!value),
+        _ => testing::fail("expected Object.is zero result"),
+    }
+}
+
+#[test]
+fn string_static_constructors_preserve_utf16_code_units() -> unit {
+    let context = vm::Context::new(runtime::Heap::new());
+    let realm = expect_realm(install(context));
+    let string_object = match property(context.heap(), realm.global_object(), "String") {
+        runtime::Value::Object(value) => value,
+        _ => realm.global_object(),
+    };
+    let from_char_code = property(context.heap(), string_object, "fromCharCode");
+    match expect_value(
+        invoke(context, from_char_code, Vec::[runtime::Value::Int(65), runtime::Value::Int(0xd800)]),
+    ) {
+        runtime::Value::String(value) => {
+            testing::assert(value == runtime::JsString::from_code_units(Vec::[65, 0xd800]))
+        },
+        _ => testing::fail("expected fromCharCode string"),
+    };
+    let from_code_point = property(context.heap(), string_object, "fromCodePoint");
+    match expect_value(invoke(context, from_code_point, Vec::[runtime::Value::Int(0x1f600)])) {
+        runtime::Value::String(value) => {
+            testing::assert(value == runtime::JsString::from_code_units(Vec::[0xd83d, 0xde00]))
+        },
+        _ => testing::fail("expected fromCodePoint string"),
+    };
+    match invoke(context, from_code_point, Vec::[runtime::Value::Int(0x110000)]) {
+        Err(vm::VmError { kind: vm::VmErrorKind::RangeError(_), .. }) => (),
+        _ => testing::fail("expected invalid code point error"),
+    }
+}
+
+#[test]
+fn string_raw_interleaves_raw_segments_and_substitutions() -> unit {
+    let context = vm::Context::new(runtime::Heap::new());
+    let realm = expect_realm(install(context));
+    let string_object = match property(context.heap(), realm.global_object(), "String") {
+        runtime::Value::Object(value) => value,
+        _ => realm.global_object(),
+    };
+    let raw_function = property(context.heap(), string_object, "raw");
+    let segments = runtime::new_array(context.heap(), 3).unwrap_or(realm.global_object());
+    let _ = runtime::define_own_property(
+        context.heap(),
+        segments,
+        runtime::string_property_key("0"),
+        runtime::data_descriptor(
+            runtime::Value::String(runtime::JsString::from_code_units(Vec::[97, 0xd800])),
+            true,
+            true,
+            true,
+        ),
+    );
+    let _ = runtime::define_own_property(
+        context.heap(),
+        segments,
+        runtime::string_property_key("1"),
+        runtime::data_descriptor(
+            runtime::Value::String(runtime::JsString::from_code_units(Vec::[98])),
+            true,
+            true,
+            true,
+        ),
+    );
+    let _ = runtime::define_own_property(
+        context.heap(),
+        segments,
+        runtime::string_property_key("2"),
+        runtime::data_descriptor(
+            runtime::Value::String(runtime::JsString::from_code_units(Vec::[99])),
+            true,
+            true,
+            true,
+        ),
+    );
+    let template = runtime::new_ordinary_object(context.heap(), Option::None).unwrap_or(
+        realm.global_object(),
+    );
+    let _ = runtime::define_own_property(
+        context.heap(),
+        template,
+        runtime::string_property_key("raw"),
+        runtime::data_descriptor(runtime::Value::Object(segments), true, true, true),
+    );
+    match expect_value(
+        invoke(
+            context,
+            raw_function,
+            Vec::[
+                runtime::Value::Object(template),
+                runtime::Value::Int(1),
+                runtime::Value::Bool(false),
+            ],
+        ),
+    ) {
+        runtime::Value::String(value) => {
+            testing::assert(
+                value
+                    == runtime::JsString::from_code_units(
+                        Vec::[97, 0xd800, 49, 98, 102, 97, 108, 115, 101, 99],
+                    ),
+            )
+        },
+        _ => testing::fail("expected String.raw result"),
+    };
+    testing::assert_eq(
+        expect_number(
+            property(
+                context.heap(),
+                match raw_function {
+                    runtime::Value::Object(value) => value,
+                    _ => realm.global_object(),
+                },
+                "length",
+            ),
+        ),
+        1.0,
+    )
+}
+
+#[test]
+fn bigint_width_truncation_uses_twos_complement() -> unit {
+    let context = vm::Context::new(runtime::Heap::new());
+    let realm = expect_realm(install(context));
+    let bigint_object = match property(context.heap(), realm.global_object(), "BigInt") {
+        runtime::Value::Object(value) => value,
+        _ => realm.global_object(),
+    };
+    let as_uint_n = property(context.heap(), bigint_object, "asUintN");
+    let as_int_n = property(context.heap(), bigint_object, "asIntN");
+    let negative_one = runtime::Value::BigInt(runtime::BigInt::from_int64(-1));
+    match expect_value(invoke(context, as_uint_n, Vec::[runtime::Value::Int(8), negative_one])) {
+        runtime::Value::BigInt(value) => testing::assert_eq(value.to_string(), "255"),
+        _ => testing::fail("expected unsigned truncated BigInt"),
+    };
+    let two_fifty_five = runtime::Value::BigInt(runtime::BigInt::from_int64(255));
+    match expect_value(invoke(context, as_int_n, Vec::[runtime::Value::Int(8), two_fifty_five])) {
+        runtime::Value::BigInt(value) => testing::assert_eq(value.to_string(), "-1"),
+        _ => testing::fail("expected signed truncated BigInt"),
+    }
+}
+
+#[test]
+fn uri_globals_follow_uri_and_component_escape_rules() -> unit {
+    let context = vm::Context::new(runtime::Heap::new());
+    let realm = expect_realm(install(context));
+    let global = realm.global_object();
+    let encode_uri = property(context.heap(), global, "encodeURI");
+    let encode_component = property(context.heap(), global, "encodeURIComponent");
+    let decode_uri = property(context.heap(), global, "decodeURI");
+    let decode_component = property(context.heap(), global, "decodeURIComponent");
+    let input = runtime::Value::String(
+        runtime::JsString::from_code_units(Vec::[0x61, 0x2f, 0x20, 0xd83d, 0xde00]),
+    );
+    match expect_value(invoke(context, encode_uri, Vec::[input])) {
+        runtime::Value::String(value) => testing::assert(value == js_string("a/%20%F0%9F%98%80")),
+        _ => testing::fail("expected encodeURI string"),
+    };
+    match expect_value(invoke(context, encode_component, Vec::[input])) {
+        runtime::Value::String(value) => testing::assert(value == js_string("a%2F%20%F0%9F%98%80")),
+        _ => testing::fail("expected encodeURIComponent string"),
+    };
+    let escaped = runtime::Value::String(js_string("%2f%3F%F0%9F%98%80"));
+    match expect_value(invoke(context, decode_uri, Vec::[escaped])) {
+        runtime::Value::String(value) => testing::assert(value == js_string("%2f%3F😀")),
+        _ => testing::fail("expected decodeURI string"),
+    };
+    match expect_value(invoke(context, decode_component, Vec::[escaped])) {
+        runtime::Value::String(value) => testing::assert(value == js_string("/?😀")),
+        _ => testing::fail("expected decodeURIComponent string"),
+    };
+    match invoke(context, decode_component, Vec::[runtime::Value::String(js_string("%E0%A4"))]) {
+        Err(vm::VmError { kind: vm::VmErrorKind::UriError(_), .. }) => (),
+        _ => testing::fail("expected malformed URI error"),
+    }
+}
+
+#[test]
+fn extended_math_functions_preserve_integer_float_and_boundary_semantics() -> unit {
+    let context = vm::Context::new(runtime::Heap::new());
+    let realm = expect_realm(install(context));
+    let math_object = realm.math_object();
+    testing::assert_eq(
+        expect_number(
+            expect_value(
+                invoke(
+                    context,
+                    property(context.heap(), math_object, "clz32"),
+                    Vec::[runtime::Value::Int(1)],
+                ),
+            ),
+        ),
+        31.0,
+    );
+    testing::assert_eq(
+        expect_number(
+            expect_value(
+                invoke(
+                    context,
+                    property(context.heap(), math_object, "imul"),
+                    Vec::[runtime::Value::Float(4294967295.0), runtime::Value::Int(5)],
+                ),
+            ),
+        ),
+        -5.0,
+    );
+    testing::assert_eq(
+        expect_number(
+            expect_value(
+                invoke(
+                    context,
+                    property(context.heap(), math_object, "hypot"),
+                    Vec::[runtime::Value::Int(3), runtime::Value::Int(4)],
+                ),
+            ),
+        ),
+        5.0,
+    );
+    testing::assert_eq(
+        expect_number(
+            expect_value(
+                invoke(
+                    context,
+                    property(context.heap(), math_object, "fround"),
+                    Vec::[runtime::Value::Float(1.5)],
+                ),
+            ),
+        ),
+        1.5,
+    );
+    testing::assert_eq(
+        expect_number(
+            expect_value(
+                invoke(
+                    context,
+                    property(context.heap(), math_object, "atan2"),
+                    Vec::[runtime::Value::Int(1), runtime::Value::Int(0)],
+                ),
+            ),
+        ),
+        1.5707963267948966,
+    );
+    let precise_values = Vec::[
+        runtime::Value::Float(1.0),
+        runtime::Value::Float(1.1102230246251565e-16),
+        runtime::Value::Float(4.9406564584124654e-324),
+    ];
+    let precise_input = match allocate_array(context.heap(), precise_values, 3) {
+        Ok(value) => value,
+        Err(value) => {
+            testing::fail(value.message);
+            math_object
+        },
+    };
+    testing::assert_eq(
+        expect_number(
+            expect_value(
+                invoke(
+                    context,
+                    property(context.heap(), math_object, "sumPrecise"),
+                    Vec::[runtime::Value::Object(precise_input)],
+                ),
+            ),
+        ),
+        1.0000000000000002,
+    );
+    let invalid_values = Vec::[runtime::Value::String(js_string("1"))];
+    let invalid_input = match allocate_array(context.heap(), invalid_values, 1) {
+        Ok(value) => value,
+        Err(value) => {
+            testing::fail(value.message);
+            math_object
+        },
+    };
+    match invoke(
+        context,
+        property(context.heap(), math_object, "sumPrecise"),
+        Vec::[runtime::Value::Object(invalid_input)],
+    ) {
+        Err(vm::VmError { kind: vm::VmErrorKind::TypeError(_), .. }) => (),
+        _ => testing::fail("expected Math.sumPrecise number type error"),
+    }
+}

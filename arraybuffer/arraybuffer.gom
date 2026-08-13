@@ -1,0 +1,1764 @@
+package arraybuffer;
+
+use gomlang::quickjs::bigint;
+use gomlang::quickjs::mathx;
+use std::bincode;
+use std::math;
+use std::num;
+
+pub const MAX_BUFFER_BYTE_LENGTH: int = 2147483647;
+
+#[derive(PartialEq, Eq, Debug)]
+pub enum BufferErrorClass {
+    TypeError,
+    RangeError,
+}
+
+#[derive(PartialEq, Eq, Debug)]
+pub enum BufferErrorReason {
+    DetachedBuffer,
+    NegativeLength,
+    LengthOutOfRange,
+    OffsetOutOfRange,
+    IndexOutOfRange,
+    MisalignedOffset,
+    CodecFailure,
+    SharedBuffer,
+}
+
+#[derive(PartialEq, Eq, Debug)]
+pub struct BufferError {
+    pub class: BufferErrorClass,
+    pub reason: BufferErrorReason,
+    pub value: int,
+    pub limit: int,
+}
+
+impl ToString for BufferError {
+    fn to_string(self: BufferError) -> string {
+        let class = match self.class {
+            BufferErrorClass::TypeError => "TypeError",
+            BufferErrorClass::RangeError => "RangeError",
+        };
+        let reason = match self.reason {
+            BufferErrorReason::DetachedBuffer => "detached buffer",
+            BufferErrorReason::NegativeLength => "negative length",
+            BufferErrorReason::LengthOutOfRange => "length out of range",
+            BufferErrorReason::OffsetOutOfRange => "offset out of range",
+            BufferErrorReason::IndexOutOfRange => "index out of range",
+            BufferErrorReason::MisalignedOffset => "misaligned offset",
+            BufferErrorReason::CodecFailure => "numeric codec failure",
+            BufferErrorReason::SharedBuffer => "shared buffer cannot be detached",
+        };
+        class + ": " + reason + " (" + self.value.to_string() + ", " + self.limit.to_string() + ")"
+    }
+}
+
+struct BackingStore {
+    bytes: Ref[Vec[byte]],
+    byte_length: Ref[int],
+    max_byte_length: Ref[int],
+    resizable: Ref[bool],
+    detached: Ref[bool],
+    shared: bool,
+}
+
+pub struct ArrayBuffer {
+    store: BackingStore,
+}
+
+pub struct DataView {
+    store: BackingStore,
+    view_offset: int,
+    view_length: int,
+}
+
+pub struct Uint8Array {
+    store: BackingStore,
+    view_offset: int,
+    element_length: int,
+}
+
+pub struct Int32Array {
+    store: BackingStore,
+    view_offset: int,
+    element_length: int,
+}
+
+pub struct Float64Array {
+    store: BackingStore,
+    view_offset: int,
+    element_length: int,
+}
+
+#[derive(PartialEq, Eq, Debug)]
+pub enum NumericArrayKind {
+    Uint8Clamped,
+    Int8,
+    Int16,
+    Uint16,
+    Uint32,
+    Float16,
+    Float32,
+}
+
+pub struct NumericArray {
+    store: BackingStore,
+    view_offset: int,
+    element_length: int,
+    kind_value: NumericArrayKind,
+}
+
+#[derive(PartialEq, Eq, Debug)]
+pub enum BigIntArrayKind {
+    Signed,
+    Unsigned,
+}
+
+pub struct BigIntArray {
+    store: BackingStore,
+    view_offset: int,
+    element_length: int,
+    kind_value: BigIntArrayKind,
+}
+
+fn buffer_error(class: BufferErrorClass, reason: BufferErrorReason, value: int, limit: int) -> BufferError {
+    BufferError { class, reason, value, limit }
+}
+
+fn type_error(reason: BufferErrorReason) -> BufferError {
+    buffer_error(BufferErrorClass::TypeError, reason, 0, 0)
+}
+
+fn range_error(reason: BufferErrorReason, value: int, limit: int) -> BufferError {
+    buffer_error(BufferErrorClass::RangeError, reason, value, limit)
+}
+
+fn allocate_bytes(length: int) -> Result[Vec[byte], BufferError] {
+    if length < 0 {
+        return Result::Err(range_error(BufferErrorReason::NegativeLength, length, 0))
+    } else if length > MAX_BUFFER_BYTE_LENGTH {
+        return Result::Err(
+            range_error(BufferErrorReason::LengthOutOfRange, length, MAX_BUFFER_BYTE_LENGTH),
+        )
+    } else {};
+    let values: Vec[byte] = Vec::with_capacity(length);
+    let mut index = 0;
+    while index < length {
+        values.push(0);
+        index += 1;
+    }
+    Result::Ok(values)
+}
+
+fn copy_bytes(values: Vec[byte], start: int, length: int) -> Vec[byte] {
+    let output: Vec[byte] = Vec::with_capacity(length);
+    let mut index = 0;
+    while index < length {
+        output.push(values[start + index]);
+        index += 1;
+    }
+    output
+}
+
+fn new_store(values: Vec[byte], shared: bool, max_byte_length: int, resizable: bool) -> BackingStore {
+    let length = values.len();
+    BackingStore {
+        bytes: Ref::new(values),
+        byte_length: Ref::new(length),
+        max_byte_length: Ref::new(max_byte_length),
+        resizable: Ref::new(resizable),
+        detached: Ref::new(false),
+        shared,
+    }
+}
+
+fn require_attached(store: BackingStore) -> Result[unit, BufferError] {
+    if store.detached.get() {
+        Result::Err(type_error(BufferErrorReason::DetachedBuffer))
+    } else {
+        Result::Ok(())
+    }
+}
+
+fn detach_store(store: BackingStore) -> Result[unit, BufferError] {
+    require_attached(store)?;
+    let empty: Vec[byte] = Vec::[];
+    store.bytes.set(empty);
+    store.byte_length.set(0);
+    store.max_byte_length.set(0);
+    store.resizable.set(false);
+    store.detached.set(true);
+    Result::Ok(())
+}
+
+fn check_range(offset: int, length: int, total: int) -> Result[unit, BufferError] {
+    if offset < 0 || offset > total {
+        Result::Err(range_error(BufferErrorReason::OffsetOutOfRange, offset, total))
+    } else if length < 0 {
+        Result::Err(range_error(BufferErrorReason::NegativeLength, length, 0))
+    } else if length > total - offset {
+        Result::Err(range_error(BufferErrorReason::LengthOutOfRange, length, total - offset))
+    } else {
+        Result::Ok(())
+    }
+}
+
+fn check_index(index: int, length: int) -> Result[unit, BufferError] {
+    if index < 0 || index >= length {
+        Result::Err(range_error(BufferErrorReason::IndexOutOfRange, index, length))
+    } else {
+        Result::Ok(())
+    }
+}
+
+fn normalize_relative_index(index: int, length: int) -> int {
+    if index < 0 {
+        if index < -length {
+            0
+        } else {
+            length + index
+        }
+    } else if index > length {
+        length
+    } else {
+        index
+    }
+}
+
+fn optional_endianness(value: Option[bool]) -> bool {
+    value.unwrap_or(false)
+}
+
+fn read_unsigned_at(store: BackingStore, offset: int, width: int, little_endian: bool) -> uint64 {
+    let values = store.bytes.get();
+    let mut result = 0.to_uint64();
+    let mut index = 0;
+    while index < width {
+        let source = if little_endian {
+            offset + index
+        } else {
+            offset + width - index - 1
+        };
+        result = result | (values[source].to_uint64() << (index * 8));
+        index += 1;
+    }
+    result
+}
+
+fn write_unsigned_at(
+    store: BackingStore,
+    offset: int,
+    width: int,
+    value: uint64,
+    little_endian: bool,
+) -> unit {
+    let values = store.bytes.get();
+    let mut index = 0;
+    while index < width {
+        let target = if little_endian {
+            offset + index
+        } else {
+            offset + width - index - 1
+        };
+        values[target] = ((value >> (index * 8)) & 0xff).to_uint8();
+        index += 1;
+    }
+}
+
+fn bincode_config(little_endian: bool) -> bincode::Config {
+    if little_endian {
+        bincode::with_little_endian(bincode::legacy())
+    } else {
+        bincode::with_big_endian(bincode::legacy())
+    }
+}
+
+fn encode_float32(value: float32, little_endian: bool) -> Result[Vec[byte], BufferError] {
+    match bincode::encode_to_vec(value, bincode_config(little_endian)) {
+        Ok(values) => Result::Ok(values),
+        Err(_) => Result::Err(type_error(BufferErrorReason::CodecFailure)),
+    }
+}
+
+fn encode_float64(value: float64, little_endian: bool) -> Result[Vec[byte], BufferError] {
+    match bincode::encode_to_vec(value, bincode_config(little_endian)) {
+        Ok(values) => Result::Ok(values),
+        Err(_) => Result::Err(type_error(BufferErrorReason::CodecFailure)),
+    }
+}
+
+fn decode_float32(values: Vec[byte], start: int, little_endian: bool) -> Result[
+    float32,
+    BufferError,
+] {
+    let decoded: Result[(float32, int), string] = bincode::decode_from_slice(
+        values.slice(start, start + 4),
+        bincode_config(little_endian),
+    );
+    match decoded {
+        Ok((value, consumed)) => if consumed == 4 {
+            Result::Ok(value)
+        } else {
+            Result::Err(type_error(BufferErrorReason::CodecFailure))
+        },
+        Err(_) => Result::Err(type_error(BufferErrorReason::CodecFailure)),
+    }
+}
+
+fn decode_float64(values: Vec[byte], start: int, little_endian: bool) -> Result[
+    float64,
+    BufferError,
+] {
+    let decoded: Result[(float64, int), string] = bincode::decode_from_slice(
+        values.slice(start, start + 8),
+        bincode_config(little_endian),
+    );
+    match decoded {
+        Ok((value, consumed)) => if consumed == 8 {
+            Result::Ok(value)
+        } else {
+            Result::Err(type_error(BufferErrorReason::CodecFailure))
+        },
+        Err(_) => Result::Err(type_error(BufferErrorReason::CodecFailure)),
+    }
+}
+
+fn write_encoded(store: BackingStore, offset: int, encoded: Vec[byte]) -> unit {
+    let values = store.bytes.get();
+    let mut index = 0;
+    while index < encoded.len() {
+        values[offset + index] = encoded[index];
+        index += 1;
+    }
+}
+
+fn to_uint32(value: float64) -> uint32 {
+    if !math::is_finite(value) || value == 0.0 {
+        0
+    } else {
+        let integer = math::trunc(value);
+        let mut remaining = integer - math::floor(integer / 4294967296.0) * 4294967296.0;
+        let mut place = 2147483648.0;
+        let mut mask: uint32 = 0x80000000;
+        let mut result: uint32 = 0;
+        while mask != 0 {
+            if remaining >= place {
+                result = result | mask;
+                remaining -= place;
+            } else {};
+            place /= 2.0;
+            mask >>= 1;
+        }
+        result
+    }
+}
+
+impl ArrayBuffer {
+    pub fn new(byte_length: int) -> Result[ArrayBuffer, BufferError] {
+        Result::Ok(
+            ArrayBuffer {
+                store: new_store(allocate_bytes(byte_length)?, false, byte_length, false),
+            },
+        )
+    }
+
+    pub fn new_shared(byte_length: int) -> Result[ArrayBuffer, BufferError] {
+        Result::Ok(
+            ArrayBuffer { store: new_store(allocate_bytes(byte_length)?, true, byte_length, false) },
+        )
+    }
+
+    pub fn new_growable_shared(byte_length: int, max_byte_length: int) -> Result[
+        ArrayBuffer,
+        BufferError,
+    ] {
+        if max_byte_length < byte_length || max_byte_length < 0 {
+            return Result::Err(
+                range_error(BufferErrorReason::LengthOutOfRange, max_byte_length, byte_length),
+            )
+        } else if max_byte_length > MAX_BUFFER_BYTE_LENGTH {
+            return Result::Err(
+                range_error(
+                    BufferErrorReason::LengthOutOfRange,
+                    max_byte_length,
+                    MAX_BUFFER_BYTE_LENGTH,
+                ),
+            )
+        } else {};
+        Result::Ok(
+            ArrayBuffer {
+                store: new_store(allocate_bytes(byte_length)?, true, max_byte_length, true),
+            },
+        )
+    }
+
+    pub fn new_resizable(byte_length: int, max_byte_length: int) -> Result[ArrayBuffer, BufferError] {
+        if max_byte_length < byte_length || max_byte_length < 0 {
+            return Result::Err(
+                range_error(BufferErrorReason::LengthOutOfRange, max_byte_length, byte_length),
+            )
+        } else if max_byte_length > MAX_BUFFER_BYTE_LENGTH {
+            return Result::Err(
+                range_error(
+                    BufferErrorReason::LengthOutOfRange,
+                    max_byte_length,
+                    MAX_BUFFER_BYTE_LENGTH,
+                ),
+            )
+        } else {};
+        Result::Ok(
+            ArrayBuffer {
+                store: new_store(allocate_bytes(byte_length)?, false, max_byte_length, true),
+            },
+        )
+    }
+
+    pub fn from_bytes(values: Slice[byte]) -> Result[ArrayBuffer, BufferError] {
+        if values.len() > MAX_BUFFER_BYTE_LENGTH {
+            return Result::Err(
+                range_error(
+                    BufferErrorReason::LengthOutOfRange,
+                    values.len(),
+                    MAX_BUFFER_BYTE_LENGTH,
+                ),
+            )
+        } else {};
+        let copied: Vec[byte] = Vec::with_capacity(values.len());
+        for value in values {
+            copied.push(value)
+        }
+        Result::Ok(ArrayBuffer { store: new_store(copied, false, values.len(), false) })
+    }
+
+    pub fn from_bytes_resizable(values: Slice[byte], max_byte_length: int) -> Result[
+        ArrayBuffer,
+        BufferError,
+    ] {
+        let result = ArrayBuffer::new_resizable(values.len(), max_byte_length)?;
+        result.write_bytes(0, values)?;
+        Result::Ok(result)
+    }
+
+    pub fn byte_length(self: ArrayBuffer) -> int {
+        self.store.byte_length.get()
+    }
+
+    pub fn is_detached(self: ArrayBuffer) -> bool {
+        self.store.detached.get()
+    }
+
+    pub fn is_shared(self: ArrayBuffer) -> bool {
+        self.store.shared
+    }
+
+    pub fn max_byte_length(self: ArrayBuffer) -> int {
+        if self.store.detached.get() {
+            0
+        } else {
+            self.store.max_byte_length.get()
+        }
+    }
+
+    pub fn is_resizable(self: ArrayBuffer) -> bool {
+        !self.store.detached.get() && !self.store.shared && self.store.resizable.get()
+    }
+
+    pub fn is_growable(self: ArrayBuffer) -> bool {
+        !self.store.detached.get() && self.store.shared && self.store.resizable.get()
+    }
+
+    pub fn resize(self: ArrayBuffer, new_byte_length: int) -> Result[unit, BufferError] {
+        require_attached(self.store)?;
+        if !self.store.resizable.get() || self.store.shared {
+            return Result::Err(type_error(BufferErrorReason::LengthOutOfRange))
+        } else if new_byte_length < 0 {
+            return Result::Err(range_error(BufferErrorReason::NegativeLength, new_byte_length, 0))
+        } else if new_byte_length > self.store.max_byte_length.get() {
+            return Result::Err(
+                range_error(
+                    BufferErrorReason::LengthOutOfRange,
+                    new_byte_length,
+                    self.store.max_byte_length.get(),
+                ),
+            )
+        } else {};
+        let values = allocate_bytes(new_byte_length)?;
+        let previous = self.store.bytes.get();
+        let count = if previous.len() < new_byte_length {
+            previous.len()
+        } else {
+            new_byte_length
+        };
+        let mut index = 0;
+        while index < count {
+            values[index] = previous[index];
+            index += 1;
+        }
+        self.store.bytes.set(values);
+        self.store.byte_length.set(new_byte_length);
+        Result::Ok(())
+    }
+
+    pub fn grow(self: ArrayBuffer, new_byte_length: int) -> Result[unit, BufferError] {
+        require_attached(self.store)?;
+        if !self.store.shared || !self.store.resizable.get() {
+            return Result::Err(type_error(BufferErrorReason::LengthOutOfRange))
+        } else if new_byte_length < self.store.byte_length.get() {
+            return Result::Err(
+                range_error(
+                    BufferErrorReason::LengthOutOfRange,
+                    new_byte_length,
+                    self.store.byte_length.get(),
+                ),
+            )
+        } else if new_byte_length > self.store.max_byte_length.get() {
+            return Result::Err(
+                range_error(
+                    BufferErrorReason::LengthOutOfRange,
+                    new_byte_length,
+                    self.store.max_byte_length.get(),
+                ),
+            )
+        } else if new_byte_length == self.store.byte_length.get() {
+            return Result::Ok(())
+        } else {};
+        let values = allocate_bytes(new_byte_length)?;
+        let previous = self.store.bytes.get();
+        let mut index = 0;
+        while index < previous.len() {
+            values[index] = previous[index];
+            index += 1;
+        }
+        self.store.bytes.set(values);
+        self.store.byte_length.set(new_byte_length);
+        Result::Ok(())
+    }
+
+    pub fn to_bytes(self: ArrayBuffer) -> Result[Vec[byte], BufferError] {
+        require_attached(self.store)?;
+        Result::Ok(copy_bytes(self.store.bytes.get(), 0, self.store.byte_length.get()))
+    }
+
+    pub fn write_bytes(self: ArrayBuffer, byte_offset: int, values: Slice[byte]) -> Result[
+        unit,
+        BufferError,
+    ] {
+        require_attached(self.store)?;
+        check_range(byte_offset, values.len(), self.store.byte_length.get())?;
+        let target = self.store.bytes.get();
+        let mut index = 0;
+        while index < values.len() {
+            target[byte_offset + index] = values[index];
+            index += 1;
+        }
+        Result::Ok(())
+    }
+
+    pub fn slice(self: ArrayBuffer, begin: int, end: int) -> Result[ArrayBuffer, BufferError] {
+        require_attached(self.store)?;
+        let length = self.store.byte_length.get();
+        let first = normalize_relative_index(begin, length);
+        let final_index = normalize_relative_index(end, length);
+        let count = if final_index > first {
+            final_index - first
+        } else {
+            0
+        };
+        Result::Ok(
+            ArrayBuffer {
+                store: new_store(
+                    copy_bytes(self.store.bytes.get(), first, count),
+                    self.store.shared,
+                    count,
+                    false,
+                ),
+            },
+        )
+    }
+
+    fn transfer_with_mode(self: ArrayBuffer, new_byte_length: Option[int], fixed_length: bool) -> Result[
+        ArrayBuffer,
+        BufferError,
+    ] {
+        require_attached(self.store)?;
+        if self.store.shared {
+            return Result::Err(type_error(BufferErrorReason::SharedBuffer))
+        } else {};
+        let old_length = self.store.byte_length.get();
+        let target_length = new_byte_length.unwrap_or(old_length);
+        if target_length < 0 {
+            return Result::Err(range_error(BufferErrorReason::NegativeLength, target_length, 0))
+        } else if target_length > MAX_BUFFER_BYTE_LENGTH {
+            return Result::Err(
+                range_error(
+                    BufferErrorReason::LengthOutOfRange,
+                    target_length,
+                    MAX_BUFFER_BYTE_LENGTH,
+                ),
+            )
+        } else if !fixed_length && self.store.resizable.get()
+            && target_length > self.store.max_byte_length.get() {
+            return Result::Err(type_error(BufferErrorReason::LengthOutOfRange))
+        } else {};
+        let target_values = if target_length == old_length {
+            self.store.bytes.get()
+        } else {
+            let values = allocate_bytes(target_length)?;
+            let count = if old_length < target_length {
+                old_length
+            } else {
+                target_length
+            };
+            let source = self.store.bytes.get();
+            let mut index = 0;
+            while index < count {
+                values[index] = source[index];
+                index += 1;
+            }
+            values
+        };
+        let resizable = !fixed_length && self.store.resizable.get();
+        let maximum = if resizable {
+            self.store.max_byte_length.get()
+        } else {
+            target_length
+        };
+        let result = ArrayBuffer { store: new_store(target_values, false, maximum, resizable) };
+        detach_store(self.store)?;
+        Result::Ok(result)
+    }
+
+    pub fn transfer(self: ArrayBuffer, new_byte_length: Option[int]) -> Result[
+        ArrayBuffer,
+        BufferError,
+    ] {
+        self.transfer_with_mode(new_byte_length, false)
+    }
+
+    pub fn transfer_to_fixed_length(self: ArrayBuffer, new_byte_length: Option[int]) -> Result[
+        ArrayBuffer,
+        BufferError,
+    ] {
+        self.transfer_with_mode(new_byte_length, true)
+    }
+
+    pub fn detach(self: ArrayBuffer) -> Result[unit, BufferError] {
+        if self.store.shared {
+            return Result::Err(type_error(BufferErrorReason::SharedBuffer))
+        } else {};
+        detach_store(self.store)
+    }
+}
+
+impl DataView {
+    pub fn new(buffer: ArrayBuffer, byte_offset: int, byte_length: Option[int]) -> Result[
+        DataView,
+        BufferError,
+    ] {
+        require_attached(buffer.store)?;
+        let buffer_length = buffer.store.byte_length.get();
+        if byte_offset < 0 || byte_offset > buffer_length {
+            return Result::Err(
+                range_error(BufferErrorReason::OffsetOutOfRange, byte_offset, buffer_length),
+            )
+        } else {};
+        let length = byte_length.unwrap_or(buffer_length - byte_offset);
+        check_range(byte_offset, length, buffer_length)?;
+        Result::Ok(
+            DataView {
+                store: buffer.store,
+                view_offset: byte_offset,
+                view_length: match byte_length {
+                    None => if buffer.store.resizable.get() {
+                        -1
+                    } else {
+                        length
+                    },
+                    Some(_) => length,
+                },
+            },
+        )
+    }
+
+    pub fn buffer(self: DataView) -> ArrayBuffer {
+        ArrayBuffer { store: self.store }
+    }
+
+    pub fn byte_offset(self: DataView) -> Result[int, BufferError] {
+        require_attached(self.store)?;
+        if self.view_offset > self.store.byte_length.get()
+            || self.view_length >= 0
+                && self.view_length > self.store.byte_length.get() - self.view_offset {
+            Result::Err(type_error(BufferErrorReason::LengthOutOfRange))
+        } else {
+            Result::Ok(self.view_offset)
+        }
+    }
+
+    pub fn byte_length(self: DataView) -> Result[int, BufferError] {
+        require_attached(self.store)?;
+        if self.view_offset > self.store.byte_length.get() {
+            Result::Err(type_error(BufferErrorReason::LengthOutOfRange))
+        } else if self.view_length < 0 {
+            Result::Ok(self.store.byte_length.get() - self.view_offset)
+        } else if self.view_length > self.store.byte_length.get() - self.view_offset {
+            Result::Err(type_error(BufferErrorReason::LengthOutOfRange))
+        } else {
+            Result::Ok(self.view_length)
+        }
+    }
+
+    fn checked_offset(self: DataView, offset: int, width: int) -> Result[int, BufferError] {
+        check_range(offset, width, self.byte_length()?)?;
+        Result::Ok(self.view_offset + offset)
+    }
+
+    pub fn get_int8(self: DataView, byte_offset: int) -> Result[int8, BufferError] {
+        let offset = self.checked_offset(byte_offset, 1)?;
+        Result::Ok(read_unsigned_at(self.store, offset, 1, false).to_int8())
+    }
+
+    pub fn get_uint8(self: DataView, byte_offset: int) -> Result[uint8, BufferError] {
+        let offset = self.checked_offset(byte_offset, 1)?;
+        Result::Ok(read_unsigned_at(self.store, offset, 1, false).to_uint8())
+    }
+
+    pub fn get_int16(self: DataView, byte_offset: int, little_endian: Option[bool]) -> Result[
+        int16,
+        BufferError,
+    ] {
+        let offset = self.checked_offset(byte_offset, 2)?;
+        Result::Ok(
+            read_unsigned_at(self.store, offset, 2, optional_endianness(little_endian)).to_int16(),
+        )
+    }
+
+    pub fn get_uint16(self: DataView, byte_offset: int, little_endian: Option[bool]) -> Result[
+        uint16,
+        BufferError,
+    ] {
+        let offset = self.checked_offset(byte_offset, 2)?;
+        Result::Ok(
+            read_unsigned_at(self.store, offset, 2, optional_endianness(little_endian)).to_uint16(),
+        )
+    }
+
+    pub fn get_int32(self: DataView, byte_offset: int, little_endian: Option[bool]) -> Result[
+        int32,
+        BufferError,
+    ] {
+        let offset = self.checked_offset(byte_offset, 4)?;
+        Result::Ok(
+            read_unsigned_at(self.store, offset, 4, optional_endianness(little_endian)).to_int32(),
+        )
+    }
+
+    pub fn get_uint32(self: DataView, byte_offset: int, little_endian: Option[bool]) -> Result[
+        uint32,
+        BufferError,
+    ] {
+        let offset = self.checked_offset(byte_offset, 4)?;
+        Result::Ok(
+            read_unsigned_at(self.store, offset, 4, optional_endianness(little_endian)).to_uint32(),
+        )
+    }
+
+    pub fn get_big_int64(self: DataView, byte_offset: int, little_endian: Option[bool]) -> Result[
+        bigint::BigInteger,
+        BufferError,
+    ] {
+        let offset = self.checked_offset(byte_offset, 8)?;
+        Result::Ok(
+            bigint_from_uint64(
+                read_unsigned_at(self.store, offset, 8, optional_endianness(little_endian)),
+                BigIntArrayKind::Signed,
+            ),
+        )
+    }
+
+    pub fn get_big_uint64(self: DataView, byte_offset: int, little_endian: Option[bool]) -> Result[
+        bigint::BigInteger,
+        BufferError,
+    ] {
+        let offset = self.checked_offset(byte_offset, 8)?;
+        Result::Ok(
+            bigint_from_uint64(
+                read_unsigned_at(self.store, offset, 8, optional_endianness(little_endian)),
+                BigIntArrayKind::Unsigned,
+            ),
+        )
+    }
+
+    pub fn get_float32(self: DataView, byte_offset: int, little_endian: Option[bool]) -> Result[
+        float32,
+        BufferError,
+    ] {
+        let offset = self.checked_offset(byte_offset, 4)?;
+        decode_float32(self.store.bytes.get(), offset, optional_endianness(little_endian))
+    }
+
+    pub fn get_float16(self: DataView, byte_offset: int, little_endian: Option[bool]) -> Result[
+        float64,
+        BufferError,
+    ] {
+        let offset = self.checked_offset(byte_offset, 2)?;
+        Result::Ok(
+            mathx::float16_from_bits(
+                read_unsigned_at(self.store, offset, 2, optional_endianness(little_endian)).to_uint16(),
+            ),
+        )
+    }
+
+    pub fn get_float64(self: DataView, byte_offset: int, little_endian: Option[bool]) -> Result[
+        float64,
+        BufferError,
+    ] {
+        let offset = self.checked_offset(byte_offset, 8)?;
+        decode_float64(self.store.bytes.get(), offset, optional_endianness(little_endian))
+    }
+
+    pub fn set_int8(self: DataView, byte_offset: int, value: float64) -> Result[unit, BufferError] {
+        let offset = self.checked_offset(byte_offset, 1)?;
+        write_unsigned_at(self.store, offset, 1, to_uint32(value).to_uint64(), false);
+        Result::Ok(())
+    }
+
+    pub fn set_uint8(self: DataView, byte_offset: int, value: float64) -> Result[unit, BufferError] {
+        let offset = self.checked_offset(byte_offset, 1)?;
+        write_unsigned_at(self.store, offset, 1, to_uint32(value).to_uint64(), false);
+        Result::Ok(())
+    }
+
+    pub fn set_int16(self: DataView, byte_offset: int, value: float64, little_endian: Option[bool]) -> Result[
+        unit,
+        BufferError,
+    ] {
+        let offset = self.checked_offset(byte_offset, 2)?;
+        write_unsigned_at(
+            self.store,
+            offset,
+            2,
+            to_uint32(value).to_uint64(),
+            optional_endianness(little_endian),
+        );
+        Result::Ok(())
+    }
+
+    pub fn set_uint16(self: DataView, byte_offset: int, value: float64, little_endian: Option[bool]) -> Result[
+        unit,
+        BufferError,
+    ] {
+        let offset = self.checked_offset(byte_offset, 2)?;
+        write_unsigned_at(
+            self.store,
+            offset,
+            2,
+            to_uint32(value).to_uint64(),
+            optional_endianness(little_endian),
+        );
+        Result::Ok(())
+    }
+
+    pub fn set_int32(self: DataView, byte_offset: int, value: float64, little_endian: Option[bool]) -> Result[
+        unit,
+        BufferError,
+    ] {
+        let offset = self.checked_offset(byte_offset, 4)?;
+        write_unsigned_at(
+            self.store,
+            offset,
+            4,
+            to_uint32(value).to_uint64(),
+            optional_endianness(little_endian),
+        );
+        Result::Ok(())
+    }
+
+    pub fn set_uint32(self: DataView, byte_offset: int, value: float64, little_endian: Option[bool]) -> Result[
+        unit,
+        BufferError,
+    ] {
+        let offset = self.checked_offset(byte_offset, 4)?;
+        write_unsigned_at(
+            self.store,
+            offset,
+            4,
+            to_uint32(value).to_uint64(),
+            optional_endianness(little_endian),
+        );
+        Result::Ok(())
+    }
+
+    pub fn set_big_int64(
+        self: DataView,
+        byte_offset: int,
+        value: bigint::BigInteger,
+        little_endian: Option[bool],
+    ) -> Result[unit, BufferError] {
+        let offset = self.checked_offset(byte_offset, 8)?;
+        write_unsigned_at(
+            self.store,
+            offset,
+            8,
+            bigint_low_uint64(value),
+            optional_endianness(little_endian),
+        );
+        Result::Ok(())
+    }
+
+    pub fn set_big_uint64(
+        self: DataView,
+        byte_offset: int,
+        value: bigint::BigInteger,
+        little_endian: Option[bool],
+    ) -> Result[unit, BufferError] {
+        self.set_big_int64(byte_offset, value, little_endian)
+    }
+
+    pub fn set_float32(
+        self: DataView,
+        byte_offset: int,
+        value: float32,
+        little_endian: Option[bool],
+    ) -> Result[unit, BufferError] {
+        let offset = self.checked_offset(byte_offset, 4)?;
+        write_encoded(
+            self.store,
+            offset,
+            encode_float32(value, optional_endianness(little_endian))?,
+        );
+        Result::Ok(())
+    }
+
+    pub fn set_float16(
+        self: DataView,
+        byte_offset: int,
+        value: float64,
+        little_endian: Option[bool],
+    ) -> Result[unit, BufferError] {
+        let offset = self.checked_offset(byte_offset, 2)?;
+        write_unsigned_at(
+            self.store,
+            offset,
+            2,
+            mathx::float16_bits(value).to_uint64(),
+            optional_endianness(little_endian),
+        );
+        Result::Ok(())
+    }
+
+    pub fn set_float64(
+        self: DataView,
+        byte_offset: int,
+        value: float64,
+        little_endian: Option[bool],
+    ) -> Result[unit, BufferError] {
+        let offset = self.checked_offset(byte_offset, 8)?;
+        write_encoded(
+            self.store,
+            offset,
+            encode_float64(value, optional_endianness(little_endian))?,
+        );
+        Result::Ok(())
+    }
+}
+
+fn checked_element_byte_length(length: int, element_size: int) -> Result[int, BufferError] {
+    if length < 0 {
+        Result::Err(range_error(BufferErrorReason::NegativeLength, length, 0))
+    } else if length > MAX_BUFFER_BYTE_LENGTH / element_size {
+        Result::Err(
+            range_error(
+                BufferErrorReason::LengthOutOfRange,
+                length,
+                MAX_BUFFER_BYTE_LENGTH / element_size,
+            ),
+        )
+    } else {
+        Result::Ok(length * element_size)
+    }
+}
+
+fn typed_view_layout(store: BackingStore, byte_offset: int, length: Option[int], element_size: int) -> Result[
+    (int, int),
+    BufferError,
+] {
+    require_attached(store)?;
+    let buffer_length = store.byte_length.get();
+    if byte_offset < 0 || byte_offset > buffer_length {
+        return Result::Err(
+            range_error(BufferErrorReason::OffsetOutOfRange, byte_offset, buffer_length),
+        )
+    } else if byte_offset % element_size != 0 {
+        return Result::Err(
+            range_error(BufferErrorReason::MisalignedOffset, byte_offset, element_size),
+        )
+    } else {};
+    let remaining = buffer_length - byte_offset;
+    let element_length = match length {
+        Some(value) => {
+            let byte_length = checked_element_byte_length(value, element_size)?;
+            if byte_length > remaining {
+                return Result::Err(
+                    range_error(BufferErrorReason::LengthOutOfRange, byte_length, remaining),
+                )
+            } else {};
+            value
+        },
+        None => if remaining % element_size != 0 {
+            return Result::Err(
+                range_error(BufferErrorReason::LengthOutOfRange, remaining, element_size),
+            )
+        } else if store.resizable.get() {
+            -1
+        } else {
+            remaining / element_size
+        },
+    };
+    Result::Ok((byte_offset, element_length))
+}
+
+fn typed_out_of_bounds(store: BackingStore, offset: int, length: int, element_size: int) -> bool {
+    if store.detached.get() || offset > store.byte_length.get() {
+        true
+    } else {
+        length >= 0 && length > (store.byte_length.get() - offset) / element_size
+    }
+}
+
+fn typed_length(store: BackingStore, offset: int, length: int, element_size: int) -> int {
+    if typed_out_of_bounds(store, offset, length, element_size) {
+        0
+    } else if length < 0 {
+        (store.byte_length.get() - offset) / element_size
+    } else {
+        length
+    }
+}
+
+fn typed_byte_offset(store: BackingStore, offset: int, length: int, element_size: int) -> int {
+    if typed_out_of_bounds(store, offset, length, element_size) {
+        0
+    } else {
+        offset
+    }
+}
+
+fn check_set_range(target_offset: int, source_length: int, target_length: int) -> Result[
+    unit,
+    BufferError,
+] {
+    if target_offset < 0 || target_offset > target_length {
+        Result::Err(range_error(BufferErrorReason::OffsetOutOfRange, target_offset, target_length))
+    } else if source_length > target_length - target_offset {
+        Result::Err(
+            range_error(
+                BufferErrorReason::LengthOutOfRange,
+                source_length,
+                target_length - target_offset,
+            ),
+        )
+    } else {
+        Result::Ok(())
+    }
+}
+
+fn numeric_array_element_size(kind: NumericArrayKind) -> int {
+    match kind {
+        NumericArrayKind::Uint8Clamped | NumericArrayKind::Int8 => 1,
+        NumericArrayKind::Int16 | NumericArrayKind::Uint16 | NumericArrayKind::Float16 => 2,
+        NumericArrayKind::Uint32 | NumericArrayKind::Float32 => 4,
+    }
+}
+
+fn numeric_array_float(value: string) -> float64 {
+    num::parse_float64(value).unwrap_or(0.0)
+}
+
+fn float32_bits_as_float64(bits: uint32) -> float64 {
+    let negative = bits & 0x80000000 != 0;
+    let exponent = ((bits >> 23) & 0xff).to_int();
+    let fraction = bits & 0x007fffff;
+    let zero = 0.0;
+    if exponent == 255 {
+        if fraction == 0 {
+            if negative {
+                -1.0 / zero
+            } else {
+                1.0 / zero
+            }
+        } else {
+            zero / zero
+        }
+    } else if exponent == 0 && fraction == 0 {
+        if negative {
+            -1.0 / (1.0 / zero)
+        } else {
+            0.0
+        }
+    } else {
+        let magnitude = if exponent == 0 {
+            numeric_array_float(fraction.to_string()) * math::pow(2.0, -149.0)
+        } else {
+            numeric_array_float((0x00800000 + fraction).to_string())
+                * math::pow(2.0, numeric_array_float((exponent - 150).to_string()))
+        };
+        if negative {
+            -magnitude
+        } else {
+            magnitude
+        }
+    }
+}
+
+pub fn widen_float32(value: float32) -> float64 {
+    match encode_float32(value, true) {
+        Ok(bytes) => float32_bits_as_float64(
+            bytes[0].to_uint32() | bytes[1].to_uint32() << 8 | bytes[2].to_uint32() << 16
+                | bytes[3].to_uint32() << 24,
+        ),
+        Err(_) => {
+            let zero = 0.0;
+            zero / zero
+        },
+    }
+}
+
+fn uint8_clamped(value: float64) -> uint8 {
+    if math::is_nan(value) || value <= 0.0 {
+        0
+    } else if value >= 255.0 {
+        255
+    } else {
+        let lower = math::floor(value);
+        let fraction = value - lower;
+        let integer = num::parse_int(lower.to_string()).unwrap_or(0);
+        if fraction > 0.5 || fraction == 0.5 && integer % 2 != 0 {
+            (integer + 1).to_uint8()
+        } else {
+            integer.to_uint8()
+        }
+    }
+}
+
+impl NumericArray {
+    pub fn new(kind: NumericArrayKind, length: int) -> Result[NumericArray, BufferError] {
+        let size = numeric_array_element_size(kind);
+        let buffer = ArrayBuffer::new(checked_element_byte_length(length, size)?)?;
+        Result::Ok(
+            NumericArray {
+                store: buffer.store,
+                view_offset: 0,
+                element_length: length,
+                kind_value: kind,
+            },
+        )
+    }
+
+    pub fn from_buffer(
+        kind: NumericArrayKind,
+        buffer: ArrayBuffer,
+        byte_offset: int,
+        length: Option[int],
+    ) -> Result[NumericArray, BufferError] {
+        let size = numeric_array_element_size(kind);
+        let (offset, element_length) = typed_view_layout(buffer.store, byte_offset, length, size)?;
+        Result::Ok(
+            NumericArray {
+                store: buffer.store,
+                view_offset: offset,
+                element_length,
+                kind_value: kind,
+            },
+        )
+    }
+
+    pub fn kind(self: NumericArray) -> NumericArrayKind {
+        self.kind_value
+    }
+
+    pub fn buffer(self: NumericArray) -> ArrayBuffer {
+        ArrayBuffer { store: self.store }
+    }
+
+    pub fn is_out_of_bounds(self: NumericArray) -> bool {
+        typed_out_of_bounds(
+            self.store,
+            self.view_offset,
+            self.element_length,
+            numeric_array_element_size(self.kind_value),
+        )
+    }
+
+    pub fn is_length_tracking(self: NumericArray) -> bool {
+        self.element_length < 0
+    }
+
+    pub fn length(self: NumericArray) -> int {
+        typed_length(
+            self.store,
+            self.view_offset,
+            self.element_length,
+            numeric_array_element_size(self.kind_value),
+        )
+    }
+
+    pub fn byte_length(self: NumericArray) -> int {
+        self.length() * numeric_array_element_size(self.kind_value)
+    }
+
+    pub fn byte_offset(self: NumericArray) -> int {
+        typed_byte_offset(
+            self.store,
+            self.view_offset,
+            self.element_length,
+            numeric_array_element_size(self.kind_value),
+        )
+    }
+
+    pub fn get(self: NumericArray, index: int) -> Result[float64, BufferError] {
+        require_attached(self.store)?;
+        check_index(index, self.length())?;
+        let size = numeric_array_element_size(self.kind_value);
+        let offset = self.view_offset + index * size;
+        match self.kind_value {
+            NumericArrayKind::Uint8Clamped => Result::Ok(
+                numeric_array_float(
+                    read_unsigned_at(self.store, offset, 1, true).to_uint8().to_string(),
+                ),
+            ),
+            NumericArrayKind::Int8 => Result::Ok(
+                numeric_array_float(
+                    read_unsigned_at(self.store, offset, 1, true).to_int8().to_string(),
+                ),
+            ),
+            NumericArrayKind::Int16 => Result::Ok(
+                numeric_array_float(
+                    read_unsigned_at(self.store, offset, 2, true).to_int16().to_string(),
+                ),
+            ),
+            NumericArrayKind::Uint16 => Result::Ok(
+                numeric_array_float(
+                    read_unsigned_at(self.store, offset, 2, true).to_uint16().to_string(),
+                ),
+            ),
+            NumericArrayKind::Uint32 => Result::Ok(
+                numeric_array_float(
+                    read_unsigned_at(self.store, offset, 4, true).to_uint32().to_string(),
+                ),
+            ),
+            NumericArrayKind::Float16 => Result::Ok(
+                mathx::float16_from_bits(read_unsigned_at(self.store, offset, 2, true).to_uint16()),
+            ),
+            NumericArrayKind::Float32 => Result::Ok(
+                widen_float32(decode_float32(self.store.bytes.get(), offset, true)?),
+            ),
+        }
+    }
+
+    pub fn set(self: NumericArray, index: int, value: float64) -> Result[unit, BufferError] {
+        require_attached(self.store)?;
+        check_index(index, self.length())?;
+        let size = numeric_array_element_size(self.kind_value);
+        let offset = self.view_offset + index * size;
+        match self.kind_value {
+            NumericArrayKind::Uint8Clamped => {
+                write_unsigned_at(self.store, offset, 1, uint8_clamped(value).to_uint64(), true);
+                Result::Ok(())
+            },
+            NumericArrayKind::Int8 => {
+                write_unsigned_at(self.store, offset, 1, to_uint32(value).to_uint64(), true);
+                Result::Ok(())
+            },
+            NumericArrayKind::Int16 | NumericArrayKind::Uint16 => {
+                write_unsigned_at(self.store, offset, 2, to_uint32(value).to_uint64(), true);
+                Result::Ok(())
+            },
+            NumericArrayKind::Uint32 => {
+                write_unsigned_at(self.store, offset, 4, to_uint32(value).to_uint64(), true);
+                Result::Ok(())
+            },
+            NumericArrayKind::Float16 => {
+                write_unsigned_at(
+                    self.store,
+                    offset,
+                    2,
+                    mathx::float16_bits(value).to_uint64(),
+                    true,
+                );
+                Result::Ok(())
+            },
+            NumericArrayKind::Float32 => {
+                let converted = num::parse_float32(value.to_string()).unwrap_or(0.0);
+                write_encoded(self.store, offset, encode_float32(converted, true)?);
+                Result::Ok(())
+            },
+        }
+    }
+
+    pub fn subarray(self: NumericArray, begin: int, end: int) -> Result[NumericArray, BufferError] {
+        require_attached(self.store)?;
+        let current_length = self.length();
+        let first = normalize_relative_index(begin, current_length);
+        let final_index = normalize_relative_index(end, current_length);
+        let length = if final_index > first {
+            final_index - first
+        } else {
+            0
+        };
+        Result::Ok(
+            NumericArray {
+                store: self.store,
+                view_offset: self.view_offset + first * numeric_array_element_size(self.kind_value),
+                element_length: length,
+                kind_value: self.kind_value,
+            },
+        )
+    }
+}
+
+fn bigint_low_uint64(value: bigint::BigInteger) -> uint64 {
+    let limbs = value.limbs();
+    let low = if limbs.is_empty() {
+        0.to_uint64()
+    } else {
+        limbs[0].to_uint64()
+    };
+    let high = if limbs.len() < 2 {
+        0.to_uint64()
+    } else {
+        limbs[1].to_uint64()
+    };
+    let magnitude = low | high << 32;
+    if value.is_negative() {
+        ~magnitude + 1
+    } else {
+        magnitude
+    }
+}
+
+fn bigint_from_uint64(value: uint64, kind: BigIntArrayKind) -> bigint::BigInteger {
+    let unsigned = bigint::BigInteger::from_uint64(value);
+    match kind {
+        BigIntArrayKind::Unsigned => unsigned,
+        BigIntArrayKind::Signed => if value & 0x8000000000000000 == 0 {
+            unsigned
+        } else {
+            unsigned.subtract(bigint::BigInteger::from_parts(false, Vec::[0, 0, 1]))
+        },
+    }
+}
+
+impl BigIntArray {
+    pub fn new(kind: BigIntArrayKind, length: int) -> Result[BigIntArray, BufferError] {
+        let buffer = ArrayBuffer::new(checked_element_byte_length(length, 8)?)?;
+        Result::Ok(
+            BigIntArray {
+                store: buffer.store,
+                view_offset: 0,
+                element_length: length,
+                kind_value: kind,
+            },
+        )
+    }
+
+    pub fn from_buffer(
+        kind: BigIntArrayKind,
+        buffer: ArrayBuffer,
+        byte_offset: int,
+        length: Option[int],
+    ) -> Result[BigIntArray, BufferError] {
+        let (offset, element_length) = typed_view_layout(buffer.store, byte_offset, length, 8)?;
+        Result::Ok(
+            BigIntArray {
+                store: buffer.store,
+                view_offset: offset,
+                element_length,
+                kind_value: kind,
+            },
+        )
+    }
+
+    pub fn kind(self: BigIntArray) -> BigIntArrayKind {
+        self.kind_value
+    }
+
+    pub fn buffer(self: BigIntArray) -> ArrayBuffer {
+        ArrayBuffer { store: self.store }
+    }
+
+    pub fn is_out_of_bounds(self: BigIntArray) -> bool {
+        typed_out_of_bounds(self.store, self.view_offset, self.element_length, 8)
+    }
+
+    pub fn is_length_tracking(self: BigIntArray) -> bool {
+        self.element_length < 0
+    }
+
+    pub fn length(self: BigIntArray) -> int {
+        typed_length(self.store, self.view_offset, self.element_length, 8)
+    }
+
+    pub fn byte_length(self: BigIntArray) -> int {
+        self.length() * 8
+    }
+
+    pub fn byte_offset(self: BigIntArray) -> int {
+        typed_byte_offset(self.store, self.view_offset, self.element_length, 8)
+    }
+
+    pub fn get(self: BigIntArray, index: int) -> Result[bigint::BigInteger, BufferError] {
+        require_attached(self.store)?;
+        check_index(index, self.length())?;
+        Result::Ok(
+            bigint_from_uint64(
+                read_unsigned_at(self.store, self.view_offset + index * 8, 8, true),
+                self.kind_value,
+            ),
+        )
+    }
+
+    pub fn set(self: BigIntArray, index: int, value: bigint::BigInteger) -> Result[
+        unit,
+        BufferError,
+    ] {
+        require_attached(self.store)?;
+        check_index(index, self.length())?;
+        write_unsigned_at(
+            self.store,
+            self.view_offset + index * 8,
+            8,
+            bigint_low_uint64(value),
+            true,
+        );
+        Result::Ok(())
+    }
+
+    pub fn subarray(self: BigIntArray, begin: int, end: int) -> Result[BigIntArray, BufferError] {
+        require_attached(self.store)?;
+        let current_length = self.length();
+        let first = normalize_relative_index(begin, current_length);
+        let final_index = normalize_relative_index(end, current_length);
+        let length = if final_index > first {
+            final_index - first
+        } else {
+            0
+        };
+        Result::Ok(
+            BigIntArray {
+                store: self.store,
+                view_offset: self.view_offset + first * 8,
+                element_length: length,
+                kind_value: self.kind_value,
+            },
+        )
+    }
+}
+
+impl Uint8Array {
+    pub fn new(length: int) -> Result[Uint8Array, BufferError] {
+        let byte_length = checked_element_byte_length(length, 1)?;
+        let buffer = ArrayBuffer::new(byte_length)?;
+        Result::Ok(Uint8Array { store: buffer.store, view_offset: 0, element_length: length })
+    }
+
+    pub fn from_buffer(buffer: ArrayBuffer, byte_offset: int, length: Option[int]) -> Result[
+        Uint8Array,
+        BufferError,
+    ] {
+        let (offset, element_length) = typed_view_layout(buffer.store, byte_offset, length, 1)?;
+        Result::Ok(Uint8Array { store: buffer.store, view_offset: offset, element_length })
+    }
+
+    pub fn buffer(self: Uint8Array) -> ArrayBuffer {
+        ArrayBuffer { store: self.store }
+    }
+
+    pub fn is_out_of_bounds(self: Uint8Array) -> bool {
+        typed_out_of_bounds(self.store, self.view_offset, self.element_length, 1)
+    }
+
+    pub fn is_length_tracking(self: Uint8Array) -> bool {
+        self.element_length < 0
+    }
+
+    pub fn length(self: Uint8Array) -> int {
+        typed_length(self.store, self.view_offset, self.element_length, 1)
+    }
+
+    pub fn byte_length(self: Uint8Array) -> int {
+        self.length()
+    }
+
+    pub fn byte_offset(self: Uint8Array) -> int {
+        typed_byte_offset(self.store, self.view_offset, self.element_length, 1)
+    }
+
+    pub fn get(self: Uint8Array, index: int) -> Result[uint8, BufferError] {
+        require_attached(self.store)?;
+        check_index(index, self.length())?;
+        Result::Ok(self.store.bytes.get()[self.view_offset + index])
+    }
+
+    pub fn set(self: Uint8Array, index: int, value: float64) -> Result[unit, BufferError] {
+        require_attached(self.store)?;
+        check_index(index, self.length())?;
+        self.store.bytes.get()[self.view_offset + index] = to_uint32(value).to_uint8();
+        Result::Ok(())
+    }
+
+    pub fn subarray(self: Uint8Array, begin: int, end: int) -> Result[Uint8Array, BufferError] {
+        require_attached(self.store)?;
+        let current_length = self.length();
+        let first = normalize_relative_index(begin, current_length);
+        let final_index = normalize_relative_index(end, current_length);
+        let length = if final_index > first {
+            final_index - first
+        } else {
+            0
+        };
+        Result::Ok(
+            Uint8Array {
+                store: self.store,
+                view_offset: self.view_offset + first,
+                element_length: length,
+            },
+        )
+    }
+
+    pub fn set_from(self: Uint8Array, source: Uint8Array, target_offset: int) -> Result[
+        unit,
+        BufferError,
+    ] {
+        require_attached(self.store)?;
+        require_attached(source.store)?;
+        let source_length = source.length();
+        let target_length = self.length();
+        check_set_range(target_offset, source_length, target_length)?;
+        let snapshot: Vec[byte] = Vec::with_capacity(source_length);
+        let source_bytes = source.store.bytes.get();
+        let mut index = 0;
+        while index < source_length {
+            snapshot.push(source_bytes[source.view_offset + index]);
+            index += 1;
+        }
+        let target_bytes = self.store.bytes.get();
+        index = 0;
+        while index < snapshot.len() {
+            target_bytes[self.view_offset + target_offset + index] = snapshot[index];
+            index += 1;
+        }
+        Result::Ok(())
+    }
+}
+
+impl Int32Array {
+    pub fn new(length: int) -> Result[Int32Array, BufferError] {
+        let byte_length = checked_element_byte_length(length, 4)?;
+        let buffer = ArrayBuffer::new(byte_length)?;
+        Result::Ok(Int32Array { store: buffer.store, view_offset: 0, element_length: length })
+    }
+
+    pub fn from_buffer(buffer: ArrayBuffer, byte_offset: int, length: Option[int]) -> Result[
+        Int32Array,
+        BufferError,
+    ] {
+        let (offset, element_length) = typed_view_layout(buffer.store, byte_offset, length, 4)?;
+        Result::Ok(Int32Array { store: buffer.store, view_offset: offset, element_length })
+    }
+
+    pub fn buffer(self: Int32Array) -> ArrayBuffer {
+        ArrayBuffer { store: self.store }
+    }
+
+    pub fn is_out_of_bounds(self: Int32Array) -> bool {
+        typed_out_of_bounds(self.store, self.view_offset, self.element_length, 4)
+    }
+
+    pub fn is_length_tracking(self: Int32Array) -> bool {
+        self.element_length < 0
+    }
+
+    pub fn length(self: Int32Array) -> int {
+        typed_length(self.store, self.view_offset, self.element_length, 4)
+    }
+
+    pub fn byte_length(self: Int32Array) -> int {
+        self.length() * 4
+    }
+
+    pub fn byte_offset(self: Int32Array) -> int {
+        typed_byte_offset(self.store, self.view_offset, self.element_length, 4)
+    }
+
+    pub fn get(self: Int32Array, index: int) -> Result[int32, BufferError] {
+        require_attached(self.store)?;
+        check_index(index, self.length())?;
+        Result::Ok(read_unsigned_at(self.store, self.view_offset + index * 4, 4, true).to_int32())
+    }
+
+    pub fn set(self: Int32Array, index: int, value: float64) -> Result[unit, BufferError] {
+        require_attached(self.store)?;
+        check_index(index, self.length())?;
+        write_unsigned_at(
+            self.store,
+            self.view_offset + index * 4,
+            4,
+            to_uint32(value).to_uint64(),
+            true,
+        );
+        Result::Ok(())
+    }
+
+    pub fn subarray(self: Int32Array, begin: int, end: int) -> Result[Int32Array, BufferError] {
+        require_attached(self.store)?;
+        let current_length = self.length();
+        let first = normalize_relative_index(begin, current_length);
+        let final_index = normalize_relative_index(end, current_length);
+        let length = if final_index > first {
+            final_index - first
+        } else {
+            0
+        };
+        Result::Ok(
+            Int32Array {
+                store: self.store,
+                view_offset: self.view_offset + first * 4,
+                element_length: length,
+            },
+        )
+    }
+
+    pub fn set_from(self: Int32Array, source: Int32Array, target_offset: int) -> Result[
+        unit,
+        BufferError,
+    ] {
+        require_attached(self.store)?;
+        require_attached(source.store)?;
+        let source_length = source.length();
+        let target_length = self.length();
+        check_set_range(target_offset, source_length, target_length)?;
+        let snapshot: Vec[int32] = Vec::with_capacity(source_length);
+        let mut index = 0;
+        while index < source_length {
+            snapshot.push(
+                read_unsigned_at(source.store, source.view_offset + index * 4, 4, true).to_int32(),
+            );
+            index += 1;
+        }
+        index = 0;
+        while index < snapshot.len() {
+            write_unsigned_at(
+                self.store,
+                self.view_offset + (target_offset + index) * 4,
+                4,
+                snapshot[index].to_uint32().to_uint64(),
+                true,
+            );
+            index += 1;
+        }
+        Result::Ok(())
+    }
+}
+
+impl Float64Array {
+    pub fn new(length: int) -> Result[Float64Array, BufferError] {
+        let byte_length = checked_element_byte_length(length, 8)?;
+        let buffer = ArrayBuffer::new(byte_length)?;
+        Result::Ok(Float64Array { store: buffer.store, view_offset: 0, element_length: length })
+    }
+
+    pub fn from_buffer(buffer: ArrayBuffer, byte_offset: int, length: Option[int]) -> Result[
+        Float64Array,
+        BufferError,
+    ] {
+        let (offset, element_length) = typed_view_layout(buffer.store, byte_offset, length, 8)?;
+        Result::Ok(Float64Array { store: buffer.store, view_offset: offset, element_length })
+    }
+
+    pub fn buffer(self: Float64Array) -> ArrayBuffer {
+        ArrayBuffer { store: self.store }
+    }
+
+    pub fn is_out_of_bounds(self: Float64Array) -> bool {
+        typed_out_of_bounds(self.store, self.view_offset, self.element_length, 8)
+    }
+
+    pub fn is_length_tracking(self: Float64Array) -> bool {
+        self.element_length < 0
+    }
+
+    pub fn length(self: Float64Array) -> int {
+        typed_length(self.store, self.view_offset, self.element_length, 8)
+    }
+
+    pub fn byte_length(self: Float64Array) -> int {
+        self.length() * 8
+    }
+
+    pub fn byte_offset(self: Float64Array) -> int {
+        typed_byte_offset(self.store, self.view_offset, self.element_length, 8)
+    }
+
+    pub fn get(self: Float64Array, index: int) -> Result[float64, BufferError] {
+        require_attached(self.store)?;
+        check_index(index, self.length())?;
+        decode_float64(self.store.bytes.get(), self.view_offset + index * 8, true)
+    }
+
+    pub fn set(self: Float64Array, index: int, value: float64) -> Result[unit, BufferError] {
+        require_attached(self.store)?;
+        check_index(index, self.length())?;
+        write_encoded(self.store, self.view_offset + index * 8, encode_float64(value, true)?);
+        Result::Ok(())
+    }
+
+    pub fn subarray(self: Float64Array, begin: int, end: int) -> Result[Float64Array, BufferError] {
+        require_attached(self.store)?;
+        let current_length = self.length();
+        let first = normalize_relative_index(begin, current_length);
+        let final_index = normalize_relative_index(end, current_length);
+        let length = if final_index > first {
+            final_index - first
+        } else {
+            0
+        };
+        Result::Ok(
+            Float64Array {
+                store: self.store,
+                view_offset: self.view_offset + first * 8,
+                element_length: length,
+            },
+        )
+    }
+
+    pub fn set_from(self: Float64Array, source: Float64Array, target_offset: int) -> Result[
+        unit,
+        BufferError,
+    ] {
+        require_attached(self.store)?;
+        require_attached(source.store)?;
+        let source_length = source.length();
+        let target_length = self.length();
+        check_set_range(target_offset, source_length, target_length)?;
+        let snapshot: Vec[float64] = Vec::with_capacity(source_length);
+        let mut index = 0;
+        while index < source_length {
+            snapshot.push(
+                decode_float64(source.store.bytes.get(), source.view_offset + index * 8, true)?,
+            );
+            index += 1;
+        }
+        index = 0;
+        while index < snapshot.len() {
+            write_encoded(
+                self.store,
+                self.view_offset + (target_offset + index) * 8,
+                encode_float64(snapshot[index], true)?,
+            );
+            index += 1;
+        }
+        Result::Ok(())
+    }
+}

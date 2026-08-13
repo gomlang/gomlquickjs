@@ -1,0 +1,1586 @@
+package builtins;
+
+use gomlang::quickjs::arraybuffer;
+use gomlang::quickjs::bigint;
+use gomlang::quickjs::dtoa;
+use gomlang::quickjs::mathx;
+use gomlang::quickjs::runtime;
+use gomlang::quickjs::vm;
+use std::bytes;
+use std::env;
+use std::fs;
+use std::num;
+use std::process;
+use std::text;
+use std::time;
+
+struct OsFileState {
+    contents: Ref[Vec[byte]],
+    position: Ref[int],
+    path: Option[string],
+    readable: bool,
+    writable: bool,
+    append: bool,
+}
+
+struct OsState {
+    files: HashMap[int, OsFileState],
+    next_file: Ref[int],
+    buffers: HashMap[runtime::ObjectId, arraybuffer::ArrayBuffer],
+    processes: HashMap[int, int],
+    next_process: Ref[int],
+    peers: HashMap[int, int],
+    read_handlers: HashMap[int, runtime::Value],
+    write_handlers: HashMap[int, runtime::Value],
+    read_scheduled: HashMap[int, bool],
+    write_scheduled: HashMap[int, bool],
+    environment: HashMap[string, string],
+    time_origin: time::Instant,
+    directory: Ref[string],
+    signal_handlers: HashMap[int, Ref[runtime::Value]],
+    process_id: int,
+}
+
+fn new_os_state(buffers: HashMap[runtime::ObjectId, arraybuffer::ArrayBuffer]) -> OsState {
+    let environment: HashMap[string, string] = HashMap::{};
+    for (name, value) in env::vars() {
+        environment.set(name, value)
+    }
+    OsState {
+        files: HashMap::{},
+        next_file: Ref::new(3),
+        buffers,
+        processes: HashMap::{},
+        next_process: Ref::new(1000),
+        peers: HashMap::{},
+        read_handlers: HashMap::{},
+        write_handlers: HashMap::{},
+        read_scheduled: HashMap::{},
+        write_scheduled: HashMap::{},
+        environment,
+        time_origin: time::Instant::now(),
+        directory: Ref::new(env::current_dir().unwrap_or(".")),
+        signal_handlers: HashMap::{},
+        process_id: os_host_process_id(),
+    }
+}
+
+fn os_host_process_id() -> int {
+    let output = match process::Command::new("/bin/sh").args(Vec::["-c", "printf %s \"$PPID\""]).output() {
+        Ok(value) => value.stdout(),
+        Err(_) => return -1,
+    };
+    match output.to_string() {
+        Ok(value) => num::parse_int(value).unwrap_or(-1),
+        Err(_) => -1,
+    }
+}
+
+fn os_resolve_path(state: OsState, path: string) -> string {
+    if path.byte_len() > 0 && path.byte_get(0) == b'/' {
+        path
+    } else {
+        state.directory.get() + "/" + path
+    }
+}
+
+fn os_set_signal_handler(context: vm::Context, state: OsState, signal: int, handler: runtime::Value) -> unit {
+    match state.signal_handlers.get(signal) {
+        Some(value) => value.set(handler),
+        None => {
+            let value = Ref::new(handler);
+            context.add_external_root(value);
+            state.signal_handlers.set(signal, value)
+        },
+    }
+}
+
+fn os_pair(heap: runtime::Heap, value: runtime::Value, error: int) -> Result[
+    runtime::Value,
+    vm::VmError,
+] {
+    match allocate_array(heap, Vec::[value, runtime::Value::Int(error.to_int32())], 2) {
+        Ok(value) => Result::Ok(runtime::Value::Object(value)),
+        Err(value) => Result::Err(function_vm_error(value.message)),
+    }
+}
+
+fn os_file_descriptor(context: vm::Context, value: runtime::Value, depth: int) -> Result[
+    int,
+    vm::VmError,
+] {
+    std_file_index(context, value, depth)
+}
+
+fn os_file_state(state: OsState, descriptor: int) -> Result[OsFileState, vm::VmError] {
+    match state.files.get(descriptor) {
+        Some(value) => Result::Ok(value),
+        None => Result::Err(function_vm_error("invalid file descriptor")),
+    }
+}
+
+fn os_file_flush(file: OsFileState) -> bool {
+    if !file.writable {
+        true
+    } else {
+        match file.path {
+            Some(path) => match fs::write_bytes(path, bytes::Bytes::from_vec(file.contents.get())) {
+                Ok(()) => true,
+                Err(_) => false,
+            },
+            None => true,
+        }
+    }
+}
+
+fn os_write_file(file: OsFileState, values: Slice[byte]) -> int {
+    let contents = file.contents.get();
+    let mut position = if file.append {
+        contents.len()
+    } else {
+        file.position.get()
+    };
+    while contents.len() < position {
+        contents.push(0)
+    }
+    for value in values {
+        if position < contents.len() {
+            contents[position] = value;
+        } else {
+            contents.push(value);
+        };
+        position += 1;
+    }
+    file.position.set(position);
+    values.len()
+}
+
+fn os_offset_value(value: runtime::Value) -> Result[(int, bool), vm::VmError] {
+    match value {
+        runtime::Value::BigInt(value) => {
+            let text_value = value.integer().to_string();
+            match num::parse_int(text_value) {
+                Ok(value) => Result::Ok((value, true)),
+                Err(_) => Result::Err(function_range_error("file offset is out of range")),
+            }
+        },
+        runtime::Value::Int(value) => Result::Ok((value.to_int(), false)),
+        runtime::Value::Float(value) => Result::Ok((std_truncated_int(value), false)),
+        _ => Result::Err(function_vm_error("invalid file offset")),
+    }
+}
+
+fn os_seek_result(value: int, bigint_value: bool) -> runtime::Value {
+    if bigint_value {
+        runtime::Value::BigInt(runtime::BigInt::from_int64(value.to_int64()))
+    } else if value >= -2147483648 && value <= 2147483647 {
+        runtime::Value::Int(value.to_int32())
+    } else {
+        runtime::Value::Float(num::parse_float64(value.to_string()).unwrap_or(0.0))
+    }
+}
+
+fn os_signed_file_descriptor(context: vm::Context, value: runtime::Value, depth: int) -> Result[
+    int,
+    vm::VmError,
+] {
+    match number_value_at_depth(context, value, depth)? {
+        runtime::Value::Float(value) => Result::Ok(std_truncated_int(value)),
+        _ => Result::Ok(0),
+    }
+}
+
+fn os_tty_window_size(context: vm::Context, descriptor: int) -> Result[runtime::Value, vm::VmError] {
+    let output = match process::Command::new("/bin/sh").args(
+        Vec::["-c", "stty size <&" + descriptor.to_string()],
+    ).output() {
+        Ok(value) => if value.status().success() {
+            value.stdout()
+        } else {
+            return Result::Ok(runtime::Value::Null)
+        },
+        Err(_) => return Result::Ok(runtime::Value::Null),
+    };
+    let text = match output.to_string() {
+        Ok(value) => text::trim(value),
+        Err(_) => return Result::Ok(runtime::Value::Null),
+    };
+    let values = text::split(text, " ");
+    if values.len() != 2 {
+        return Result::Ok(runtime::Value::Null)
+    } else {};
+    let rows = num::parse_int(values[0]).unwrap_or(0);
+    let columns = num::parse_int(values[1]).unwrap_or(0);
+    if rows < 4 || columns < 4 {
+        Result::Ok(runtime::Value::Null)
+    } else {
+        match allocate_array(
+            context.heap(),
+            Vec::[runtime::Value::Int(columns.to_int32()), runtime::Value::Int(rows.to_int32())],
+            2,
+        ) {
+            Ok(value) => Result::Ok(runtime::Value::Object(value)),
+            Err(value) => Result::Err(function_vm_error(value.message)),
+        }
+    }
+}
+
+fn os_metadata_object(heap: runtime::Heap, metadata: fs::Metadata, followed: bool) -> Result[
+    runtime::Value,
+    vm::VmError,
+] {
+    let object = match runtime::new_ordinary_object(heap, heap.object_prototype()) {
+        Ok(value) => value,
+        Err(value) => return Result::Err(function_vm_error(value.message)),
+    };
+    let file_type = metadata.file_type();
+    let type_mode = if !followed && file_type.is_symlink() {
+        0o120000
+    } else if file_type.is_dir() {
+        0o040000
+    } else if file_type.is_file() {
+        0o100000
+    } else {
+        0
+    };
+    let mode = type_mode | metadata.permissions().mode().to_int32().to_int();
+    let milliseconds = metadata.modified_unix_nanoseconds() / 1000000;
+    let modified = runtime::Value::Float(
+        num::parse_float64(milliseconds.to_string()).unwrap_or(0.0),
+    );
+    for (name, value) in Vec::[
+        ("mode", runtime::Value::Int(mode.to_int32())),
+        ("size", os_seek_result(metadata.len().to_int(), false)),
+        ("mtime", modified),
+        ("atime", modified),
+        ("ctime", modified),
+    ] {
+        if !runtime::define_own_property(
+            heap,
+            object,
+            runtime::string_property_key(name),
+            runtime::data_descriptor(value, true, true, true),
+        ) {
+            return Result::Err(function_vm_error("cannot define stat property"))
+        } else {}
+    }
+    Result::Ok(runtime::Value::Object(object))
+}
+
+fn os_string_array(context: vm::Context, value: runtime::Value, depth: int) -> Result[
+    Vec[string],
+    vm::VmError,
+] {
+    let length_value = context.read_property_at_depth(
+        value,
+        runtime::Value::String(js_string("length")),
+        depth,
+    )?;
+    let length = match length_value {
+        runtime::Value::Int(value) => value.to_int(),
+        runtime::Value::Float(value) => std_truncated_int(value),
+        _ => return Result::Err(function_vm_error("os.exec arguments must be an Array")),
+    };
+    let result: Vec[string] = Vec::with_capacity(length);
+    let mut index = 0;
+    while index < length {
+        result.push(
+            std_value_host_string(
+                context,
+                context.read_property_at_depth(value, runtime::Value::Int(index.to_int32()), depth)?,
+                depth,
+            )?,
+        );
+        index += 1;
+    }
+    Result::Ok(result)
+}
+
+fn os_option_block(context: vm::Context, arguments: Vec[runtime::Value], depth: int) -> Result[
+    bool,
+    vm::VmError,
+] {
+    if arguments.len() < 2 {
+        return Result::Ok(true)
+    } else {};
+    match arguments[1] {
+        runtime::Value::Undefined => Result::Ok(true),
+        value => {
+            let block = context.read_property_at_depth(
+                value,
+                runtime::Value::String(js_string("block")),
+                depth,
+            )?;
+            match block {
+                runtime::Value::Undefined => Result::Ok(true),
+                _ => Result::Ok(runtime::to_boolean(block)),
+            }
+        },
+    }
+}
+
+fn os_option_value(context: vm::Context, arguments: Vec[runtime::Value], name: string, depth: int) -> Result[
+    runtime::Value,
+    vm::VmError,
+] {
+    if arguments.len() < 2 {
+        Result::Ok(runtime::Value::Undefined)
+    } else {
+        match arguments[1] {
+            runtime::Value::Undefined => Result::Ok(runtime::Value::Undefined),
+            value => context.read_property_at_depth(
+                value,
+                runtime::Value::String(js_string(name)),
+                depth,
+            ),
+        }
+    }
+}
+
+fn os_command_environment(context: vm::Context, arguments: Vec[runtime::Value], depth: int) -> Result[
+    (bool, Vec[(string, string)]),
+    vm::VmError,
+] {
+    let environment = os_option_value(context, arguments, "env", depth)?;
+    let object = match environment {
+        runtime::Value::Object(value) => value,
+        runtime::Value::Undefined => return Result::Ok((false, Vec::[])),
+        _ => return Result::Ok((true, Vec::[])),
+    };
+    let result: Vec[(string, string)] = Vec::[];
+    for key in runtime::own_property_keys(context.heap(), object) {
+        match key {
+            runtime::PropertyKey::String(name) => match name.to_host_string() {
+                Ok(host_name) => {
+                    let property = context.read_property_at_depth(
+                        runtime::Value::Object(object),
+                        runtime::Value::String(name),
+                        depth,
+                    )?;
+                    result.push((host_name, std_value_host_string(context, property, depth)?))
+                },
+                Err(_) => (),
+            },
+            runtime::PropertyKey::Symbol(_) => (),
+        }
+    }
+    Result::Ok((true, result))
+}
+
+fn os_handler(state: OsState, descriptor: int, read: bool) -> Option[runtime::Value] {
+    if read {
+        state.read_handlers.get(descriptor)
+    } else {
+        state.write_handlers.get(descriptor)
+    }
+}
+
+fn os_handler_scheduled(state: OsState, descriptor: int, read: bool) -> bool {
+    if read {
+        state.read_scheduled.get(descriptor).is_some()
+    } else {
+        state.write_scheduled.get(descriptor).is_some()
+    }
+}
+
+fn os_set_handler_scheduled(state: OsState, descriptor: int, read: bool, value: bool) -> unit {
+    if read {
+        if value {
+            state.read_scheduled.set(descriptor, true)
+        } else {
+            let _ = state.read_scheduled.remove(descriptor);
+        }
+    } else if value {
+        state.write_scheduled.set(descriptor, true)
+    } else {
+        let _ = state.write_scheduled.remove(descriptor);
+    }
+}
+
+fn os_schedule_handler(context: vm::Context, state: OsState, descriptor: int, read: bool) -> Result[
+    unit,
+    vm::VmError,
+] {
+    if os_handler_scheduled(state, descriptor, read) {
+        return Result::Ok(())
+    } else {};
+    let callback = match os_handler(state, descriptor, read) {
+        Some(value) => value,
+        None => return Result::Ok(()),
+    };
+    let wrapper = match allocate_vm_function_with_length(
+        context,
+        "",
+        0,
+        |this_value, arguments, depth| {
+            let _ = this_value;
+            os_set_handler_scheduled(state, descriptor, read, false);
+            let queued = argument(arguments, 0);
+            match os_handler(state, descriptor, read) {
+                Some(current) => if runtime::same_value(current, queued) {
+                    let callback_arguments: Vec[runtime::Value] = Vec::[];
+                    let result = context.invoke_with_this_at_depth(
+                        current,
+                        callback_arguments,
+                        runtime::Value::Undefined,
+                        depth,
+                    )?;
+                    match os_handler(state, descriptor, read) {
+                        Some(remaining) => if runtime::same_value(remaining, current) {
+                            os_schedule_handler(context, state, descriptor, read)?
+                        } else {},
+                        None => (),
+                    };
+                    Result::Ok(result)
+                } else {
+                    os_schedule_handler(context, state, descriptor, read)?;
+                    Result::Ok(runtime::Value::Undefined)
+                },
+                None => Result::Ok(runtime::Value::Undefined),
+            }
+        },
+    ) {
+        Ok(value) => value,
+        Err(value) => return Result::Err(function_vm_error(value.message)),
+    };
+    context.enqueue_host_job(wrapper, Vec::[callback])?;
+    os_set_handler_scheduled(state, descriptor, read, true);
+    Result::Ok(())
+}
+
+fn os_set_descriptor_handler(
+    context: vm::Context,
+    state: OsState,
+    read: bool,
+    arguments: Vec[runtime::Value],
+    depth: int,
+) -> Result[runtime::Value, vm::VmError] {
+    let descriptor = os_file_descriptor(context, argument(arguments, 0), depth)?;
+    let file = os_file_state(state, descriptor)?;
+    let callback = argument(arguments, 1);
+    match callback {
+        runtime::Value::Null => {
+            if read {
+                let _ = state.read_handlers.remove(descriptor);
+            } else {
+                let _ = state.write_handlers.remove(descriptor);
+            };
+            os_set_handler_scheduled(state, descriptor, read, false);
+            return Result::Ok(runtime::Value::Undefined)
+        },
+        _ => (),
+    };
+    match callback {
+        runtime::Value::Object(object) => if !object.is_callable()
+            || !context.heap().contains(object) {
+            return Result::Err(function_vm_error("descriptor handler is not callable"))
+        } else {},
+        _ => return Result::Err(function_vm_error("descriptor handler is not callable")),
+    };
+    if read {
+        if !file.readable {
+            return Result::Err(function_vm_error("file descriptor is not readable"))
+        } else {};
+        state.read_handlers.set(descriptor, callback);
+        if file.position.get() < file.contents.get().len() {
+            os_schedule_handler(context, state, descriptor, true)?
+        } else {}
+    } else {
+        if !file.writable {
+            return Result::Err(function_vm_error("file descriptor is not writable"))
+        } else {};
+        state.write_handlers.set(descriptor, callback);
+        os_schedule_handler(context, state, descriptor, false)?
+    };
+    Result::Ok(runtime::Value::Undefined)
+}
+
+pub fn install_os(context: vm::Context, object: runtime::ObjectId, state: OsState) -> Result[
+    unit,
+    BuiltinError,
+] {
+    for (name, value) in Vec::[
+        ("O_RDONLY", 0),
+        ("O_WRONLY", 1),
+        ("O_RDWR", 2),
+        ("O_CREAT", 64),
+        ("O_EXCL", 128),
+        ("O_TRUNC", 512),
+        ("O_APPEND", 1024),
+        ("S_IFMT", 0o170000),
+        ("S_IFIFO", 0o010000),
+        ("S_IFCHR", 0o020000),
+        ("S_IFDIR", 0o040000),
+        ("S_IFBLK", 0o060000),
+        ("S_IFREG", 0o100000),
+        ("S_IFLNK", 0o120000),
+        ("S_IFSOCK", 0o140000),
+        ("S_ISUID", 0o004000),
+        ("S_ISGID", 0o002000),
+        ("WNOHANG", 1),
+        ("SIGINT", 2),
+        ("SIGQUIT", 3),
+        ("SIGILL", 4),
+        ("SIGABRT", 6),
+        ("SIGFPE", 8),
+        ("SIGUSR1", 10),
+        ("SIGSEGV", 11),
+        ("SIGUSR2", 12),
+        ("SIGPIPE", 13),
+        ("SIGALRM", 14),
+        ("SIGTERM", 15),
+        ("SIGCHLD", 17),
+        ("SIGCONT", 18),
+        ("SIGSTOP", 19),
+        ("SIGTSTP", 20),
+        ("SIGTTIN", 21),
+        ("SIGTTOU", 22),
+    ] {
+        define_value(
+            context.heap(),
+            object,
+            name,
+            runtime::Value::Int(value.to_int32()),
+            false,
+            false,
+        )?
+    }
+    define_value(
+        context.heap(),
+        object,
+        "ttyGetWinSize",
+        allocate_vm_function_with_length(
+            context,
+            "os.ttyGetWinSize",
+            1,
+            |this_value, arguments, depth| {
+                let _ = this_value;
+                let descriptor = os_signed_file_descriptor(context, argument(arguments, 0), depth)?;
+                os_tty_window_size(context, descriptor)
+            },
+        )?,
+        true,
+        true,
+    )?;
+    define_value(
+        context.heap(),
+        object,
+        "ttySetRaw",
+        allocate_vm_function_with_length(
+            context,
+            "os.ttySetRaw",
+            1,
+            |this_value, arguments, depth| {
+                let _ = this_value;
+                let descriptor = os_signed_file_descriptor(context, argument(arguments, 0), depth)?;
+                let _ = process::Command::new("/bin/sh").args(
+                    Vec::["-c", "stty raw <&" + descriptor.to_string()],
+                ).output();
+                Result::Ok(runtime::Value::Undefined)
+            },
+        )?,
+        true,
+        true,
+    )?;
+    define_value(
+        context.heap(),
+        object,
+        "now",
+        allocate_vm_function_with_length(
+            context,
+            "os.now",
+            0,
+            |this_value, arguments, depth| {
+                let _ = this_value;
+                let _ = arguments;
+                let _ = depth;
+                let nanoseconds = state.time_origin.elapsed().as_nanoseconds();
+                let milliseconds = num::parse_float64(nanoseconds.to_string()).unwrap_or(0.0)
+                    / 1000000.0;
+                Result::Ok(runtime::Value::Float(milliseconds))
+            },
+        )?,
+        true,
+        true,
+    )?;
+    define_value(
+        context.heap(),
+        object,
+        "sleep",
+        allocate_vm_function_with_length(
+            context,
+            "os.sleep",
+            1,
+            |this_value, arguments, depth| {
+                let _ = this_value;
+                let converted = number_value_at_depth(context, argument(arguments, 0), depth)?;
+                let milliseconds = match converted {
+                    runtime::Value::Float(value) => std_truncated_int64(value),
+                    _ => 0,
+                };
+                if milliseconds > 0 {
+                    time::sleep(
+                        time::Duration::from_milliseconds(
+                            if milliseconds > 9223372036854 {
+                                9223372036854
+                            } else {
+                                milliseconds
+                            },
+                        ),
+                    )
+                } else {};
+                Result::Ok(runtime::Value::Int(0))
+            },
+        )?,
+        true,
+        true,
+    )?;
+    define_value(
+        context.heap(),
+        object,
+        "getpid",
+        allocate_vm_function_with_length(
+            context,
+            "os.getpid",
+            0,
+            |this_value, arguments, depth| {
+                let _ = this_value;
+                let _ = arguments;
+                let _ = depth;
+                Result::Ok(runtime::Value::Int(state.process_id.to_int32()))
+            },
+        )?,
+        true,
+        true,
+    )?;
+    define_value(
+        context.heap(),
+        object,
+        "mkdir",
+        allocate_vm_function_with_length(
+            context,
+            "os.mkdir",
+            1,
+            |this_value, arguments, depth| {
+                let _ = this_value;
+                let path = os_resolve_path(
+                    state,
+                    std_value_host_string(context, argument(arguments, 0), depth)?,
+                );
+                Result::Ok(
+                    runtime::Value::Int(
+                        if fs::create_dir(path).is_ok() {
+                            0
+                        } else {
+                            -1
+                        },
+                    ),
+                )
+            },
+        )?,
+        true,
+        true,
+    )?;
+    define_value(
+        context.heap(),
+        object,
+        "open",
+        allocate_vm_function_with_length(
+            context,
+            "os.open",
+            2,
+            |this_value, arguments, depth| {
+                let _ = this_value;
+                let path = os_resolve_path(
+                    state,
+                    std_value_host_string(context, argument(arguments, 0), depth)?,
+                );
+                let flags = std_file_index(context, argument(arguments, 1), depth)?;
+                let access = flags & 3;
+                let writable = access == 1 || access == 2;
+                let readable = access == 0 || access == 2;
+                let create = flags & 64 != 0;
+                let exclusive = flags & 128 != 0;
+                let truncate = flags & 512 != 0;
+                let append = flags & 1024 != 0;
+                let exists = fs::exists(path);
+                if create && exclusive && exists {
+                    return Result::Ok(runtime::Value::Int(-17))
+                } else {};
+                let contents: Vec[byte] = if truncate && writable {
+                    Vec::[]
+                } else {
+                    match fs::read_bytes(path) {
+                        Ok(value) => value.to_vec(),
+                        Err(_) => if create {
+                            Vec::[]
+                        } else {
+                            return Result::Ok(runtime::Value::Int(-2))
+                        },
+                    }
+                };
+                if create && !exists {
+                    match fs::write_bytes(path, bytes::Bytes::from_vec(Vec::[])) {
+                        Ok(()) => (),
+                        Err(_) => return Result::Ok(runtime::Value::Int(-1)),
+                    }
+                } else {};
+                let descriptor = state.next_file.get();
+                state.next_file.set(descriptor + 1);
+                state.files.set(
+                    descriptor,
+                    OsFileState {
+                        contents: Ref::new(contents),
+                        position: Ref::new(
+                            if append {
+                                contents.len()
+                            } else {
+                                0
+                            },
+                        ),
+                        path: Option::Some(path),
+                        readable,
+                        writable,
+                        append,
+                    },
+                );
+                Result::Ok(runtime::Value::Int(descriptor.to_int32()))
+            },
+        )?,
+        true,
+        true,
+    )?;
+    define_value(
+        context.heap(),
+        object,
+        "close",
+        allocate_vm_function_with_length(
+            context,
+            "os.close",
+            1,
+            |this_value, arguments, depth| {
+                let _ = this_value;
+                let descriptor = os_file_descriptor(context, argument(arguments, 0), depth)?;
+                let file = match state.files.get(descriptor) {
+                    Some(value) => value,
+                    None => return Result::Ok(runtime::Value::Int(-1)),
+                };
+                state.files.remove(descriptor);
+                Result::Ok(
+                    runtime::Value::Int(
+                        if os_file_flush(file) {
+                            0
+                        } else {
+                            -1
+                        },
+                    ),
+                )
+            },
+        )?,
+        true,
+        true,
+    )?;
+    define_value(
+        context.heap(),
+        object,
+        "dup",
+        allocate_vm_function_with_length(
+            context,
+            "os.dup",
+            1,
+            |this_value, arguments, depth| {
+                let _ = this_value;
+                let descriptor = os_file_descriptor(context, argument(arguments, 0), depth)?;
+                let file = match state.files.get(descriptor) {
+                    Some(value) => value,
+                    None => return Result::Ok(runtime::Value::Int(-1)),
+                };
+                let duplicate = state.next_file.get();
+                state.next_file.set(duplicate + 1);
+                state.files.set(duplicate, file);
+                Result::Ok(runtime::Value::Int(duplicate.to_int32()))
+            },
+        )?,
+        true,
+        true,
+    )?;
+    define_value(
+        context.heap(),
+        object,
+        "dup2",
+        allocate_vm_function_with_length(
+            context,
+            "os.dup2",
+            2,
+            |this_value, arguments, depth| {
+                let _ = this_value;
+                let descriptor = os_file_descriptor(context, argument(arguments, 0), depth)?;
+                let target = os_file_descriptor(context, argument(arguments, 1), depth)?;
+                let file = match state.files.get(descriptor) {
+                    Some(value) => value,
+                    None => return Result::Ok(runtime::Value::Int(-1)),
+                };
+                state.files.set(target, file);
+                if target >= state.next_file.get() {
+                    state.next_file.set(target + 1)
+                } else {};
+                Result::Ok(runtime::Value::Int(target.to_int32()))
+            },
+        )?,
+        true,
+        true,
+    )?;
+    define_value(
+        context.heap(),
+        object,
+        "seek",
+        allocate_vm_function_with_length(
+            context,
+            "os.seek",
+            3,
+            |this_value, arguments, depth| {
+                let _ = this_value;
+                let descriptor = os_file_descriptor(context, argument(arguments, 0), depth)?;
+                let file = match state.files.get(descriptor) {
+                    Some(value) => value,
+                    None => return Result::Ok(runtime::Value::Int(-1)),
+                };
+                let (offset, bigint_value) = os_offset_value(argument(arguments, 1))?;
+                let whence = std_file_index(context, argument(arguments, 2), depth)?;
+                let base = if whence == 0 {
+                    0
+                } else if whence == 1 {
+                    file.position.get()
+                } else if whence == 2 {
+                    file.contents.get().len()
+                } else {
+                    return Result::Ok(os_seek_result(-1, bigint_value))
+                };
+                if offset < -base {
+                    Result::Ok(os_seek_result(-1, bigint_value))
+                } else {
+                    file.position.set(base + offset);
+                    Result::Ok(os_seek_result(base + offset, bigint_value))
+                }
+            },
+        )?,
+        true,
+        true,
+    )?;
+    define_value(
+        context.heap(),
+        object,
+        "read",
+        allocate_vm_function_with_length(
+            context,
+            "os.read",
+            4,
+            |this_value, arguments, depth| {
+                let _ = this_value;
+                let descriptor = os_file_descriptor(context, argument(arguments, 0), depth)?;
+                let file = match state.files.get(descriptor) {
+                    Some(value) => value,
+                    None => return Result::Ok(runtime::Value::Int(-1)),
+                };
+                if !file.readable {
+                    return Result::Ok(runtime::Value::Int(-1))
+                } else {};
+                let buffer = std_file_buffer(state.buffers, argument(arguments, 1))?;
+                let offset = std_file_index(context, argument(arguments, 2), depth)?;
+                let length = std_file_index(context, argument(arguments, 3), depth)?;
+                if offset > buffer.byte_length() || length > buffer.byte_length() - offset {
+                    return Result::Err(function_range_error("read array buffer overflow"))
+                } else {};
+                let contents = file.contents.get();
+                let position = file.position.get();
+                let count = if length < contents.len() - position {
+                    length
+                } else {
+                    contents.len() - position
+                };
+                match buffer.write_bytes(offset, contents.slice(position, position + count)) {
+                    Ok(()) => (),
+                    Err(value) => return Result::Err(function_vm_error(value.to_string())),
+                };
+                file.position.set(position + count);
+                Result::Ok(runtime::Value::Int(count.to_int32()))
+            },
+        )?,
+        true,
+        true,
+    )?;
+    define_value(
+        context.heap(),
+        object,
+        "write",
+        allocate_vm_function_with_length(
+            context,
+            "os.write",
+            4,
+            |this_value, arguments, depth| {
+                let _ = this_value;
+                let descriptor = os_file_descriptor(context, argument(arguments, 0), depth)?;
+                let file = match state.files.get(descriptor) {
+                    Some(value) => value,
+                    None => return Result::Ok(runtime::Value::Int(-1)),
+                };
+                if !file.writable {
+                    return Result::Ok(runtime::Value::Int(-1))
+                } else {};
+                let buffer = std_file_buffer(state.buffers, argument(arguments, 1))?;
+                let offset = std_file_index(context, argument(arguments, 2), depth)?;
+                let length = std_file_index(context, argument(arguments, 3), depth)?;
+                let values = match buffer.to_bytes() {
+                    Ok(value) => value,
+                    Err(value) => return Result::Err(function_vm_error(value.to_string())),
+                };
+                if offset > values.len() || length > values.len() - offset {
+                    return Result::Err(function_range_error("write array buffer overflow"))
+                } else {};
+                let count = os_write_file(file, values.slice(offset, offset + length));
+                match state.peers.get(descriptor) {
+                    Some(read_descriptor) => {
+                        os_schedule_handler(context, state, read_descriptor, true)?
+                    },
+                    None => (),
+                };
+                Result::Ok(runtime::Value::Int(count.to_int32()))
+            },
+        )?,
+        true,
+        true,
+    )?;
+    define_value(
+        context.heap(),
+        object,
+        "readdir",
+        allocate_vm_function_with_length(
+            context,
+            "os.readdir",
+            1,
+            |this_value, arguments, depth| {
+                let _ = this_value;
+                let path = os_resolve_path(
+                    state,
+                    std_value_host_string(context, argument(arguments, 0), depth)?,
+                );
+                let names = match fs::read_dir(path) {
+                    Ok(value) => value,
+                    Err(_) => return os_pair(context.heap(), runtime::Value::Null, -1),
+                };
+                let values: Vec[runtime::Value] = Vec::with_capacity(names.len());
+                for name in names {
+                    values.push(runtime::Value::String(js_string(name)))
+                }
+                let array = match allocate_array(context.heap(), values, names.len()) {
+                    Ok(value) => value,
+                    Err(value) => return Result::Err(function_vm_error(value.message)),
+                };
+                os_pair(context.heap(), runtime::Value::Object(array), 0)
+            },
+        )?,
+        true,
+        true,
+    )?;
+    define_value(
+        context.heap(),
+        object,
+        "getcwd",
+        allocate_vm_function_with_length(
+            context,
+            "os.getcwd",
+            0,
+            |this_value, arguments, depth| {
+                let _ = this_value;
+                let _ = arguments;
+                let _ = depth;
+                os_pair(context.heap(), runtime::Value::String(js_string(state.directory.get())), 0)
+            },
+        )?,
+        true,
+        true,
+    )?;
+    define_value(
+        context.heap(),
+        object,
+        "chdir",
+        allocate_vm_function_with_length(
+            context,
+            "os.chdir",
+            0,
+            |this_value, arguments, depth| {
+                let _ = this_value;
+                let path = os_resolve_path(
+                    state,
+                    std_value_host_string(context, argument(arguments, 0), depth)?,
+                );
+                if !fs::exists(path) {
+                    return Result::Ok(runtime::Value::Int(-2))
+                } else if !fs::is_dir(path) {
+                    return Result::Ok(runtime::Value::Int(-20))
+                } else {};
+                match fs::canonicalize(path) {
+                    Ok(value) => {
+                        state.directory.set(value);
+                        Result::Ok(runtime::Value::Int(0))
+                    },
+                    Err(_) => Result::Ok(runtime::Value::Int(-1)),
+                }
+            },
+        )?,
+        true,
+        true,
+    )?;
+    define_value(
+        context.heap(),
+        object,
+        "realpath",
+        allocate_vm_function_with_length(
+            context,
+            "os.realpath",
+            1,
+            |this_value, arguments, depth| {
+                let _ = this_value;
+                let path = os_resolve_path(
+                    state,
+                    std_value_host_string(context, argument(arguments, 0), depth)?,
+                );
+                match fs::canonicalize(path) {
+                    Ok(value) => os_pair(
+                        context.heap(),
+                        runtime::Value::String(js_string(value)),
+                        0,
+                    ),
+                    Err(_) => os_pair(context.heap(), runtime::Value::String(js_string("")), -1),
+                }
+            },
+        )?,
+        true,
+        true,
+    )?;
+    for (name, follow) in Vec::[("stat", true), ("lstat", false)] {
+        define_value(
+            context.heap(),
+            object,
+            name,
+            allocate_vm_function_with_length(
+                context,
+                "os." + name,
+                1,
+                |this_value, arguments, depth| {
+                    let _ = this_value;
+                    let path = os_resolve_path(
+                        state,
+                        std_value_host_string(context, argument(arguments, 0), depth)?,
+                    );
+                    let metadata = if follow {
+                        fs::metadata(path)
+                    } else {
+                        fs::symlink_metadata(path)
+                    };
+                    match metadata {
+                        Ok(value) => os_pair(
+                            context.heap(),
+                            os_metadata_object(context.heap(), value, follow)?,
+                            0,
+                        ),
+                        Err(_) => os_pair(context.heap(), runtime::Value::Null, -1),
+                    }
+                },
+            )?,
+            true,
+            true,
+        )?
+    }
+    define_value(
+        context.heap(),
+        object,
+        "symlink",
+        allocate_vm_function_with_length(
+            context,
+            "os.symlink",
+            2,
+            |this_value, arguments, depth| {
+                let _ = this_value;
+                let target = std_value_host_string(context, argument(arguments, 0), depth)?;
+                let path = os_resolve_path(
+                    state,
+                    std_value_host_string(context, argument(arguments, 1), depth)?,
+                );
+                Result::Ok(
+                    runtime::Value::Int(
+                        if fs::symbolic_link(target, path).is_ok() {
+                            0
+                        } else {
+                            -1
+                        },
+                    ),
+                )
+            },
+        )?,
+        true,
+        true,
+    )?;
+    define_value(
+        context.heap(),
+        object,
+        "readlink",
+        allocate_vm_function_with_length(
+            context,
+            "os.readlink",
+            1,
+            |this_value, arguments, depth| {
+                let _ = this_value;
+                let path = os_resolve_path(
+                    state,
+                    std_value_host_string(context, argument(arguments, 0), depth)?,
+                );
+                match process::Command::new("readlink").arg(path).output() {
+                    Ok(value) => if value.status().success() {
+                        let target = value.stdout().to_string().unwrap_or("");
+                        os_pair(
+                            context.heap(),
+                            runtime::Value::String(js_string(text::trim_end(target))),
+                            0,
+                        )
+                    } else {
+                        os_pair(context.heap(), runtime::Value::Null, -1)
+                    },
+                    Err(_) => os_pair(context.heap(), runtime::Value::Null, -1),
+                }
+            },
+        )?,
+        true,
+        true,
+    )?;
+    define_value(
+        context.heap(),
+        object,
+        "utimes",
+        allocate_vm_function_with_length(
+            context,
+            "os.utimes",
+            3,
+            |this_value, arguments, depth| {
+                let _ = this_value;
+                let path = os_resolve_path(
+                    state,
+                    std_value_host_string(context, argument(arguments, 0), depth)?,
+                );
+                let milliseconds = std_file_index(context, argument(arguments, 2), depth)?;
+                let seconds = num::parse_float64(milliseconds.to_string()).unwrap_or(0.0) / 1000.0;
+                let timestamp = dtoa::number_to_string(seconds);
+                let status = process::Command::new("touch").args(
+                    Vec::["-m", "-d", "@" + timestamp, path],
+                ).status();
+                Result::Ok(
+                    runtime::Value::Int(
+                        match status {
+                            Ok(value) => value.code().unwrap_or(-1).to_int32(),
+                            Err(_) => -1,
+                        },
+                    ),
+                )
+            },
+        )?,
+        true,
+        true,
+    )?;
+    define_value(
+        context.heap(),
+        object,
+        "pipe",
+        allocate_vm_function_with_length(
+            context,
+            "os.pipe",
+            0,
+            |this_value, arguments, depth| {
+                let _ = this_value;
+                let _ = arguments;
+                let _ = depth;
+                let contents: Ref[Vec[byte]] = Ref::new(Vec::[]);
+                let read_descriptor = state.next_file.get();
+                let write_descriptor = read_descriptor + 1;
+                state.next_file.set(write_descriptor + 1);
+                state.files.set(
+                    read_descriptor,
+                    OsFileState {
+                        contents,
+                        position: Ref::new(0),
+                        path: Option::None,
+                        readable: true,
+                        writable: false,
+                        append: false,
+                    },
+                );
+                state.files.set(
+                    write_descriptor,
+                    OsFileState {
+                        contents,
+                        position: Ref::new(0),
+                        path: Option::None,
+                        readable: false,
+                        writable: true,
+                        append: false,
+                    },
+                );
+                state.peers.set(read_descriptor, write_descriptor);
+                state.peers.set(write_descriptor, read_descriptor);
+                let pair = match allocate_array(
+                    context.heap(),
+                    Vec::[
+                        runtime::Value::Int(read_descriptor.to_int32()),
+                        runtime::Value::Int(write_descriptor.to_int32()),
+                    ],
+                    2,
+                ) {
+                    Ok(value) => value,
+                    Err(value) => return Result::Err(function_vm_error(value.message)),
+                };
+                Result::Ok(runtime::Value::Object(pair))
+            },
+        )?,
+        true,
+        true,
+    )?;
+    for (name, read) in Vec::[("setReadHandler", true), ("setWriteHandler", false)] {
+        define_value(
+            context.heap(),
+            object,
+            name,
+            allocate_vm_function_with_length(
+                context,
+                "os." + name,
+                2,
+                |this_value, arguments, depth| {
+                    let _ = this_value;
+                    os_set_descriptor_handler(context, state, read, arguments, depth)
+                },
+            )?,
+            true,
+            true,
+        )?
+    }
+    define_value(
+        context.heap(),
+        object,
+        "signal",
+        allocate_vm_function_with_length(
+            context,
+            "os.signal",
+            2,
+            |this_value, arguments, depth| {
+                let _ = this_value;
+                let number = number_value_at_depth(context, argument(arguments, 0), depth)?;
+                let signal = match number {
+                    runtime::Value::Float(value) => mathx::to_uint32(value).to_int32().to_int(),
+                    _ => 0,
+                };
+                if signal < 0 || signal >= 64 {
+                    return Result::Err(function_range_error("invalid signal number"))
+                } else {};
+                match argument(arguments, 1) {
+                    runtime::Value::Null => {
+                        os_set_signal_handler(context, state, signal, runtime::Value::Null)
+                    },
+                    runtime::Value::Undefined => {
+                        os_set_signal_handler(context, state, signal, runtime::Value::Undefined)
+                    },
+                    runtime::Value::Object(value) => if value.is_callable()
+                        && context.heap().contains(value) {
+                        os_set_signal_handler(context, state, signal, runtime::Value::Object(value))
+                    } else {
+                        return Result::Err(function_vm_error("signal handler is not callable"))
+                    },
+                    _ => return Result::Err(function_vm_error("signal handler is not callable")),
+                };
+                Result::Ok(runtime::Value::Undefined)
+            },
+        )?,
+        true,
+        true,
+    )?;
+    define_value(
+        context.heap(),
+        object,
+        "exec",
+        allocate_vm_function_with_length(
+            context,
+            "os.exec",
+            1,
+            |this_value, arguments, depth| {
+                let _ = this_value;
+                let values = os_string_array(context, argument(arguments, 0), depth)?;
+                if values.is_empty() {
+                    return Result::Err(function_vm_error("os.exec command must not be empty"))
+                } else {};
+                let block = os_option_block(context, arguments, depth)?;
+                let command_arguments: Vec[string] = Vec::[];
+                let mut index = 1;
+                while index < values.len() {
+                    command_arguments.push(values[index]);
+                    index += 1;
+                }
+                let (explicit_environment, environment) = os_command_environment(
+                    context,
+                    arguments,
+                    depth,
+                )?;
+                let command = process::Command::new(values[0]).args(command_arguments).current_dir(
+                    state.directory.get(),
+                ).env_clear().envs(
+                    if explicit_environment {
+                        environment
+                    } else {
+                        std_environment_entries(state)
+                    },
+                );
+                if block {
+                    let status = match command.status() {
+                        Ok(value) => value.code().unwrap_or(-1),
+                        Err(_) => -1,
+                    };
+                    Result::Ok(runtime::Value::Int(status.to_int32()))
+                } else {
+                    let stdout_value = os_option_value(context, arguments, "stdout", depth)?;
+                    let stdout_descriptor = match stdout_value {
+                        runtime::Value::Undefined => Option::None,
+                        value => Option::Some(os_file_descriptor(context, value, depth)?),
+                    };
+                    let raw_status = match stdout_descriptor {
+                        Some(descriptor) => match command.output() {
+                            Ok(value) => {
+                                match state.files.get(descriptor) {
+                                    Some(file) => {
+                                        let output = value.stdout().to_vec();
+                                        let _ = os_write_file(file, output.slice(0, output.len()));
+                                    },
+                                    None => (),
+                                };
+                                value.status().code().unwrap_or(-1) << 8
+                            },
+                            Err(_) => -1,
+                        },
+                        None => 0,
+                    };
+                    let process_id = state.next_process.get();
+                    state.next_process.set(process_id + 1);
+                    state.processes.set(process_id, raw_status);
+                    Result::Ok(runtime::Value::Int(process_id.to_int32()))
+                }
+            },
+        )?,
+        true,
+        true,
+    )?;
+    define_value(
+        context.heap(),
+        object,
+        "isatty",
+        allocate_vm_function_with_length(
+            context,
+            "os.isatty",
+            1,
+            |this_value, arguments, depth| {
+                let _ = this_value;
+                let descriptor = std_file_index(context, argument(arguments, 0), depth)?;
+                let status = process::Command::new("/bin/sh").args(
+                    Vec::["-c", "test -t " + descriptor.to_string()],
+                ).status();
+                Result::Ok(
+                    runtime::Value::Bool(
+                        match status {
+                            Ok(value) => value.success(),
+                            Err(_) => false,
+                        },
+                    ),
+                )
+            },
+        )?,
+        true,
+        true,
+    )?;
+    define_value(
+        context.heap(),
+        object,
+        "waitpid",
+        allocate_vm_function_with_length(
+            context,
+            "os.waitpid",
+            2,
+            |this_value, arguments, depth| {
+                let _ = this_value;
+                let process_id = std_file_index(context, argument(arguments, 0), depth)?;
+                match state.processes.get(process_id) {
+                    Some(status) => {
+                        state.processes.remove(process_id);
+                        let pair = match allocate_array(
+                            context.heap(),
+                            Vec::[
+                                runtime::Value::Int(process_id.to_int32()),
+                                runtime::Value::Int(status.to_int32()),
+                            ],
+                            2,
+                        ) {
+                            Ok(value) => value,
+                            Err(value) => return Result::Err(function_vm_error(value.message)),
+                        };
+                        Result::Ok(runtime::Value::Object(pair))
+                    },
+                    None => os_pair(context.heap(), runtime::Value::Int(-1), -1),
+                }
+            },
+        )?,
+        true,
+        true,
+    )?;
+    define_value(
+        context.heap(),
+        object,
+        "kill",
+        allocate_vm_function_with_length(
+            context,
+            "os.kill",
+            2,
+            |this_value, arguments, depth| {
+                let _ = this_value;
+                let process_id = std_file_index(context, argument(arguments, 0), depth)?;
+                let signal = std_file_index(context, argument(arguments, 1), depth)?;
+                if state.processes.get(process_id).is_some() {
+                    state.processes.set(process_id, signal & 0x7f);
+                    Result::Ok(runtime::Value::Int(0))
+                } else if process_id == state.process_id {
+                    match state.signal_handlers.get(signal) {
+                        Some(value) => match value.get() {
+                            runtime::Value::Undefined => (),
+                            runtime::Value::Null => {
+                                let status = process::Command::new("kill").args(
+                                    Vec::["-" + signal.to_string(), process_id.to_string()],
+                                ).status();
+                                return Result::Ok(
+                                    runtime::Value::Int(
+                                        match status {
+                                            Ok(value) => if value.success() {
+                                                0
+                                            } else {
+                                                -1
+                                            },
+                                            Err(_) => -1,
+                                        },
+                                    ),
+                                )
+                            },
+                            handler => {
+                                let arguments: Vec[runtime::Value] = Vec::[];
+                                context.enqueue_host_job(handler, arguments)?
+                            },
+                        },
+                        None => {
+                            let status = process::Command::new("kill").args(
+                                Vec::["-" + signal.to_string(), process_id.to_string()],
+                            ).status();
+                            return Result::Ok(
+                                runtime::Value::Int(
+                                    match status {
+                                        Ok(value) => if value.success() {
+                                            0
+                                        } else {
+                                            -1
+                                        },
+                                        Err(_) => -1,
+                                    },
+                                ),
+                            )
+                        },
+                    };
+                    Result::Ok(runtime::Value::Int(0))
+                } else {
+                    let status = process::Command::new("kill").args(
+                        Vec::["-" + signal.to_string(), process_id.to_string()],
+                    ).status();
+                    Result::Ok(
+                        runtime::Value::Int(
+                            match status {
+                                Ok(value) => if value.success() {
+                                    0
+                                } else {
+                                    -1
+                                },
+                                Err(_) => -1,
+                            },
+                        ),
+                    )
+                }
+            },
+        )?,
+        true,
+        true,
+    )?;
+    define_value(
+        context.heap(),
+        object,
+        "rename",
+        allocate_vm_function_with_length(
+            context,
+            "os.rename",
+            2,
+            |this_value, arguments, depth| {
+                let _ = this_value;
+                let from = os_resolve_path(
+                    state,
+                    std_value_host_string(context, argument(arguments, 0), depth)?,
+                );
+                let to = os_resolve_path(
+                    state,
+                    std_value_host_string(context, argument(arguments, 1), depth)?,
+                );
+                Result::Ok(
+                    runtime::Value::Int(
+                        if fs::rename(from, to).is_ok() {
+                            0
+                        } else {
+                            -1
+                        },
+                    ),
+                )
+            },
+        )?,
+        true,
+        true,
+    )?;
+    define_value(
+        context.heap(),
+        object,
+        "remove",
+        allocate_vm_function_with_length(
+            context,
+            "os.remove",
+            1,
+            |this_value, arguments, depth| {
+                let _ = this_value;
+                let path = os_resolve_path(
+                    state,
+                    std_value_host_string(context, argument(arguments, 0), depth)?,
+                );
+                let removed = match fs::remove_file(path) {
+                    Ok(()) => true,
+                    Err(_) => match fs::remove_dir_all(path) {
+                        Ok(()) => true,
+                        Err(_) => false,
+                    },
+                };
+                Result::Ok(
+                    runtime::Value::Int(
+                        if removed {
+                            0
+                        } else {
+                            -1
+                        },
+                    ),
+                )
+            },
+        )?,
+        true,
+        true,
+    )
+}

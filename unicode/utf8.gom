@@ -1,0 +1,174 @@
+package unicode;
+
+pub const QUICKJS_UTF8_MAX: uint32 = 0x7fffffff;
+
+pub const QUICKJS_UTF8_MAX_BYTES: int = 6;
+
+pub enum Utf8Error {
+    EmptyInput,
+    OffsetOutOfBounds(int),
+    CodePointOutOfRange(uint32),
+    InvalidLeadingByte(byte),
+    InvalidContinuationByte(int, byte),
+    TruncatedSequence(int, int),
+    OverlongEncoding(uint32, int),
+}
+
+impl ToString for Utf8Error {
+    fn to_string(self: Utf8Error) -> string {
+        match self {
+            Utf8Error::EmptyInput => "empty UTF-8 input",
+            Utf8Error::OffsetOutOfBounds(offset) => {
+                "UTF-8 offset out of bounds: " + offset.to_string()
+            },
+            Utf8Error::CodePointOutOfRange(value) => {
+                "code point exceeds QuickJS 31-bit UTF-8 range: " + value.to_string()
+            },
+            Utf8Error::InvalidLeadingByte(value) => {
+                "invalid UTF-8 leading byte: " + value.to_string()
+            },
+            Utf8Error::InvalidContinuationByte(index, value) => {
+                "invalid UTF-8 continuation byte at " + index.to_string() + ": " + value.to_string()
+            },
+            Utf8Error::TruncatedSequence(expected, available) => {
+                "truncated UTF-8 sequence: expected " + expected.to_string() + " bytes, found "
+                    + available.to_string()
+            },
+            Utf8Error::OverlongEncoding(value, length) => {
+                "overlong " + length.to_string() + "-byte UTF-8 encoding for " + value.to_string()
+            },
+        }
+    }
+}
+
+impl Debug for Utf8Error {
+    fn debug(self: Utf8Error) -> string {
+        self.to_string()
+    }
+}
+
+pub struct Utf8Decoded {
+    code_point_value: uint32,
+    length_value: int,
+}
+
+impl Utf8Decoded {
+    pub fn code_point(self: Utf8Decoded) -> uint32 {
+        self.code_point_value
+    }
+
+    pub fn length(self: Utf8Decoded) -> int {
+        self.length_value
+    }
+}
+
+fn continuation(value: uint32) -> byte {
+    ((value & 0x3f) | 0x80).to_uint8()
+}
+
+pub fn unicode_to_utf8(code_point: uint32) -> Result[Vec[byte], Utf8Error] {
+    let output: Vec[byte] = Vec::with_capacity(QUICKJS_UTF8_MAX_BYTES);
+    if code_point < 0x80 {
+        output.push(code_point.to_uint8());
+    } else if code_point < 0x800 {
+        output.push(((code_point >> 6) | 0xc0).to_uint8());
+        output.push(continuation(code_point));
+    } else if code_point < 0x10000 {
+        output.push(((code_point >> 12) | 0xe0).to_uint8());
+        output.push(continuation(code_point >> 6));
+        output.push(continuation(code_point));
+    } else if code_point < 0x00200000 {
+        output.push(((code_point >> 18) | 0xf0).to_uint8());
+        output.push(continuation(code_point >> 12));
+        output.push(continuation(code_point >> 6));
+        output.push(continuation(code_point));
+    } else if code_point < 0x04000000 {
+        output.push(((code_point >> 24) | 0xf8).to_uint8());
+        output.push(continuation(code_point >> 18));
+        output.push(continuation(code_point >> 12));
+        output.push(continuation(code_point >> 6));
+        output.push(continuation(code_point));
+    } else if code_point <= QUICKJS_UTF8_MAX {
+        output.push(((code_point >> 30) | 0xfc).to_uint8());
+        output.push(continuation(code_point >> 24));
+        output.push(continuation(code_point >> 18));
+        output.push(continuation(code_point >> 12));
+        output.push(continuation(code_point >> 6));
+        output.push(continuation(code_point));
+    } else {
+        return Result::Err(Utf8Error::CodePointOutOfRange(code_point))
+    };
+    Result::Ok(output)
+}
+
+pub fn try_unicode_to_utf8(code_point: uint32) -> Option[Vec[byte]] {
+    match unicode_to_utf8(code_point) {
+        Result::Ok(output) => Option::Some(output),
+        Result::Err(_) => Option::None,
+    }
+}
+
+fn leading_byte_shape(first: byte) -> Result[(int, uint32, uint32), Utf8Error] {
+    let value = first.to_uint32();
+    if first >= 0xc0 && first <= 0xdf {
+        Result::Ok((2, value & 0x1f, 0x80))
+    } else if first >= 0xe0 && first <= 0xef {
+        Result::Ok((3, value & 0x0f, 0x800))
+    } else if first >= 0xf0 && first <= 0xf7 {
+        Result::Ok((4, value & 0x07, 0x10000))
+    } else if first >= 0xf8 && first <= 0xfb {
+        Result::Ok((5, value & 0x03, 0x00200000))
+    } else if first >= 0xfc && first <= 0xfd {
+        Result::Ok((6, value & 0x01, 0x04000000))
+    } else {
+        Result::Err(Utf8Error::InvalidLeadingByte(first))
+    }
+}
+
+pub fn unicode_from_utf8_at(input: Slice[byte], offset: int) -> Result[Utf8Decoded, Utf8Error] {
+    if offset < 0 || offset > input.len() {
+        return Result::Err(Utf8Error::OffsetOutOfBounds(offset))
+    } else if offset == input.len() {
+        return Result::Err(Utf8Error::EmptyInput)
+    } else {};
+    let first = input.get(offset);
+    if first < 0x80 {
+        return Result::Ok(Utf8Decoded { code_point_value: first.to_uint32(), length_value: 1 })
+    } else {};
+    let (length, initial, minimum) = leading_byte_shape(first)?;
+    let available = input.len() - offset;
+    if available < length {
+        return Result::Err(Utf8Error::TruncatedSequence(length, available))
+    } else {};
+    let mut code_point = initial;
+    let mut index = 1;
+    while index < length {
+        let byte_index = offset + index;
+        let current = input.get(byte_index);
+        if current < 0x80 || current >= 0xc0 {
+            return Result::Err(Utf8Error::InvalidContinuationByte(byte_index, current))
+        } else {};
+        code_point = (code_point << 6) | (current.to_uint32() & 0x3f);
+        index += 1;
+    }
+    if code_point < minimum {
+        Result::Err(Utf8Error::OverlongEncoding(code_point, length))
+    } else {
+        Result::Ok(Utf8Decoded { code_point_value: code_point, length_value: length })
+    }
+}
+
+pub fn unicode_from_utf8(input: Slice[byte]) -> Result[Utf8Decoded, Utf8Error] {
+    unicode_from_utf8_at(input, 0)
+}
+
+pub fn try_unicode_from_utf8_at(input: Slice[byte], offset: int) -> Option[Utf8Decoded] {
+    match unicode_from_utf8_at(input, offset) {
+        Result::Ok(decoded) => Option::Some(decoded),
+        Result::Err(_) => Option::None,
+    }
+}
+
+pub fn try_unicode_from_utf8(input: Slice[byte]) -> Option[Utf8Decoded] {
+    try_unicode_from_utf8_at(input, 0)
+}

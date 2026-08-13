@@ -1,0 +1,415 @@
+package test262;
+
+use gomlang::quickjs::builtins;
+use gomlang::quickjs::compiler;
+use gomlang::quickjs::modules;
+use gomlang::quickjs::runtime;
+use gomlang::quickjs::vm;
+use std::fs;
+use std::path;
+use std::text;
+
+pub type HarnessLoader = (string) -> Result[string, string];
+
+#[derive(PartialEq, Eq, Debug)]
+pub enum RunStatus {
+    Passed,
+    Failed,
+    Skipped,
+}
+
+#[derive(PartialEq, Eq, Debug)]
+pub struct RunResult {
+    pub variant: SourceVariant,
+    pub status: RunStatus,
+    pub message: string,
+}
+
+enum AsyncCompletion {
+    Pending,
+    Passed,
+    Failed(runtime::Value),
+    Duplicate,
+}
+
+fn result(variant: SourceVariant, status: RunStatus, message: string) -> RunResult {
+    RunResult { variant, status, message }
+}
+
+fn append_source(builder: text::StringBuilder, source: string) -> unit {
+    builder.write_string(source);
+    if source.byte_len() == 0 || source.byte_get(source.byte_len() - 1) != b'\n' {
+        builder.write_char('\n')
+    } else {}
+}
+
+fn harness_names(metadata: Metadata, variant: SourceVariant) -> Vec[string] {
+    let names: Vec[string] = Vec::[];
+    if variant == SourceVariant::Raw {
+        return names
+    } else {};
+    push_unique(names, "sta.js");
+    push_unique(names, "assert.js");
+    for name in metadata.includes {
+        push_unique(names, name)
+    }
+    names
+}
+
+pub fn prepare_source(case: TestCase, variant: SourceVariant, loader: HarnessLoader) -> Result[
+    string,
+    string,
+] {
+    let builder = text::StringBuilder::new();
+    for name in harness_names(case.metadata, variant) {
+        match loader(name) {
+            Ok(source) => append_source(builder, source),
+            Err(message) => return Result::Err("cannot load harness `" + name + "`: " + message),
+        }
+    }
+    if variant == SourceVariant::Strict {
+        append_source(builder, "\"use strict\";")
+    } else {};
+    append_source(builder, case.source);
+    Result::Ok(builder.finish())
+}
+
+fn compile_messages(errors: Vec[compiler::CompileError]) -> string {
+    let builder = text::StringBuilder::new();
+    let mut first = true;
+    for compile_error in errors {
+        if !first {
+            builder.write_string("; ")
+        } else {};
+        builder.write_string(compile_error.span.start.to_string());
+        builder.write_char(':');
+        builder.write_string(compile_error.span.end.to_string());
+        builder.write_string(": ");
+        builder.write_string(compile_error.message);
+        first = false;
+    }
+    builder.finish()
+}
+
+fn runtime_type(error: vm::VmErrorKind) -> string {
+    match error {
+        vm::VmErrorKind::TypeError(_) => "TypeError",
+        vm::VmErrorKind::RangeError(_) => "RangeError",
+        vm::VmErrorKind::ReferenceError(_) => "ReferenceError",
+        vm::VmErrorKind::SyntaxError(_) => "SyntaxError",
+        vm::VmErrorKind::UriError(_) => "URIError",
+        vm::VmErrorKind::Thrown(_) => "Thrown",
+        vm::VmErrorKind::CallDepthExceeded => "InternalError",
+        _ => "RuntimeError",
+    }
+}
+
+fn compile_failure(variant: SourceVariant, metadata: Metadata, errors: Vec[compiler::CompileError]) -> RunResult {
+    let message = compile_messages(errors);
+    match metadata.negative {
+        Some(NegativeExpectation { phase: NegativePhase::Parse, .. }) | Some(NegativeExpectation {
+            phase: NegativePhase::Resolution,
+            ..,
+        }) => {
+            result(variant, RunStatus::Passed, message)
+        },
+        Some(_) => result(
+            variant,
+            RunStatus::Failed,
+            "expected a runtime failure but compilation failed: " + message,
+        ),
+        None => result(variant, RunStatus::Failed, "unexpected compile failure: " + message),
+    }
+}
+
+fn runtime_success(variant: SourceVariant, metadata: Metadata) -> RunResult {
+    match metadata.negative {
+        Some(NegativeExpectation { phase, type_name }) => result(
+            variant,
+            RunStatus::Failed,
+            "expected "
+                + match phase {
+                    NegativePhase::Parse => "parse",
+                    NegativePhase::Resolution => "resolution",
+                    NegativePhase::Runtime => "runtime",
+                }
+                + " "
+                + type_name
+                + " failure",
+        ),
+        None => result(variant, RunStatus::Passed, ""),
+    }
+}
+
+fn runtime_failure(variant: SourceVariant, metadata: Metadata, offset: int, kind: vm::VmErrorKind) -> RunResult {
+    let actual_type = runtime_type(kind);
+    let detail = "runtime " + actual_type + " at bytecode " + offset.to_string();
+    match metadata.negative {
+        Some(NegativeExpectation { phase: NegativePhase::Runtime, type_name }) => if type_name
+            == actual_type {
+            result(variant, RunStatus::Passed, detail)
+        } else {
+            result(
+                variant,
+                RunStatus::Failed,
+                "expected runtime " + type_name + " but got " + actual_type,
+            )
+        },
+        Some(NegativeExpectation { phase, type_name }) => result(
+            variant,
+            RunStatus::Failed,
+            "expected "
+                + match phase {
+                    NegativePhase::Parse => "parse",
+                    NegativePhase::Resolution => "resolution",
+                    NegativePhase::Runtime => "runtime",
+                }
+                + " "
+                + type_name
+                + " but got "
+                + detail,
+        ),
+        None => result(variant, RunStatus::Failed, "unexpected " + detail),
+    }
+}
+
+fn async_argument(arguments: Vec[runtime::Value]) -> runtime::Value {
+    if arguments.is_empty() {
+        runtime::Value::Undefined
+    } else {
+        arguments[0]
+    }
+}
+
+fn install_async_done(
+    context: vm::Context,
+    global: runtime::ObjectId,
+    completion: Ref[AsyncCompletion],
+) -> Result[unit, string] {
+    let callback = match context.new_vm_function(
+        |_, arguments, _| {
+            completion.set(
+                match completion.get() {
+                    AsyncCompletion::Pending => {
+                        let value = async_argument(arguments);
+                        if runtime::to_boolean(value) {
+                            AsyncCompletion::Failed(value)
+                        } else {
+                            AsyncCompletion::Passed
+                        }
+                    },
+                    _ => AsyncCompletion::Duplicate,
+                },
+            );
+            Result::Ok(runtime::Value::Undefined)
+        },
+    ) {
+        Ok(value) => value,
+        Err(error) => return Result::Err(error.kind.debug()),
+    };
+    if runtime::define_own_property(
+        context.heap(),
+        global,
+        runtime::string_property_key("$DONE"),
+        runtime::data_descriptor(callback, false, false, false),
+    ) {
+        Result::Ok(())
+    } else {
+        Result::Err("cannot install async $DONE callback")
+    }
+}
+
+fn async_failure_message(context: vm::Context, value: runtime::Value) -> string {
+    match context.value_to_string_at_depth(value, 0) {
+        Ok(value) => match value.to_host_string() {
+            Ok(value) => value,
+            Err(_) => "unprintable async failure",
+        },
+        Err(_) => "unprintable async failure",
+    }
+}
+
+fn async_success(
+    context: vm::Context,
+    variant: SourceVariant,
+    metadata: Metadata,
+    completion: Ref[AsyncCompletion],
+) -> RunResult {
+    match context.run_pending_jobs() {
+        Ok(_) => (),
+        Err(error) => return runtime_failure(variant, metadata, error.offset, error.kind),
+    };
+    match completion.get() {
+        AsyncCompletion::Passed => runtime_success(variant, metadata),
+        AsyncCompletion::Failed(value) => result(
+            variant,
+            RunStatus::Failed,
+            "$DONE reported " + async_failure_message(context, value),
+        ),
+        AsyncCompletion::Duplicate => result(
+            variant,
+            RunStatus::Failed,
+            "$DONE was called more than once",
+        ),
+        AsyncCompletion::Pending => result(
+            variant,
+            RunStatus::Failed,
+            "async test completed without calling $DONE",
+        ),
+    }
+}
+
+pub fn run_variant(case: TestCase, variant: SourceVariant, loader: HarnessLoader) -> RunResult {
+    if variant == SourceVariant::Module {
+        return result(variant, RunStatus::Skipped, "modules are not implemented")
+    } else {};
+    let source = match prepare_source(case, variant, loader) {
+        Ok(value) => value,
+        Err(message) => return result(variant, RunStatus::Failed, message),
+    };
+    let function = match compiler::compile(source) {
+        Ok(value) => value,
+        Err(errors) => return compile_failure(variant, case.metadata, errors),
+    };
+    let context = vm::Context::new(runtime::Heap::new());
+    compiler::install_dynamic_function_compiler(context);
+    match builtins::install(context) {
+        Err(error) => result(
+            variant,
+            RunStatus::Failed,
+            "cannot initialize realm: " + error.message,
+        ),
+        Ok(realm) => {
+            let completion = Ref::new(AsyncCompletion::Pending);
+            if case.metadata.asynchronous {
+                match install_async_done(context, realm.global_object(), completion) {
+                    Ok(()) => (),
+                    Err(message) => return result(variant, RunStatus::Failed, message),
+                }
+            } else {};
+            match context.execute(function) {
+                Ok(_) => if case.metadata.asynchronous {
+                    async_success(context, variant, case.metadata, completion)
+                } else {
+                    runtime_success(variant, case.metadata)
+                },
+                Err(error) => runtime_failure(variant, case.metadata, error.offset, error.kind),
+            }
+        },
+    }
+}
+
+pub fn run(case: TestCase, loader: HarnessLoader) -> Vec[RunResult] {
+    let results: Vec[RunResult] = Vec::[];
+    for variant in source_variants(case.metadata) {
+        results.push(run_variant(case, variant, loader))
+    }
+    results
+}
+
+fn prepare_module_harness(metadata: Metadata, loader: HarnessLoader) -> Result[string, string] {
+    let builder = text::StringBuilder::new();
+    for name in harness_names(metadata, SourceVariant::Module) {
+        match loader(name) {
+            Ok(source) => append_source(builder, source),
+            Err(message) => return Result::Err("cannot load harness `" + name + "`: " + message),
+        }
+    }
+    Result::Ok(builder.finish())
+}
+
+fn module_failure(metadata: Metadata, error: modules::ModuleError) -> RunResult {
+    let detail = error.path + ": " + error.message;
+    match metadata.negative {
+        Some(NegativeExpectation { phase: NegativePhase::Resolution, .. }) => {
+            result(SourceVariant::Module, RunStatus::Passed, detail)
+        },
+        Some(NegativeExpectation { phase: NegativePhase::Runtime, type_name }) => result(
+            SourceVariant::Module,
+            RunStatus::Failed,
+            "expected runtime " + type_name + " but got " + detail,
+        ),
+        Some(NegativeExpectation { phase: NegativePhase::Parse, type_name }) => result(
+            SourceVariant::Module,
+            RunStatus::Failed,
+            "expected parse " + type_name + " but got " + detail,
+        ),
+        None => result(SourceVariant::Module, RunStatus::Failed, "unexpected " + detail),
+    }
+}
+
+fn run_module_file(case: TestCase, file: string, loader: HarnessLoader) -> RunResult {
+    match compiler::compile_module(case.source) {
+        Err(errors) => return compile_failure(SourceVariant::Module, case.metadata, errors),
+        Ok(_) => (),
+    };
+    let harness = match prepare_module_harness(case.metadata, loader) {
+        Ok(value) => value,
+        Err(message) => return result(SourceVariant::Module, RunStatus::Failed, message),
+    };
+    let harness_function = match compiler::compile(harness) {
+        Ok(value) => value,
+        Err(errors) => return result(
+            SourceVariant::Module,
+            RunStatus::Failed,
+            "cannot compile module harness: " + compile_messages(errors),
+        ),
+    };
+    let context = vm::Context::new(runtime::Heap::new());
+    compiler::install_dynamic_function_compiler(context);
+    let realm = match builtins::install(context) {
+        Ok(value) => value,
+        Err(error) => return result(
+            SourceVariant::Module,
+            RunStatus::Failed,
+            "cannot initialize realm: " + error.message,
+        ),
+    };
+    let completion = Ref::new(AsyncCompletion::Pending);
+    if case.metadata.asynchronous {
+        match install_async_done(context, realm.global_object(), completion) {
+            Ok(()) => (),
+            Err(message) => return result(SourceVariant::Module, RunStatus::Failed, message),
+        }
+    } else {};
+    match context.execute(harness_function) {
+        Err(error) => return runtime_failure(
+            SourceVariant::Module,
+            case.metadata,
+            error.offset,
+            error.kind,
+        ),
+        Ok(_) => (),
+    };
+    match modules::execute_source(context, realm.global_object(), file, case.source) {
+        Ok(_) => if case.metadata.asynchronous {
+            async_success(context, SourceVariant::Module, case.metadata, completion)
+        } else {
+            runtime_success(SourceVariant::Module, case.metadata)
+        },
+        Err(error) => module_failure(case.metadata, error),
+    }
+}
+
+pub fn run_file(file: string, harness_directory: string) -> Result[Vec[RunResult], string] {
+    let source = match fs::read_file(file) {
+        Ok(value) => value,
+        Err(message) => return Result::Err("cannot read test `" + file + "`: " + message),
+    };
+    let case = match parse(source) {
+        Ok(value) => value,
+        Err(metadata_error) => return Result::Err(metadata_error.to_string()),
+    };
+    let loader: HarnessLoader = |name| {
+        fs::read_file(path::join(harness_directory, name))
+    };
+    let results: Vec[RunResult] = Vec::[];
+    for variant in source_variants(case.metadata) {
+        if variant == SourceVariant::Module {
+            results.push(run_module_file(case, file, loader))
+        } else {
+            results.push(run_variant(case, variant, loader))
+        }
+    }
+    Result::Ok(results)
+}

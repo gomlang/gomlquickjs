@@ -1,0 +1,782 @@
+package regexp;
+
+use gomlang::quickjs::runtime;
+use gomlang::quickjs::unicode;
+use std::testing;
+
+fn js_string(value: string) -> runtime::JsString {
+    let bytes = value.to_bytes();
+    runtime::JsString::from_utf8(bytes.slice(0, bytes.len()))
+}
+
+fn expect_regex(value: Result[Regex, RegexError]) -> Regex {
+    match value {
+        Result::Ok(regex) => regex,
+        Result::Err(error) => {
+            testing::fail(error.message + " at " + error.offset.to_string());
+            Regex {
+                nodes: Vec::[Node::Empty],
+                root: 0,
+                flags: RegexFlags::new(),
+                canonicalizer: unicode::CaseCanonicalizer::new(false),
+                capture_count: 0,
+                capture_names: Vec::[Option::None],
+            }
+        },
+    }
+}
+
+fn expect_match(value: Option[RegexMatch]) -> RegexMatch {
+    match value {
+        Some(found) => found,
+        None => {
+            testing::fail("expected a regular expression match");
+            RegexMatch {
+                start: 0,
+                end: 0,
+                captures: Vec::[Option::Some(RegexCapture { start: 0, end: 0 })],
+            }
+        },
+    }
+}
+
+fn assert_match_range(value: Option[RegexMatch], start: int, end: int) -> RegexMatch {
+    let found = expect_match(value);
+    testing::assert_eq(found.start, start);
+    testing::assert_eq(found.end, end);
+    found
+}
+
+#[test]
+fn searches_literals_and_respects_alternation_precedence() -> unit {
+    let regex = expect_regex(compile_utf8("ab|cd"));
+    assert_match_range(regex.search(js_string("xxcdyy")), 2, 4);
+    testing::assert(!regex.is_match(js_string("ac")));
+    let grouped = expect_regex(compile_utf8("a(b|c)d"));
+    testing::assert(grouped.is_match(js_string("acd")));
+    testing::assert(grouped.is_match(js_string("abd")))
+}
+
+#[test]
+fn anchors_and_dot_use_ecmascript_line_terminators() -> unit {
+    let anchored = expect_regex(compile_utf8("^a.$"));
+    testing::assert(anchored.is_match(js_string("ab")));
+    testing::assert(!anchored.is_match(js_string("zab")));
+    testing::assert(!anchored.is_match(js_string("a\n")));
+    testing::assert(expect_regex(compile_utf8("$")).is_match(js_string("anything")));
+    testing::assert(expect_regex(compile_utf8("x$")).is_match(js_string("x\r\n")))
+}
+
+#[test]
+fn character_classes_support_ranges_negation_and_escapes() -> unit {
+    let class = expect_regex(compile_utf8("^[a-cx\\-]+$"));
+    testing::assert(class.is_match(js_string("cab-x")));
+    testing::assert(!class.is_match(js_string("cad")));
+    let negated = expect_regex(compile_utf8("^[^0-9]+$"));
+    testing::assert(negated.is_match(js_string("goml")));
+    testing::assert(!negated.is_match(js_string("go2")));
+    testing::assert(expect_regex(compile_utf8("^[\\n\\r\\t]$")).is_match(js_string("\n")))
+}
+
+#[test]
+fn greedy_and_non_greedy_quantifiers_choose_ordered_results() -> unit {
+    let greedy = expect_regex(compile_utf8("a+"));
+    let lazy = expect_regex(compile_utf8("a+?"));
+    assert_match_range(greedy.search(js_string("aaab")), 0, 3);
+    assert_match_range(lazy.search(js_string("aaab")), 0, 1);
+    testing::assert(expect_regex(compile_utf8("^ab?$")).is_match(js_string("a")));
+    testing::assert(expect_regex(compile_utf8("^ab*$")).is_match(js_string("abbb")))
+}
+
+#[test]
+fn counted_quantifiers_handle_exact_open_and_bounded_forms() -> unit {
+    testing::assert(expect_regex(compile_utf8("^a{3}$")).is_match(js_string("aaa")));
+    testing::assert(expect_regex(compile_utf8("^a{2,}$")).is_match(js_string("aaaa")));
+    testing::assert(expect_regex(compile_utf8("^a{2,4}$")).is_match(js_string("aaa")));
+    testing::assert(!expect_regex(compile_utf8("^a{2,4}$")).is_match(js_string("aaaaa")));
+    let lazy = expect_regex(compile_utf8("a{2,4}?"));
+    let _ = assert_match_range(lazy.search(js_string("aaaaa")), 0, 2);
+}
+
+#[test]
+fn matching_operates_on_utf16_code_units() -> unit {
+    let face = runtime::JsString::from_code_units(Vec::[0xd83d, 0xde00]);
+    let literal = expect_regex(compile(runtime::JsString::from_code_units(Vec::[0xd83d, 0xde00])));
+    assert_match_range(literal.search(face), 0, 2);
+    let dot = expect_regex(compile_utf8("."));
+    let _ = assert_match_range(dot.search(face), 0, 1);
+}
+
+#[test]
+fn malformed_patterns_return_offset_errors() -> unit {
+    let reversed = compile_utf8("[z-a]");
+    match reversed {
+        Result::Err(error) => testing::assert_eq(error.offset, 1),
+        Result::Ok(_) => testing::fail("expected reversed range error"),
+    };
+    testing::assert(compile_utf8("(abc").is_err());
+    testing::assert(compile_utf8("abc\\").is_err());
+    testing::assert(compile_utf8("a{3,2}").is_err());
+    testing::assert(compile_utf8("*a").is_err());
+    testing::assert(compile_utf8("a**").is_err())
+}
+
+#[test]
+fn empty_match_quantifiers_terminate() -> unit {
+    let nested = expect_regex(compile_utf8("^(a?)*$"));
+    testing::assert(nested.is_match(js_string("")));
+    testing::assert(nested.is_match(js_string("aaa")));
+    testing::assert(!nested.is_match(js_string("b")));
+    testing::assert(expect_regex(compile_utf8("^(){3}$")).is_match(js_string("")));
+    testing::assert(expect_regex(compile_utf8("^()*$")).is_match(js_string("")))
+}
+
+#[test]
+fn character_class_escapes_and_character_escapes_match() -> unit {
+    testing::assert(expect_regex(compile_utf8("^\\d\\w\\s$")).is_match(js_string("4a ")));
+    testing::assert(!expect_regex(compile_utf8("^\\D$")).is_match(js_string("7")));
+    testing::assert(expect_regex(compile_utf8("^[\\S]+$")).is_match(js_string("goml")));
+    testing::assert(
+        expect_regex(compile_utf8("^\\x41\\u0042\\cC$")).is_match(js_string("AB\u0003")),
+    );
+    testing::assert(
+        expect_regex(compile_utf8("^[\\b]$")).is_match(runtime::JsString::from_code_units(Vec::[8])),
+    )
+}
+
+#[test]
+fn word_boundaries_and_flags_affect_matching() -> unit {
+    testing::assert(expect_regex(compile_utf8("\\bcat\\b")).is_match(js_string("a cat!")));
+    testing::assert(!expect_regex(compile_utf8("\\Bcat\\B")).is_match(js_string("cat")));
+    testing::assert(
+        expect_regex(compile_utf8_with_flags("^cat$", "im")).is_match(js_string("DOG\nCAT\n")),
+    );
+    testing::assert(expect_regex(compile_utf8_with_flags("^.$", "s")).is_match(js_string("\n")));
+    testing::assert(!expect_regex(compile_utf8_with_flags("cat", "y")).is_match(js_string("a cat")))
+}
+
+#[test]
+fn flags_and_invalid_backreferences_report_errors() -> unit {
+    testing::assert(compile_utf8_with_flags("a", "ii").is_err());
+    testing::assert(compile_utf8_with_flags("a", "z").is_err());
+    testing::assert(compile_utf8_with_flags("\\a", "u").is_err());
+    testing::assert(compile_utf8_with_flags("\\1", "u").is_err());
+    testing::assert(compile_utf8_with_flags("(a)\\2", "u").is_err())
+}
+
+#[test]
+fn unicode_property_ranges_use_quickjs_unicode_17_data() -> unit {
+    let lower = expect_regex(compile_utf8_with_flags("^\\p{Lower}+$", "u"));
+    testing::assert(lower.is_match(js_string("aßª")));
+    testing::assert(!lower.is_match(js_string("A")));
+    let lower_category = expect_regex(compile_utf8_with_flags("^\\p{Ll}+$", "u"));
+    testing::assert(lower_category.is_match(js_string("aß")));
+    testing::assert(!lower_category.is_match(js_string("ª")));
+    let upper = expect_regex(
+        compile_utf8_with_flags("^\\p{General_Category=Uppercase_Letter}+$", "u"),
+    );
+    testing::assert(upper.is_match(js_string("AZ")));
+    testing::assert(!upper.is_match(js_string("a")));
+    testing::assert(
+        expect_regex(compile_utf8_with_flags("^\\P{Lower}+$", "iu")).is_match(js_string("aA#")),
+    );
+    testing::assert(
+        expect_regex(compile_utf8_with_flags("^\\P{Lower}+$", "iv")).is_match(js_string("#")),
+    );
+    testing::assert(
+        !expect_regex(compile_utf8_with_flags("^\\P{Lower}+$", "iv")).is_match(js_string("a")),
+    );
+    testing::assert(compile_utf8_with_flags("\\p{Missing}", "u").is_err());
+    testing::assert(compile_utf8_with_flags("\\p{Lower}", "").is_ok())
+}
+
+#[test]
+fn unicode_sets_support_nested_algebra_and_string_members() -> unit {
+    let intersection = expect_regex(compile_utf8_with_flags("^[[a-c]&&B]$", "iv"));
+    testing::assert(intersection.is_match(js_string("b")));
+    testing::assert(intersection.is_match(js_string("B")));
+    testing::assert(!intersection.is_match(js_string("a")));
+    let difference = expect_regex(compile_utf8_with_flags("^[[a-c]--B]+$", "iv"));
+    testing::assert(difference.is_match(js_string("aAcC")));
+    testing::assert(!difference.is_match(js_string("b")));
+    let strings = expect_regex(compile_utf8_with_flags("[\\q{BC|A}]", "iv"));
+    let first = assert_match_range(strings.search(js_string("bcA")), 0, 2);
+    testing::assert_eq(first.end - first.start, 2);
+    let removed = expect_regex(compile_utf8_with_flags("[\\q{BC|A}--a]", "iv"));
+    testing::assert(removed.is_match(js_string("bc")));
+    testing::assert(!removed.is_match(js_string("a")));
+    let property = expect_regex(compile_utf8_with_flags("^[^\\P{Lower}]+$", "iv"));
+    testing::assert(property.is_match(js_string("aAbB")));
+    testing::assert(!property.is_match(js_string("#")));
+    testing::assert(compile_utf8_with_flags("[ab&&b]", "v").is_err());
+    testing::assert(compile_utf8_with_flags("[a--b&&c]", "v").is_err());
+    testing::assert(compile_utf8_with_flags("a", "uv").is_err())
+}
+
+#[test]
+fn nested_and_alternating_captures_keep_path_local_state() -> unit {
+    let regex = expect_regex(compile_utf8("^((a)|(b))+$"));
+    let found = assert_match_range(regex.search(js_string("aba")), 0, 3);
+    testing::assert_eq(found.capture_count(), 3);
+    testing::assert(found.capture(0) == Option::Some(RegexCapture { start: 0, end: 3 }));
+    testing::assert(found.capture(1) == Option::Some(RegexCapture { start: 2, end: 3 }));
+    testing::assert(found.capture(2) == Option::Some(RegexCapture { start: 2, end: 3 }));
+    testing::assert(found.capture(3).is_none())
+}
+
+#[test]
+fn optional_and_repeated_captures_follow_ecmascript_last_participation() -> unit {
+    let optional = expect_regex(compile_utf8("^(a)?b\\1$"));
+    let absent = assert_match_range(optional.search(js_string("b")), 0, 1);
+    testing::assert(absent.capture(1).is_none());
+    let present = assert_match_range(optional.search(js_string("aba")), 0, 3);
+    testing::assert(present.capture(1) == Option::Some(RegexCapture { start: 0, end: 1 }));
+    let repeated = expect_regex(compile_utf8("^(a(b)?)+$"));
+    let found = assert_match_range(repeated.search(js_string("aba")), 0, 3);
+    testing::assert(found.capture(1) == Option::Some(RegexCapture { start: 2, end: 3 }));
+    testing::assert(found.capture(2).is_none())
+}
+
+#[test]
+fn noncapturing_groups_and_backreferences_preserve_ordered_backtracking() -> unit {
+    let noncapturing = expect_regex(compile_utf8("^(?:a)(b)\\1$"));
+    let found = assert_match_range(noncapturing.search(js_string("abb")), 0, 3);
+    testing::assert_eq(found.capture_count(), 1);
+    testing::assert(found.capture(1) == Option::Some(RegexCapture { start: 1, end: 2 }));
+    let backtracking = expect_regex(compile_utf8("^(a|ab)c\\1$"));
+    let selected = assert_match_range(backtracking.search(js_string("abcab")), 0, 5);
+    testing::assert(selected.capture(1) == Option::Some(RegexCapture { start: 0, end: 2 }));
+    let first_branch = expect_regex(compile_utf8("^(aa|a)+$"));
+    let first_match = assert_match_range(first_branch.search(js_string("aa")), 0, 2);
+    testing::assert(first_match.capture(1) == Option::Some(RegexCapture { start: 0, end: 2 }));
+    let repeated_branch = expect_regex(compile_utf8("^(a|aa)+$"));
+    let repeated_match = assert_match_range(repeated_branch.search(js_string("aa")), 0, 2);
+    testing::assert(repeated_match.capture(1) == Option::Some(RegexCapture { start: 1, end: 2 }))
+}
+
+#[test]
+fn forward_backreferences_match_empty_until_their_capture_participates() -> unit {
+    let first = expect_regex(compile_utf8_with_flags("^\\1(a)$", "u"));
+    let first_match = assert_match_range(first.search(js_string("a")), 0, 1);
+    testing::assert(first_match.capture(1) == Option::Some(RegexCapture { start: 0, end: 1 }));
+    let second = expect_regex(compile_utf8_with_flags("^\\2(a)(b)$", "u"));
+    let second_match = assert_match_range(second.search(js_string("ab")), 0, 2);
+    testing::assert(second_match.capture(1) == Option::Some(RegexCapture { start: 0, end: 1 }));
+    testing::assert(second_match.capture(2) == Option::Some(RegexCapture { start: 1, end: 2 }))
+}
+
+#[test]
+fn invalid_backreferences_report_the_escape_offset() -> unit {
+    match compile_utf8_with_flags("(a)\\2", "u") {
+        Result::Err(error) => testing::assert_eq(error.offset, 3),
+        Result::Ok(_) => testing::fail("expected out of range backreference error"),
+    };
+    match compile_utf8_with_flags("(?:a)\\1", "u") {
+        Result::Err(error) => testing::assert_eq(error.offset, 5),
+        Result::Ok(_) => testing::fail("expected missing capture error"),
+    };
+    match compile_utf8_with_flags("\\999(a)", "u") {
+        Result::Err(error) => testing::assert_eq(error.offset, 0),
+        Result::Ok(_) => testing::fail("expected oversized backreference error"),
+    }
+}
+
+#[test]
+fn capture_offsets_are_utf16_code_unit_offsets() -> unit {
+    let regex = expect_regex(compile_utf8("(😀)"));
+    let found = assert_match_range(regex.search(js_string("x😀y")), 1, 3);
+    testing::assert(found.capture(1) == Option::Some(RegexCapture { start: 1, end: 3 }));
+    testing::assert(found.capture(2).is_none())
+}
+
+#[test]
+fn lookahead_assertions_are_zero_width() -> unit {
+    let positive = expect_regex(compile_utf8("foo(?=bar)"));
+    let _ = assert_match_range(positive.search(js_string("xxfoobar")), 2, 5);
+    testing::assert(!positive.is_match(js_string("xxfoobaz")));
+    let negative = expect_regex(compile_utf8("foo(?!bar)"));
+    let _ = assert_match_range(negative.search(js_string("xxfoobaz")), 2, 5);
+    testing::assert(!negative.is_match(js_string("xxfoobar")));
+    let empty = expect_regex(compile_utf8("(?=)"));
+    let _ = assert_match_range(empty.search(js_string("goml")), 0, 0);
+    testing::assert(!expect_regex(compile_utf8("(?!)")).is_match(js_string("goml")))
+}
+
+#[test]
+fn positive_lookahead_captures_are_atomic_and_path_local() -> unit {
+    let exported = expect_regex(compile_utf8("^(?=(a)(b))\\1\\2$"));
+    let found = assert_match_range(exported.search(js_string("ab")), 0, 2);
+    testing::assert(found.capture(1) == Option::Some(RegexCapture { start: 0, end: 1 }));
+    testing::assert(found.capture(2) == Option::Some(RegexCapture { start: 1, end: 2 }));
+    testing::assert(!expect_regex(compile_utf8("^(?=(a+))a*b\\1$")).is_match(js_string("aaba")));
+    let ordered = expect_regex(compile_utf8("^(?=(a|aa))a*b\\1$"));
+    let selected = assert_match_range(ordered.search(js_string("aaba")), 0, 4);
+    testing::assert(selected.capture(1) == Option::Some(RegexCapture { start: 0, end: 1 }))
+}
+
+#[test]
+fn negative_lookahead_discards_internal_captures() -> unit {
+    let regex = expect_regex(compile_utf8("^(a)(?!(b))c$"));
+    let found = assert_match_range(regex.search(js_string("ac")), 0, 2);
+    testing::assert(found.capture(1) == Option::Some(RegexCapture { start: 0, end: 1 }));
+    testing::assert(found.capture(2).is_none());
+    testing::assert(!regex.is_match(js_string("abc")))
+}
+
+#[test]
+fn lookahead_captures_use_utf16_offsets_and_flags() -> unit {
+    let utf16 = expect_regex(compile_utf8("(?=(😀))"));
+    let found = assert_match_range(utf16.search(js_string("x😀y")), 1, 1);
+    testing::assert(found.capture(1) == Option::Some(RegexCapture { start: 1, end: 3 }));
+    testing::assert(
+        expect_regex(compile_utf8_with_flags("^(?=CAT$)cat$", "i")).is_match(js_string("cat")),
+    );
+    testing::assert(
+        expect_regex(compile_utf8_with_flags("(?=a.b)a.b", "s")).is_match(js_string("a\nb")),
+    )
+}
+
+#[test]
+fn quantified_lookahead_terminates_and_unicode_mode_rejects_it() -> unit {
+    let optional = expect_regex(compile_utf8("^(?=(a))*a$"));
+    let optional_match = assert_match_range(optional.search(js_string("a")), 0, 1);
+    testing::assert(optional_match.capture(1).is_none());
+    let required = expect_regex(compile_utf8("^(?=(a))+a$"));
+    let required_match = assert_match_range(required.search(js_string("a")), 0, 1);
+    testing::assert(required_match.capture(1) == Option::Some(RegexCapture { start: 0, end: 1 }));
+    match compile_utf8_with_flags("(?=a)+", "u") {
+        Result::Err(error) => testing::assert_eq(error.offset, 5),
+        Result::Ok(_) => testing::fail("expected quantified lookahead error in unicode mode"),
+    };
+    let grouped = expect_regex(compile_utf8_with_flags("^(?:(?=(a)))+a$", "u"));
+    let grouped_match = assert_match_range(grouped.search(js_string("a")), 0, 1);
+    testing::assert(grouped_match.capture(1) == Option::Some(RegexCapture { start: 0, end: 1 }))
+}
+
+#[test]
+fn lookbehind_assertions_are_zero_width() -> unit {
+    let positive = expect_regex(compile_utf8("foo(?<=foo)bar"));
+    let _ = assert_match_range(positive.search(js_string("xxfoobar")), 2, 8);
+    testing::assert(!positive.is_match(js_string("xxfoobaz")));
+    let negative = expect_regex(compile_utf8("(?<!foo)bar"));
+    let _ = assert_match_range(negative.search(js_string("xxbar")), 2, 5);
+    testing::assert(!negative.is_match(js_string("foobar")))
+}
+
+#[test]
+fn lookbehind_matches_sequences_backwards_and_preserves_alternative_order() -> unit {
+    let reverse = expect_regex(compile_utf8("(?<=([ab]+)([bc]+))$"));
+    let found = assert_match_range(reverse.search(js_string("abc")), 3, 3);
+    testing::assert(found.capture(1) == Option::Some(RegexCapture { start: 0, end: 1 }));
+    testing::assert(found.capture(2) == Option::Some(RegexCapture { start: 1, end: 3 }));
+    let first = expect_regex(compile_utf8("(?<=(a|aa))b"));
+    let first_match = assert_match_range(first.search(js_string("aab")), 2, 3);
+    testing::assert(first_match.capture(1) == Option::Some(RegexCapture { start: 1, end: 2 }));
+    let long_first = expect_regex(compile_utf8("(?<=(aa|a))b"));
+    let long_match = assert_match_range(long_first.search(js_string("aab")), 2, 3);
+    testing::assert(long_match.capture(1) == Option::Some(RegexCapture { start: 0, end: 2 }))
+}
+
+#[test]
+fn lookbehind_quantifiers_select_reverse_greedy_and_lazy_captures() -> unit {
+    let greedy = expect_regex(compile_utf8("(?<=(a+))b"));
+    let greedy_match = assert_match_range(greedy.search(js_string("aaab")), 3, 4);
+    testing::assert(greedy_match.capture(1) == Option::Some(RegexCapture { start: 0, end: 3 }));
+    let lazy = expect_regex(compile_utf8("(?<=(a+?))b"));
+    let lazy_match = assert_match_range(lazy.search(js_string("aaab")), 3, 4);
+    testing::assert(lazy_match.capture(1) == Option::Some(RegexCapture { start: 2, end: 3 }));
+    let repeated = expect_regex(compile_utf8("(?<=([ab])+)c"));
+    let repeated_match = assert_match_range(repeated.search(js_string("abc")), 2, 3);
+    testing::assert(repeated_match.capture(1) == Option::Some(RegexCapture { start: 0, end: 1 }))
+}
+
+#[test]
+fn lookbehind_backreferences_follow_reverse_evaluation_order() -> unit {
+    let available = expect_regex(compile_utf8("(?<=(\\2)(a))b"));
+    let available_match = assert_match_range(available.search(js_string("aab")), 2, 3);
+    testing::assert(available_match.capture(1) == Option::Some(RegexCapture { start: 0, end: 1 }));
+    testing::assert(available_match.capture(2) == Option::Some(RegexCapture { start: 1, end: 2 }));
+    let forward = expect_regex(compile_utf8("(?<=(a)\\1)b"));
+    let forward_match = assert_match_range(forward.search(js_string("ab")), 1, 2);
+    testing::assert(forward_match.capture(1) == Option::Some(RegexCapture { start: 0, end: 1 }))
+}
+
+#[test]
+fn lookbehind_is_atomic_when_following_terms_fail() -> unit {
+    testing::assert(!expect_regex(compile_utf8("(?<=(a+))b\\1")).is_match(js_string("aaabaa")));
+    let lazy = expect_regex(compile_utf8("(?<=(a+?))b\\1"));
+    let found = assert_match_range(lazy.search(js_string("aaabaa")), 3, 5);
+    testing::assert(found.capture(1) == Option::Some(RegexCapture { start: 2, end: 3 }))
+}
+
+#[test]
+fn lookbehind_nested_assertions_and_flags_use_the_assertion_offset() -> unit {
+    let nested = expect_regex(compile_utf8("(?<=(a)(?=b))b"));
+    let nested_match = assert_match_range(nested.search(js_string("ab")), 1, 2);
+    testing::assert(nested_match.capture(1) == Option::Some(RegexCapture { start: 0, end: 1 }));
+    testing::assert(
+        expect_regex(compile_utf8_with_flags("(?<=^a)b", "m")).is_match(js_string("x\nab")),
+    );
+    testing::assert(
+        expect_regex(compile_utf8_with_flags("(?<=(.))b", "s")).is_match(js_string("\nb")),
+    );
+    testing::assert(
+        expect_regex(compile_utf8_with_flags("(?<=CAT)dog", "i")).is_match(js_string("catdog")),
+    )
+}
+
+#[test]
+fn lookbehind_captures_use_utf16_offsets_and_negative_captures_are_discarded() -> unit {
+    let utf16 = expect_regex(compile_utf8("(?<=(😀))x"));
+    let found = assert_match_range(utf16.search(js_string("😀x")), 2, 3);
+    testing::assert(found.capture(1) == Option::Some(RegexCapture { start: 0, end: 2 }));
+    let negative = expect_regex(compile_utf8("(?<!([ab]+))c"));
+    let negative_match = assert_match_range(negative.search(js_string("zc")), 1, 2);
+    testing::assert(negative_match.capture(1).is_none());
+    testing::assert(!negative.is_match(js_string("abc")))
+}
+
+#[test]
+fn quantified_lookbehind_reports_the_quantifier_offset() -> unit {
+    match compile_utf8("a(?<=a)+b") {
+        Result::Err(error) => {
+            testing::assert_eq(error.offset, 7);
+            testing::assert_eq(error.message, "lookbehind assertion cannot be quantified")
+        },
+        Result::Ok(_) => testing::fail("expected quantified lookbehind error"),
+    }
+}
+
+#[test]
+fn named_captures_and_backreferences_share_numeric_capture_slots() -> unit {
+    let regex = expect_regex(compile_utf8("^(?<word>a+)b\\k<word>$"));
+    testing::assert_eq(regex.capture_count(), 1);
+    testing::assert(regex.capture_name(1) == Option::Some(js_string("word")));
+    testing::assert(regex.has_named_captures());
+    let found = assert_match_range(regex.search(js_string("aabaa")), 0, 5);
+    testing::assert(found.capture(1) == Option::Some(RegexCapture { start: 0, end: 2 }));
+    let unnamed = expect_regex(compile_utf8("(a)"));
+    testing::assert(!unnamed.has_named_captures());
+    testing::assert(unnamed.capture_name(1).is_none())
+}
+
+#[test]
+fn named_backreferences_can_point_forward_and_names_normalize_unicode_escapes() -> unit {
+    let forward = expect_regex(compile_utf8("^\\k<later>(?<later>a)$"));
+    testing::assert(forward.is_match(js_string("a")));
+    let escaped = expect_regex(compile_utf8("^(?<\\u0061>x)\\k<a>$"));
+    testing::assert(escaped.capture_name(1) == Option::Some(js_string("a")));
+    testing::assert(escaped.is_match(js_string("xx")));
+    let unicode_name = expect_regex(compile_utf8("^(?<π>x)\\k<π>$"));
+    testing::assert(unicode_name.is_match(js_string("xx")))
+}
+
+#[test]
+fn duplicate_named_captures_are_allowed_across_disjoint_alternatives() -> unit {
+    let regex = expect_regex(compile_utf8("^(?:(?<value>a)|(?<value>b))\\k<value>$"));
+    testing::assert_eq(regex.capture_count(), 2);
+    testing::assert(regex.capture_name(1) == Option::Some(js_string("value")));
+    testing::assert(regex.capture_name(2) == Option::Some(js_string("value")));
+    testing::assert(regex.is_match(js_string("aa")));
+    testing::assert(regex.is_match(js_string("bb")));
+    testing::assert(!regex.is_match(js_string("ab")))
+}
+
+#[test]
+fn inline_modifiers_scope_ignore_case_multiline_and_dot_all() -> unit {
+    let local_case = expect_regex(compile_utf8("^a(?i:b[cd])e$"));
+    testing::assert(local_case.is_match(js_string("aBCe")));
+    testing::assert(!local_case.is_match(js_string("ABCE")));
+    let removed_case = expect_regex(compile_utf8_with_flags("^a(?-i:b)c$", "i"));
+    testing::assert(removed_case.is_match(js_string("AbC")));
+    testing::assert(!removed_case.is_match(js_string("ABC")));
+    testing::assert(expect_regex(compile_utf8("(?s:.)")).is_match(js_string("\n")));
+    testing::assert(!expect_regex(compile_utf8(".")).is_match(js_string("\n")));
+    testing::assert(expect_regex(compile_utf8("(?m:^a$)")).is_match(js_string("x\na\ny")));
+    testing::assert(expect_regex(compile_utf8("^(?i:(a)\\1)$")).is_match(js_string("aA")));
+    testing::assert(expect_regex(compile_utf8("(?i:(?<=a)b)")).is_match(js_string("AB")));
+    testing::assert(expect_regex(compile_utf8("^(?i:a(?-i:b)c)$")).is_match(js_string("AbC")));
+    testing::assert(!expect_regex(compile_utf8("^(?i:a(?-i:b)c)$")).is_match(js_string("ABC")))
+}
+
+#[test]
+fn ignore_case_uses_quickjs_unicode_canonicalization() -> unit {
+    testing::assert(expect_regex(compile_utf8_with_flags("^k$", "iu")).is_match(js_string("K")));
+    testing::assert(!expect_regex(compile_utf8_with_flags("^k$", "i")).is_match(js_string("K")));
+    testing::assert(expect_regex(compile_utf8_with_flags("^[k]$", "iu")).is_match(js_string("K")));
+    testing::assert(!expect_regex(compile_utf8_with_flags("^[^k]$", "iu")).is_match(js_string("K")));
+    testing::assert(expect_regex(compile_utf8_with_flags("^s$", "iu")).is_match(js_string("ſ")));
+    testing::assert(!expect_regex(compile_utf8_with_flags("^s$", "i")).is_match(js_string("ſ")));
+    testing::assert(expect_regex(compile_utf8_with_flags("^σ$", "i")).is_match(js_string("ς")));
+    testing::assert(expect_regex(compile_utf8_with_flags("^𐐀$", "iu")).is_match(js_string("𐐨")));
+    testing::assert(expect_regex(compile_utf8_with_flags("^\\w$", "iu")).is_match(js_string("K")));
+    testing::assert(!expect_regex(compile_utf8_with_flags("^\\W$", "iu")).is_match(js_string("K")));
+    testing::assert(
+        !expect_regex(compile_utf8_with_flags("^[^\\w]$", "iu")).is_match(js_string("K")),
+    );
+    testing::assert(
+        expect_regex(compile_utf8_with_flags("^\\bK\\b$", "iu")).is_match(js_string("K")),
+    );
+    testing::assert(
+        !expect_regex(compile_utf8_with_flags("^\\bK\\b$", "i")).is_match(js_string("K")),
+    )
+}
+
+#[test]
+fn invalid_inline_modifiers_report_the_group_offset() -> unit {
+    for pattern in Vec::["(?i-i:a)", "(?d:a)", "(?-:a)"] {
+        match compile_utf8(pattern) {
+            Result::Err(error) => testing::assert_eq(error.offset, 0),
+            Result::Ok(_) => testing::fail("expected invalid inline modifier error"),
+        }
+    }
+}
+
+#[test]
+fn unicode_mode_consumes_supplementary_code_points_as_single_atoms() -> unit {
+    let emoji = js_string("😀");
+    let dot = expect_regex(compile_utf8_with_flags("^(.)$", "u"));
+    let found = assert_match_range(dot.search(emoji), 0, 2);
+    testing::assert(found.capture(1) == Option::Some(RegexCapture { start: 0, end: 2 }));
+    testing::assert(!expect_regex(compile_utf8("^.$")).is_match(emoji));
+    testing::assert(expect_regex(compile_utf8_with_flags("^😀$", "u")).is_match(emoji));
+    testing::assert(expect_regex(compile_utf8_with_flags("^\\u{1F600}$", "u")).is_match(emoji));
+    testing::assert(
+        expect_regex(compile_utf8_with_flags("^[\\u{1F600}-\\u{1F601}]$", "u")).is_match(
+            js_string("😁"),
+        ),
+    );
+    let behind = expect_regex(compile_utf8_with_flags("(?<=.)x", "u"));
+    let _ = assert_match_range(behind.search(js_string("😀x")), 2, 3);
+}
+
+#[test]
+fn unicode_mode_preserves_lone_surrogates_and_rejects_out_of_range_escapes() -> unit {
+    let lone = runtime::JsString::from_code_units(Vec::[0xd800.to_uint16()]);
+    testing::assert(expect_regex(compile_utf8_with_flags("^.$", "u")).is_match(lone));
+    testing::assert(expect_regex(compile_utf8_with_flags("^\\uD800$", "u")).is_match(lone));
+    match compile_utf8_with_flags("\\u{110000}", "u") {
+        Result::Err(error) => testing::assert_eq(
+            error.message,
+            "Unicode code point escape is out of range",
+        ),
+        Result::Ok(_) => testing::fail("expected out-of-range Unicode escape error"),
+    }
+}
+
+#[test]
+fn annex_b_decimal_escapes_fall_back_to_octal_or_identity() -> unit {
+    testing::assert(
+        expect_regex(compile_utf8("^\\1$")).is_match(
+            runtime::JsString::from_code_units(Vec::[1.to_uint16()]),
+        ),
+    );
+    testing::assert(
+        expect_regex(compile_utf8("^(a)\\11$")).is_match(
+            runtime::JsString::from_code_units(Vec::[97.to_uint16(), 9.to_uint16()]),
+        ),
+    );
+    testing::assert(
+        expect_regex(compile_utf8("^\\377$")).is_match(
+            runtime::JsString::from_code_units(Vec::[255.to_uint16()]),
+        ),
+    );
+    testing::assert(expect_regex(compile_utf8("^\\400$")).is_match(js_string(" 0")));
+    testing::assert(expect_regex(compile_utf8("^\\8\\9$")).is_match(js_string("89")));
+    testing::assert(
+        expect_regex(compile_utf8("^\\08$")).is_match(
+            runtime::JsString::from_code_units(Vec::[0.to_uint16(), 56.to_uint16()]),
+        ),
+    );
+    testing::assert(
+        expect_regex(compile_utf8("^[\\11]$")).is_match(
+            runtime::JsString::from_code_units(Vec::[9.to_uint16()]),
+        ),
+    );
+    testing::assert(expect_regex(compile_utf8("^(a)\\1$")).is_match(js_string("aa")))
+}
+
+#[test]
+fn annex_b_control_and_counted_quantifier_fallbacks_are_literals() -> unit {
+    testing::assert(
+        expect_regex(compile_utf8("^\\ca$")).is_match(
+            runtime::JsString::from_code_units(Vec::[1.to_uint16()]),
+        ),
+    );
+    testing::assert(expect_regex(compile_utf8("^\\c0$")).is_match(js_string("\\c0")));
+    testing::assert(
+        expect_regex(compile_utf8("^[\\c0]$")).is_match(
+            runtime::JsString::from_code_units(Vec::[16.to_uint16()]),
+        ),
+    );
+    testing::assert(expect_regex(compile_utf8("^{1a}$")).is_match(js_string("{1a}")));
+    testing::assert(expect_regex(compile_utf8("^a{1+$")).is_match(js_string("a{11")));
+    for pattern in Vec::["\\c0", "{1a}", "a{1+", "{value}", "value}"] {
+        testing::assert(compile_utf8_with_flags(pattern, "u").is_err())
+    }
+}
+
+#[test]
+fn unicode_mode_rejects_legacy_decimal_escapes() -> unit {
+    for pattern in Vec::["\\1", "\\8", "\\08", "[\\1]"] {
+        match compile_utf8_with_flags(pattern, "u") {
+            Result::Err(_) => (),
+            Result::Ok(_) => testing::fail("expected Unicode decimal escape error"),
+        }
+    }
+}
+
+#[test]
+fn invalid_named_capture_forms_report_the_group_name_offset() -> unit {
+    match compile_utf8("(?<name>a)(?<name>b)") {
+        Result::Err(error) => {
+            testing::assert_eq(error.offset, 13);
+            testing::assert_eq(error.message, "duplicate group name")
+        },
+        Result::Ok(_) => testing::fail("expected duplicate named capture error"),
+    };
+    match compile_utf8("(?<present>a)\\k<missing>") {
+        Result::Err(error) => {
+            testing::assert_eq(error.offset, 13);
+            testing::assert_eq(error.message, "group name is not defined")
+        },
+        Result::Ok(_) => testing::fail("expected undefined named backreference error"),
+    };
+    match compile_utf8("(?<1bad>a)") {
+        Result::Err(error) => {
+            testing::assert_eq(error.offset, 3);
+            testing::assert_eq(error.message, "invalid group name")
+        },
+        Result::Ok(_) => testing::fail("expected invalid group name error"),
+    };
+    testing::assert(expect_regex(compile_utf8("^k<missing>$")).is_match(js_string("k<missing>")));
+    testing::assert(expect_regex(compile_utf8("^\\k<missing>$")).is_match(js_string("k<missing>")));
+    match compile_utf8_with_flags("\\k<missing>", "u") {
+        Result::Err(error) => testing::assert_eq(error.message, "group name is not defined"),
+        Result::Ok(_) => testing::fail("expected unicode named backreference error"),
+    }
+}
+
+#[test]
+fn unicode_property_alias_batch_matches_quickjs_ranges() -> unit {
+    testing::assert(
+        expect_regex(compile_utf8_with_flags("^\\p{ID_Start}\\p{ID_Continue}*$", "u")).is_match(
+            js_string("A0́"),
+        ),
+    );
+    testing::assert(
+        !expect_regex(compile_utf8_with_flags("^\\p{ID_Start}$", "u")).is_match(js_string("0")),
+    );
+    testing::assert(
+        expect_regex(compile_utf8_with_flags("^\\p{Case_Ignorable}+$", "u")).is_match(
+            js_string("'́"),
+        ),
+    );
+    testing::assert(
+        expect_regex(compile_utf8_with_flags("^\\p{Deprecated}$", "u")).is_match(
+            runtime::JsString::from_code_units(Vec::[0x149.to_uint16()]),
+        ),
+    );
+    testing::assert(
+        expect_regex(compile_utf8_with_flags("^\\p{gc=Zs}+$", "u")).is_match(js_string("   ")),
+    );
+    testing::assert(
+        expect_regex(compile_utf8_with_flags("^\\p{ASCII}+$", "u")).is_match(js_string("QuickJS")),
+    );
+    testing::assert(
+        expect_regex(compile_utf8_with_flags("^\\p{Any}$", "u")).is_match(js_string("😀")),
+    );
+    testing::assert(
+        expect_regex(compile_utf8_with_flags("^\\P{ASCII}$", "u")).is_match(js_string("é")),
+    )
+}
+
+#[test]
+fn unicode_binary_property_batch_matches_quickjs() -> unit {
+    testing::assert(
+        expect_regex(compile_utf8_with_flags("^\\p{AHex}+$", "u")).is_match(js_string("09AF")),
+    );
+    testing::assert(
+        expect_regex(compile_utf8_with_flags("^\\p{White_Space}+$", "u")).is_match(
+            js_string(" \u2028"),
+        ),
+    );
+    testing::assert(
+        expect_regex(compile_utf8_with_flags("^\\p{Emoji_Presentation}$", "u")).is_match(
+            js_string("😀"),
+        ),
+    );
+    testing::assert(
+        expect_regex(compile_utf8_with_flags("^\\p{Alphabetic}+$", "u")).is_match(js_string("Aª中")),
+    );
+    testing::assert(
+        expect_regex(compile_utf8_with_flags("^\\p{Changes_When_Casefolded}+$", "u")).is_match(
+            js_string("Aß"),
+        ),
+    );
+    testing::assert(
+        expect_regex(compile_utf8_with_flags("^\\p{Grapheme_Extend}$", "u")).is_match(
+            js_string("́"),
+        ),
+    );
+    testing::assert(
+        expect_regex(compile_utf8_with_flags("^\\p{XID_Start}\\p{XID_Continue}*$", "u")).is_match(
+            js_string("A0́"),
+        ),
+    );
+    for name in Vec::["ID_Compat_Math_Start", "ID_Compat_Math_Continue", "InCB"] {
+        testing::assert(compile_utf8_with_flags("\\p{" + name + "}", "u").is_err())
+    }
+}
+
+#[test]
+fn unicode_general_category_batch_matches_letters_marks_symbols_and_other() -> unit {
+    testing::assert(
+        expect_regex(compile_utf8_with_flags("^\\p{Lt}\\p{Lm}\\p{Lo}$", "u")).is_match(
+            js_string("ǅʰ中"),
+        ),
+    );
+    testing::assert(
+        expect_regex(compile_utf8_with_flags("^\\p{Mn}\\p{Mc}\\p{Me}$", "u")).is_match(
+            js_string("́ः҈"),
+        ),
+    );
+    testing::assert(
+        expect_regex(compile_utf8_with_flags("^\\p{Sc}\\p{Sk}\\p{So}$", "u")).is_match(
+            js_string("$^©"),
+        ),
+    );
+    testing::assert(
+        expect_regex(compile_utf8_with_flags("^\\p{gc=Number}+$", "u")).is_match(js_string("1Ⅷ½")),
+    );
+    testing::assert(
+        expect_regex(compile_utf8_with_flags("^\\p{General_Category=Other}+$", "u")).is_match(
+            runtime::JsString::from_code_units(Vec::[0.to_uint16(), 0xd800.to_uint16()]),
+        ),
+    )
+}
+
+#[test]
+fn unicode_script_and_script_extensions_batch_match_quickjs() -> unit {
+    testing::assert(
+        expect_regex(compile_utf8_with_flags("^\\p{Script=Latin}+$", "u")).is_match(
+            js_string("QuickJS"),
+        ),
+    );
+    testing::assert(
+        expect_regex(compile_utf8_with_flags("^\\p{sc=Hani}+$", "u")).is_match(js_string("漢字")),
+    );
+    testing::assert(
+        !expect_regex(compile_utf8_with_flags("^\\p{Script=Hiragana}$", "u")).is_match(
+            js_string("ー"),
+        ),
+    );
+    testing::assert(
+        expect_regex(compile_utf8_with_flags("^\\p{scx=Hira}$", "u")).is_match(js_string("ー")),
+    );
+    testing::assert(
+        expect_regex(compile_utf8_with_flags("^\\p{Script=Kirat_Rai}$", "u")).is_match(
+            js_string("𖵀"),
+        ),
+    )
+}

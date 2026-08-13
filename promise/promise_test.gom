@@ -1,0 +1,346 @@
+package promise;
+
+use gomlang::quickjs::runtime;
+use std::testing;
+
+fn promise_assert_value(actual: runtime::Value, expected: runtime::Value) -> unit {
+    testing::assert(runtime::same_value(actual, expected))
+}
+
+fn promise_assert_scalar(promise: Promise, expected: runtime::Value) -> unit {
+    match promise.state() {
+        PromiseState::Fulfilled(PromiseFulfillment::Value(actual)) => {
+            promise_assert_value(actual, expected)
+        },
+        _ => testing::fail("expected scalar fulfillment"),
+    }
+}
+
+fn promise_scalar_result(input: PromiseFulfillment) -> Result[runtime::Value, PromiseFailure] {
+    match input {
+        PromiseFulfillment::Value(value) => Result::Ok(value),
+        _ => Result::Err(PromiseFailure::TypeError("expected scalar fulfillment")),
+    }
+}
+
+fn promise_rejection(value: runtime::Value) -> PromiseFailure {
+    PromiseFailure::Rejection(value)
+}
+
+#[test]
+fn job_queue_is_fifo_and_drains_nested_jobs() -> unit {
+    let queue = JobQueue::new();
+    let order: Vec[int] = Vec::[];
+    queue.enqueue(
+        || {
+            order.push(1);
+            queue.enqueue(|| order.push(3))
+        },
+    );
+    queue.enqueue(|| order.push(2));
+    testing::assert_eq(queue.len(), 2);
+    testing::assert(queue.run_one());
+    testing::assert_eq(order.len(), 1);
+    testing::assert_eq(order[0], 1);
+    testing::assert_eq(queue.len(), 2);
+    testing::assert_eq(queue.run_all(), 2);
+    testing::assert_eq(order.len(), 3);
+    testing::assert_eq(order[0], 1);
+    testing::assert_eq(order[1], 2);
+    testing::assert_eq(order[2], 3);
+    testing::assert(queue.is_empty());
+    testing::assert(!queue.run_one())
+}
+
+#[test]
+fn resolution_is_locked_and_self_resolution_rejects() -> unit {
+    let queue = JobQueue::new();
+    let promise = Promise::pending(queue);
+    testing::assert(promise.resolve(value(runtime::Value::Int(7))));
+    testing::assert(!promise.reject(promise_rejection(runtime::Value::Int(8))));
+    testing::assert(!promise.resolve(value(runtime::Value::Int(9))));
+    promise_assert_scalar(promise, runtime::Value::Int(7));
+    let self_promise = Promise::pending(queue);
+    testing::assert(self_promise.resolve(PromiseResolution::Promise(self_promise)));
+    match self_promise.state() {
+        PromiseState::Rejected(PromiseFailure::TypeError(message)) => {
+            testing::assert_eq(message, "promise cannot resolve itself")
+        },
+        _ => testing::fail("expected self-resolution TypeError"),
+    }
+}
+
+#[test]
+fn then_is_async_and_propagates_missing_handlers() -> unit {
+    let queue = JobQueue::new();
+    let called = Ref::new(false);
+    let source = Promise::fulfilled(queue, runtime::Value::Int(4));
+    let child = source.then(
+        Option::Some(
+            |input| {
+                called.set(true);
+                match promise_scalar_result(input)? {
+                    runtime::Value::Int(number) => Result::Ok(
+                        value(runtime::Value::Int(number + 1)),
+                    ),
+                    _ => Result::Err(PromiseFailure::TypeError("expected integer")),
+                }
+            },
+        ),
+        Option::None,
+    );
+    let grandchild = child.then(Option::None, Option::None);
+    testing::assert(!called.get());
+    testing::assert(child.is_pending());
+    testing::assert(grandchild.is_pending());
+    testing::assert_eq(queue.run_all(), 2);
+    testing::assert(called.get());
+    promise_assert_scalar(child, runtime::Value::Int(5));
+    promise_assert_scalar(grandchild, runtime::Value::Int(5))
+}
+
+#[test]
+fn catch_recovers_and_reactions_keep_registration_order() -> unit {
+    let queue = JobQueue::new();
+    let rejected = Promise::rejected(queue, promise_rejection(runtime::Value::Int(11)));
+    let recovered = rejected.catch(
+        |error| match error {
+            PromiseFailure::Rejection(reason) => {
+                promise_assert_value(reason, runtime::Value::Int(11));
+                Result::Ok(value(runtime::Value::Int(12)))
+            },
+            _ => Result::Err(PromiseFailure::TypeError("unexpected failure")),
+        },
+    );
+    testing::assert(recovered.is_pending());
+    let order: Vec[int] = Vec::[];
+    let fulfilled = Promise::fulfilled(queue, runtime::Value::Int(0));
+    let _ = fulfilled.then(
+        Option::Some(
+            |input| {
+                order.push(1);
+                let _ = fulfilled.then(
+                    Option::Some(
+                        |nested_input| {
+                            order.push(3);
+                            Result::Ok(PromiseResolution::Fulfillment(nested_input))
+                        },
+                    ),
+                    Option::None,
+                );
+                Result::Ok(PromiseResolution::Fulfillment(input))
+            },
+        ),
+        Option::None,
+    );
+    let _ = fulfilled.then(
+        Option::Some(
+            |input| {
+                order.push(2);
+                Result::Ok(PromiseResolution::Fulfillment(input))
+            },
+        ),
+        Option::None,
+    );
+    let _ = queue.run_all();
+    promise_assert_scalar(recovered, runtime::Value::Int(12));
+    testing::assert_eq(order.len(), 3);
+    testing::assert_eq(order[0], 1);
+    testing::assert_eq(order[1], 2);
+    testing::assert_eq(order[2], 3)
+}
+
+#[test]
+fn thenable_assimilation_is_deferred_and_one_shot() -> unit {
+    let queue = JobQueue::new();
+    let promise = Promise::resolved(
+        queue,
+        PromiseResolution::Thenable(
+            |capability| {
+                testing::assert(capability.resolve(value(runtime::Value::Int(21))));
+                testing::assert(!capability.reject(promise_rejection(runtime::Value::Int(22))));
+                Result::Ok(())
+            },
+        ),
+    );
+    testing::assert(promise.is_pending());
+    testing::assert(queue.run_one());
+    promise_assert_scalar(promise, runtime::Value::Int(21));
+    let failed = Promise::resolved(
+        queue,
+        PromiseResolution::Thenable(|_| Result::Err(PromiseFailure::TypeError("thenable failed"))),
+    );
+    testing::assert(failed.is_pending());
+    let _ = queue.run_all();
+    match failed.state() {
+        PromiseState::Rejected(PromiseFailure::TypeError(message)) => {
+            testing::assert_eq(message, "thenable failed")
+        },
+        _ => testing::fail("expected thenable failure"),
+    }
+}
+
+#[test]
+fn finally_preserves_settlement_and_can_override_it() -> unit {
+    let queue = JobQueue::new();
+    let calls = Ref::new(0);
+    let fulfilled = Promise::fulfilled(queue, runtime::Value::Int(31)).finally(
+        || {
+            calls.set(calls.get() + 1);
+            Result::Ok(value(runtime::Value::Int(99)))
+        },
+    );
+    let rejected = Promise::rejected(queue, promise_rejection(runtime::Value::Int(32))).finally(
+        || {
+            calls.set(calls.get() + 1);
+            Result::Ok(value(runtime::Value::Undefined))
+        },
+    );
+    let overridden = Promise::fulfilled(queue, runtime::Value::Int(33)).finally(
+        || Result::Err(PromiseFailure::TypeError("cleanup failed")),
+    );
+    let _ = queue.run_all();
+    testing::assert_eq(calls.get(), 2);
+    promise_assert_scalar(fulfilled, runtime::Value::Int(31));
+    match rejected.state() {
+        PromiseState::Rejected(PromiseFailure::Rejection(reason)) => {
+            promise_assert_value(reason, runtime::Value::Int(32))
+        },
+        _ => testing::fail("expected original rejection"),
+    };
+    match overridden.state() {
+        PromiseState::Rejected(PromiseFailure::TypeError(message)) => {
+            testing::assert_eq(message, "cleanup failed")
+        },
+        _ => testing::fail("expected cleanup rejection"),
+    }
+}
+
+#[test]
+fn all_and_race_follow_input_order_and_first_settlement() -> unit {
+    let queue = JobQueue::new();
+    let first = Promise::pending(queue);
+    let second = Promise::pending(queue);
+    let combined = all(
+        queue,
+        Vec::[
+            PromiseResolution::Promise(first),
+            PromiseResolution::Promise(second),
+            value(runtime::Value::Int(3)),
+        ],
+    );
+    testing::assert(second.resolve(value(runtime::Value::Int(2))));
+    testing::assert(first.resolve(value(runtime::Value::Int(1))));
+    let _ = queue.run_all();
+    match combined.state() {
+        PromiseState::Fulfilled(PromiseFulfillment::Values(values)) => {
+            testing::assert_eq(values.len(), 3);
+            promise_assert_value(values[0], runtime::Value::Int(1));
+            promise_assert_value(values[1], runtime::Value::Int(2));
+            promise_assert_value(values[2], runtime::Value::Int(3))
+        },
+        _ => testing::fail("expected ordered all result"),
+    };
+    let race_first = Promise::pending(queue);
+    let race_second = Promise::pending(queue);
+    let raced = race(
+        queue,
+        Vec::[PromiseResolution::Promise(race_first), PromiseResolution::Promise(race_second)],
+    );
+    testing::assert(race_second.reject(promise_rejection(runtime::Value::Int(42))));
+    testing::assert(race_first.resolve(value(runtime::Value::Int(41))));
+    let _ = queue.run_all();
+    match raced.state() {
+        PromiseState::Rejected(PromiseFailure::Rejection(reason)) => {
+            promise_assert_value(reason, runtime::Value::Int(42))
+        },
+        _ => testing::fail("expected first race settlement"),
+    }
+}
+
+#[test]
+fn all_settled_and_any_collect_results_in_input_order() -> unit {
+    let queue = JobQueue::new();
+    let first = Promise::pending(queue);
+    let second = Promise::pending(queue);
+    let settled = all_settled(
+        queue,
+        Vec::[PromiseResolution::Promise(first), PromiseResolution::Promise(second)],
+    );
+    testing::assert(second.reject(promise_rejection(runtime::Value::Int(52))));
+    testing::assert(first.resolve(value(runtime::Value::Int(51))));
+    let _ = queue.run_all();
+    match settled.state() {
+        PromiseState::Fulfilled(PromiseFulfillment::Settlements(results)) => {
+            testing::assert_eq(results.len(), 2);
+            match results[0] {
+                PromiseSettlement::Fulfilled(value) => {
+                    promise_assert_value(value, runtime::Value::Int(51))
+                },
+                _ => testing::fail("expected first fulfillment"),
+            };
+            match results[1] {
+                PromiseSettlement::Rejected(PromiseFailure::Rejection(reason)) => {
+                    promise_assert_value(reason, runtime::Value::Int(52))
+                },
+                _ => testing::fail("expected second rejection"),
+            }
+        },
+        _ => testing::fail("expected allSettled result"),
+    };
+    let any_first = Promise::pending(queue);
+    let any_second = Promise::pending(queue);
+    let selected = any(
+        queue,
+        Vec::[PromiseResolution::Promise(any_first), PromiseResolution::Promise(any_second)],
+    );
+    testing::assert(any_second.reject(promise_rejection(runtime::Value::Int(62))));
+    testing::assert(any_first.reject(promise_rejection(runtime::Value::Int(61))));
+    let _ = queue.run_all();
+    match selected.state() {
+        PromiseState::Rejected(PromiseFailure::Aggregate(aggregate)) => {
+            testing::assert_eq(aggregate.errors.len(), 2);
+            match aggregate.errors[0] {
+                PromiseFailure::Rejection(reason) => {
+                    promise_assert_value(reason, runtime::Value::Int(61))
+                },
+                _ => testing::fail("expected first aggregate reason"),
+            };
+            match aggregate.errors[1] {
+                PromiseFailure::Rejection(reason) => {
+                    promise_assert_value(reason, runtime::Value::Int(62))
+                },
+                _ => testing::fail("expected second aggregate reason"),
+            }
+        },
+        _ => testing::fail("expected Aggregate failure"),
+    }
+}
+
+#[test]
+fn empty_combinators_have_ecmascript_terminal_states() -> unit {
+    let queue = JobQueue::new();
+    let empty_all = all(queue, Vec::[]);
+    let empty_race = race(queue, Vec::[]);
+    let empty_settled = all_settled(queue, Vec::[]);
+    let empty_any = any(queue, Vec::[]);
+    match empty_all.state() {
+        PromiseState::Fulfilled(PromiseFulfillment::Values(values)) => {
+            testing::assert(values.is_empty())
+        },
+        _ => testing::fail("expected empty all fulfillment"),
+    };
+    testing::assert(empty_race.is_pending());
+    match empty_settled.state() {
+        PromiseState::Fulfilled(PromiseFulfillment::Settlements(values)) => {
+            testing::assert(values.is_empty())
+        },
+        _ => testing::fail("expected empty allSettled fulfillment"),
+    };
+    match empty_any.state() {
+        PromiseState::Rejected(PromiseFailure::Aggregate(aggregate)) => {
+            testing::assert(aggregate.errors.is_empty())
+        },
+        _ => testing::fail("expected empty any rejection"),
+    }
+}

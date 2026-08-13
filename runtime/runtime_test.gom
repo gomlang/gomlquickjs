@@ -1,0 +1,603 @@
+package runtime;
+
+use gomlang::quickjs::arraybuffer;
+use std::math;
+use std::num;
+use std::testing;
+
+fn expect_number(value: Result[float64, TypeError]) -> float64 {
+    match value {
+        Ok(number) => number,
+        Err(error) => {
+            testing::fail(error.message);
+            0.0
+        },
+    }
+}
+
+fn expect_property(value: Result[Option[Value], TypeError]) -> Value {
+    match value {
+        Ok(Some(property)) => property,
+        Ok(None) => {
+            testing::fail("expected property");
+            Value::Undefined
+        },
+        Err(error) => {
+            testing::fail(error.message);
+            Value::Undefined
+        },
+    }
+}
+
+fn expect_set(value: Result[bool, TypeError]) -> bool {
+    match value {
+        Ok(result) => result,
+        Err(error) => {
+            testing::fail(error.message);
+            false
+        },
+    }
+}
+
+fn expect_object(value: Result[ObjectId, TypeError]) -> ObjectId {
+    match value {
+        Ok(object) => object,
+        Err(error) => {
+            testing::fail(error.message);
+            let heap = Heap::new();
+            expect_object(new_ordinary_object(heap, Option::None))
+        },
+    }
+}
+
+fn js_string(value: string) -> JsString {
+    let bytes = value.to_bytes();
+    JsString::from_utf8(bytes.slice(0, bytes.len()))
+}
+
+#[test]
+fn implements_primitive_value_semantics() -> unit {
+    let heap = Heap::new();
+    let nan = num::parse_float64("NaN").unwrap_or(0.0);
+    let positive_zero = num::parse_float64("0").unwrap_or(1.0);
+    let negative_zero = num::parse_float64("-0").unwrap_or(1.0);
+    testing::assert(same_value(Value::Float(nan), Value::Float(nan)));
+    testing::assert(!strict_equal(Value::Float(nan), Value::Float(nan)));
+    testing::assert(!same_value(Value::Float(positive_zero), Value::Float(negative_zero)));
+    testing::assert(same_value_zero(Value::Float(positive_zero), Value::Float(negative_zero)));
+    testing::assert(strict_equal(Value::Int(1), Value::Float(1.0)));
+    testing::assert(!to_boolean(Value::Undefined));
+    testing::assert(!to_boolean(Value::Null));
+    testing::assert(!to_boolean(Value::Int(0)));
+    testing::assert(!to_boolean(Value::Float(nan)));
+    testing::assert(!to_boolean(Value::String(js_string(""))));
+    testing::assert(!to_boolean(Value::BigInt(BigInt::new(false, "000"))));
+    testing::assert(to_boolean(Value::String(js_string("0"))));
+    testing::assert_eq(type_of(Value::Null), "object");
+    testing::assert_eq(type_of(Value::BigInt(BigInt::new(false, "1"))), "bigint");
+    testing::assert_eq(
+        type_of(Value::Object(expect_object(new_object(heap, ObjectKind::Function, Option::None)))),
+        "function",
+    )
+}
+
+#[test]
+fn stores_native_big_integer_values_and_parses_strings() -> unit {
+    let value = BigInt::parse_radix("ffffffffffffffffffffffffffffffff", 16).unwrap_or(
+        BigInt::from_int64(0),
+    );
+    testing::assert_eq(value.to_string(), "340282366920938463463374607431768211455");
+    testing::assert_eq(
+        value.add(BigInt::from_int64(1)).to_string(),
+        "340282366920938463463374607431768211456",
+    );
+    testing::assert_eq(
+        string_to_bigint(JsString::from_code_units(Vec::[0x3000, 45, 52, 50, 0xfeff])).unwrap_or(
+            BigInt::from_int64(0),
+        ).to_string(),
+        "-42",
+    );
+    testing::assert_eq(
+        string_to_bigint(js_string("0x10000000000000000")).unwrap_or(BigInt::from_int64(0)).to_string(),
+        "18446744073709551616",
+    );
+    testing::assert(string_to_bigint(js_string("12.5")).is_err())
+}
+
+#[test]
+fn converts_integral_ieee_numbers_to_bigint_exactly() -> unit {
+    testing::assert_eq(
+        integral_number_to_bigint(9007199254740992.0).unwrap_or(BigInt::from_int64(0)).to_string(),
+        "9007199254740992",
+    );
+    testing::assert_eq(
+        integral_number_to_bigint(-1.0).unwrap_or(BigInt::from_int64(0)).to_string(),
+        "-1",
+    );
+    testing::assert(integral_number_to_bigint(1.5).is_err());
+    testing::assert(
+        integral_number_to_bigint(num::parse_float64("Infinity").unwrap_or(0.0)).is_err(),
+    )
+}
+
+#[test]
+fn converts_primitive_numbers() -> unit {
+    testing::assert_eq(expect_number(primitive_to_number(Value::Null)), 0.0);
+    testing::assert_eq(expect_number(primitive_to_number(Value::Bool(true))), 1.0);
+    testing::assert_eq(expect_number(primitive_to_number(Value::String(js_string("  42\n")))), 42.0);
+    testing::assert_eq(expect_number(primitive_to_number(Value::String(js_string("0xff")))), 255.0);
+    testing::assert_eq(expect_number(primitive_to_number(Value::String(js_string("0b101")))), 5.0);
+    testing::assert_eq(expect_number(primitive_to_number(Value::String(js_string("0o17")))), 15.0);
+    testing::assert_eq(
+        expect_number(
+            primitive_to_number(
+                Value::String(JsString::from_code_units(Vec::[0x00a0, 0x3000, 52, 50, 0xfeff])),
+            ),
+        ),
+        42.0,
+    );
+    testing::assert(math::is_nan(expect_number(primitive_to_number(Value::Undefined))));
+    testing::assert(
+        math::is_nan(expect_number(primitive_to_number(Value::String(js_string("nope"))))),
+    );
+    testing::assert(
+        math::is_nan(expect_number(primitive_to_number(Value::String(js_string("+0x1"))))),
+    );
+    testing::assert(primitive_to_number(Value::Symbol(Symbol::new(1, Option::None))).is_err());
+    testing::assert(primitive_to_number(Value::BigInt(BigInt::new(false, "1"))).is_err())
+}
+
+#[test]
+fn enforces_property_descriptor_invariants() -> unit {
+    let heap = Heap::new();
+    let object = expect_object(new_ordinary_object(heap, Option::None));
+    let key = string_property_key("fixed");
+    testing::assert(
+        define_own_property(heap, object, key, data_descriptor(Value::Int(1), false, true, false)),
+    );
+    testing::assert(
+        !define_own_property(heap, object, key, data_descriptor(Value::Int(2), false, true, false)),
+    );
+    testing::assert(
+        define_own_property(heap, object, key, data_descriptor(Value::Int(1), false, true, false)),
+    );
+    testing::assert(!set_existing_data_property(heap, object, key, Value::Int(2)));
+    testing::assert(!delete_property(heap, object, key));
+    testing::assert(prevent_extensions(heap, object));
+    testing::assert(
+        !define_own_property(
+            heap,
+            object,
+            string_property_key("new"),
+            data_descriptor(Value::Int(1), true, true, true),
+        ),
+    )
+}
+
+#[test]
+fn resolves_prototypes_and_rejects_cycles() -> unit {
+    let heap = Heap::new();
+    let parent = expect_object(new_ordinary_object(heap, Option::None));
+    let child = expect_object(new_ordinary_object(heap, Option::Some(parent)));
+    let key = string_property_key("answer");
+    testing::assert(
+        define_own_property(heap, parent, key, data_descriptor(Value::Int(42), true, true, true)),
+    );
+    match expect_property(get_property(heap, child, key)) {
+        Value::Int(value) => testing::assert_eq(value, 42),
+        _ => testing::fail("expected inherited integer"),
+    };
+    testing::assert(!set_prototype_of(heap, parent, Option::Some(child)));
+    testing::assert(set_prototype_of(heap, child, Option::None))
+}
+
+#[test]
+fn sets_own_properties_with_inherited_constraints() -> unit {
+    let heap = Heap::new();
+    let parent = expect_object(new_ordinary_object(heap, Option::None));
+    let child = expect_object(new_ordinary_object(heap, Option::Some(parent)));
+    let fixed = string_property_key("fixed");
+    let open = string_property_key("open");
+    testing::assert(
+        define_own_property(heap, parent, fixed, data_descriptor(Value::Int(1), false, true, true)),
+    );
+    testing::assert(!expect_set(set_property(heap, child, fixed, Value::Int(2))));
+    testing::assert(expect_set(set_property(heap, child, open, Value::Int(3))));
+    match expect_property(get_property(heap, child, open)) {
+        Value::Int(value) => testing::assert_eq(value, 3),
+        _ => testing::fail("expected own integer"),
+    };
+    testing::assert(prevent_extensions(heap, child));
+    testing::assert(
+        !expect_set(set_property(heap, child, string_property_key("blocked"), Value::Int(4))),
+    )
+}
+
+#[test]
+fn orders_own_keys_like_ecmascript() -> unit {
+    let heap = Heap::new();
+    let object = expect_object(new_ordinary_object(heap, Option::None));
+    let symbol = Symbol::new(9, Option::Some("marker"));
+    let insertion = [
+        string_property_key("later"),
+        string_property_key("10"),
+        string_property_key("2"),
+        string_property_key("01"),
+        PropertyKey::Symbol(symbol),
+        string_property_key("0"),
+    ];
+    for key in insertion {
+        testing::assert(
+            define_own_property(
+                heap,
+                object,
+                key,
+                data_descriptor(Value::Undefined, true, true, true),
+            ),
+        )
+    }
+    let keys = own_property_keys(heap, object);
+    testing::assert_eq(keys.len(), 6);
+    testing::assert(keys[0] == string_property_key("0"));
+    testing::assert(keys[1] == string_property_key("2"));
+    testing::assert(keys[2] == string_property_key("10"));
+    testing::assert(keys[3] == string_property_key("later"));
+    testing::assert(keys[4] == string_property_key("01"));
+    testing::assert(keys[5] == PropertyKey::Symbol(symbol))
+}
+
+#[test]
+fn preserves_utf16_property_key_identity_and_order() -> unit {
+    let heap = Heap::new();
+    let object = expect_object(new_ordinary_object(heap, Option::None));
+    let first = js_string_property_key(JsString::from_code_units(Vec::[0xd800]));
+    let second = js_string_property_key(JsString::from_code_units(Vec::[0xd801]));
+    testing::assert(
+        define_own_property(heap, object, first, data_descriptor(Value::Int(1), true, true, true)),
+    );
+    testing::assert(
+        define_own_property(
+            heap,
+            object,
+            string_property_key("10"),
+            data_descriptor(Value::Int(10), true, true, true),
+        ),
+    );
+    testing::assert(
+        define_own_property(heap, object, second, data_descriptor(Value::Int(2), true, true, true)),
+    );
+    testing::assert(
+        define_own_property(
+            heap,
+            object,
+            string_property_key("2"),
+            data_descriptor(Value::Int(2), true, true, true),
+        ),
+    );
+    testing::assert(expect_set(set_property(heap, object, first, Value::Int(3))));
+    match expect_property(get_property(heap, object, first)) {
+        Value::Int(value) => testing::assert_eq(value, 3),
+        _ => testing::fail("expected first surrogate property"),
+    };
+    match expect_property(get_property(heap, object, second)) {
+        Value::Int(value) => testing::assert_eq(value, 2),
+        _ => testing::fail("expected second surrogate property"),
+    };
+    match heap.get(object) {
+        Some(value) => testing::assert_eq(value.own_property_count(), 4),
+        None => testing::fail("expected live object"),
+    };
+    let keys = own_property_keys(heap, object);
+    testing::assert(keys[0] == string_property_key("2"));
+    testing::assert(keys[1] == string_property_key("10"));
+    testing::assert(keys[2] == first);
+    testing::assert(keys[3] == second)
+}
+
+#[test]
+fn heap_reuses_slots_without_reviving_stale_ids() -> unit {
+    let heap = Heap::new();
+    let first = expect_object(new_ordinary_object(heap, Option::None));
+    testing::assert(heap.contains(first));
+    testing::assert_eq(heap.live_count(), 1);
+    testing::assert_eq(heap.slot_count(), 1);
+    testing::assert(heap.free(first));
+    testing::assert(!heap.contains(first));
+    testing::assert(heap.get(first).is_none());
+    testing::assert(!heap.free(first));
+    let second = expect_object(new_ordinary_object(heap, Option::None));
+    testing::assert_eq(second.slot(), first.slot());
+    testing::assert_eq(second.generation(), first.generation() + 1);
+    testing::assert(second != first);
+    testing::assert(heap.contains(second));
+    testing::assert_eq(heap.live_count(), 1);
+    testing::assert_eq(heap.slot_count(), 1)
+}
+
+#[test]
+fn rejects_object_ids_from_other_heaps() -> unit {
+    let first_heap = Heap::new();
+    let second_heap = Heap::new();
+    let first = expect_object(new_ordinary_object(first_heap, Option::None));
+    let second = expect_object(new_ordinary_object(second_heap, Option::None));
+    let key = string_property_key("value");
+    testing::assert(first != second);
+    testing::assert(!first_heap.contains(second));
+    testing::assert(first_heap.get(second).is_none());
+    testing::assert(!set_prototype_of(first_heap, first, Option::Some(second)));
+    testing::assert(
+        !define_own_property(
+            first_heap,
+            second,
+            key,
+            data_descriptor(Value::Int(1), true, true, true),
+        ),
+    );
+    testing::assert(get_property(first_heap, second, key).is_err());
+    testing::assert(new_ordinary_object(first_heap, Option::Some(second)).is_err())
+}
+
+#[test]
+fn object_values_compare_by_heap_identity_and_generation() -> unit {
+    let heap = Heap::new();
+    let first = expect_object(new_ordinary_object(heap, Option::None));
+    let alias = first;
+    let second = expect_object(new_ordinary_object(heap, Option::None));
+    testing::assert(same_value(Value::Object(first), Value::Object(alias)));
+    testing::assert(strict_equal(Value::Object(first), Value::Object(alias)));
+    testing::assert(!same_value(Value::Object(first), Value::Object(second)));
+    testing::assert(heap.free(first));
+    let replacement = expect_object(new_ordinary_object(heap, Option::None));
+    testing::assert_eq(first.slot(), replacement.slot());
+    testing::assert(!strict_equal(Value::Object(first), Value::Object(replacement)))
+}
+
+#[test]
+fn creates_arrays_with_non_enumerable_length_and_no_materialized_holes() -> unit {
+    let heap = Heap::new();
+    let array = expect_object(new_array(heap, 3));
+    match heap.get(array) {
+        Some(value) => {
+            match value.kind() {
+                ObjectKind::Array => (),
+                _ => testing::fail("expected array kind"),
+            };
+            match value.own_property(string_property_key("length")) {
+                Some(descriptor) => {
+                    testing::assert(!descriptor_enumerable(descriptor));
+                    testing::assert(!descriptor_configurable(descriptor))
+                },
+                None => testing::fail("expected length descriptor"),
+            }
+        },
+        None => testing::fail("expected array object"),
+    };
+    match get_property(heap, array, string_property_key("length")) {
+        Ok(Some(Value::Int(value))) => testing::assert_eq(value, 3),
+        _ => testing::fail("expected array length"),
+    };
+    match get_property(heap, array, string_property_key("0")) {
+        Ok(value) => testing::assert(value.is_none()),
+        Err(value) => testing::fail(value.message),
+    };
+    let keys = own_property_keys(heap, array);
+    testing::assert_eq(keys.len(), 1);
+    testing::assert(keys[0] == string_property_key("length"));
+    testing::assert(new_array(heap, -1).is_err())
+}
+
+#[test]
+fn array_exotic_definitions_grow_and_shrink_length() -> unit {
+    let heap = Heap::new();
+    let array = expect_object(new_array(heap, 1));
+    testing::assert(
+        define_own_property(
+            heap,
+            array,
+            string_property_key("3"),
+            data_descriptor(Value::Int(7), true, true, true),
+        ),
+    );
+    match get_property(heap, array, string_property_key("length")) {
+        Ok(Some(Value::Int(value))) => testing::assert_eq(value, 4),
+        _ => testing::fail("expected grown array length"),
+    };
+    testing::assert(
+        set_property(heap, array, string_property_key("length"), Value::Int(2)).unwrap_or(false),
+    );
+    match get_property(heap, array, string_property_key("3")) {
+        Ok(value) => testing::assert(value.is_none()),
+        Err(value) => testing::fail(value.message),
+    };
+    match get_property(heap, array, string_property_key("length")) {
+        Ok(Some(Value::Int(value))) => testing::assert_eq(value, 2),
+        _ => testing::fail("expected shrunk array length"),
+    }
+}
+
+#[test]
+fn array_exotic_length_enforces_writability_and_rolls_back_failed_shrinks() -> unit {
+    let heap = Heap::new();
+    let array = expect_object(new_array(heap, 4));
+    testing::assert(
+        define_own_property(
+            heap,
+            array,
+            string_property_key("2"),
+            data_descriptor(Value::Int(2), true, true, false),
+        ),
+    );
+    testing::assert(
+        !define_own_property(
+            heap,
+            array,
+            string_property_key("length"),
+            data_descriptor(Value::Int(1), true, false, false),
+        ),
+    );
+    match get_property(heap, array, string_property_key("length")) {
+        Ok(Some(Value::Int(value))) => testing::assert_eq(value, 3),
+        _ => testing::fail("expected rolled back array length"),
+    };
+    testing::assert(
+        define_own_property(
+            heap,
+            array,
+            string_property_key("length"),
+            data_descriptor(Value::Int(3), false, false, false),
+        ),
+    );
+    testing::assert(
+        !define_own_property(
+            heap,
+            array,
+            string_property_key("3"),
+            data_descriptor(Value::Int(3), true, true, true),
+        ),
+    );
+    testing::assert(
+        !set_property(heap, array, string_property_key("length"), Value::Int(4)).unwrap_or(true),
+    )
+}
+
+#[test]
+fn configured_array_prototype_is_inherited_and_rooted_by_heap() -> unit {
+    let heap = Heap::new();
+    let prototype = expect_object(new_ordinary_object(heap, Option::None));
+    testing::assert(heap.set_array_prototype(prototype));
+    let array = expect_object(new_array(heap, 0));
+    match heap.get(array) {
+        Some(value) => testing::assert(value.prototype() == Option::Some(prototype)),
+        None => testing::fail("expected array"),
+    };
+    let roots: Vec[Value] = Vec::[];
+    let stats = heap.collect(roots);
+    testing::assert(heap.contains(prototype));
+    testing::assert(!heap.contains(array));
+    testing::assert_eq(stats.live_after, 1)
+}
+
+#[test]
+fn configured_object_prototype_is_inherited_and_rooted_by_heap() -> unit {
+    let heap = Heap::new();
+    let prototype = expect_object(new_null_prototype_object(heap));
+    testing::assert(heap.set_object_prototype(prototype));
+    let object = expect_object(new_ordinary_object(heap, Option::None));
+    let null_object = expect_object(new_null_prototype_object(heap));
+    match heap.get(object) {
+        Some(value) => testing::assert(value.prototype() == Option::Some(prototype)),
+        None => testing::fail("expected ordinary object"),
+    };
+    match heap.get(null_object) {
+        Some(value) => testing::assert(value.prototype().is_none()),
+        None => testing::fail("expected null prototype object"),
+    };
+    let roots: Vec[Value] = Vec::[];
+    let stats = heap.collect(roots);
+    testing::assert(heap.contains(prototype));
+    testing::assert(!heap.contains(object));
+    testing::assert(!heap.contains(null_object));
+    testing::assert_eq(stats.live_after, 1)
+}
+
+#[test]
+fn configured_function_prototype_is_callable_and_rooted_by_heap() -> unit {
+    let heap = Heap::new();
+    let object_prototype = expect_object(new_null_prototype_object(heap));
+    testing::assert(heap.set_object_prototype(object_prototype));
+    let function_prototype = match new_object(
+        heap,
+        ObjectKind::Function,
+        Option::Some(object_prototype),
+    ) {
+        Ok(value) => value,
+        Err(value) => {
+            testing::fail(value.message);
+            object_prototype
+        },
+    };
+    testing::assert(heap.set_function_prototype(function_prototype));
+    testing::assert(function_prototype.is_callable());
+    let roots: Vec[Value] = Vec::[];
+    let stats = heap.collect(roots);
+    testing::assert(heap.contains(object_prototype));
+    testing::assert(heap.contains(function_prototype));
+    testing::assert_eq(stats.live_after, 2)
+}
+
+#[test]
+fn mapped_argument_cells_are_visible_and_traced() -> unit {
+    let heap = Heap::new();
+    let arguments = expect_object(new_ordinary_object(heap, Option::None));
+    let first = expect_object(new_ordinary_object(heap, Option::None));
+    let second = expect_object(new_ordinary_object(heap, Option::None));
+    testing::assert(
+        define_own_property(
+            heap,
+            arguments,
+            string_property_key("0"),
+            data_descriptor(Value::Undefined, true, true, true),
+        ),
+    );
+    let cell = Ref::new(Value::Object(first));
+    testing::assert(map_argument_index(heap, arguments, 0, cell));
+    match get_property(heap, arguments, string_property_key("0")) {
+        Ok(Some(Value::Object(value))) => testing::assert(value == first),
+        _ => testing::fail("expected mapped argument value"),
+    };
+    cell.set(Value::Object(second));
+    let stats = heap.collect(Vec::[Value::Object(arguments)]);
+    testing::assert(!heap.contains(first));
+    testing::assert(heap.contains(second));
+    testing::assert_eq(stats.live_after, 2)
+}
+
+#[test]
+fn typed_array_elements_are_synthetic_and_trace_their_buffer_object() -> unit {
+    let heap = Heap::new();
+    let buffer_object = expect_object(new_null_prototype_object(heap));
+    let object = expect_object(new_null_prototype_object(heap));
+    let view = match arraybuffer::Uint8Array::new(2) {
+        Ok(value) => value,
+        Err(value) => {
+            testing::fail(value.to_string());
+            loop {}
+        },
+    };
+    testing::assert(register_typed_array(heap, object, TypedArrayView::Uint8(view), buffer_object));
+    testing::assert(
+        define_own_property(
+            heap,
+            object,
+            string_property_key("0"),
+            data_descriptor(Value::Int(257), true, true, true),
+        ),
+    );
+    match heap.get(object) {
+        Some(value) => match value.own_property(string_property_key("0")) {
+            Some(PropertyDescriptor::Data {
+                value: Value::Int(value),
+                writable,
+                enumerable,
+                configurable,
+            }) => testing::assert(value == 1 && writable && enumerable && configurable),
+            _ => testing::fail("expected typed array element descriptor"),
+        },
+        None => testing::fail("expected typed array object"),
+    };
+    testing::assert_eq(own_property_keys(heap, object).len(), 2);
+    testing::assert(
+        !define_own_property(
+            heap,
+            object,
+            string_property_key("2"),
+            data_descriptor(Value::Int(1), true, true, true),
+        ),
+    );
+    let rooted = heap.collect(Vec::[Value::Object(object)]);
+    testing::assert(heap.contains(buffer_object));
+    testing::assert_eq(rooted.live_after, 2);
+    let empty_roots: Vec[Value] = Vec::[];
+    let collected = heap.collect(empty_roots);
+    testing::assert_eq(collected.live_after, 0)
+}

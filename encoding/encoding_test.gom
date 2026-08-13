@@ -1,0 +1,140 @@
+package encoding;
+
+use std::testing;
+
+fn encoding_units(value: string) -> Vec[uint16] {
+    let output: Vec[uint16] = Vec::with_capacity(value.byte_len());
+    for byte in value.to_bytes() {
+        output.push(byte.to_uint16())
+    }
+    output
+}
+
+fn encoding_decode_base64(
+    value: string,
+    alphabet: Base64Alphabet,
+    handling: LastChunkHandling,
+    capacity: Option[int],
+) -> DecodeResult {
+    let units = encoding_units(value);
+    match decode_base64(units.slice(0, units.len()), alphabet, handling, capacity) {
+        Ok(value) => value,
+        Err(_) => {
+            testing::fail("expected base64 value");
+            loop {}
+        },
+    }
+}
+
+fn encoding_decode_hex(value: string, capacity: Option[int]) -> DecodeResult {
+    let units = encoding_units(value);
+    match decode_hex(units.slice(0, units.len()), capacity) {
+        Ok(value) => value,
+        Err(_) => {
+            testing::fail("expected hex value");
+            loop {}
+        },
+    }
+}
+
+#[test]
+fn base64_encodes_standard_url_and_padding_forms() -> unit {
+    let input: Vec[byte] = Vec::[0, 171, 255];
+    testing::assert(
+        encode_base64(input.slice(0, input.len()), Base64Alphabet::Base64, false)
+            == "AKv/".to_bytes(),
+    );
+    testing::assert(
+        encode_base64(input.slice(0, input.len()), Base64Alphabet::Base64Url, true)
+            == "AKv_".to_bytes(),
+    );
+    let short: Vec[byte] = Vec::[102];
+    testing::assert(
+        encode_base64(short.slice(0, short.len()), Base64Alphabet::Base64, false)
+            == "Zg==".to_bytes(),
+    )
+}
+
+#[test]
+fn base64_decodes_whitespace_url_and_loose_chunks() -> unit {
+    testing::assert(
+        encoding_decode_base64(
+            "SG V\nsbG8=",
+            Base64Alphabet::Base64,
+            LastChunkHandling::Loose,
+            Option::None,
+        ).bytes
+            == "Hello".to_bytes(),
+    );
+    testing::assert(
+        encoding_decode_base64(
+            "-_8=",
+            Base64Alphabet::Base64Url,
+            LastChunkHandling::Strict,
+            Option::None,
+        ).bytes
+            == Vec::[251, 255],
+    );
+    testing::assert(
+        encoding_decode_base64(
+            "Zm8",
+            Base64Alphabet::Base64,
+            LastChunkHandling::Loose,
+            Option::None,
+        ).bytes
+            == "fo".to_bytes(),
+    )
+}
+
+#[test]
+fn base64_enforces_strict_and_stop_before_partial_modes() -> unit {
+    let strict_units = encoding_units("Zh==");
+    testing::assert(
+        decode_base64(
+            strict_units.slice(0, strict_units.len()),
+            Base64Alphabet::Base64,
+            LastChunkHandling::Strict,
+            Option::None,
+        ).is_err(),
+    );
+    let stopped = encoding_decode_base64(
+        " Zg ",
+        Base64Alphabet::Base64,
+        LastChunkHandling::StopBeforePartial,
+        Option::None,
+    );
+    testing::assert(stopped.bytes.len() == 0);
+    testing::assert(stopped.read == 0)
+}
+
+#[test]
+fn base64_capacity_stops_before_an_atomic_chunk() -> unit {
+    let short = encoding_decode_base64(
+        " Zm9v",
+        Base64Alphabet::Base64,
+        LastChunkHandling::Loose,
+        Option::Some(2),
+    );
+    testing::assert(short.bytes.len() == 0);
+    testing::assert(short.read == 0);
+    let exact = encoding_decode_base64(
+        " Zm8= ",
+        Base64Alphabet::Base64,
+        LastChunkHandling::Loose,
+        Option::Some(2),
+    );
+    testing::assert(exact.bytes == "fo".to_bytes());
+    testing::assert(exact.read == 6)
+}
+
+#[test]
+fn hex_codec_is_lowercase_and_capacity_aware() -> unit {
+    let decoded = encoding_decode_hex("00aBff", Option::None);
+    testing::assert(decoded.bytes == Vec::[0, 171, 255]);
+    testing::assert(encode_hex(decoded.bytes.slice(0, decoded.bytes.len())) == "00abff".to_bytes());
+    let partial = encoding_decode_hex("001122", Option::Some(2));
+    testing::assert(partial.bytes == Vec::[0, 17]);
+    testing::assert(partial.read == 4);
+    let odd = encoding_units("001");
+    testing::assert(decode_hex(odd.slice(0, odd.len()), Option::None).is_err())
+}

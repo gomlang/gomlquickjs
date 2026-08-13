@@ -1,0 +1,218 @@
+package builtins;
+
+use gomlang::quickjs::runtime;
+use gomlang::quickjs::vm;
+use std::testing;
+
+fn bjson_test_module(context: vm::Context) -> runtime::ObjectId {
+    let _ = expect_realm(install(context));
+    match context.virtual_module("./bjson.so") {
+        Some(runtime::Value::Object(value)) => value,
+        _ => {
+            testing::fail("bjson virtual module is missing");
+            bjson_test_module(context)
+        },
+    }
+}
+
+fn bjson_test_property(context: vm::Context, value: runtime::Value, name: string) -> runtime::Value {
+    match context.read_property_at_depth(value, runtime::Value::String(js_string(name)), 0) {
+        Ok(value) => value,
+        Err(error) => {
+            testing::fail(error.kind.debug());
+            runtime::Value::Undefined
+        },
+    }
+}
+
+fn bjson_test_roundtrip(
+    context: vm::Context,
+    module: runtime::ObjectId,
+    value: runtime::Value,
+    allow_reference: bool,
+) -> runtime::Value {
+    let write = property(context.heap(), module, "write");
+    let encoded = expect_value(
+        invoke(context, write, Vec::[value, runtime::Value::Bool(allow_reference)]),
+    );
+    let length = bjson_test_property(context, encoded, "byteLength");
+    let read = property(context.heap(), module, "read");
+    expect_value(
+        invoke(
+            context,
+            read,
+            Vec::[encoded, runtime::Value::Int(0), length, runtime::Value::Bool(allow_reference)],
+        ),
+    )
+}
+
+fn bjson_test_object(value: runtime::Value) -> runtime::ObjectId {
+    match value {
+        runtime::Value::Object(value) => value,
+        _ => {
+            testing::fail("expected object");
+            bjson_test_object(value)
+        },
+    }
+}
+
+fn bjson_test_new_object(context: vm::Context) -> runtime::ObjectId {
+    match runtime::new_ordinary_object(context.heap(), context.heap().object_prototype()) {
+        Ok(value) => value,
+        Err(error) => {
+            testing::fail(error.message);
+            bjson_test_new_object(context)
+        },
+    }
+}
+
+fn bjson_test_global(context: vm::Context) -> runtime::ObjectId {
+    match context.global_object() {
+        Some(value) => value,
+        None => {
+            testing::fail("global object is missing");
+            bjson_test_global(context)
+        },
+    }
+}
+
+fn bjson_test_array(context: vm::Context, values: Vec[runtime::Value]) -> runtime::ObjectId {
+    match allocate_array(context.heap(), values, values.len()) {
+        Ok(value) => value,
+        Err(error) => {
+            testing::fail(error.message);
+            bjson_test_array(context, Vec::[])
+        },
+    }
+}
+
+#[test]
+fn bjson_roundtrips_values_bigints_and_enumerable_properties() -> unit {
+    let context = vm::Context::new(runtime::Heap::new());
+    let module = bjson_test_module(context);
+    let object = bjson_test_new_object(context);
+    let _ = runtime::define_own_property(
+        context.heap(),
+        object,
+        runtime::string_property_key("answer"),
+        runtime::data_descriptor(runtime::Value::Int(42), true, true, true),
+    );
+    let _ = runtime::define_own_property(
+        context.heap(),
+        object,
+        runtime::string_property_key("hidden"),
+        runtime::data_descriptor(runtime::Value::Int(7), true, false, true),
+    );
+    let bigint = runtime::Value::BigInt(runtime::BigInt::new(true, "4886718345"));
+    let _ = runtime::define_own_property(
+        context.heap(),
+        object,
+        runtime::string_property_key("big"),
+        runtime::data_descriptor(bigint, true, true, true),
+    );
+    let decoded = bjson_test_roundtrip(context, module, runtime::Value::Object(object), false);
+    testing::assert(
+        runtime::same_value(
+            bjson_test_property(context, decoded, "answer"),
+            runtime::Value::Int(42),
+        ),
+    );
+    testing::assert(runtime::same_value(bjson_test_property(context, decoded, "big"), bigint));
+    match bjson_test_property(context, decoded, "hidden") {
+        runtime::Value::Undefined => (),
+        _ => testing::fail("non-enumerable property was serialized"),
+    }
+}
+
+#[test]
+fn bjson_reference_mode_preserves_cycles_and_rejects_them_when_disabled() -> unit {
+    let context = vm::Context::new(runtime::Heap::new());
+    let module = bjson_test_module(context);
+    let object = bjson_test_new_object(context);
+    let _ = runtime::define_own_property(
+        context.heap(),
+        object,
+        runtime::string_property_key("self"),
+        runtime::data_descriptor(runtime::Value::Object(object), true, true, true),
+    );
+    let write = property(context.heap(), module, "write");
+    match invoke(context, write, Vec::[runtime::Value::Object(object)]) {
+        Err(vm::VmError { kind: vm::VmErrorKind::TypeError(message), .. }) => {
+            testing::assert(message.contains("circular reference"))
+        },
+        _ => testing::fail("expected circular reference error"),
+    };
+    let decoded = bjson_test_roundtrip(context, module, runtime::Value::Object(object), true);
+    let decoded_object = bjson_test_object(decoded);
+    match bjson_test_property(context, decoded, "self") {
+        runtime::Value::Object(value) => testing::assert(value == decoded_object),
+        _ => testing::fail("cycle identity was not preserved"),
+    }
+}
+
+#[test]
+fn bjson_preserves_typed_array_buffer_identity_and_view_metadata() -> unit {
+    let context = vm::Context::new(runtime::Heap::new());
+    let module = bjson_test_module(context);
+    let global = bjson_test_global(context);
+    let array_buffer = property(context.heap(), global, "ArrayBuffer");
+    let uint8_array = property(context.heap(), global, "Uint8Array");
+    let buffer = arraybuffer_construct(context, array_buffer, Vec::[runtime::Value::Int(8)]);
+    let first = arraybuffer_construct(
+        context,
+        uint8_array,
+        Vec::[buffer, runtime::Value::Int(1), runtime::Value::Int(2)],
+    );
+    let second = arraybuffer_construct(
+        context,
+        uint8_array,
+        Vec::[buffer, runtime::Value::Int(4), runtime::Value::Int(3)],
+    );
+    let array = bjson_test_array(context, Vec::[first, second]);
+    let decoded = bjson_test_roundtrip(context, module, runtime::Value::Object(array), true);
+    let decoded_first = bjson_test_property(context, decoded, "0");
+    let decoded_second = bjson_test_property(context, decoded, "1");
+    let first_buffer = bjson_test_property(context, decoded_first, "buffer");
+    let second_buffer = bjson_test_property(context, decoded_second, "buffer");
+    testing::assert(runtime::same_value(first_buffer, second_buffer));
+    testing::assert_eq(
+        expect_number(bjson_test_property(context, decoded_first, "byteOffset")),
+        1.0,
+    );
+    testing::assert_eq(expect_number(bjson_test_property(context, decoded_first, "length")), 2.0);
+    testing::assert_eq(
+        expect_number(bjson_test_property(context, decoded_second, "byteOffset")),
+        4.0,
+    );
+    testing::assert_eq(expect_number(bjson_test_property(context, decoded_second, "length")), 3.0)
+}
+
+#[test]
+fn arraybuffer_resizable_metadata_and_resize_are_observable() -> unit {
+    let context = vm::Context::new(runtime::Heap::new());
+    let _ = bjson_test_module(context);
+    let global = bjson_test_global(context);
+    let constructor = property(context.heap(), global, "ArrayBuffer");
+    let options = bjson_test_new_object(context);
+    let _ = runtime::define_own_property(
+        context.heap(),
+        options,
+        runtime::string_property_key("maxByteLength"),
+        runtime::data_descriptor(runtime::Value::Int(8), true, true, true),
+    );
+    let buffer = arraybuffer_construct(
+        context,
+        constructor,
+        Vec::[runtime::Value::Int(4), runtime::Value::Object(options)],
+    );
+    testing::assert_eq(expect_number(bjson_test_property(context, buffer, "byteLength")), 4.0);
+    testing::assert_eq(expect_number(bjson_test_property(context, buffer, "maxByteLength")), 8.0);
+    match bjson_test_property(context, buffer, "resizable") {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected resizable flag"),
+    };
+    let _ = expect_value(
+        arraybuffer_invoke_method(context, buffer, "resize", Vec::[runtime::Value::Int(7)]),
+    );
+    testing::assert_eq(expect_number(bjson_test_property(context, buffer, "byteLength")), 7.0)
+}

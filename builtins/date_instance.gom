@@ -1,0 +1,992 @@
+package builtins;
+
+use gomlang::quickjs::date;
+use gomlang::quickjs::runtime;
+use gomlang::quickjs::vm;
+use std::math;
+use std::num;
+use std::text;
+use std::time;
+
+fn date_instance_nan() -> float64 {
+    num::parse_float64("NaN").unwrap_or(0.0)
+}
+
+fn date_instance_float(value: int64) -> float64 {
+    num::parse_float64(value.to_string()).unwrap_or(date_instance_nan())
+}
+
+fn date_instance_now() -> float64 {
+    date_instance_float(time::SystemTime::now().unix_milliseconds())
+}
+
+fn date_instance_state(states: HashMap[runtime::ObjectId, Ref[float64]], value: runtime::Value) -> Result[
+    Ref[float64],
+    vm::VmError,
+] {
+    match value {
+        runtime::Value::Object(object) => match states.get(object) {
+            Some(value) => Result::Ok(value),
+            None => Result::Err(function_vm_error("Date method requires a Date receiver")),
+        },
+        _ => Result::Err(function_vm_error("Date method requires a Date receiver")),
+    }
+}
+
+fn date_instance_number(context: vm::Context, value: runtime::Value, depth: int) -> Result[
+    float64,
+    vm::VmError,
+] {
+    match number_value_at_depth(context, value, depth)? {
+        runtime::Value::Float(value) => Result::Ok(value),
+        _ => Result::Err(function_vm_error("Date value is not numeric")),
+    }
+}
+
+fn date_instance_integer(context: vm::Context, value: runtime::Value, depth: int) -> Result[
+    Option[int64],
+    vm::VmError,
+] {
+    let number = date_instance_number(context, value, depth)?;
+    if !math::is_finite(number) {
+        Result::Ok(Option::None)
+    } else {
+        match date::time_clip(math::trunc(number)) {
+            Ok(value) => Result::Ok(Option::Some(value)),
+            Err(_) => Result::Ok(Option::None),
+        }
+    }
+}
+
+fn date_instance_clip(value: float64) -> float64 {
+    match date::time_clip(value) {
+        Ok(value) => date_instance_float(value),
+        Err(_) => date_instance_nan(),
+    }
+}
+
+fn date_instance_timezone_offset(timezone: date::TimeZone, value: int64) -> int {
+    timezone.offset_minutes_at(value)
+}
+
+fn date_instance_local_to_utc(timezone: date::TimeZone, value: float64) -> float64 {
+    let unadjusted = match date::time_clip(value) {
+        Ok(value) => value,
+        Err(_) => return date_instance_nan(),
+    };
+    let offset = date_instance_timezone_offset(timezone, unadjusted).to_int64() * 60000;
+    date_instance_clip(date_instance_float(unadjusted - offset))
+}
+
+fn date_instance_parse_string(timezone: date::TimeZone, value: runtime::JsString) -> float64 {
+    let source = match value.to_host_string() {
+        Ok(value) => value,
+        Err(_) => return date_instance_nan(),
+    };
+    match date::parse_iso(source) {
+        Ok(parsed) => match parsed.time_zone {
+            date::IsoTimeZone::Local => match date::parsed_iso_to_utc(
+                date::ParsedIsoDate {
+                    components: parsed.components,
+                    time_zone: date::IsoTimeZone::Utc,
+                    date_only: parsed.date_only,
+                },
+            ) {
+                Ok(value) => date_instance_local_to_utc(timezone, date_instance_float(value)),
+                Err(_) => date_instance_nan(),
+            },
+            _ => match date::parsed_iso_to_utc(parsed) {
+                Ok(value) => date_instance_float(value),
+                Err(_) => date_instance_nan(),
+            },
+        },
+        Err(_) => match date::parse_timestamp(source) {
+            Ok(value) => if text::find(source, " GMT+").is_some()
+                || text::find(source, " GMT-").is_some() {
+                date_instance_float(value)
+            } else {
+                date_instance_local_to_utc(timezone, date_instance_float(value))
+            },
+            Err(_) => date_instance_nan(),
+        },
+    }
+}
+
+fn date_instance_from_components(
+    timezone: date::TimeZone,
+    context: vm::Context,
+    arguments: Vec[runtime::Value],
+    depth: int,
+) -> Result[float64, vm::VmError] {
+    let values: Vec[float64] = Vec::[];
+    let defaults: Vec[float64] = Vec::[0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0];
+    let mut index = 0;
+    while index < 7 {
+        if index < arguments.len() {
+            values.push(date_instance_number(context, arguments[index], depth)?)
+        } else {
+            values.push(defaults[index])
+        };
+        index += 1;
+    }
+    Result::Ok(date_instance_local_to_utc(timezone, date::make_date_from_float_components(values)))
+}
+
+fn date_instance_utc_from_components(
+    context: vm::Context,
+    arguments: Vec[runtime::Value],
+    depth: int,
+) -> Result[float64, vm::VmError] {
+    let values: Vec[float64] = Vec::[];
+    let defaults: Vec[float64] = Vec::[0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0];
+    let mut index = 0;
+    while index < 7 {
+        if index < arguments.len() {
+            values.push(date_instance_number(context, arguments[index], depth)?)
+        } else {
+            values.push(defaults[index])
+        };
+        index += 1;
+    }
+    Result::Ok(date::make_date_from_float_components(values))
+}
+
+fn date_instance_prepare(
+    timezone: date::TimeZone,
+    context: vm::Context,
+    states: HashMap[runtime::ObjectId, Ref[float64]],
+    arguments: Vec[runtime::Value],
+    depth: int,
+) -> Result[Vec[runtime::Value], vm::VmError] {
+    let value = if arguments.is_empty() {
+        date_instance_now()
+    } else if arguments.len() == 1 {
+        match arguments[0] {
+            runtime::Value::Object(object) => match states.get(object) {
+                Some(value) => value.get(),
+                None => {
+                    let primitive = context.to_primitive_default_at_depth(arguments[0], depth)?;
+                    match primitive {
+                        runtime::Value::String(value) => date_instance_parse_string(timezone, value),
+                        _ => date_instance_clip(date_instance_number(context, primitive, depth)?),
+                    }
+                },
+            },
+            runtime::Value::String(value) => date_instance_parse_string(timezone, value),
+            value => date_instance_clip(date_instance_number(context, value, depth)?),
+        }
+    } else {
+        date_instance_from_components(timezone, context, arguments, depth)?
+    };
+    Result::Ok(Vec::[runtime::Value::Float(value)])
+}
+
+fn date_instance_construct(
+    context: vm::Context,
+    states: HashMap[runtime::ObjectId, Ref[float64]],
+    receiver: runtime::ObjectId,
+    arguments: Vec[runtime::Value],
+) -> Result[runtime::Value, vm::VmError] {
+    let value = match argument(arguments, 0) {
+        runtime::Value::Float(value) => value,
+        _ => return Result::Err(function_vm_error("invalid prepared Date value")),
+    };
+    states[receiver] = Ref::new(value);
+    if !context.set_object_builtin_tag(receiver, js_string("Date")) {
+        return Result::Err(function_vm_error("cannot register Date instance"))
+    } else {};
+    Result::Ok(runtime::Value::Object(receiver))
+}
+
+fn date_instance_pad(value: int, width: int) -> string {
+    let digits = value.to_string();
+    let mut output = "";
+    let mut remaining = width - digits.byte_len();
+    while remaining > 0 {
+        output += "0";
+        remaining -= 1;
+    }
+    output + digits
+}
+
+fn date_instance_year(value: int64) -> string {
+    if value >= 0 {
+        date_instance_pad(value.to_int(), 4)
+    } else if value < 0 {
+        "-" + date_instance_pad((-value).to_int(), 4)
+    } else {
+        value.to_string()
+    }
+}
+
+fn date_instance_weekday(value: int) -> string {
+    match value {
+        0 => "Sun",
+        1 => "Mon",
+        2 => "Tue",
+        3 => "Wed",
+        4 => "Thu",
+        5 => "Fri",
+        _ => "Sat",
+    }
+}
+
+fn date_instance_month(value: int) -> string {
+    match value {
+        1 => "Jan",
+        2 => "Feb",
+        3 => "Mar",
+        4 => "Apr",
+        5 => "May",
+        6 => "Jun",
+        7 => "Jul",
+        8 => "Aug",
+        9 => "Sep",
+        10 => "Oct",
+        11 => "Nov",
+        _ => "Dec",
+    }
+}
+
+fn date_instance_fields(timezone: date::TimeZone, value: float64, local: bool) -> Option[
+    date::CivilFields,
+] {
+    match date::time_clip(value) {
+        Ok(value) => {
+            let adjusted = if local {
+                value + date_instance_timezone_offset(timezone, value).to_int64() * 60000
+            } else {
+                value
+            };
+            match date::civil_from_utc(adjusted) {
+                Ok(value) => Option::Some(value),
+                Err(_) => Option::None,
+            }
+        },
+        Err(_) => Option::None,
+    }
+}
+
+fn date_instance_string(timezone: date::TimeZone, value: float64, mode: int) -> string {
+    let local = mode != 1;
+    let fields = match date_instance_fields(timezone, value, local) {
+        Some(value) => value,
+        None => return "Invalid Date",
+    };
+    let date_text = date_instance_weekday(fields.weekday) + " " + date_instance_month(fields.month)
+        + " "
+        + date_instance_pad(fields.day, 2)
+        + " "
+        + date_instance_year(fields.year);
+    let time_text = date_instance_pad(fields.hour, 2) + ":" + date_instance_pad(fields.minute, 2)
+        + ":"
+        + date_instance_pad(fields.second, 2);
+    let locale_hour = fields.hour % 12;
+    let locale_time = date_instance_pad(
+        if locale_hour == 0 {
+            12
+        } else {
+            locale_hour
+        },
+        2,
+    )
+        + ":"
+        + date_instance_pad(fields.minute, 2)
+        + ":"
+        + date_instance_pad(fields.second, 2)
+        + if fields.hour < 12 {
+            " AM"
+        } else {
+            " PM"
+        };
+    let locale_date = date_instance_pad(fields.month, 2) + "/" + date_instance_pad(fields.day, 2)
+        + "/"
+        + date_instance_year(fields.year);
+    let offset = match date::time_clip(value) {
+        Ok(value) => date_instance_timezone_offset(timezone, value),
+        Err(_) => 0,
+    };
+    let absolute_offset = if offset < 0 {
+        -offset
+    } else {
+        offset
+    };
+    let offset_text = if offset < 0 {
+        "-"
+    } else {
+        "+"
+    }
+        + date_instance_pad(absolute_offset / 60, 2)
+        + date_instance_pad(absolute_offset % 60, 2);
+    match mode {
+        1 => date_instance_weekday(fields.weekday) + ", " + date_instance_pad(fields.day, 2) + " "
+            + date_instance_month(fields.month)
+            + " "
+            + date_instance_year(fields.year)
+            + " "
+            + time_text
+            + " GMT",
+        2 => date_text,
+        3 => time_text + " GMT" + offset_text,
+        5 => locale_date + ", " + locale_time,
+        6 => locale_date,
+        7 => locale_time,
+        _ => date_text + " " + time_text + " GMT" + offset_text,
+    }
+}
+
+fn date_instance_call(
+    timezone: date::TimeZone,
+    context: vm::Context,
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+    depth: int,
+) -> Result[runtime::Value, vm::VmError] {
+    let _ = context;
+    let _ = this_value;
+    let _ = arguments;
+    let _ = depth;
+    Result::Ok(
+        runtime::Value::String(js_string(date_instance_string(timezone, date_instance_now(), 0))),
+    )
+}
+
+fn date_instance_get_time(
+    states: HashMap[runtime::ObjectId, Ref[float64]],
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+) -> Result[runtime::Value, vm::VmError] {
+    let _ = arguments;
+    Result::Ok(runtime::Value::Float(date_instance_state(states, this_value)?.get()))
+}
+
+fn date_instance_get_field(
+    timezone: date::TimeZone,
+    states: HashMap[runtime::ObjectId, Ref[float64]],
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+    operation: int,
+    local: bool,
+) -> Result[runtime::Value, vm::VmError] {
+    let _ = arguments;
+    let value = date_instance_state(states, this_value)?.get();
+    if operation == 8 {
+        return match date::time_clip(value) {
+            Ok(value) => Result::Ok(
+                runtime::Value::Float(
+                    date_instance_float(
+                        (-date_instance_timezone_offset(timezone, value)).to_int64(),
+                    ),
+                ),
+            ),
+            Err(_) => Result::Ok(runtime::Value::Float(date_instance_nan())),
+        }
+    } else {};
+    let fields = match date_instance_fields(timezone, value, local) {
+        Some(value) => value,
+        None => return Result::Ok(runtime::Value::Float(date_instance_nan())),
+    };
+    let value = match operation {
+        0 => fields.year,
+        1 => (fields.month - 1).to_int64(),
+        2 => fields.day.to_int64(),
+        3 => fields.weekday.to_int64(),
+        4 => fields.hour.to_int64(),
+        5 => fields.minute.to_int64(),
+        6 => fields.second.to_int64(),
+        7 => fields.millisecond.to_int64(),
+        _ => fields.year - 1900,
+    };
+    Result::Ok(runtime::Value::Float(date_instance_float(value)))
+}
+
+fn date_instance_format(
+    timezone: date::TimeZone,
+    states: HashMap[runtime::ObjectId, Ref[float64]],
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+    mode: int,
+) -> Result[runtime::Value, vm::VmError] {
+    let _ = arguments;
+    let value = date_instance_state(states, this_value)?.get();
+    if mode == 4 {
+        match date::time_clip(value) {
+            Ok(value) => match date::to_iso_string(value) {
+                Ok(value) => Result::Ok(runtime::Value::String(js_string(value))),
+                Err(value) => Result::Err(function_range_error(value.to_string())),
+            },
+            Err(value) => Result::Err(function_range_error(value.to_string())),
+        }
+    } else {
+        Result::Ok(runtime::Value::String(js_string(date_instance_string(timezone, value, mode))))
+    }
+}
+
+fn date_instance_make(
+    year: int64,
+    month: int64,
+    day: int64,
+    hour: int64,
+    minute: int64,
+    second: int64,
+    millisecond: int64,
+) -> float64 {
+    match date::make_day(year, month, day) {
+        Ok(day_value) => match date::make_time(hour, minute, second, millisecond) {
+            Ok(time_value) => match date::make_date(day_value, time_value) {
+                Ok(value) => date_instance_clip(date_instance_float(value)),
+                Err(_) => date_instance_nan(),
+            },
+            Err(_) => date_instance_nan(),
+        },
+        Err(_) => date_instance_nan(),
+    }
+}
+
+fn date_instance_set_time(
+    context: vm::Context,
+    states: HashMap[runtime::ObjectId, Ref[float64]],
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+    depth: int,
+) -> Result[runtime::Value, vm::VmError] {
+    let state = date_instance_state(states, this_value)?;
+    let value = date_instance_clip(date_instance_number(context, argument(arguments, 0), depth)?);
+    state.set(value);
+    Result::Ok(runtime::Value::Float(value))
+}
+
+fn date_instance_set_component(
+    timezone: date::TimeZone,
+    context: vm::Context,
+    states: HashMap[runtime::ObjectId, Ref[float64]],
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+    operation: int,
+    local: bool,
+    depth: int,
+) -> Result[runtime::Value, vm::VmError] {
+    let state = date_instance_state(states, this_value)?;
+    let converted: Vec[int64] = Vec::[];
+    let limit = match operation {
+        0 | 4 | 7 => 1,
+        1 | 5 => 2,
+        2 | 6 => 3,
+        _ => 4,
+    };
+    let mut argument_index = 0;
+    while argument_index < arguments.len() && argument_index < limit {
+        match date_instance_integer(context, arguments[argument_index], depth)? {
+            Some(value) => converted.push(value),
+            None => {
+                state.set(date_instance_nan());
+                return Result::Ok(runtime::Value::Float(date_instance_nan()))
+            },
+        };
+        argument_index += 1;
+    }
+    if converted.is_empty() {
+        let _ = date_instance_number(context, runtime::Value::Undefined, depth)?;
+        state.set(date_instance_nan());
+        return Result::Ok(runtime::Value::Float(date_instance_nan()))
+    } else {};
+    let current = state.get();
+    let fields = match date_instance_fields(timezone, current, local) {
+        Some(value) => value,
+        None => if operation == 6 || operation == 7 {
+            match date_instance_fields(timezone, 0.0, local) {
+                Some(value) => value,
+                None => {
+                    state.set(date_instance_nan());
+                    return Result::Ok(runtime::Value::Float(date_instance_nan()))
+                },
+            }
+        } else {
+            state.set(date_instance_nan());
+            return Result::Ok(runtime::Value::Float(date_instance_nan()))
+        },
+    };
+    let mut year = fields.year;
+    let mut month = (fields.month - 1).to_int64();
+    let mut day = fields.day.to_int64();
+    let mut hour = fields.hour.to_int64();
+    let mut minute = fields.minute.to_int64();
+    let mut second = fields.second.to_int64();
+    let mut millisecond = fields.millisecond.to_int64();
+    match operation {
+        0 => {
+            millisecond = converted[0];
+        },
+        1 => {
+            second = converted[0];
+            if converted.len() > 1 {
+                millisecond = converted[1];
+            } else {}
+        },
+        2 => {
+            minute = converted[0];
+            if converted.len() > 1 {
+                second = converted[1];
+            } else {};
+            if converted.len() > 2 {
+                millisecond = converted[2];
+            } else {}
+        },
+        3 => {
+            hour = converted[0];
+            if converted.len() > 1 {
+                minute = converted[1];
+            } else {};
+            if converted.len() > 2 {
+                second = converted[2];
+            } else {};
+            if converted.len() > 3 {
+                millisecond = converted[3];
+            } else {}
+        },
+        4 => {
+            day = converted[0];
+        },
+        5 => {
+            month = converted[0];
+            if converted.len() > 1 {
+                day = converted[1];
+            } else {}
+        },
+        6 => {
+            year = converted[0];
+            if converted.len() > 1 {
+                month = converted[1];
+            } else {};
+            if converted.len() > 2 {
+                day = converted[2];
+            } else {}
+        },
+        _ => {
+            year = converted[0];
+            if year >= 0 && year <= 99 {
+                year += 1900;
+            } else {}
+        },
+    };
+    let unadjusted = date_instance_make(year, month, day, hour, minute, second, millisecond);
+    let value = if local {
+        date_instance_local_to_utc(timezone, unadjusted)
+    } else {
+        unadjusted
+    };
+    state.set(value);
+    Result::Ok(runtime::Value::Float(value))
+}
+
+fn date_instance_parse(
+    timezone: date::TimeZone,
+    context: vm::Context,
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+    depth: int,
+) -> Result[runtime::Value, vm::VmError] {
+    let _ = this_value;
+    let value = match string_value_at_depth(context, argument(arguments, 0), depth)? {
+        runtime::Value::String(value) => date_instance_parse_string(timezone, value),
+        _ => date_instance_nan(),
+    };
+    Result::Ok(runtime::Value::Float(value))
+}
+
+fn date_instance_utc(
+    context: vm::Context,
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+    depth: int,
+) -> Result[runtime::Value, vm::VmError] {
+    let _ = this_value;
+    if arguments.is_empty() {
+        Result::Ok(runtime::Value::Float(date_instance_nan()))
+    } else {
+        Result::Ok(
+            runtime::Value::Float(date_instance_utc_from_components(context, arguments, depth)?),
+        )
+    }
+}
+
+fn date_instance_to_json(
+    context: vm::Context,
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+    depth: int,
+) -> Result[runtime::Value, vm::VmError] {
+    let _ = arguments;
+    let primitive = context.to_primitive_number_at_depth(this_value, depth)?;
+    match primitive {
+        runtime::Value::Int(_) => (),
+        runtime::Value::Float(value) => if !math::is_finite(value) {
+            return Result::Ok(runtime::Value::Null)
+        } else {},
+        _ => (),
+    };
+    let method = context.read_property_at_depth(
+        this_value,
+        runtime::Value::String(js_string("toISOString")),
+        depth,
+    )?;
+    let callable = function_callable(method)?;
+    let no_arguments: Vec[runtime::Value] = Vec::[];
+    context.invoke_with_this_at_depth(callable, no_arguments, this_value, depth)
+}
+
+fn date_instance_to_primitive(
+    context: vm::Context,
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+    depth: int,
+) -> Result[runtime::Value, vm::VmError] {
+    match this_value {
+        runtime::Value::Object(_) => (),
+        _ => return Result::Err(function_vm_error("Date conversion requires an object")),
+    };
+    let hint = match argument(arguments, 0) {
+        runtime::Value::String(value) => value,
+        _ => return Result::Err(function_vm_error("invalid Date conversion hint")),
+    };
+    let names = if hint == js_string("string") || hint == js_string("default") {
+        Vec::["toString", "valueOf"]
+    } else if hint == js_string("number") {
+        Vec::["valueOf", "toString"]
+    } else {
+        return Result::Err(function_vm_error("invalid Date conversion hint"))
+    };
+    for name in names {
+        let method = context.read_property_at_depth(
+            this_value,
+            runtime::Value::String(js_string(name)),
+            depth,
+        )?;
+        if json_builtin_callable(method) {
+            let no_arguments: Vec[runtime::Value] = Vec::[];
+            let value = context.invoke_with_this_at_depth(method, no_arguments, this_value, depth)?;
+            match value {
+                runtime::Value::Object(_) => (),
+                _ => return Result::Ok(value),
+            }
+        } else {}
+    }
+    Result::Err(function_vm_error("cannot convert Date object to primitive"))
+}
+
+fn date_instance_define_getter(
+    timezone: date::TimeZone,
+    context: vm::Context,
+    states: HashMap[runtime::ObjectId, Ref[float64]],
+    prototype: runtime::ObjectId,
+    name: string,
+    operation: int,
+    local: bool,
+) -> Result[unit, BuiltinError] {
+    define_value(
+        context.heap(),
+        prototype,
+        name,
+        allocate_vm_function(
+            context,
+            "Date.prototype." + name,
+            |this_value, arguments, depth| {
+                let _ = depth;
+                date_instance_get_field(timezone, states, this_value, arguments, operation, local)
+            },
+        )?,
+        true,
+        true,
+    )
+}
+
+fn date_instance_define_setter(
+    timezone: date::TimeZone,
+    context: vm::Context,
+    states: HashMap[runtime::ObjectId, Ref[float64]],
+    prototype: runtime::ObjectId,
+    name: string,
+    operation: int,
+    local: bool,
+) -> Result[unit, BuiltinError] {
+    define_value(
+        context.heap(),
+        prototype,
+        name,
+        allocate_vm_function(
+            context,
+            "Date.prototype." + name,
+            |this_value, arguments, depth| {
+                date_instance_set_component(
+                    timezone,
+                    context,
+                    states,
+                    this_value,
+                    arguments,
+                    operation,
+                    local,
+                    depth,
+                )
+            },
+        )?,
+        true,
+        true,
+    )
+}
+
+fn date_instance_define_format(
+    timezone: date::TimeZone,
+    context: vm::Context,
+    states: HashMap[runtime::ObjectId, Ref[float64]],
+    prototype: runtime::ObjectId,
+    name: string,
+    mode: int,
+) -> Result[unit, BuiltinError] {
+    define_value(
+        context.heap(),
+        prototype,
+        name,
+        allocate_vm_function(
+            context,
+            "Date.prototype." + name,
+            |this_value, arguments, depth| {
+                let _ = depth;
+                date_instance_format(timezone, states, this_value, arguments, mode)
+            },
+        )?,
+        true,
+        true,
+    )
+}
+
+fn install_date_object(context: vm::Context) -> Result[runtime::Value, BuiltinError] {
+    let heap = context.heap();
+    let timezone = date::local_time_zone();
+    let states: HashMap[runtime::ObjectId, Ref[float64]] = HashMap::{};
+    let prototype = match runtime::new_ordinary_object(heap, Option::None) {
+        Ok(value) => value,
+        Err(value) => return Result::Err(BuiltinError { message: value.message }),
+    };
+    states[prototype] = Ref::new(date_instance_nan());
+    if !context.set_object_builtin_tag(prototype, js_string("Date")) {
+        return Result::Err(BuiltinError { message: "cannot register Date prototype" })
+    } else {};
+    let constructor = allocate_vm_function(
+        context,
+        "Date",
+        |this_value, arguments, depth| {
+            date_instance_call(timezone, context, this_value, arguments, depth)
+        },
+    )?;
+    match context.set_vm_constructor_callback(
+        constructor,
+        |receiver, arguments, selected_prototype, new_target, depth| {
+            let _ = depth;
+            let _ = new_target;
+            constructor_receiver_prototype(context.heap(), receiver, selected_prototype, prototype)?;
+            date_instance_construct(context, states, receiver, arguments)
+        },
+    ) {
+        Ok(()) => (),
+        Err(value) => return Result::Err(BuiltinError { message: value.kind.debug() }),
+    };
+    match context.set_vm_constructor_prepare_callback(
+        constructor,
+        |arguments, depth| date_instance_prepare(timezone, context, states, arguments, depth),
+    ) {
+        Ok(()) => (),
+        Err(value) => return Result::Err(BuiltinError { message: value.kind.debug() }),
+    };
+    let object = function_object(constructor, "Date")?;
+    define_value(heap, object, "prototype", runtime::Value::Object(prototype), false, false)?;
+    define_value(heap, prototype, "constructor", constructor, true, true)?;
+    define_value(
+        heap,
+        object,
+        "parse",
+        allocate_vm_function(
+            context,
+            "Date.parse",
+            |this_value, arguments, depth| {
+                date_instance_parse(timezone, context, this_value, arguments, depth)
+            },
+        )?,
+        true,
+        true,
+    )?;
+    define_function(context, object, "toISOString", date_to_iso_string)?;
+    define_function(context, object, "fields", date_fields)?;
+    define_value(
+        heap,
+        object,
+        "UTC",
+        allocate_vm_function(
+            context,
+            "Date.UTC",
+            |this_value, arguments, depth| {
+                date_instance_utc(context, this_value, arguments, depth)
+            },
+        )?,
+        true,
+        true,
+    )?;
+    define_value(
+        heap,
+        object,
+        "now",
+        allocate_vm_function(
+            context,
+            "Date.now",
+            |this_value, arguments, depth| {
+                let _ = this_value;
+                let _ = arguments;
+                let _ = depth;
+                Result::Ok(runtime::Value::Float(date_instance_now()))
+            },
+        )?,
+        true,
+        true,
+    )?;
+    define_value(
+        heap,
+        prototype,
+        "getTime",
+        allocate_vm_function(
+            context,
+            "Date.prototype.getTime",
+            |this_value, arguments, depth| {
+                let _ = depth;
+                date_instance_get_time(states, this_value, arguments)
+            },
+        )?,
+        true,
+        true,
+    )?;
+    define_value(
+        heap,
+        prototype,
+        "valueOf",
+        allocate_vm_function(
+            context,
+            "Date.prototype.valueOf",
+            |this_value, arguments, depth| {
+                let _ = depth;
+                date_instance_get_time(states, this_value, arguments)
+            },
+        )?,
+        true,
+        true,
+    )?;
+    for (name, operation, local) in Vec::[
+        ("getFullYear", 0, true),
+        ("getUTCFullYear", 0, false),
+        ("getMonth", 1, true),
+        ("getUTCMonth", 1, false),
+        ("getDate", 2, true),
+        ("getUTCDate", 2, false),
+        ("getDay", 3, true),
+        ("getUTCDay", 3, false),
+        ("getHours", 4, true),
+        ("getUTCHours", 4, false),
+        ("getMinutes", 5, true),
+        ("getUTCMinutes", 5, false),
+        ("getSeconds", 6, true),
+        ("getUTCSeconds", 6, false),
+        ("getMilliseconds", 7, true),
+        ("getUTCMilliseconds", 7, false),
+        ("getTimezoneOffset", 8, true),
+        ("getYear", 9, true),
+    ] {
+        date_instance_define_getter(timezone, context, states, prototype, name, operation, local)?
+    }
+    for (name, operation, local) in Vec::[
+        ("setMilliseconds", 0, true),
+        ("setUTCMilliseconds", 0, false),
+        ("setSeconds", 1, true),
+        ("setUTCSeconds", 1, false),
+        ("setMinutes", 2, true),
+        ("setUTCMinutes", 2, false),
+        ("setHours", 3, true),
+        ("setUTCHours", 3, false),
+        ("setDate", 4, true),
+        ("setUTCDate", 4, false),
+        ("setMonth", 5, true),
+        ("setUTCMonth", 5, false),
+        ("setFullYear", 6, true),
+        ("setUTCFullYear", 6, false),
+        ("setYear", 7, true),
+    ] {
+        date_instance_define_setter(timezone, context, states, prototype, name, operation, local)?
+    }
+    define_value(
+        heap,
+        prototype,
+        "setTime",
+        allocate_vm_function(
+            context,
+            "Date.prototype.setTime",
+            |this_value, arguments, depth| {
+                date_instance_set_time(context, states, this_value, arguments, depth)
+            },
+        )?,
+        true,
+        true,
+    )?;
+    for (name, mode) in Vec::[
+        ("toString", 0),
+        ("toUTCString", 1),
+        ("toDateString", 2),
+        ("toTimeString", 3),
+        ("toISOString", 4),
+        ("toLocaleString", 5),
+        ("toLocaleDateString", 6),
+        ("toLocaleTimeString", 7),
+    ] {
+        date_instance_define_format(timezone, context, states, prototype, name, mode)?
+    }
+    define_value(
+        heap,
+        prototype,
+        "toGMTString",
+        builtin_own_value(heap, prototype, "toUTCString")?,
+        true,
+        true,
+    )?;
+    define_value(
+        heap,
+        prototype,
+        "toJSON",
+        allocate_vm_function(
+            context,
+            "Date.prototype.toJSON",
+            |this_value, arguments, depth| {
+                date_instance_to_json(context, this_value, arguments, depth)
+            },
+        )?,
+        true,
+        true,
+    )?;
+    match context.well_known_symbol(vm::WellKnownSymbolKind::ToPrimitive) {
+        Some(symbol) => if !runtime::define_own_property(
+            heap,
+            prototype,
+            runtime::PropertyKey::Symbol(symbol),
+            runtime::data_descriptor(
+                allocate_vm_function(
+                    context,
+                    "Date.prototype[Symbol.toPrimitive]",
+                    |this_value, arguments, depth| {
+                        date_instance_to_primitive(context, this_value, arguments, depth)
+                    },
+                )?,
+                false,
+                false,
+                true,
+            ),
+        ) {
+            return Result::Err(BuiltinError { message: "cannot define Date conversion" })
+        } else {},
+        None => (),
+    };
+    Result::Ok(constructor)
+}

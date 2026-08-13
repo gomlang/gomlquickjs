@@ -1,0 +1,1296 @@
+package builtins;
+
+use gomlang::quickjs::dtoa;
+use gomlang::quickjs::runtime;
+use gomlang::quickjs::vm;
+use std::math;
+use std::num;
+
+enum IteratorHelperKind {
+    Drop,
+    Filter,
+    FlatMap,
+    Map,
+    Take,
+}
+
+enum IteratorTerminalKind {
+    Every,
+    Find,
+    ForEach,
+    Some,
+}
+
+struct IteratorRecord {
+    iterator: runtime::Value,
+    next: runtime::Value,
+}
+
+struct IteratorHelperState {
+    source: IteratorRecord,
+    kind: IteratorHelperKind,
+    callback: runtime::Value,
+    remaining: Ref[int],
+    counter: Ref[int],
+    inner: Ref[Option[IteratorRecord]],
+    running: Ref[bool],
+    done: Ref[bool],
+}
+
+struct IteratorIterable {
+    value: runtime::Value,
+    method: runtime::Value,
+}
+
+struct IteratorConcatState {
+    values: Vec[IteratorIterable],
+    index: Ref[int],
+    current: Ref[Option[IteratorRecord]],
+    running: Ref[bool],
+    done: Ref[bool],
+}
+
+fn iterator_no_arguments() -> Vec[runtime::Value] {
+    Vec::[]
+}
+
+fn iterator_property(context: vm::Context, receiver: runtime::Value, name: string, depth: int) -> Result[
+    runtime::Value,
+    vm::VmError,
+] {
+    context.read_property_at_depth(receiver, runtime::Value::String(js_string(name)), depth)
+}
+
+fn iterator_callable(value: runtime::Value, message: string) -> Result[runtime::Value, vm::VmError] {
+    match value {
+        runtime::Value::Object(object) => if object.is_callable() {
+            Result::Ok(value)
+        } else {
+            Result::Err(function_vm_error(message))
+        },
+        _ => Result::Err(function_vm_error(message)),
+    }
+}
+
+fn iterator_record(context: vm::Context, value: runtime::Value, depth: int) -> Result[
+    IteratorRecord,
+    vm::VmError,
+] {
+    match value {
+        runtime::Value::Object(_) => (),
+        _ => return Result::Err(function_vm_error("iterator is not an object")),
+    };
+    let next = iterator_property(context, value, "next", depth)?;
+    Result::Ok(IteratorRecord { iterator: value, next })
+}
+
+fn iterator_step(context: vm::Context, record: IteratorRecord, depth: int) -> Result[
+    Option[runtime::Value],
+    vm::VmError,
+] {
+    let result = context.invoke_with_this_at_depth(
+        record.next,
+        iterator_no_arguments(),
+        record.iterator,
+        depth,
+    )?;
+    match result {
+        runtime::Value::Object(_) => (),
+        _ => return Result::Err(function_vm_error("iterator next result is not an object")),
+    };
+    if runtime::to_boolean(iterator_property(context, result, "done", depth)?) {
+        Result::Ok(Option::None)
+    } else {
+        Result::Ok(Option::Some(iterator_property(context, result, "value", depth)?))
+    }
+}
+
+fn iterator_close_record(context: vm::Context, record: IteratorRecord, depth: int) -> Result[
+    unit,
+    vm::VmError,
+] {
+    let method = iterator_property(context, record.iterator, "return", depth)?;
+    match method {
+        runtime::Value::Undefined | runtime::Value::Null => Result::Ok(()),
+        _ => {
+            let callable = iterator_callable(method, "iterator return is not callable")?;
+            let result = context.invoke_with_this_at_depth(
+                callable,
+                iterator_no_arguments(),
+                record.iterator,
+                depth,
+            )?;
+            match result {
+                runtime::Value::Object(_) => Result::Ok(()),
+                _ => Result::Err(function_vm_error("iterator return result is not an object")),
+            }
+        },
+    }
+}
+
+fn iterator_return_record(
+    context: vm::Context,
+    record: IteratorRecord,
+    allow_missing: bool,
+    depth: int,
+) -> Result[runtime::Value, vm::VmError] {
+    let method = iterator_property(context, record.iterator, "return", depth)?;
+    match method {
+        runtime::Value::Undefined | runtime::Value::Null => if allow_missing {
+            iterator_result(context, runtime::Value::Undefined, true)
+        } else {
+            Result::Err(function_vm_error("iterator return is not callable"))
+        },
+        _ => {
+            let callable = iterator_callable(method, "iterator return is not callable")?;
+            let result = context.invoke_with_this_at_depth(
+                callable,
+                iterator_no_arguments(),
+                record.iterator,
+                depth,
+            )?;
+            match result {
+                runtime::Value::Object(_) => Result::Ok(result),
+                _ => Result::Err(function_vm_error("iterator return result is not an object")),
+            }
+        },
+    }
+}
+
+fn iterator_close_value(context: vm::Context, value: runtime::Value, depth: int) -> unit {
+    match value {
+        runtime::Value::Object(_) => {
+            let _ = iterator_close_record(
+                context,
+                IteratorRecord { iterator: value, next: runtime::Value::Undefined },
+                depth,
+            );
+        },
+        _ => (),
+    }
+}
+
+fn iterator_close_after_error(context: vm::Context, record: IteratorRecord, depth: int) -> unit {
+    let _ = iterator_close_record(context, record, depth);
+}
+
+fn iterator_result(context: vm::Context, value: runtime::Value, done: bool) -> Result[
+    runtime::Value,
+    vm::VmError,
+] {
+    let object = match runtime::new_ordinary_object(context.heap(), Option::None) {
+        Ok(value) => value,
+        Err(value) => return Result::Err(function_vm_error(value.message)),
+    };
+    if !runtime::define_own_property(
+        context.heap(),
+        object,
+        runtime::string_property_key("value"),
+        runtime::data_descriptor(value, true, true, true),
+    )
+        || !runtime::define_own_property(
+            context.heap(),
+            object,
+            runtime::string_property_key("done"),
+            runtime::data_descriptor(runtime::Value::Bool(done), true, true, true),
+        ) {
+        Result::Err(function_vm_error("cannot allocate iterator result"))
+    } else {
+        Result::Ok(runtime::Value::Object(object))
+    }
+}
+
+fn iterator_prototype_from_global(context: vm::Context) -> Option[runtime::ObjectId] {
+    let global = match context.global_object() {
+        Some(value) => value,
+        None => return Option::None,
+    };
+    let constructor = match runtime::get_property(
+        context.heap(),
+        global,
+        runtime::string_property_key("Iterator"),
+    ) {
+        Ok(Some(runtime::Value::Object(value))) => value,
+        _ => return Option::None,
+    };
+    match runtime::get_property(
+        context.heap(),
+        constructor,
+        runtime::string_property_key("prototype"),
+    ) {
+        Ok(Some(runtime::Value::Object(value))) => Option::Some(value),
+        _ => Option::None,
+    }
+}
+
+fn iterator_allocate_object(context: vm::Context) -> Result[runtime::ObjectId, vm::VmError] {
+    match runtime::new_ordinary_object(context.heap(), iterator_prototype_from_global(context)) {
+        Ok(value) => Result::Ok(value),
+        Err(value) => Result::Err(function_vm_error(value.message)),
+    }
+}
+
+fn iterator_has_prototype(
+    heap: runtime::Heap,
+    object: runtime::ObjectId,
+    prototype: runtime::ObjectId,
+) -> bool {
+    let mut cursor = match heap.get(object) {
+        Some(value) => value.prototype(),
+        None => return false,
+    };
+    while cursor.is_some() {
+        match cursor {
+            Some(value) => if value == prototype {
+                return true
+            } else {
+                cursor = match heap.get(value) {
+                    Some(value) => value.prototype(),
+                    None => return false,
+                };
+            },
+            None => (),
+        }
+    }
+    false
+}
+
+fn iterator_identity(
+    heap: runtime::Heap,
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+) -> Result[runtime::Value, vm::NativeError] {
+    let _ = heap;
+    let _ = arguments;
+    Result::Ok(this_value)
+}
+
+fn iterator_define_method(
+    context: vm::Context,
+    object: runtime::ObjectId,
+    name: string,
+    value: runtime::Value,
+) -> Result[unit, vm::VmError] {
+    if runtime::define_own_property(
+        context.heap(),
+        object,
+        runtime::string_property_key(name),
+        runtime::data_descriptor(value, true, false, true),
+    ) {
+        Result::Ok(())
+    } else {
+        Result::Err(function_vm_error("cannot define iterator method " + name))
+    }
+}
+
+fn iterator_set_function_name(context: vm::Context, function: runtime::Value, name: string) -> Result[
+    unit,
+    BuiltinError,
+] {
+    let object = function_object(function, name)?;
+    if runtime::define_own_property(
+        context.heap(),
+        object,
+        runtime::string_property_key("name"),
+        runtime::data_descriptor(runtime::Value::String(js_string(name)), false, false, true),
+    ) {
+        Result::Ok(())
+    } else {
+        Result::Err(BuiltinError { message: "cannot define iterator function name" })
+    }
+}
+
+fn iterator_create_object(
+    context: vm::Context,
+    next: runtime::Value,
+    return_method: Option[runtime::Value],
+) -> Result[runtime::Value, vm::VmError] {
+    let object = iterator_allocate_object(context)?;
+    iterator_define_method(context, object, "next", next)?;
+    match return_method {
+        Some(value) => iterator_define_method(context, object, "return", value)?,
+        None => (),
+    };
+    Result::Ok(runtime::Value::Object(object))
+}
+
+fn iterator_from_iterable(context: vm::Context, value: runtime::Value, depth: int) -> Result[
+    IteratorRecord,
+    vm::VmError,
+] {
+    match value {
+        runtime::Value::Object(_) | runtime::Value::String(_) => (),
+        _ => return Result::Err(function_vm_error("Iterator.from called on non-object")),
+    };
+    let symbol = match context.iterator_symbol() {
+        Some(value) => value,
+        None => return Result::Err(function_vm_error("iterator symbol is not installed")),
+    };
+    let method = context.read_property_at_depth(value, runtime::Value::Symbol(symbol), depth)?;
+    let iterator = match method {
+        runtime::Value::Undefined | runtime::Value::Null => match value {
+            runtime::Value::Object(_) => value,
+            _ => return Result::Err(function_vm_error("value is not iterable")),
+        },
+        _ => {
+            let callable = iterator_callable(method, "iterator method is not callable")?;
+            let result = context.invoke_with_this_at_depth(
+                callable,
+                iterator_no_arguments(),
+                value,
+                depth,
+            )?;
+            match result {
+                runtime::Value::Object(_) => result,
+                _ => return Result::Err(function_vm_error("iterator result is not an object")),
+            }
+        },
+    };
+    iterator_record(context, iterator, depth)
+}
+
+fn iterator_wrap(context: vm::Context, record: IteratorRecord) -> Result[
+    runtime::Value,
+    vm::VmError,
+] {
+    let next = context.new_vm_function(
+        |this_value, arguments, depth| {
+            let _ = this_value;
+            let _ = arguments;
+            match iterator_step(context, record, depth)? {
+                Some(value) => iterator_result(context, value, false),
+                None => iterator_result(context, runtime::Value::Undefined, true),
+            }
+        },
+    )?;
+    let return_method = context.new_vm_function(
+        |this_value, arguments, depth| {
+            let _ = this_value;
+            let _ = arguments;
+            let method = iterator_property(context, record.iterator, "return", depth)?;
+            match method {
+                runtime::Value::Undefined | runtime::Value::Null => {
+                    iterator_result(context, runtime::Value::Undefined, true)
+                },
+                _ => {
+                    let callable = iterator_callable(method, "iterator return is not callable")?;
+                    let result = context.invoke_with_this_at_depth(
+                        callable,
+                        iterator_no_arguments(),
+                        record.iterator,
+                        depth,
+                    )?;
+                    match result {
+                        runtime::Value::Object(_) => Result::Ok(result),
+                        _ => Result::Err(
+                            function_vm_error("iterator return result is not an object"),
+                        ),
+                    }
+                },
+            }
+        },
+    )?;
+    iterator_create_object(context, next, Option::Some(return_method))
+}
+
+fn iterator_from(
+    context: vm::Context,
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+    depth: int,
+) -> Result[runtime::Value, vm::VmError] {
+    let _ = this_value;
+    let record = iterator_from_iterable(context, argument(arguments, 0), depth)?;
+    let prototype = match iterator_prototype_from_global(context) {
+        Some(value) => value,
+        None => return iterator_wrap(context, record),
+    };
+    match record.iterator {
+        runtime::Value::Object(object) => if iterator_has_prototype(
+            context.heap(),
+            object,
+            prototype,
+        ) {
+            Result::Ok(record.iterator)
+        } else {
+            iterator_wrap(context, record)
+        },
+        _ => iterator_wrap(context, record),
+    }
+}
+
+fn iterator_limit(context: vm::Context, value: runtime::Value, depth: int) -> Result[
+    int,
+    vm::VmError,
+] {
+    let primitive = context.to_primitive_number_at_depth(value, depth)?;
+    let number = match runtime::primitive_to_number(primitive) {
+        Ok(value) => value,
+        Err(value) => return Result::Err(function_vm_error(value.message)),
+    };
+    if math::is_nan(number) {
+        Result::Err(function_range_error("iterator limit must be non-negative"))
+    } else if number == infinity() {
+        Result::Ok(9007199254740991)
+    } else if number == -infinity() {
+        Result::Err(function_range_error("iterator limit must be non-negative"))
+    } else {
+        let integer = math::trunc(number);
+        if integer < 0.0 {
+            Result::Err(function_range_error("iterator limit must be non-negative"))
+        } else if integer >= 9007199254740991.0 {
+            Result::Ok(9007199254740991)
+        } else {
+            Result::Ok(num::parse_int(dtoa::number_to_string(integer)).unwrap_or(0))
+        }
+    }
+}
+
+fn iterator_callback(arguments: Vec[runtime::Value], message: string) -> Result[
+    runtime::Value,
+    vm::VmError,
+] {
+    iterator_callable(argument(arguments, 0), message)
+}
+
+fn iterator_flatten_record(context: vm::Context, value: runtime::Value, depth: int) -> Result[
+    IteratorRecord,
+    vm::VmError,
+] {
+    match value {
+        runtime::Value::Object(_) => (),
+        _ => return Result::Err(function_vm_error("flatMap mapper result is not an object")),
+    };
+    let symbol = match context.iterator_symbol() {
+        Some(value) => value,
+        None => return Result::Err(function_vm_error("iterator symbol is not installed")),
+    };
+    let method = context.read_property_at_depth(value, runtime::Value::Symbol(symbol), depth)?;
+    let iterator = match method {
+        runtime::Value::Undefined | runtime::Value::Null => value,
+        _ => {
+            let callable = iterator_callable(method, "iterator method is not callable")?;
+            let result = context.invoke_with_this_at_depth(
+                callable,
+                iterator_no_arguments(),
+                value,
+                depth,
+            )?;
+            match result {
+                runtime::Value::Object(_) => result,
+                _ => return Result::Err(function_vm_error("iterator result is not an object")),
+            }
+        },
+    };
+    match iterator_record(context, iterator, depth) {
+        Ok(value) => Result::Ok(value),
+        Err(value) => {
+            iterator_close_value(context, iterator, depth);
+            Result::Err(value)
+        },
+    }
+}
+
+fn iterator_helper_fail(
+    context: vm::Context,
+    state: IteratorHelperState,
+    depth: int,
+    error: vm::VmError,
+) -> Result[runtime::Value, vm::VmError] {
+    match state.inner.get() {
+        Some(record) => iterator_close_after_error(context, record, depth),
+        None => (),
+    };
+    iterator_close_after_error(context, state.source, depth);
+    state.inner.set(Option::None);
+    Result::Err(error)
+}
+
+fn iterator_helper_next_value(context: vm::Context, state: IteratorHelperState, depth: int) -> Result[
+    runtime::Value,
+    vm::VmError,
+] {
+    match state.kind {
+        IteratorHelperKind::Drop => {
+            while state.remaining.get() > 0 {
+                state.remaining.set(state.remaining.get() - 1);
+                match iterator_step(context, state.source, depth)? {
+                    Some(_) => (),
+                    None => {
+                        state.done.set(true);
+                        return iterator_result(context, runtime::Value::Undefined, true)
+                    },
+                }
+            }
+            match iterator_step(context, state.source, depth)? {
+                Some(value) => iterator_result(context, value, false),
+                None => {
+                    state.done.set(true);
+                    iterator_result(context, runtime::Value::Undefined, true)
+                },
+            }
+        },
+        IteratorHelperKind::Filter => loop {
+            let value = match iterator_step(context, state.source, depth)? {
+                Some(value) => value,
+                None => {
+                    state.done.set(true);
+                    return iterator_result(context, runtime::Value::Undefined, true)
+                },
+            };
+            let index = state.counter.get();
+            state.counter.set(index + 1);
+            let selected = match context.invoke_with_this_at_depth(
+                state.callback,
+                Vec::[value, array_length_value(index)],
+                runtime::Value::Undefined,
+                depth,
+            ) {
+                Ok(value) => value,
+                Err(value) => return iterator_helper_fail(context, state, depth, value),
+            };
+            if runtime::to_boolean(selected) {
+                return iterator_result(context, value, false)
+            } else {}
+        },
+        IteratorHelperKind::FlatMap => loop {
+            match state.inner.get() {
+                Some(record) => match iterator_step(context, record, depth) {
+                    Ok(Some(value)) => return iterator_result(context, value, false),
+                    Ok(None) => match iterator_close_record(context, record, depth) {
+                        Ok(()) => state.inner.set(Option::None),
+                        Err(value) => {
+                            state.inner.set(Option::None);
+                            return iterator_helper_fail(context, state, depth, value)
+                        },
+                    },
+                    Err(value) => return iterator_helper_fail(context, state, depth, value),
+                },
+                None => {
+                    let value = match iterator_step(context, state.source, depth)? {
+                        Some(value) => value,
+                        None => {
+                            state.done.set(true);
+                            return iterator_result(context, runtime::Value::Undefined, true)
+                        },
+                    };
+                    let index = state.counter.get();
+                    state.counter.set(index + 1);
+                    let mapped = match context.invoke_with_this_at_depth(
+                        state.callback,
+                        Vec::[value, array_length_value(index)],
+                        runtime::Value::Undefined,
+                        depth,
+                    ) {
+                        Ok(value) => value,
+                        Err(value) => return iterator_helper_fail(context, state, depth, value),
+                    };
+                    let record = match iterator_flatten_record(context, mapped, depth) {
+                        Ok(value) => value,
+                        Err(value) => return iterator_helper_fail(context, state, depth, value),
+                    };
+                    state.inner.set(Option::Some(record));
+                },
+            }
+        },
+        IteratorHelperKind::Map => {
+            let value = match iterator_step(context, state.source, depth)? {
+                Some(value) => value,
+                None => {
+                    state.done.set(true);
+                    return iterator_result(context, runtime::Value::Undefined, true)
+                },
+            };
+            let index = state.counter.get();
+            state.counter.set(index + 1);
+            match context.invoke_with_this_at_depth(
+                state.callback,
+                Vec::[value, array_length_value(index)],
+                runtime::Value::Undefined,
+                depth,
+            ) {
+                Ok(value) => iterator_result(context, value, false),
+                Err(value) => iterator_helper_fail(context, state, depth, value),
+            }
+        },
+        IteratorHelperKind::Take => if state.remaining.get() <= 0 {
+            match iterator_close_record(context, state.source, depth) {
+                Ok(()) => {
+                    state.done.set(true);
+                    iterator_result(context, runtime::Value::Undefined, true)
+                },
+                Err(value) => {
+                    state.done.set(true);
+                    Result::Err(value)
+                },
+            }
+        } else {
+            state.remaining.set(state.remaining.get() - 1);
+            match iterator_step(context, state.source, depth)? {
+                Some(value) => iterator_result(context, value, false),
+                None => {
+                    state.done.set(true);
+                    iterator_result(context, runtime::Value::Undefined, true)
+                },
+            }
+        },
+    }
+}
+
+fn iterator_helper_next(context: vm::Context, state: IteratorHelperState, depth: int) -> Result[
+    runtime::Value,
+    vm::VmError,
+] {
+    if state.running.get() {
+        return Result::Err(function_vm_error("cannot invoke a running iterator"))
+    } else if state.done.get() {
+        return iterator_result(context, runtime::Value::Undefined, true)
+    } else {};
+    state.running.set(true);
+    let result = iterator_helper_next_value(context, state, depth);
+    state.running.set(false);
+    result
+}
+
+fn iterator_helper_return(context: vm::Context, state: IteratorHelperState, depth: int) -> Result[
+    runtime::Value,
+    vm::VmError,
+] {
+    if state.running.get() {
+        return Result::Err(function_vm_error("cannot invoke a running iterator"))
+    } else if state.done.get() {
+        return iterator_result(context, runtime::Value::Undefined, true)
+    } else {};
+    state.running.set(true);
+    let inner_result = match state.inner.get() {
+        Some(record) => iterator_close_record(context, record, depth),
+        None => Result::Ok(()),
+    };
+    state.inner.set(Option::None);
+    let source_result = match inner_result {
+        Ok(()) => iterator_return_record(context, state.source, false, depth),
+        Err(value) => Result::Err(value),
+    };
+    state.done.set(true);
+    state.running.set(false);
+    match source_result {
+        Ok(value) => Result::Ok(value),
+        Err(value) => Result::Err(value),
+    }
+}
+
+fn iterator_create_helper(
+    context: vm::Context,
+    kind: IteratorHelperKind,
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+    depth: int,
+) -> Result[runtime::Value, vm::VmError] {
+    match this_value {
+        runtime::Value::Object(_) => (),
+        _ => return Result::Err(function_vm_error("iterator is not an object")),
+    };
+    let callback = match kind {
+        IteratorHelperKind::Filter | IteratorHelperKind::FlatMap | IteratorHelperKind::Map => {
+            match iterator_callback(arguments, "iterator helper callback is not callable") {
+                Ok(value) => value,
+                Err(value) => {
+                    iterator_close_value(context, this_value, depth);
+                    return Result::Err(value)
+                },
+            }
+        },
+        IteratorHelperKind::Drop | IteratorHelperKind::Take => runtime::Value::Undefined,
+    };
+    let remaining = match kind {
+        IteratorHelperKind::Drop | IteratorHelperKind::Take => {
+            match iterator_limit(context, argument(arguments, 0), depth) {
+                Ok(value) => value,
+                Err(value) => {
+                    iterator_close_value(context, this_value, depth);
+                    return Result::Err(value)
+                },
+            }
+        },
+        _ => 0,
+    };
+    let source = match iterator_record(context, this_value, depth) {
+        Ok(value) => value,
+        Err(value) => {
+            iterator_close_value(context, this_value, depth);
+            return Result::Err(value)
+        },
+    };
+    let state = IteratorHelperState {
+        source,
+        kind,
+        callback,
+        remaining: Ref::new(remaining),
+        counter: Ref::new(0),
+        inner: Ref::new(Option::None),
+        running: Ref::new(false),
+        done: Ref::new(false),
+    };
+    let next = context.new_vm_function(
+        |this_value, arguments, depth| {
+            let _ = this_value;
+            let _ = arguments;
+            iterator_helper_next(context, state, depth)
+        },
+    )?;
+    let return_method = context.new_vm_function(
+        |this_value, arguments, depth| {
+            let _ = this_value;
+            let _ = arguments;
+            iterator_helper_return(context, state, depth)
+        },
+    )?;
+    iterator_create_object(context, next, Option::Some(return_method))
+}
+
+fn iterator_terminal(
+    context: vm::Context,
+    kind: IteratorTerminalKind,
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+    depth: int,
+) -> Result[runtime::Value, vm::VmError] {
+    match this_value {
+        runtime::Value::Object(_) => (),
+        _ => return Result::Err(function_vm_error("iterator is not an object")),
+    };
+    let callback = match iterator_callback(arguments, "iterator callback is not callable") {
+        Ok(value) => value,
+        Err(value) => {
+            iterator_close_value(context, this_value, depth);
+            return Result::Err(value)
+        },
+    };
+    let record = iterator_record(context, this_value, depth)?;
+    let mut index = 0;
+    loop {
+        let value = match iterator_step(context, record, depth)? {
+            Some(value) => value,
+            None => return match kind {
+                IteratorTerminalKind::Every => Result::Ok(runtime::Value::Bool(true)),
+                IteratorTerminalKind::Some => Result::Ok(runtime::Value::Bool(false)),
+                IteratorTerminalKind::Find | IteratorTerminalKind::ForEach => {
+                    Result::Ok(runtime::Value::Undefined)
+                },
+            },
+        };
+        let selected = match context.invoke_with_this_at_depth(
+            callback,
+            Vec::[value, array_length_value(index)],
+            runtime::Value::Undefined,
+            depth,
+        ) {
+            Ok(value) => value,
+            Err(value) => {
+                iterator_close_after_error(context, record, depth);
+                return Result::Err(value)
+            },
+        };
+        index += 1;
+        match kind {
+            IteratorTerminalKind::Every => if !runtime::to_boolean(selected) {
+                iterator_close_record(context, record, depth)?;
+                return Result::Ok(runtime::Value::Bool(false))
+            } else {},
+            IteratorTerminalKind::Some => if runtime::to_boolean(selected) {
+                iterator_close_record(context, record, depth)?;
+                return Result::Ok(runtime::Value::Bool(true))
+            } else {},
+            IteratorTerminalKind::Find => if runtime::to_boolean(selected) {
+                iterator_close_record(context, record, depth)?;
+                return Result::Ok(value)
+            } else {},
+            IteratorTerminalKind::ForEach => (),
+        }
+    }
+}
+
+fn iterator_reduce(
+    context: vm::Context,
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+    depth: int,
+) -> Result[runtime::Value, vm::VmError] {
+    match this_value {
+        runtime::Value::Object(_) => (),
+        _ => return Result::Err(function_vm_error("iterator is not an object")),
+    };
+    let callback = match iterator_callback(arguments, "iterator reducer is not callable") {
+        Ok(value) => value,
+        Err(value) => {
+            iterator_close_value(context, this_value, depth);
+            return Result::Err(value)
+        },
+    };
+    let record = iterator_record(context, this_value, depth)?;
+    let mut index = 0;
+    let mut accumulator = if arguments.len() > 1 {
+        arguments[1]
+    } else {
+        match iterator_step(context, record, depth)? {
+            Some(value) => {
+                index = 1;
+                value
+            },
+            None => {
+                iterator_close_after_error(context, record, depth);
+                return Result::Err(function_vm_error("reduce of empty iterator"))
+            },
+        }
+    };
+    loop {
+        let value = match iterator_step(context, record, depth)? {
+            Some(value) => value,
+            None => return Result::Ok(accumulator),
+        };
+        accumulator = match context.invoke_with_this_at_depth(
+            callback,
+            Vec::[accumulator, value, array_length_value(index)],
+            runtime::Value::Undefined,
+            depth,
+        ) {
+            Ok(value) => value,
+            Err(value) => {
+                iterator_close_after_error(context, record, depth);
+                return Result::Err(value)
+            },
+        };
+        index += 1;
+    }
+}
+
+fn iterator_to_array(
+    context: vm::Context,
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+    depth: int,
+) -> Result[runtime::Value, vm::VmError] {
+    let _ = arguments;
+    let record = iterator_record(context, this_value, depth)?;
+    let values: Vec[runtime::Value] = Vec::[];
+    while values.len() < ARRAY_FROM_LIMIT {
+        match iterator_step(context, record, depth)? {
+            Some(value) => values.push(value),
+            None => return match allocate_array(context.heap(), values, values.len()) {
+                Ok(value) => Result::Ok(runtime::Value::Object(value)),
+                Err(value) => Result::Err(function_vm_error(value.message)),
+            },
+        }
+    }
+    iterator_close_after_error(context, record, depth);
+    Result::Err(function_range_error("iterator result exceeds implementation limit"))
+}
+
+fn iterator_concat_next_value(context: vm::Context, state: IteratorConcatState, depth: int) -> Result[
+    runtime::Value,
+    vm::VmError,
+] {
+    loop {
+        match state.current.get() {
+            Some(record) => match iterator_step(context, record, depth)? {
+                Some(value) => return iterator_result(context, value, false),
+                None => state.current.set(Option::None),
+            },
+            None => {
+                let index = state.index.get();
+                if index >= state.values.len() {
+                    state.done.set(true);
+                    return iterator_result(context, runtime::Value::Undefined, true)
+                } else {};
+                let source = state.values[index];
+                state.index.set(index + 1);
+                let iterator = context.invoke_with_this_at_depth(
+                    source.method,
+                    iterator_no_arguments(),
+                    source.value,
+                    depth,
+                )?;
+                state.current.set(Option::Some(iterator_record(context, iterator, depth)?));
+            },
+        }
+    }
+}
+
+fn iterator_concat_next(context: vm::Context, state: IteratorConcatState, depth: int) -> Result[
+    runtime::Value,
+    vm::VmError,
+] {
+    if state.running.get() {
+        return Result::Err(function_vm_error("cannot invoke a running iterator"))
+    } else if state.done.get() {
+        return iterator_result(context, runtime::Value::Undefined, true)
+    } else {};
+    state.running.set(true);
+    let result = iterator_concat_next_value(context, state, depth);
+    state.running.set(false);
+    result
+}
+
+fn iterator_concat_return(context: vm::Context, state: IteratorConcatState, depth: int) -> Result[
+    runtime::Value,
+    vm::VmError,
+] {
+    if state.running.get() {
+        return Result::Err(function_vm_error("cannot invoke a running iterator"))
+    } else {};
+    state.running.set(true);
+    let result = match state.current.get() {
+        Some(record) => iterator_return_record(context, record, false, depth),
+        None => Result::Ok(runtime::Value::Undefined),
+    };
+    state.current.set(Option::None);
+    state.done.set(true);
+    state.running.set(false);
+    match result {
+        Ok(value) => Result::Ok(value),
+        Err(value) => Result::Err(value),
+    }
+}
+
+fn iterator_concat(
+    context: vm::Context,
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+    depth: int,
+) -> Result[runtime::Value, vm::VmError] {
+    let _ = this_value;
+    let symbol = match context.iterator_symbol() {
+        Some(value) => value,
+        None => return Result::Err(function_vm_error("iterator symbol is not installed")),
+    };
+    let values: Vec[IteratorIterable] = Vec::[];
+    for value in arguments {
+        match value {
+            runtime::Value::Object(_) => (),
+            _ => return Result::Err(function_vm_error("Iterator.concat value is not an object")),
+        };
+        let method = iterator_callable(
+            context.read_property_at_depth(value, runtime::Value::Symbol(symbol), depth)?,
+            "iterator method is not callable",
+        )?;
+        values.push(IteratorIterable { value, method })
+    }
+    let state = IteratorConcatState {
+        values,
+        index: Ref::new(0),
+        current: Ref::new(Option::None),
+        running: Ref::new(false),
+        done: Ref::new(false),
+    };
+    let next = context.new_vm_function(
+        |this_value, arguments, depth| {
+            let _ = this_value;
+            let _ = arguments;
+            iterator_concat_next(context, state, depth)
+        },
+    )?;
+    let return_method = context.new_vm_function(
+        |this_value, arguments, depth| {
+            let _ = this_value;
+            let _ = arguments;
+            iterator_concat_return(context, state, depth)
+        },
+    )?;
+    iterator_create_object(context, next, Option::Some(return_method))
+}
+
+fn iterator_constructor_call(
+    context: vm::Context,
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+    depth: int,
+) -> Result[runtime::Value, vm::VmError] {
+    let _ = context;
+    let _ = this_value;
+    let _ = arguments;
+    let _ = depth;
+    Result::Err(function_vm_error("Iterator constructor requires new"))
+}
+
+fn iterator_constructor_set(
+    context: vm::Context,
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+    depth: int,
+) -> Result[runtime::Value, vm::VmError] {
+    let _ = depth;
+    let receiver = match this_value {
+        runtime::Value::Object(value) => value,
+        _ => return Result::Err(function_vm_error("Iterator receiver is not an object")),
+    };
+    let value = argument(arguments, 0);
+    match value {
+        runtime::Value::Object(_) => (),
+        _ => return Result::Err(function_vm_error("Iterator constructor must be an object")),
+    };
+    if runtime::define_own_property(
+        context.heap(),
+        receiver,
+        runtime::string_property_key("constructor"),
+        runtime::data_descriptor(value, true, false, true),
+    ) {
+        Result::Ok(runtime::Value::Undefined)
+    } else {
+        Result::Err(function_vm_error("cannot define Iterator constructor"))
+    }
+}
+
+fn iterator_tag_set(
+    context: vm::Context,
+    prototype: runtime::ObjectId,
+    symbol: runtime::Symbol,
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+    depth: int,
+) -> Result[runtime::Value, vm::VmError] {
+    let _ = depth;
+    let receiver = match this_value {
+        runtime::Value::Object(value) => value,
+        _ => return Result::Err(function_vm_error("Iterator receiver is not an object")),
+    };
+    if receiver == prototype {
+        return Result::Err(function_vm_error("cannot assign Iterator toStringTag"))
+    } else {};
+    if runtime::define_own_property(
+        context.heap(),
+        receiver,
+        runtime::PropertyKey::Symbol(symbol),
+        runtime::data_descriptor(argument(arguments, 0), true, true, true),
+    ) {
+        Result::Ok(runtime::Value::Undefined)
+    } else {
+        Result::Err(function_vm_error("cannot define Iterator toStringTag"))
+    }
+}
+
+fn install_iterator(context: vm::Context) -> Result[runtime::Value, BuiltinError] {
+    let constructor = allocate_vm_function(
+        context,
+        "Iterator",
+        |this_value, arguments, depth| {
+            iterator_constructor_call(context, this_value, arguments, depth)
+        },
+    )?;
+    let constructor_object = function_object(constructor, "Iterator")?;
+    let prototype = match runtime::new_ordinary_object(context.heap(), Option::None) {
+        Ok(value) => value,
+        Err(value) => return Result::Err(BuiltinError { message: value.message }),
+    };
+    define_value(
+        context.heap(),
+        constructor_object,
+        "prototype",
+        runtime::Value::Object(prototype),
+        false,
+        false,
+    )?;
+    let constructor_get = allocate_vm_function_with_length(
+        context,
+        "",
+        0,
+        |this_value, arguments, depth| {
+            let _ = this_value;
+            let _ = arguments;
+            let _ = depth;
+            Result::Ok(constructor)
+        },
+    )?;
+    let constructor_set = allocate_vm_function_with_length(
+        context,
+        "",
+        0,
+        |this_value, arguments, depth| {
+            iterator_constructor_set(context, this_value, arguments, depth)
+        },
+    )?;
+    if !runtime::define_own_property(
+        context.heap(),
+        prototype,
+        runtime::string_property_key("constructor"),
+        runtime::accessor_descriptor(
+            Option::Some(constructor_get),
+            Option::Some(constructor_set),
+            false,
+            true,
+        ),
+    ) {
+        return Result::Err(BuiltinError { message: "cannot define Iterator constructor" })
+    } else {};
+    match context.set_vm_constructor_callback(
+        constructor,
+        |object, arguments, selected_prototype, new_target, depth| {
+            let _ = arguments;
+            let _ = depth;
+            if runtime::same_value(new_target, constructor) {
+                Result::Err(function_vm_error("abstract Iterator is not constructable"))
+            } else {
+                constructor_receiver_prototype(
+                    context.heap(),
+                    object,
+                    selected_prototype,
+                    prototype,
+                )?;
+                Result::Ok(runtime::Value::Object(object))
+            }
+        },
+    ) {
+        Ok(()) => (),
+        Err(_) => return Result::Err(BuiltinError { message: "cannot register Iterator" }),
+    };
+    define_value(
+        context.heap(),
+        constructor_object,
+        "from",
+        allocate_vm_function(
+            context,
+            "Iterator.from",
+            |this_value, arguments, depth| {
+                iterator_from(context, this_value, arguments, depth)
+            },
+        )?,
+        true,
+        true,
+    )?;
+    define_value(
+        context.heap(),
+        constructor_object,
+        "concat",
+        allocate_vm_function(
+            context,
+            "Iterator.concat",
+            |this_value, arguments, depth| {
+                iterator_concat(context, this_value, arguments, depth)
+            },
+        )?,
+        true,
+        true,
+    )?;
+    for (name, kind) in Vec::[
+        ("drop", IteratorHelperKind::Drop),
+        ("filter", IteratorHelperKind::Filter),
+        ("flatMap", IteratorHelperKind::FlatMap),
+        ("map", IteratorHelperKind::Map),
+        ("take", IteratorHelperKind::Take),
+    ] {
+        define_value(
+            context.heap(),
+            prototype,
+            name,
+            allocate_vm_function(
+                context,
+                "Iterator.prototype." + name,
+                |this_value, arguments, depth| {
+                    iterator_create_helper(context, kind, this_value, arguments, depth)
+                },
+            )?,
+            true,
+            true,
+        )?
+    }
+    for (name, kind) in Vec::[
+        ("every", IteratorTerminalKind::Every),
+        ("find", IteratorTerminalKind::Find),
+        ("forEach", IteratorTerminalKind::ForEach),
+        ("some", IteratorTerminalKind::Some),
+    ] {
+        define_value(
+            context.heap(),
+            prototype,
+            name,
+            allocate_vm_function(
+                context,
+                "Iterator.prototype." + name,
+                |this_value, arguments, depth| {
+                    iterator_terminal(context, kind, this_value, arguments, depth)
+                },
+            )?,
+            true,
+            true,
+        )?
+    }
+    define_value(
+        context.heap(),
+        prototype,
+        "reduce",
+        allocate_vm_function(
+            context,
+            "Iterator.prototype.reduce",
+            |this_value, arguments, depth| {
+                iterator_reduce(context, this_value, arguments, depth)
+            },
+        )?,
+        true,
+        true,
+    )?;
+    define_value(
+        context.heap(),
+        prototype,
+        "toArray",
+        allocate_vm_function(
+            context,
+            "Iterator.prototype.toArray",
+            |this_value, arguments, depth| {
+                iterator_to_array(context, this_value, arguments, depth)
+            },
+        )?,
+        true,
+        true,
+    )?;
+    match context.iterator_symbol() {
+        Some(symbol) => {
+            let identity = allocate_function(
+                context,
+                "Iterator.prototype[Symbol.iterator]",
+                iterator_identity,
+            )?;
+            if !runtime::define_own_property(
+                context.heap(),
+                prototype,
+                runtime::PropertyKey::Symbol(symbol),
+                runtime::data_descriptor(identity, true, false, true),
+            ) {
+                return Result::Err(BuiltinError { message: "cannot define Iterator protocol" })
+            } else {}
+        },
+        None => return Result::Err(BuiltinError { message: "iterator symbol is not installed" }),
+    };
+    let tag_symbol = match context.well_known_symbol(vm::WellKnownSymbolKind::ToStringTag) {
+        Some(value) => value,
+        None => return Result::Err(BuiltinError { message: "toStringTag symbol is not installed" }),
+    };
+    let tag_get = allocate_vm_function_with_length(
+        context,
+        "get [Symbol.toStringTag]",
+        0,
+        |this_value, arguments, depth| {
+            let _ = this_value;
+            let _ = arguments;
+            let _ = depth;
+            Result::Ok(runtime::Value::String(js_string("Iterator")))
+        },
+    )?;
+    let tag_set = allocate_vm_function_with_length(
+        context,
+        "set [Symbol.toStringTag]",
+        1,
+        |this_value, arguments, depth| {
+            iterator_tag_set(context, prototype, tag_symbol, this_value, arguments, depth)
+        },
+    )?;
+    iterator_set_function_name(context, tag_get, "get [Symbol.toStringTag]")?;
+    iterator_set_function_name(context, tag_set, "set [Symbol.toStringTag]")?;
+    if !runtime::define_own_property(
+        context.heap(),
+        prototype,
+        runtime::PropertyKey::Symbol(tag_symbol),
+        runtime::accessor_descriptor(Option::Some(tag_get), Option::Some(tag_set), false, true),
+    ) {
+        return Result::Err(BuiltinError { message: "cannot define Iterator toStringTag" })
+    } else {};
+    Result::Ok(constructor)
+}

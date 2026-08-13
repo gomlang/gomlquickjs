@@ -1,0 +1,275 @@
+package runtime;
+
+use std::testing;
+
+fn gc_expect_object(value: Result[ObjectId, TypeError]) -> ObjectId {
+    match value {
+        Ok(object) => object,
+        Err(error) => {
+            testing::fail(error.message);
+            let heap = Heap::new();
+            gc_expect_object(new_ordinary_object(heap, Option::None))
+        },
+    }
+}
+
+fn gc_link(heap: Heap, from: ObjectId, name: string, to: ObjectId) -> unit {
+    testing::assert(
+        define_own_property(
+            heap,
+            from,
+            string_property_key(name),
+            data_descriptor(Value::Object(to), true, true, true),
+        ),
+    )
+}
+
+#[test]
+fn gc_root_preserves_the_reachable_graph() -> unit {
+    let heap = Heap::new();
+    let root = gc_expect_object(new_ordinary_object(heap, Option::None));
+    let child = gc_expect_object(new_ordinary_object(heap, Option::None));
+    let leaf = gc_expect_object(new_ordinary_object(heap, Option::None));
+    gc_link(heap, root, "child", child);
+    gc_link(heap, child, "leaf", leaf);
+    gc_link(heap, root, "duplicate", leaf);
+    let stats = heap.collect(Vec::[Value::Object(root), Value::Object(root)]);
+    testing::assert_eq(stats.live_before, 3);
+    testing::assert_eq(stats.reachable, 3);
+    testing::assert_eq(stats.collected, 0);
+    testing::assert_eq(stats.live_after, 3);
+    testing::assert(heap.contains(root));
+    testing::assert(heap.contains(child));
+    testing::assert(heap.contains(leaf));
+    testing::assert_eq(heap.live_count(), 3)
+}
+
+#[test]
+fn gc_collects_an_unreachable_cycle() -> unit {
+    let heap = Heap::new();
+    let left = gc_expect_object(new_ordinary_object(heap, Option::None));
+    let right = gc_expect_object(new_ordinary_object(heap, Option::None));
+    gc_link(heap, left, "right", right);
+    gc_link(heap, right, "left", left);
+    let roots: Vec[Value] = Vec::[];
+    let stats = heap.collect(roots);
+    testing::assert_eq(stats.live_before, 2);
+    testing::assert_eq(stats.reachable, 0);
+    testing::assert_eq(stats.collected, 2);
+    testing::assert_eq(stats.live_after, 0);
+    testing::assert(!heap.contains(left));
+    testing::assert(!heap.contains(right));
+    testing::assert_eq(heap.live_count(), 0)
+}
+
+#[test]
+fn gc_traces_prototypes_and_accessor_values() -> unit {
+    let heap = Heap::new();
+    let getter = gc_expect_object(new_object(heap, ObjectKind::Function, Option::None));
+    let setter = gc_expect_object(new_object(heap, ObjectKind::Function, Option::None));
+    let prototype = gc_expect_object(new_ordinary_object(heap, Option::None));
+    testing::assert(
+        define_own_property(
+            heap,
+            prototype,
+            string_property_key("property"),
+            accessor_descriptor(
+                Option::Some(Value::Object(getter)),
+                Option::Some(Value::Object(setter)),
+                true,
+                true,
+            ),
+        ),
+    );
+    let child = gc_expect_object(new_ordinary_object(heap, Option::Some(prototype)));
+    let stats = heap.collect(Vec::[Value::Object(child)]);
+    testing::assert_eq(stats.live_before, 4);
+    testing::assert_eq(stats.reachable, 4);
+    testing::assert_eq(stats.collected, 0);
+    testing::assert(heap.contains(child));
+    testing::assert(heap.contains(prototype));
+    testing::assert(heap.contains(getter));
+    testing::assert(heap.contains(setter))
+}
+
+#[test]
+fn gc_traces_hidden_private_names_and_values() -> unit {
+    let heap = Heap::new();
+    let target = gc_expect_object(new_ordinary_object(heap, Option::None));
+    let field_name = gc_expect_object(new_ordinary_object(heap, Option::None));
+    let method_name = gc_expect_object(new_ordinary_object(heap, Option::None));
+    let accessor_name = gc_expect_object(new_ordinary_object(heap, Option::None));
+    let field = gc_expect_object(new_ordinary_object(heap, Option::None));
+    let method = gc_expect_object(new_object(heap, ObjectKind::Function, Option::None));
+    let getter = gc_expect_object(new_object(heap, ObjectKind::Function, Option::None));
+    let setter = gc_expect_object(new_object(heap, ObjectKind::Function, Option::None));
+    testing::assert(define_private_field(heap, target, field_name, Value::Object(field)));
+    testing::assert(define_private_method(heap, target, method_name, Value::Object(method)));
+    testing::assert(
+        define_private_accessor(heap, target, accessor_name, Value::Object(getter), true),
+    );
+    testing::assert(
+        define_private_accessor(heap, target, accessor_name, Value::Object(setter), false),
+    );
+    testing::assert_eq(own_property_keys(heap, target).len(), 0);
+    testing::assert(has_private_element(heap, target, field_name));
+    let stats = heap.collect(Vec::[Value::Object(target)]);
+    testing::assert_eq(stats.reachable, 8);
+    testing::assert_eq(stats.collected, 0);
+    testing::assert(heap.contains(field_name));
+    testing::assert(heap.contains(method_name));
+    testing::assert(heap.contains(accessor_name));
+    testing::assert(heap.contains(field));
+    testing::assert(heap.contains(method));
+    testing::assert(heap.contains(getter));
+    testing::assert(heap.contains(setter))
+}
+
+#[test]
+fn gc_ignores_foreign_and_stale_roots_and_reuses_slots() -> unit {
+    let heap = Heap::new();
+    let stale = gc_expect_object(new_ordinary_object(heap, Option::None));
+    testing::assert(heap.free(stale));
+    let replacement = gc_expect_object(new_ordinary_object(heap, Option::None));
+    testing::assert_eq(replacement.slot(), stale.slot());
+    let foreign_heap = Heap::new();
+    let foreign = gc_expect_object(new_ordinary_object(foreign_heap, Option::None));
+    let stats = heap.collect(
+        Vec::[Value::Object(stale), Value::Object(foreign), Value::Int(1), Value::Undefined],
+    );
+    testing::assert_eq(stats.live_before, 1);
+    testing::assert_eq(stats.reachable, 0);
+    testing::assert_eq(stats.collected, 1);
+    testing::assert_eq(stats.live_after, 0);
+    testing::assert(!heap.contains(stale));
+    testing::assert(!heap.contains(replacement));
+    let reused = gc_expect_object(new_ordinary_object(heap, Option::None));
+    testing::assert_eq(reused.slot(), replacement.slot());
+    testing::assert_eq(reused.generation(), replacement.generation() + 1);
+    testing::assert(heap.contains(reused));
+    testing::assert(!heap.contains(stale));
+    testing::assert(!heap.contains(replacement));
+    testing::assert_eq(heap.slot_count(), 1);
+    testing::assert_eq(heap.live_count(), 1)
+}
+
+#[test]
+fn gc_marks_weak_map_values_to_an_ephemeron_fixed_point() -> unit {
+    let heap = Heap::new();
+    let first_map = gc_expect_object(new_ordinary_object(heap, Option::None));
+    let second_map = gc_expect_object(new_ordinary_object(heap, Option::None));
+    let key = gc_expect_object(new_ordinary_object(heap, Option::None));
+    let middle = gc_expect_object(new_ordinary_object(heap, Option::None));
+    let leaf = gc_expect_object(new_ordinary_object(heap, Option::None));
+    testing::assert(weak_map_set(heap, first_map, Value::Object(key), Value::Object(middle)));
+    testing::assert(weak_map_set(heap, second_map, Value::Object(middle), Value::Object(leaf)));
+    let kept = heap.collect(
+        Vec::[Value::Object(first_map), Value::Object(second_map), Value::Object(key)],
+    );
+    testing::assert_eq(kept.reachable, 5);
+    testing::assert(heap.contains(middle));
+    testing::assert(heap.contains(leaf));
+    let dropped = heap.collect(Vec::[Value::Object(first_map), Value::Object(second_map)]);
+    testing::assert_eq(dropped.reachable, 2);
+    testing::assert(!heap.contains(key));
+    testing::assert(!heap.contains(middle));
+    testing::assert(!heap.contains(leaf));
+    testing::assert(!weak_map_has(heap, first_map, Value::Object(key)))
+}
+
+#[test]
+fn gc_does_not_mark_a_weak_ref_target() -> unit {
+    let heap = Heap::new();
+    let reference = gc_expect_object(new_ordinary_object(heap, Option::None));
+    let target = gc_expect_object(new_ordinary_object(heap, Option::None));
+    testing::assert(weak_ref_set(heap, reference, Value::Object(target)));
+    match weak_ref_deref(heap, reference) {
+        Some(Value::Object(value)) => testing::assert(value == target),
+        _ => testing::fail("expected live weak reference target"),
+    };
+    let stats = heap.collect(Vec::[Value::Object(reference)]);
+    testing::assert_eq(stats.reachable, 1);
+    testing::assert(!heap.contains(target));
+    testing::assert(weak_ref_deref(heap, reference).is_none())
+}
+
+#[test]
+fn gc_tracks_strong_symbol_roots_for_weak_references() -> unit {
+    let heap = Heap::new();
+    let reference = expect_object(new_ordinary_object(heap, Option::None));
+    let symbol = Value::Symbol(Symbol::new(9001, Option::Some("weak")));
+    testing::assert(weak_ref_set(heap, reference, symbol));
+    let _ = heap.collect(Vec::[Value::Object(reference), symbol]);
+    match weak_ref_deref(heap, reference) {
+        Some(value) => testing::assert(same_value(value, symbol)),
+        None => testing::fail("strongly rooted symbol was cleared"),
+    };
+    let _ = heap.collect(Vec::[Value::Object(reference)]);
+    testing::assert(weak_ref_deref(heap, reference).is_none())
+}
+
+#[test]
+fn gc_queues_finalization_jobs_and_honors_unregister_tokens() -> unit {
+    let heap = Heap::new();
+    let registry = gc_expect_object(new_ordinary_object(heap, Option::None));
+    let callback = gc_expect_object(new_object(heap, ObjectKind::Function, Option::None));
+    let first_target = gc_expect_object(new_ordinary_object(heap, Option::None));
+    let held = gc_expect_object(new_ordinary_object(heap, Option::None));
+    let token = gc_expect_object(new_ordinary_object(heap, Option::None));
+    testing::assert(
+        finalization_register(
+            heap,
+            registry,
+            Value::Object(callback),
+            Value::Object(first_target),
+            Value::Object(held),
+            Option::Some(Value::Object(token)),
+        ),
+    );
+    let retained = heap.collect(
+        Vec::[Value::Object(registry), Value::Object(first_target), Value::Object(token)],
+    );
+    testing::assert_eq(retained.reachable, 5);
+    match finalization_unregister(heap, registry, Value::Object(token)) {
+        Some(value) => testing::assert(value),
+        None => testing::fail("expected valid finalization token"),
+    };
+    let second_target = gc_expect_object(new_ordinary_object(heap, Option::None));
+    testing::assert(
+        finalization_register(
+            heap,
+            registry,
+            Value::Object(callback),
+            Value::Object(second_target),
+            Value::Object(held),
+            Option::None,
+        ),
+    );
+    let finalized = heap.collect(Vec::[Value::Object(registry)]);
+    testing::assert_eq(finalized.reachable, 3);
+    testing::assert(!heap.contains(first_target));
+    testing::assert(!heap.contains(second_target));
+    match pop_finalization_job(heap) {
+        Some(job) => {
+            testing::assert(same_value(job.callback, Value::Object(callback)));
+            testing::assert(same_value(job.held, Value::Object(held)))
+        },
+        None => testing::fail("expected finalization job"),
+    };
+    testing::assert(pop_finalization_job(heap).is_none())
+}
+
+#[test]
+fn gc_traces_proxy_target_and_handler_until_revocation() -> unit {
+    let heap = Heap::new();
+    let target = gc_expect_object(new_ordinary_object(heap, Option::None));
+    let handler = gc_expect_object(new_ordinary_object(heap, Option::None));
+    let proxy = gc_expect_object(new_proxy(heap, target, handler));
+    let retained = heap.collect(Vec::[Value::Object(proxy)]);
+    testing::assert_eq(retained.reachable, 3);
+    testing::assert(heap.contains(target) && heap.contains(handler));
+    testing::assert(revoke_proxy(heap, proxy));
+    let revoked = heap.collect(Vec::[Value::Object(proxy)]);
+    testing::assert_eq(revoked.reachable, 1);
+    testing::assert(!heap.contains(target) && !heap.contains(handler))
+}

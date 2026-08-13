@@ -1,0 +1,487 @@
+package builtins;
+
+use gomlang::quickjs::bytecode;
+use gomlang::quickjs::runtime;
+use gomlang::quickjs::vm;
+use std::testing;
+
+fn regexp_expect_install(value: Result[runtime::Value, BuiltinError]) -> runtime::Value {
+    match value {
+        Ok(value) => value,
+        Err(value) => {
+            testing::fail(value.message);
+            runtime::Value::Undefined
+        },
+    }
+}
+
+fn regexp_expect_value(value: Result[runtime::Value, vm::VmError]) -> runtime::Value {
+    match value {
+        Ok(value) => value,
+        Err(value) => {
+            testing::fail(value.kind.debug());
+            runtime::Value::Undefined
+        },
+    }
+}
+
+fn regexp_expect_object(value: runtime::Value) -> runtime::ObjectId {
+    match value {
+        runtime::Value::Object(value) => value,
+        _ => {
+            testing::fail("expected object");
+            match runtime::new_ordinary_object(runtime::Heap::new(), Option::None) {
+                Ok(value) => value,
+                Err(_) => regexp_expect_object(runtime::Value::Undefined),
+            }
+        },
+    }
+}
+
+fn regexp_property(context: vm::Context, object: runtime::ObjectId, name: string) -> runtime::Value {
+    match context.read_property_at_depth(
+        runtime::Value::Object(object),
+        runtime::Value::String(js_string(name)),
+        0,
+    ) {
+        Ok(value) => value,
+        Err(value) => {
+            testing::fail(value.kind.debug());
+            runtime::Value::Undefined
+        },
+    }
+}
+
+fn regexp_invoke(context: vm::Context, callable: runtime::Value, arguments: Vec[runtime::Value]) -> Result[
+    runtime::Value,
+    vm::VmError,
+] {
+    let code: Vec[bytecode::Instruction] = Vec::[bytecode::Instruction::GetLoc(0)];
+    let mut index = 0;
+    while index < arguments.len() {
+        code.push(bytecode::Instruction::GetLoc(index + 1));
+        index += 1;
+    }
+    code.push(bytecode::Instruction::Call(arguments.len()));
+    code.push(bytecode::Instruction::Return);
+    let locals: Vec[runtime::Value] = Vec::with_capacity(arguments.len() + 1);
+    locals.push(callable);
+    for value in arguments {
+        locals.push(value)
+    }
+    context.execute_with_locals(bytecode::Function::new(Vec::[], code, locals.len()), locals)
+}
+
+fn regexp_invoke_method(
+    context: vm::Context,
+    receiver: runtime::Value,
+    callable: runtime::Value,
+    arguments: Vec[runtime::Value],
+) -> Result[runtime::Value, vm::VmError] {
+    let code: Vec[bytecode::Instruction] = Vec::[
+        bytecode::Instruction::GetLoc(0),
+        bytecode::Instruction::GetLoc(1),
+    ];
+    let mut index = 0;
+    while index < arguments.len() {
+        code.push(bytecode::Instruction::GetLoc(index + 2));
+        index += 1;
+    }
+    code.push(bytecode::Instruction::CallMethod(arguments.len()));
+    code.push(bytecode::Instruction::Return);
+    let locals: Vec[runtime::Value] = Vec::with_capacity(arguments.len() + 2);
+    locals.push(receiver);
+    locals.push(callable);
+    for value in arguments {
+        locals.push(value)
+    }
+    context.execute_with_locals(bytecode::Function::new(Vec::[], code, locals.len()), locals)
+}
+
+fn regexp_new(context: vm::Context, constructor: runtime::Value, pattern: string, flags: string) -> runtime::ObjectId {
+    regexp_expect_object(
+        regexp_expect_value(
+            regexp_invoke(
+                context,
+                constructor,
+                Vec::[
+                    runtime::Value::String(js_string(pattern)),
+                    runtime::Value::String(js_string(flags)),
+                ],
+            ),
+        ),
+    )
+}
+
+fn regexp_expect_int(value: runtime::Value) -> int {
+    match value {
+        runtime::Value::Int(value) => value.to_int(),
+        _ => {
+            testing::fail("expected integer value");
+            0
+        },
+    }
+}
+
+fn regexp_expect_bool(value: runtime::Value) -> bool {
+    match value {
+        runtime::Value::Bool(value) => value,
+        _ => {
+            testing::fail("expected boolean value");
+            false
+        },
+    }
+}
+
+fn regexp_expect_string(value: runtime::Value) -> runtime::JsString {
+    match value {
+        runtime::Value::String(value) => value,
+        _ => {
+            testing::fail("expected string value");
+            js_string("")
+        },
+    }
+}
+
+fn regexp_set_last_index(heap: runtime::Heap, object: runtime::ObjectId, value: runtime::Value) -> unit {
+    match runtime::set_property(heap, object, runtime::string_property_key("lastIndex"), value) {
+        Ok(true) => (),
+        _ => testing::fail("cannot set RegExp lastIndex"),
+    }
+}
+
+#[test]
+fn regexp_constructor_exposes_canonical_instance_properties() -> unit {
+    let context = vm::Context::new(runtime::Heap::new());
+    let constructor = regexp_expect_install(install_regexp(context));
+    let constructor_object = regexp_expect_object(constructor);
+    let prototype = regexp_expect_object(regexp_property(context, constructor_object, "prototype"));
+    testing::assert(
+        runtime::same_value(regexp_property(context, prototype, "constructor"), constructor),
+    );
+    let instance = regexp_new(context, constructor, "a+", "migd");
+    testing::assert(
+        regexp_expect_string(regexp_property(context, instance, "source")) == js_string("a+"),
+    );
+    testing::assert(
+        regexp_expect_string(regexp_property(context, instance, "flags")) == js_string("dgim"),
+    );
+    testing::assert(regexp_expect_bool(regexp_property(context, instance, "hasIndices")));
+    testing::assert(regexp_expect_bool(regexp_property(context, instance, "global")));
+    testing::assert(regexp_expect_bool(regexp_property(context, instance, "ignoreCase")));
+    testing::assert(regexp_expect_bool(regexp_property(context, instance, "multiline")));
+    testing::assert(!regexp_expect_bool(regexp_property(context, instance, "dotAll")));
+    testing::assert(!regexp_expect_bool(regexp_property(context, instance, "unicode")));
+    testing::assert(!regexp_expect_bool(regexp_property(context, instance, "sticky")));
+    testing::assert_eq(regexp_expect_int(regexp_property(context, instance, "lastIndex")), 0);
+    testing::assert(regexp_expect_object(regexp_property(context, instance, "exec")).is_callable());
+    testing::assert(regexp_expect_object(regexp_property(context, instance, "test")).is_callable())
+}
+
+#[test]
+fn regexp_exec_returns_array_captures_index_and_input() -> unit {
+    let context = vm::Context::new(runtime::Heap::new());
+    let constructor = regexp_expect_install(install_regexp(context));
+    let instance = regexp_new(context, constructor, "(a)?(b)", "");
+    let input = js_string("xxb");
+    let result = regexp_expect_object(
+        regexp_expect_value(
+            regexp_invoke_method(
+                context,
+                runtime::Value::Object(instance),
+                regexp_property(context, instance, "exec"),
+                Vec::[runtime::Value::String(input)],
+            ),
+        ),
+    );
+    match context.heap().get(result) {
+        Some(object) => match object.kind() {
+            runtime::ObjectKind::Array => (),
+            _ => testing::fail("expected RegExp exec array"),
+        },
+        None => testing::fail("missing RegExp exec result"),
+    };
+    testing::assert(regexp_expect_string(regexp_property(context, result, "0")) == js_string("b"));
+    match regexp_property(context, result, "1") {
+        runtime::Value::Undefined => (),
+        _ => testing::fail("expected nonparticipating capture to be undefined"),
+    };
+    testing::assert(regexp_expect_string(regexp_property(context, result, "2")) == js_string("b"));
+    testing::assert_eq(regexp_expect_int(regexp_property(context, result, "length")), 3);
+    testing::assert_eq(regexp_expect_int(regexp_property(context, result, "index")), 2);
+    testing::assert(regexp_expect_string(regexp_property(context, result, "input")) == input);
+    match regexp_property(context, result, "groups") {
+        runtime::Value::Undefined => (),
+        _ => testing::fail("expected unnamed RegExp groups to be undefined"),
+    }
+}
+
+#[test]
+fn regexp_exec_exposes_named_capture_groups() -> unit {
+    let context = vm::Context::new(runtime::Heap::new());
+    let constructor = regexp_expect_install(install_regexp(context));
+    let instance = regexp_new(context, constructor, "(?<first>a)(?<optional>b)?", "");
+    let result = regexp_expect_object(
+        regexp_expect_value(
+            regexp_invoke_method(
+                context,
+                runtime::Value::Object(instance),
+                regexp_property(context, instance, "exec"),
+                Vec::[runtime::Value::String(js_string("a"))],
+            ),
+        ),
+    );
+    testing::assert(regexp_expect_string(regexp_property(context, result, "1")) == js_string("a"));
+    let groups = regexp_expect_object(regexp_property(context, result, "groups"));
+    testing::assert(
+        regexp_expect_string(regexp_property(context, groups, "first")) == js_string("a"),
+    );
+    match regexp_property(context, groups, "optional") {
+        runtime::Value::Undefined => (),
+        _ => testing::fail("expected unmatched named capture to be undefined"),
+    }
+}
+
+#[test]
+fn regexp_indices_expose_capture_ranges_and_named_group_identity() -> unit {
+    let context = vm::Context::new(runtime::Heap::new());
+    let constructor = regexp_expect_install(install_regexp(context));
+    let instance = regexp_new(context, constructor, "(?<first>a)(b)?", "d");
+    let result = regexp_expect_object(
+        regexp_expect_value(
+            regexp_invoke_method(
+                context,
+                runtime::Value::Object(instance),
+                regexp_property(context, instance, "exec"),
+                Vec::[runtime::Value::String(js_string("a"))],
+            ),
+        ),
+    );
+    let indices = regexp_expect_object(regexp_property(context, result, "indices"));
+    let whole = regexp_expect_object(regexp_property(context, indices, "0"));
+    testing::assert_eq(regexp_expect_int(regexp_property(context, whole, "0")), 0);
+    testing::assert_eq(regexp_expect_int(regexp_property(context, whole, "1")), 1);
+    let first = regexp_property(context, indices, "1");
+    let groups = regexp_expect_object(regexp_property(context, indices, "groups"));
+    testing::assert(runtime::same_value(regexp_property(context, groups, "first"), first));
+    match regexp_property(context, indices, "2") {
+        runtime::Value::Undefined => (),
+        _ => testing::fail("expected unmatched capture indices to be undefined"),
+    }
+}
+
+#[test]
+fn global_regexp_exec_updates_and_resets_last_index() -> unit {
+    let context = vm::Context::new(runtime::Heap::new());
+    let constructor = regexp_expect_install(install_regexp(context));
+    let instance = regexp_new(context, constructor, "(a)", "g");
+    let exec = regexp_property(context, instance, "exec");
+    let input = runtime::Value::String(js_string("baac"));
+    let first = regexp_expect_object(
+        regexp_expect_value(
+            regexp_invoke_method(context, runtime::Value::Object(instance), exec, Vec::[input]),
+        ),
+    );
+    testing::assert_eq(regexp_expect_int(regexp_property(context, first, "index")), 1);
+    testing::assert(regexp_expect_string(regexp_property(context, first, "1")) == js_string("a"));
+    testing::assert_eq(regexp_expect_int(regexp_property(context, instance, "lastIndex")), 2);
+    let second = regexp_expect_object(
+        regexp_expect_value(
+            regexp_invoke_method(context, runtime::Value::Object(instance), exec, Vec::[input]),
+        ),
+    );
+    testing::assert_eq(regexp_expect_int(regexp_property(context, second, "index")), 2);
+    testing::assert_eq(regexp_expect_int(regexp_property(context, instance, "lastIndex")), 3);
+    match regexp_expect_value(
+        regexp_invoke_method(context, runtime::Value::Object(instance), exec, Vec::[input]),
+    ) {
+        runtime::Value::Null => (),
+        _ => testing::fail("expected exhausted global RegExp to return null"),
+    };
+    testing::assert_eq(regexp_expect_int(regexp_property(context, instance, "lastIndex")), 0)
+}
+
+#[test]
+fn sticky_regexp_uses_full_input_context_at_last_index() -> unit {
+    let context = vm::Context::new(runtime::Heap::new());
+    let constructor = regexp_expect_install(install_regexp(context));
+    let sticky = regexp_new(context, constructor, "(?<=b)a", "y");
+    regexp_set_last_index(context.heap(), sticky, runtime::Value::Int(1));
+    let test = regexp_property(context, sticky, "test");
+    testing::assert(
+        regexp_expect_bool(
+            regexp_expect_value(
+                regexp_invoke_method(
+                    context,
+                    runtime::Value::Object(sticky),
+                    test,
+                    Vec::[runtime::Value::String(js_string("ba"))],
+                ),
+            ),
+        ),
+    );
+    testing::assert_eq(regexp_expect_int(regexp_property(context, sticky, "lastIndex")), 2);
+    let anchored = regexp_new(context, constructor, "^a", "g");
+    regexp_set_last_index(context.heap(), anchored, runtime::Value::Int(1));
+    let anchored_test = regexp_property(context, anchored, "test");
+    testing::assert(
+        !regexp_expect_bool(
+            regexp_expect_value(
+                regexp_invoke_method(
+                    context,
+                    runtime::Value::Object(anchored),
+                    anchored_test,
+                    Vec::[runtime::Value::String(js_string("ba"))],
+                ),
+            ),
+        ),
+    );
+    testing::assert_eq(regexp_expect_int(regexp_property(context, anchored, "lastIndex")), 0)
+}
+
+#[test]
+fn non_indexed_regexp_ignores_and_preserves_last_index() -> unit {
+    let context = vm::Context::new(runtime::Heap::new());
+    let constructor = regexp_expect_install(install_regexp(context));
+    let instance = regexp_new(context, constructor, "a", "");
+    regexp_set_last_index(context.heap(), instance, runtime::Value::Int(7));
+    let test = regexp_property(context, instance, "test");
+    testing::assert(
+        regexp_expect_bool(
+            regexp_expect_value(
+                regexp_invoke_method(
+                    context,
+                    runtime::Value::Object(instance),
+                    test,
+                    Vec::[runtime::Value::String(js_string("ba"))],
+                ),
+            ),
+        ),
+    );
+    testing::assert_eq(regexp_expect_int(regexp_property(context, instance, "lastIndex")), 7)
+}
+
+#[test]
+fn regexp_constructor_handles_empty_source_escaping_and_existing_instances() -> unit {
+    let context = vm::Context::new(runtime::Heap::new());
+    let constructor = regexp_expect_install(install_regexp(context));
+    let empty = regexp_expect_object(
+        regexp_expect_value(regexp_invoke(context, constructor, Vec::[])),
+    );
+    testing::assert(
+        regexp_expect_string(regexp_property(context, empty, "source")) == js_string("(?:)"),
+    );
+    let escaped = regexp_new(context, constructor, "a/b\n", "");
+    testing::assert(
+        regexp_expect_string(regexp_property(context, escaped, "source")) == js_string("a\\/b\\n"),
+    );
+    let same = regexp_expect_value(
+        regexp_invoke(context, constructor, Vec::[runtime::Value::Object(escaped)]),
+    );
+    testing::assert(runtime::same_value(same, runtime::Value::Object(escaped)));
+    let changed = regexp_expect_object(
+        regexp_expect_value(
+            regexp_invoke(
+                context,
+                constructor,
+                Vec::[runtime::Value::Object(escaped), runtime::Value::String(js_string("i"))],
+            ),
+        ),
+    );
+    testing::assert(changed != escaped);
+    testing::assert(
+        regexp_expect_string(regexp_property(context, changed, "flags")) == js_string("i"),
+    )
+}
+
+#[test]
+fn regexp_to_string_and_compile_update_the_existing_instance() -> unit {
+    let context = vm::Context::new(runtime::Heap::new());
+    let constructor = regexp_expect_install(install_regexp(context));
+    let instance = regexp_new(context, constructor, "a", "g");
+    let receiver = runtime::Value::Object(instance);
+    let to_string = regexp_property(context, instance, "toString");
+    testing::assert(
+        regexp_expect_string(
+            regexp_expect_value(regexp_invoke_method(context, receiver, to_string, Vec::[])),
+        )
+            == js_string("/a/g"),
+    );
+    regexp_set_last_index(context.heap(), instance, runtime::Value::Int(4));
+    let replacement = regexp_new(context, constructor, "b", "i");
+    let compile_method = regexp_property(context, instance, "compile");
+    let result = regexp_expect_value(
+        regexp_invoke_method(
+            context,
+            receiver,
+            compile_method,
+            Vec::[runtime::Value::Object(replacement)],
+        ),
+    );
+    testing::assert(runtime::same_value(result, receiver));
+    testing::assert(
+        regexp_expect_string(regexp_property(context, instance, "source")) == js_string("b"),
+    );
+    testing::assert(
+        regexp_expect_string(regexp_property(context, instance, "flags")) == js_string("i"),
+    );
+    testing::assert_eq(regexp_expect_int(regexp_property(context, instance, "lastIndex")), 0)
+}
+
+#[test]
+fn regexp_compile_failures_become_native_errors() -> unit {
+    let context = vm::Context::new(runtime::Heap::new());
+    let constructor = regexp_expect_install(install_regexp(context));
+    match regexp_invoke(
+        context,
+        constructor,
+        Vec::[runtime::Value::String(js_string("(")), runtime::Value::String(js_string(""))],
+    ) {
+        Err(vm::VmError { kind: vm::VmErrorKind::SyntaxError(_), .. }) => (),
+        _ => testing::fail("expected invalid RegExp pattern error"),
+    };
+    match regexp_invoke(
+        context,
+        constructor,
+        Vec::[runtime::Value::String(js_string("a")), runtime::Value::String(js_string("gg"))],
+    ) {
+        Err(vm::VmError { kind: vm::VmErrorKind::SyntaxError(_), .. }) => (),
+        _ => testing::fail("expected invalid RegExp flags error"),
+    }
+}
+
+#[test]
+fn unicode_regexp_rewinds_last_index_from_a_trailing_surrogate() -> unit {
+    let context = vm::Context::new(runtime::Heap::new());
+    let constructor = regexp_expect_install(install_regexp(context));
+    let empty = regexp_new(context, constructor, "(?:)", "gu");
+    regexp_set_last_index(context.heap(), empty, runtime::Value::Int(1));
+    let exec = regexp_property(context, empty, "exec");
+    let _ = regexp_expect_value(
+        regexp_invoke_method(
+            context,
+            runtime::Value::Object(empty),
+            exec,
+            Vec::[runtime::Value::String(js_string("🐱"))],
+        ),
+    );
+    testing::assert_eq(regexp_expect_int(regexp_property(context, empty, "lastIndex")), 0);
+    let scalar = regexp_new(context, constructor, "𐀀", "vgd");
+    regexp_set_last_index(context.heap(), scalar, runtime::Value::Int(1));
+    let scalar_exec = regexp_property(context, scalar, "exec");
+    let result = regexp_expect_object(
+        regexp_expect_value(
+            regexp_invoke_method(
+                context,
+                runtime::Value::Object(scalar),
+                scalar_exec,
+                Vec::[runtime::Value::String(js_string("𐀀_𐀀"))],
+            ),
+        ),
+    );
+    testing::assert_eq(regexp_expect_int(regexp_property(context, result, "index")), 0);
+    let indices = regexp_expect_object(regexp_property(context, result, "indices"));
+    let full = regexp_expect_object(regexp_property(context, indices, "0"));
+    testing::assert_eq(regexp_expect_int(regexp_property(context, full, "0")), 0);
+    testing::assert_eq(regexp_expect_int(regexp_property(context, full, "1")), 2)
+}

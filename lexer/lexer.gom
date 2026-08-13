@@ -1,0 +1,1724 @@
+package lexer;
+
+use gomlang::quickjs::unicode;
+use std::ascii;
+use std::text;
+
+#[derive(PartialEq, Eq, Debug)]
+pub enum TokenKind {
+    Identifier,
+    PrivateIdentifier,
+    Number,
+    BigInt,
+    String,
+    RegExp,
+    NoSubstitutionTemplate,
+    TemplateHead,
+    TemplateMiddle,
+    TemplateTail,
+    LParen,
+    RParen,
+    LBrace,
+    RBrace,
+    LBracket,
+    RBracket,
+    Semicolon,
+    Comma,
+    Colon,
+    Dot,
+    Ellipsis,
+    Question,
+    OptionalChain,
+    Arrow,
+    Assign,
+    Plus,
+    Minus,
+    Star,
+    Slash,
+    Percent,
+    Power,
+    Increment,
+    Decrement,
+    PlusAssign,
+    MinusAssign,
+    StarAssign,
+    SlashAssign,
+    PercentAssign,
+    PowerAssign,
+    ShiftLeft,
+    ShiftRight,
+    ShiftRightUnsigned,
+    ShiftLeftAssign,
+    ShiftRightAssign,
+    ShiftRightUnsignedAssign,
+    Less,
+    LessEqual,
+    Greater,
+    GreaterEqual,
+    Equal,
+    StrictEqual,
+    NotEqual,
+    StrictNotEqual,
+    BitAnd,
+    BitOr,
+    BitXor,
+    BitNot,
+    BitAndAssign,
+    BitOrAssign,
+    BitXorAssign,
+    LogicalAnd,
+    LogicalOr,
+    NullishCoalescing,
+    LogicalAndAssign,
+    LogicalOrAssign,
+    NullishCoalescingAssign,
+    LogicalNot,
+    NullKeyword,
+    FalseKeyword,
+    TrueKeyword,
+    IfKeyword,
+    ElseKeyword,
+    ReturnKeyword,
+    VarKeyword,
+    ThisKeyword,
+    DeleteKeyword,
+    VoidKeyword,
+    TypeofKeyword,
+    NewKeyword,
+    InKeyword,
+    InstanceofKeyword,
+    DoKeyword,
+    WhileKeyword,
+    ForKeyword,
+    BreakKeyword,
+    ContinueKeyword,
+    SwitchKeyword,
+    CaseKeyword,
+    DefaultKeyword,
+    ThrowKeyword,
+    TryKeyword,
+    CatchKeyword,
+    FinallyKeyword,
+    FunctionKeyword,
+    DebuggerKeyword,
+    WithKeyword,
+    ClassKeyword,
+    ConstKeyword,
+    EnumKeyword,
+    ExportKeyword,
+    ExtendsKeyword,
+    ImportKeyword,
+    SuperKeyword,
+    ImplementsKeyword,
+    InterfaceKeyword,
+    LetKeyword,
+    PackageKeyword,
+    PrivateKeyword,
+    ProtectedKeyword,
+    PublicKeyword,
+    StaticKeyword,
+    YieldKeyword,
+    AwaitKeyword,
+    Error,
+    Eof,
+}
+
+#[derive(PartialEq, Eq, Debug)]
+pub struct Span {
+    pub start: int,
+    pub end: int,
+}
+
+#[derive(PartialEq, Eq, Debug)]
+pub struct LexError {
+    pub message: string,
+    pub span: Span,
+}
+
+#[derive(PartialEq, Eq)]
+pub struct Token {
+    pub kind: TokenKind,
+    pub lexeme: string,
+    pub value: string,
+    pub regex_flags: string,
+    pub span: Span,
+    pub line_break_before: bool,
+    pub has_escape: bool,
+    pub is_reserved: bool,
+    pub template_errors: Vec[LexError],
+}
+
+#[derive(PartialEq, Eq)]
+pub struct LexResult {
+    pub tokens: Vec[Token],
+    pub errors: Vec[LexError],
+}
+
+struct StringScan {
+    end: int,
+    value: string,
+}
+
+struct TemplateScan {
+    end: int,
+    kind: TokenKind,
+    value: string,
+    opens_substitution: bool,
+    errors: Vec[LexError],
+}
+
+struct DigitScan {
+    end: int,
+    valid: bool,
+    any: bool,
+}
+
+struct NumberScan {
+    end: int,
+    kind: TokenKind,
+    valid: bool,
+}
+
+struct TriviaScan {
+    end: int,
+    line_break: bool,
+}
+
+struct BlockCommentScan {
+    end: int,
+    line_break: bool,
+    closed: bool,
+}
+
+struct IdentifierEscapeScan {
+    end: int,
+    codepoint: uint32,
+    valid: bool,
+}
+
+struct IdentifierScan {
+    end: int,
+    value: string,
+    has_escape: bool,
+    valid: bool,
+}
+
+struct RegExpScan {
+    end: int,
+    pattern: string,
+    flags: string,
+    valid: bool,
+}
+
+fn span(start: int, end: int) -> Span {
+    Span { start, end }
+}
+
+fn push_error(errors: Vec[LexError], message: string, start: int, end: int) -> unit {
+    errors.push(LexError { message, span: span(start, end) })
+}
+
+fn push_token(
+    tokens: Vec[Token],
+    source: string,
+    kind: TokenKind,
+    value: string,
+    start: int,
+    end: int,
+    line_break_before: bool,
+) -> unit {
+    tokens.push(
+        Token {
+            kind,
+            lexeme: source.byte_slice(start, end),
+            value,
+            regex_flags: "",
+            span: span(start, end),
+            line_break_before,
+            has_escape: false,
+            is_reserved: false,
+            template_errors: Vec::[],
+        },
+    )
+}
+
+fn push_identifier_token(
+    tokens: Vec[Token],
+    source: string,
+    kind: TokenKind,
+    value: string,
+    start: int,
+    end: int,
+    line_break_before: bool,
+    has_escape: bool,
+    is_reserved: bool,
+) -> unit {
+    tokens.push(
+        Token {
+            kind,
+            lexeme: source.byte_slice(start, end),
+            value,
+            regex_flags: "",
+            span: span(start, end),
+            line_break_before,
+            has_escape,
+            is_reserved,
+            template_errors: Vec::[],
+        },
+    )
+}
+
+fn is_line_terminator(value: char) -> bool {
+    value == '\n' || value == '\r' || value == '\u2028' || value == '\u2029'
+}
+
+fn is_non_ascii_whitespace(value: char) -> bool {
+    value == '\u00A0' || value == '\u1680' || value == '\u2000' || value == '\u2001'
+        || value == '\u2002'
+        || value == '\u2003'
+        || value == '\u2004'
+        || value == '\u2005'
+        || value == '\u2006'
+        || value == '\u2007'
+        || value == '\u2008'
+        || value == '\u2009'
+        || value == '\u200A'
+        || value == '\u202F'
+        || value == '\u205F'
+        || value == '\u3000'
+        || value == '\uFEFF'
+}
+
+fn line_terminator_width(source: string, index: int) -> int {
+    if index >= source.byte_len() {
+        0
+    } else {
+        let value = source.byte_get(index);
+        if value == b'\r' {
+            if index + 1 < source.byte_len() && source.byte_get(index + 1) == b'\n' {
+                2
+            } else {
+                1
+            }
+        } else if value == b'\n' {
+            1
+        } else if value < 128 {
+            0
+        } else {
+            match source.decode_at(index) {
+                Some((character, width)) => if is_line_terminator(character) {
+                    width
+                } else {
+                    0
+                },
+                None => 0,
+            }
+        }
+    }
+}
+
+fn whitespace_width(source: string, index: int) -> int {
+    if index >= source.byte_len() {
+        0
+    } else {
+        let value = source.byte_get(index);
+        if value < 128 {
+            if ascii::is_whitespace(value) {
+                1
+            } else {
+                0
+            }
+        } else {
+            match source.decode_at(index) {
+                Some((character, width)) => if is_non_ascii_whitespace(character)
+                    || is_line_terminator(character) {
+                    width
+                } else {
+                    0
+                },
+                None => 0,
+            }
+        }
+    }
+}
+
+fn is_ascii_identifier_start(value: byte) -> bool {
+    ascii::is_alphabetic(value) || value == b'_' || value == b'$'
+}
+
+fn is_ascii_identifier_continue(value: byte) -> bool {
+    ascii::is_alphanumeric(value) || value == b'_' || value == b'$'
+}
+
+fn is_identifier_start_codepoint(tables: unicode::IdentifierTables, codepoint: uint32) -> bool {
+    codepoint == 36 || codepoint == 95 || tables.is_start(codepoint)
+}
+
+fn is_identifier_continue_codepoint(tables: unicode::IdentifierTables, codepoint: uint32) -> bool {
+    codepoint == 36 || codepoint == 95 || codepoint == 8204 || codepoint == 8205
+        || tables.is_continue(codepoint)
+}
+
+fn identifier_width(tables: unicode::IdentifierTables, source: string, index: int, first: bool) -> int {
+    if index >= source.byte_len() {
+        0
+    } else {
+        let value = source.byte_get(index);
+        if value < 128 {
+            if if first {
+                is_ascii_identifier_start(value)
+            } else {
+                is_ascii_identifier_continue(value)
+            } {
+                1
+            } else {
+                0
+            }
+        } else {
+            match source.decode_at(index) {
+                Some((character, width)) => if if first {
+                    is_identifier_start_codepoint(tables, character.to_uint32())
+                } else {
+                    is_identifier_continue_codepoint(tables, character.to_uint32())
+                } {
+                    width
+                } else {
+                    0
+                },
+                None => 0,
+            }
+        }
+    }
+}
+
+fn scan_identifier_escape(source: string, slash: int) -> IdentifierEscapeScan {
+    let digit_start = slash + 2;
+    if digit_start < source.byte_len() && source.byte_get(digit_start) == b'{' {
+        let mut index = digit_start + 1;
+        let mut count = 0;
+        let mut codepoint = 0.to_uint32();
+        let mut valid = true;
+        while index < source.byte_len() && source.byte_get(index) != b'}'
+            && whitespace_width(source, index) == 0 {
+            match hex_value(source.byte_get(index)) {
+                Some(value) => {
+                    count += 1;
+                    if count <= 6 {
+                        codepoint = codepoint * 16 + value;
+                    } else {
+                        valid = false;
+                    }
+                },
+                None => {
+                    valid = false;
+                },
+            }
+            index += 1;
+        }
+        if index < source.byte_len() && source.byte_get(index) == b'}' {
+            index += 1;
+        } else {
+            valid = false;
+        };
+        IdentifierEscapeScan {
+            end: index,
+            codepoint,
+            valid: valid && count > 0 && codepoint <= 1114111
+                && !(codepoint >= 55296 && codepoint <= 57343),
+        }
+    } else {
+        let mut index = digit_start;
+        let mut count = 0;
+        let mut codepoint = 0.to_uint32();
+        while count < 4 && index < source.byte_len() && hex_value(source.byte_get(index)).is_some() {
+            match hex_value(source.byte_get(index)) {
+                Some(value) => {
+                    codepoint = codepoint * 16 + value;
+                },
+                None => (),
+            }
+            count += 1;
+            index += 1;
+        }
+        IdentifierEscapeScan {
+            end: index,
+            codepoint,
+            valid: count == 4 && !(codepoint >= 55296 && codepoint <= 57343),
+        }
+    }
+}
+
+fn write_identifier_codepoint(builder: text::StringBuilder, codepoint: uint32) -> unit {
+    match char_from_uint32(codepoint) {
+        Some(character) => builder.write_char(character),
+        None => (),
+    }
+}
+
+fn write_identifier_source(builder: text::StringBuilder, source: string, index: int) -> unit {
+    if source.byte_get(index) < 128 {
+        write_identifier_codepoint(builder, source.byte_get(index).to_uint32())
+    } else {
+        match source.decode_at(index) {
+            Some((character, _)) => builder.write_char(character),
+            None => (),
+        }
+    }
+}
+
+fn scan_identifier(
+    tables: unicode::IdentifierTables,
+    source: string,
+    start: int,
+    errors: Vec[LexError],
+) -> IdentifierScan {
+    let builder = text::StringBuilder::new();
+    let mut index = start;
+    let mut first = true;
+    let mut has_escape = false;
+    let mut valid = true;
+    let mut scanning = true;
+    while index < source.byte_len() && scanning {
+        if source.byte_get(index) == b'\\' && index + 1 < source.byte_len()
+            && source.byte_get(index + 1) == b'u' {
+            has_escape = true;
+            let escape_start = index;
+            let escaped = scan_identifier_escape(source, index);
+            index = escaped.end;
+            if !escaped.valid {
+                push_error(errors, "invalid Unicode escape in identifier", escape_start, index);
+                valid = false;
+            } else {
+                let allowed = if first {
+                    is_identifier_start_codepoint(tables, escaped.codepoint)
+                } else {
+                    is_identifier_continue_codepoint(tables, escaped.codepoint)
+                };
+                if !allowed {
+                    push_error(
+                        errors,
+                        if first {
+                            "escaped code point is not valid at the start of an identifier"
+                        } else {
+                            "escaped code point is not valid in an identifier"
+                        },
+                        escape_start,
+                        index,
+                    );
+                    valid = false;
+                } else {};
+                write_identifier_codepoint(builder, escaped.codepoint)
+            };
+            first = false;
+        } else {
+            let width = identifier_width(tables, source, index, first);
+            if width == 0 {
+                scanning = false;
+            } else {
+                write_identifier_source(builder, source, index);
+                index += width;
+                first = false;
+            }
+        }
+    }
+    IdentifierScan { end: index, value: builder.finish(), has_escape, valid: valid && !first }
+}
+
+fn keyword_kind(value: string) -> TokenKind {
+    match value {
+        "null" => TokenKind::NullKeyword,
+        "false" => TokenKind::FalseKeyword,
+        "true" => TokenKind::TrueKeyword,
+        "if" => TokenKind::IfKeyword,
+        "else" => TokenKind::ElseKeyword,
+        "return" => TokenKind::ReturnKeyword,
+        "var" => TokenKind::VarKeyword,
+        "this" => TokenKind::ThisKeyword,
+        "delete" => TokenKind::DeleteKeyword,
+        "void" => TokenKind::VoidKeyword,
+        "typeof" => TokenKind::TypeofKeyword,
+        "new" => TokenKind::NewKeyword,
+        "in" => TokenKind::InKeyword,
+        "instanceof" => TokenKind::InstanceofKeyword,
+        "do" => TokenKind::DoKeyword,
+        "while" => TokenKind::WhileKeyword,
+        "for" => TokenKind::ForKeyword,
+        "break" => TokenKind::BreakKeyword,
+        "continue" => TokenKind::ContinueKeyword,
+        "switch" => TokenKind::SwitchKeyword,
+        "case" => TokenKind::CaseKeyword,
+        "default" => TokenKind::DefaultKeyword,
+        "throw" => TokenKind::ThrowKeyword,
+        "try" => TokenKind::TryKeyword,
+        "catch" => TokenKind::CatchKeyword,
+        "finally" => TokenKind::FinallyKeyword,
+        "function" => TokenKind::FunctionKeyword,
+        "debugger" => TokenKind::DebuggerKeyword,
+        "with" => TokenKind::WithKeyword,
+        "class" => TokenKind::ClassKeyword,
+        "const" => TokenKind::ConstKeyword,
+        "enum" => TokenKind::EnumKeyword,
+        "export" => TokenKind::ExportKeyword,
+        "extends" => TokenKind::ExtendsKeyword,
+        "import" => TokenKind::ImportKeyword,
+        "super" => TokenKind::SuperKeyword,
+        "implements" => TokenKind::ImplementsKeyword,
+        "interface" => TokenKind::InterfaceKeyword,
+        "let" => TokenKind::LetKeyword,
+        "package" => TokenKind::PackageKeyword,
+        "private" => TokenKind::PrivateKeyword,
+        "protected" => TokenKind::ProtectedKeyword,
+        "public" => TokenKind::PublicKeyword,
+        "static" => TokenKind::StaticKeyword,
+        "yield" => TokenKind::YieldKeyword,
+        "await" => TokenKind::AwaitKeyword,
+        _ => TokenKind::Identifier,
+    }
+}
+
+fn hex_value(value: byte) -> Option[uint32] {
+    if value >= b'0' && value <= b'9' {
+        Option::Some((value - b'0').to_uint32())
+    } else if value >= b'a' && value <= b'f' {
+        Option::Some((value - b'a' + 10).to_uint32())
+    } else if value >= b'A' && value <= b'F' {
+        Option::Some((value - b'A' + 10).to_uint32())
+    } else {
+        Option::None
+    }
+}
+
+fn write_codepoint(
+    builder: text::StringBuilder,
+    errors: Vec[LexError],
+    codepoint: uint32,
+    start: int,
+    end: int,
+) -> unit {
+    if codepoint >= 0xd800 && codepoint <= 0xdfff {} else {
+        match char_from_uint32(codepoint) {
+            Some(character) => builder.write_char(character),
+            None => push_error(errors, "invalid Unicode escape", start, end),
+        }
+    }
+}
+
+fn write_byte(
+    builder: text::StringBuilder,
+    errors: Vec[LexError],
+    value: byte,
+    start: int,
+    end: int,
+) -> unit {
+    write_codepoint(builder, errors, value.to_uint32(), start, end)
+}
+
+fn scan_fixed_hex(source: string, start: int, count: int) -> Option[uint32] {
+    if start + count > source.byte_len() {
+        Option::None
+    } else {
+        let mut result = 0.to_uint32();
+        for index in start..start + count {
+            match hex_value(source.byte_get(index)) {
+                Some(value) => {
+                    result = result * 16 + value;
+                },
+                None => return Option::None,
+            }
+        }
+        Option::Some(result)
+    }
+}
+
+fn scan_unicode_escape(
+    source: string,
+    slash: int,
+    builder: text::StringBuilder,
+    errors: Vec[LexError],
+) -> int {
+    let start = slash + 2;
+    if start < source.byte_len() && source.byte_get(start) == b'{' {
+        let mut index = start + 1;
+        let mut count = 0;
+        let mut codepoint = 0.to_uint32();
+        let mut valid = true;
+        while index < source.byte_len() && source.byte_get(index) != b'}' {
+            match hex_value(source.byte_get(index)) {
+                Some(value) => {
+                    codepoint = codepoint * 16 + value;
+                    count += 1;
+                    if count > 6 {
+                        valid = false;
+                    } else {}
+                },
+                None => {
+                    valid = false;
+                },
+            }
+            index += 1;
+        }
+        if index >= source.byte_len() || source.byte_get(index) != b'}' {
+            push_error(errors, "unterminated Unicode escape", slash, index);
+            index
+        } else {
+            let end = index + 1;
+            if !valid || count == 0 || codepoint > 1114111 {
+                push_error(errors, "invalid Unicode escape", slash, end)
+            } else {
+                write_codepoint(builder, errors, codepoint, slash, end)
+            };
+            end
+        }
+    } else {
+        match scan_fixed_hex(source, start, 4) {
+            Some(codepoint) => {
+                let end = start + 4;
+                write_codepoint(builder, errors, codepoint, slash, end);
+                end
+            },
+            None => {
+                let end = if start + 4 < source.byte_len() {
+                    start + 4
+                } else {
+                    source.byte_len()
+                };
+                push_error(errors, "invalid Unicode escape", slash, end);
+                if end > slash + 2 {
+                    end
+                } else {
+                    slash + 2
+                }
+            },
+        }
+    }
+}
+
+fn scan_hex_escape(source: string, slash: int, builder: text::StringBuilder, errors: Vec[LexError]) -> int {
+    let start = slash + 2;
+    match scan_fixed_hex(source, start, 2) {
+        Some(codepoint) => {
+            let end = start + 2;
+            write_codepoint(builder, errors, codepoint, slash, end);
+            end
+        },
+        None => {
+            let end = if start + 2 < source.byte_len() {
+                start + 2
+            } else {
+                source.byte_len()
+            };
+            push_error(errors, "invalid hexadecimal escape", slash, end);
+            if end > slash + 2 {
+                end
+            } else {
+                slash + 2
+            }
+        },
+    }
+}
+
+fn scan_string_escape(
+    source: string,
+    slash: int,
+    builder: text::StringBuilder,
+    errors: Vec[LexError],
+) -> int {
+    if slash + 1 >= source.byte_len() {
+        push_error(errors, "unterminated string escape", slash, source.byte_len());
+        source.byte_len()
+    } else {
+        let escaped = source.byte_get(slash + 1);
+        if escaped == b'b' {
+            write_byte(builder, errors, 8, slash, slash + 2);
+            slash + 2
+        } else if escaped == b'f' {
+            write_byte(builder, errors, 12, slash, slash + 2);
+            slash + 2
+        } else if escaped == b'n' {
+            builder.write_char('\n');
+            slash + 2
+        } else if escaped == b'r' {
+            builder.write_char('\r');
+            slash + 2
+        } else if escaped == b't' {
+            builder.write_char('\t');
+            slash + 2
+        } else if escaped == b'v' {
+            write_byte(builder, errors, 11, slash, slash + 2);
+            slash + 2
+        } else if escaped == b'0' {
+            if slash + 2 < source.byte_len() && ascii::is_digit(source.byte_get(slash + 2)) {
+                push_error(errors, "legacy octal escape is not supported", slash, slash + 2)
+            } else {
+                write_byte(builder, errors, 0, slash, slash + 2)
+            };
+            slash + 2
+        } else if escaped == b'x' {
+            scan_hex_escape(source, slash, builder, errors)
+        } else if escaped == b'u' {
+            scan_unicode_escape(source, slash, builder, errors)
+        } else if escaped == b'\r' {
+            if slash + 2 < source.byte_len() && source.byte_get(slash + 2) == b'\n' {
+                slash + 3
+            } else {
+                slash + 2
+            }
+        } else if escaped == b'\n' {
+            slash + 2
+        } else if escaped < 128 {
+            write_byte(builder, errors, escaped, slash, slash + 2);
+            slash + 2
+        } else {
+            match source.decode_at(slash + 1) {
+                Some((character, width)) => {
+                    builder.write_char(character);
+                    slash + 1 + width
+                },
+                None => {
+                    push_error(errors, "invalid UTF-8 in string escape", slash, slash + 2);
+                    slash + 2
+                },
+            }
+        }
+    }
+}
+
+fn scan_string(source: string, start: int, quote: byte, errors: Vec[LexError]) -> StringScan {
+    let builder = text::StringBuilder::new();
+    let mut index = start + 1;
+    while index < source.byte_len() {
+        let value = source.byte_get(index);
+        if value == quote {
+            return StringScan { end: index + 1, value: builder.finish() }
+        } else if value == b'\n' || value == b'\r' {
+            push_error(errors, "unterminated string literal", start, index);
+            return StringScan { end: index, value: builder.finish() }
+        } else if value == b'\\' {
+            index = scan_string_escape(source, index, builder, errors);
+        } else if value < 128 {
+            write_byte(builder, errors, value, index, index + 1);
+            index += 1;
+        } else {
+            match source.decode_at(index) {
+                Some((character, width)) => {
+                    builder.write_char(character);
+                    index += width;
+                },
+                None => {
+                    push_error(errors, "invalid UTF-8 in string literal", index, index + 1);
+                    index += 1;
+                },
+            }
+        }
+    }
+    push_error(errors, "unterminated string literal", start, source.byte_len());
+    StringScan { end: source.byte_len(), value: builder.finish() }
+}
+
+fn scan_template(source: string, start: int, initial: bool, errors: Vec[LexError]) -> TemplateScan {
+    let builder = text::StringBuilder::new();
+    let template_errors: Vec[LexError] = Vec::[];
+    let mut index = start + 1;
+    while index < source.byte_len() {
+        let value = source.byte_get(index);
+        if value == b'`' {
+            return TemplateScan {
+                end: index + 1,
+                kind: if initial {
+                    TokenKind::NoSubstitutionTemplate
+                } else {
+                    TokenKind::TemplateTail
+                },
+                value: builder.finish(),
+                opens_substitution: false,
+                errors: template_errors,
+            }
+        } else if value == b'$' && index + 1 < source.byte_len()
+            && source.byte_get(index + 1) == b'{' {
+            return TemplateScan {
+                end: index + 2,
+                kind: if initial {
+                    TokenKind::TemplateHead
+                } else {
+                    TokenKind::TemplateMiddle
+                },
+                value: builder.finish(),
+                opens_substitution: true,
+                errors: template_errors,
+            }
+        } else if value == b'\\' {
+            if index + 1 < source.byte_len() && source.byte_get(index + 1) >= b'1'
+                && source.byte_get(index + 1) <= b'9' {
+                push_error(
+                    template_errors,
+                    "legacy octal escape is not supported",
+                    index,
+                    index + 2,
+                )
+            } else {};
+            index = scan_string_escape(source, index, builder, template_errors);
+        } else if value == b'\r' {
+            builder.write_char('\n');
+            if index + 1 < source.byte_len() && source.byte_get(index + 1) == b'\n' {
+                index += 2;
+            } else {
+                index += 1;
+            }
+        } else if value < 128 {
+            write_byte(builder, errors, value, index, index + 1);
+            index += 1;
+        } else {
+            match source.decode_at(index) {
+                Some((character, width)) => {
+                    builder.write_char(character);
+                    index += width;
+                },
+                None => {
+                    push_error(errors, "invalid UTF-8 in template literal", index, index + 1);
+                    index += 1;
+                },
+            }
+        }
+    }
+    for value in template_errors {
+        errors.push(value)
+    }
+    push_error(errors, "unterminated template literal", start, source.byte_len());
+    TemplateScan {
+        end: source.byte_len(),
+        kind: TokenKind::Error,
+        value: builder.finish(),
+        opens_substitution: false,
+        errors: Vec::[],
+    }
+}
+
+fn push_template_token(
+    tokens: Vec[Token],
+    source: string,
+    scanned: TemplateScan,
+    start: int,
+    line_break_before: bool,
+) -> unit {
+    tokens.push(
+        Token {
+            kind: scanned.kind,
+            lexeme: source.byte_slice(start, scanned.end),
+            value: scanned.value,
+            regex_flags: "",
+            span: span(start, scanned.end),
+            line_break_before,
+            has_escape: false,
+            is_reserved: false,
+            template_errors: scanned.errors,
+        },
+    )
+}
+
+fn radix_digit(value: byte, radix: int) -> bool {
+    if radix == 2 {
+        value == b'0' || value == b'1'
+    } else if radix == 8 {
+        value >= b'0' && value <= b'7'
+    } else if radix == 10 {
+        ascii::is_digit(value)
+    } else {
+        ascii::is_hexdigit(value)
+    }
+}
+
+fn scan_digits(source: string, start: int, radix: int) -> DigitScan {
+    let mut index = start;
+    let mut any = false;
+    let mut valid = true;
+    let mut previous_digit = false;
+    while index < source.byte_len() {
+        let value = source.byte_get(index);
+        if radix_digit(value, radix) {
+            any = true;
+            previous_digit = true;
+            index += 1;
+        } else if value == b'_' {
+            if !previous_digit || index + 1 >= source.byte_len()
+                || !radix_digit(source.byte_get(index + 1), radix) {
+                valid = false;
+            } else {}
+            previous_digit = false;
+            index += 1;
+        } else {
+            break
+        }
+    }
+    DigitScan { end: index, valid: valid && previous_digit, any }
+}
+
+fn scan_prefixed_number(tables: unicode::IdentifierTables, source: string, start: int, radix: int) -> NumberScan {
+    let mut index = start + 2;
+    let mut valid = true;
+    let mut any = false;
+    let mut previous_digit = false;
+    while index < source.byte_len() {
+        let value = source.byte_get(index);
+        if ascii::is_alphanumeric(value) || value == b'_' || value == b'$' {
+            if radix_digit(value, radix) {
+                any = true;
+                previous_digit = true;
+            } else if value == b'_' {
+                if !previous_digit || index + 1 >= source.byte_len()
+                    || !radix_digit(source.byte_get(index + 1), radix) {
+                    valid = false;
+                } else {}
+                previous_digit = false;
+            } else if value == b'n' && any && previous_digit {
+                if index + 1 == source.byte_len()
+                    || identifier_width(tables, source, index + 1, false) == 0 {
+                    return NumberScan { end: index + 1, kind: TokenKind::BigInt, valid }
+                } else {
+                    valid = false;
+                }
+            } else {
+                valid = false;
+                previous_digit = false;
+            }
+            index += 1;
+        } else if value >= 128 {
+            let width = identifier_width(tables, source, index, false);
+            if width == 0 {
+                break
+            } else {
+                valid = false;
+                index += width;
+            }
+        } else {
+            break
+        }
+    }
+    NumberScan { end: index, kind: TokenKind::Number, valid: valid && any && previous_digit }
+}
+
+fn scan_decimal_number(tables: unicode::IdentifierTables, source: string, start: int) -> NumberScan {
+    let mut index = start;
+    let mut valid = true;
+    let mut fractional = false;
+    let mut exponent = false;
+    let mut integer_digits = 0;
+    if source.byte_get(start) != b'.' {
+        let digits = scan_digits(source, start, 10);
+        index = digits.end;
+        valid = valid && digits.valid && digits.any;
+        integer_digits = index - start;
+    } else {};
+    if index < source.byte_len() && source.byte_get(index) == b'.' {
+        fractional = true;
+        index += 1;
+        if index < source.byte_len() && ascii::is_digit(source.byte_get(index)) {
+            let digits = scan_digits(source, index, 10);
+            index = digits.end;
+            valid = valid && digits.valid;
+        } else if start == index - 1 {
+            valid = false;
+        } else {}
+    } else {};
+    if index < source.byte_len()
+        && (source.byte_get(index) == b'e' || source.byte_get(index) == b'E') {
+        exponent = true;
+        index += 1;
+        if index < source.byte_len()
+            && (source.byte_get(index) == b'+' || source.byte_get(index) == b'-') {
+            index += 1;
+        } else {};
+        let digits = scan_digits(source, index, 10);
+        index = digits.end;
+        valid = valid && digits.valid && digits.any;
+    } else {};
+    let mut kind = TokenKind::Number;
+    if index < source.byte_len() && source.byte_get(index) == b'n' {
+        kind = TokenKind::BigInt;
+        index += 1;
+        if fractional || exponent || integer_digits > 1 && source.byte_get(start) == b'0' {
+            valid = false;
+        } else {}
+    } else {};
+    if index < source.byte_len() && identifier_width(tables, source, index, false) > 0 {
+        valid = false;
+        loop {
+            let width = identifier_width(tables, source, index, false);
+            if width == 0 {
+                break
+            } else {
+                index += width;
+            }
+        }
+    } else {};
+    NumberScan { end: index, kind, valid }
+}
+
+fn scan_legacy_octal_number(source: string, start: int) -> Option[NumberScan] {
+    let mut index = start;
+    while index < source.byte_len() && source.byte_get(index) >= b'0'
+        && source.byte_get(index) <= b'7' {
+        index += 1;
+    }
+    if index <= start + 1 {
+        Option::None
+    } else if index < source.byte_len()
+        && (source.byte_get(index) == b'8' || source.byte_get(index) == b'9') {
+        Option::None
+    } else {
+        Option::Some(NumberScan { end: index, kind: TokenKind::Number, valid: true })
+    }
+}
+
+fn scan_number(tables: unicode::IdentifierTables, source: string, start: int) -> NumberScan {
+    if source.byte_get(start) == b'0' && start + 1 < source.byte_len() {
+        let prefix = source.byte_get(start + 1);
+        if prefix == b'b' || prefix == b'B' {
+            scan_prefixed_number(tables, source, start, 2)
+        } else if prefix == b'o' || prefix == b'O' {
+            scan_prefixed_number(tables, source, start, 8)
+        } else if prefix == b'x' || prefix == b'X' {
+            scan_prefixed_number(tables, source, start, 16)
+        } else {
+            match scan_legacy_octal_number(source, start) {
+                Some(value) => value,
+                None => scan_decimal_number(tables, source, start),
+            }
+        }
+    } else {
+        scan_decimal_number(tables, source, start)
+    }
+}
+
+fn scan_symbol(source: string, start: int) -> Option[(TokenKind, int)] {
+    if text::starts_with_at(source, start, ">>>=") {
+        Option::Some((TokenKind::ShiftRightUnsignedAssign, start + 4))
+    } else if text::starts_with_at(source, start, "===") {
+        Option::Some((TokenKind::StrictEqual, start + 3))
+    } else if text::starts_with_at(source, start, "!==") {
+        Option::Some((TokenKind::StrictNotEqual, start + 3))
+    } else if text::starts_with_at(source, start, ">>>") {
+        Option::Some((TokenKind::ShiftRightUnsigned, start + 3))
+    } else if text::starts_with_at(source, start, "<<=") {
+        Option::Some((TokenKind::ShiftLeftAssign, start + 3))
+    } else if text::starts_with_at(source, start, ">>=") {
+        Option::Some((TokenKind::ShiftRightAssign, start + 3))
+    } else if text::starts_with_at(source, start, "**=") {
+        Option::Some((TokenKind::PowerAssign, start + 3))
+    } else if text::starts_with_at(source, start, "&&=") {
+        Option::Some((TokenKind::LogicalAndAssign, start + 3))
+    } else if text::starts_with_at(source, start, "||=") {
+        Option::Some((TokenKind::LogicalOrAssign, start + 3))
+    } else if text::starts_with_at(source, start, "??=") {
+        Option::Some((TokenKind::NullishCoalescingAssign, start + 3))
+    } else if text::starts_with_at(source, start, "...") {
+        Option::Some((TokenKind::Ellipsis, start + 3))
+    } else if text::starts_with_at(source, start, "=>") {
+        Option::Some((TokenKind::Arrow, start + 2))
+    } else if text::starts_with_at(source, start, "==") {
+        Option::Some((TokenKind::Equal, start + 2))
+    } else if text::starts_with_at(source, start, "!=") {
+        Option::Some((TokenKind::NotEqual, start + 2))
+    } else if text::starts_with_at(source, start, "<=") {
+        Option::Some((TokenKind::LessEqual, start + 2))
+    } else if text::starts_with_at(source, start, ">=") {
+        Option::Some((TokenKind::GreaterEqual, start + 2))
+    } else if text::starts_with_at(source, start, "<<") {
+        Option::Some((TokenKind::ShiftLeft, start + 2))
+    } else if text::starts_with_at(source, start, ">>") {
+        Option::Some((TokenKind::ShiftRight, start + 2))
+    } else if text::starts_with_at(source, start, "**") {
+        Option::Some((TokenKind::Power, start + 2))
+    } else if text::starts_with_at(source, start, "++") {
+        Option::Some((TokenKind::Increment, start + 2))
+    } else if text::starts_with_at(source, start, "--") {
+        Option::Some((TokenKind::Decrement, start + 2))
+    } else if text::starts_with_at(source, start, "+=") {
+        Option::Some((TokenKind::PlusAssign, start + 2))
+    } else if text::starts_with_at(source, start, "-=") {
+        Option::Some((TokenKind::MinusAssign, start + 2))
+    } else if text::starts_with_at(source, start, "*=") {
+        Option::Some((TokenKind::StarAssign, start + 2))
+    } else if text::starts_with_at(source, start, "/=") {
+        Option::Some((TokenKind::SlashAssign, start + 2))
+    } else if text::starts_with_at(source, start, "%=") {
+        Option::Some((TokenKind::PercentAssign, start + 2))
+    } else if text::starts_with_at(source, start, "&=") {
+        Option::Some((TokenKind::BitAndAssign, start + 2))
+    } else if text::starts_with_at(source, start, "|=") {
+        Option::Some((TokenKind::BitOrAssign, start + 2))
+    } else if text::starts_with_at(source, start, "^=") {
+        Option::Some((TokenKind::BitXorAssign, start + 2))
+    } else if text::starts_with_at(source, start, "&&") {
+        Option::Some((TokenKind::LogicalAnd, start + 2))
+    } else if text::starts_with_at(source, start, "||") {
+        Option::Some((TokenKind::LogicalOr, start + 2))
+    } else if text::starts_with_at(source, start, "??") {
+        Option::Some((TokenKind::NullishCoalescing, start + 2))
+    } else if text::starts_with_at(source, start, "?.")
+        && (start + 2 >= source.byte_len() || !ascii::is_digit(source.byte_get(start + 2))) {
+        Option::Some((TokenKind::OptionalChain, start + 2))
+    } else {
+        let kind = match source.byte_get(start) {
+            b'(' => Option::Some(TokenKind::LParen),
+            b')' => Option::Some(TokenKind::RParen),
+            b'{' => Option::Some(TokenKind::LBrace),
+            b'}' => Option::Some(TokenKind::RBrace),
+            b'[' => Option::Some(TokenKind::LBracket),
+            b']' => Option::Some(TokenKind::RBracket),
+            b';' => Option::Some(TokenKind::Semicolon),
+            b',' => Option::Some(TokenKind::Comma),
+            b':' => Option::Some(TokenKind::Colon),
+            b'.' => Option::Some(TokenKind::Dot),
+            b'?' => Option::Some(TokenKind::Question),
+            b'=' => Option::Some(TokenKind::Assign),
+            b'+' => Option::Some(TokenKind::Plus),
+            b'-' => Option::Some(TokenKind::Minus),
+            b'*' => Option::Some(TokenKind::Star),
+            b'/' => Option::Some(TokenKind::Slash),
+            b'%' => Option::Some(TokenKind::Percent),
+            b'<' => Option::Some(TokenKind::Less),
+            b'>' => Option::Some(TokenKind::Greater),
+            b'&' => Option::Some(TokenKind::BitAnd),
+            b'|' => Option::Some(TokenKind::BitOr),
+            b'^' => Option::Some(TokenKind::BitXor),
+            b'~' => Option::Some(TokenKind::BitNot),
+            b'!' => Option::Some(TokenKind::LogicalNot),
+            _ => Option::None,
+        };
+        match kind {
+            Some(value) => Option::Some((value, start + 1)),
+            None => Option::None,
+        }
+    }
+}
+
+fn advance_character(source: string, index: int) -> int {
+    match source.decode_at(index) {
+        Some((_, width)) => index + width,
+        None => index + 1,
+    }
+}
+
+fn scan_line_comment_end(source: string, start: int) -> int {
+    let mut index = start + 2;
+    while index < source.byte_len() && line_terminator_width(source, index) == 0 {
+        index = advance_character(source, index);
+    }
+    index
+}
+
+fn scan_block_comment(source: string, start: int) -> BlockCommentScan {
+    let mut index = start + 2;
+    let mut line_break = false;
+    let mut closed = false;
+    while index < source.byte_len() && !closed {
+        if text::starts_with_at(source, index, "*/") {
+            index += 2;
+            closed = true;
+        } else {
+            let width = line_terminator_width(source, index);
+            if width > 0 {
+                line_break = true;
+                index += width;
+            } else {
+                index = advance_character(source, index);
+            }
+        }
+    }
+    BlockCommentScan { end: index, line_break, closed }
+}
+
+fn scan_trivia(source: string, start: int, errors: Vec[LexError]) -> TriviaScan {
+    let mut index = start;
+    let mut line_break = false;
+    let mut scanning = true;
+    while index < source.byte_len() && scanning {
+        let width = whitespace_width(source, index);
+        if width > 0 {
+            if line_terminator_width(source, index) > 0 {
+                line_break = true;
+            } else {};
+            index += width;
+        } else if text::starts_with_at(source, index, "//") {
+            index = scan_line_comment_end(source, index);
+        } else if text::starts_with_at(source, index, "/*") {
+            let comment_start = index;
+            let scanned = scan_block_comment(source, index);
+            index = scanned.end;
+            line_break = line_break || scanned.line_break;
+            if !scanned.closed {
+                push_error(errors, "unterminated block comment", comment_start, index)
+            } else {}
+        } else {
+            scanning = false;
+        }
+    }
+    TriviaScan { end: index, line_break }
+}
+
+fn scan_regexp(tables: unicode::IdentifierTables, source: string, start: int) -> RegExpScan {
+    let mut index = start + 1;
+    let mut class = false;
+    let mut escaped = false;
+    while index < source.byte_len() {
+        if line_terminator_width(source, index) > 0 {
+            return RegExpScan { end: index, pattern: "", flags: "", valid: false }
+        } else {};
+        let value = source.byte_get(index);
+        if escaped {
+            escaped = false;
+            index = advance_character(source, index);
+        } else if value == b'\\' {
+            escaped = true;
+            index += 1;
+        } else if value == b'[' {
+            class = true;
+            index += 1;
+        } else if value == b']' && class {
+            class = false;
+            index += 1;
+        } else if value == b'/' && !class {
+            let pattern_end = index;
+            index += 1;
+            let flags_start = index;
+            loop {
+                let width = identifier_width(tables, source, index, false);
+                if width == 0 {
+                    break
+                } else {
+                    index += width;
+                }
+            }
+            return RegExpScan {
+                end: index,
+                pattern: source.byte_slice(start + 1, pattern_end),
+                flags: source.byte_slice(flags_start, index),
+                valid: true,
+            }
+        } else {
+            index = advance_character(source, index);
+        }
+    }
+    RegExpScan { end: index, pattern: "", flags: "", valid: false }
+}
+
+fn control_parenthesis(tokens: Vec[Token]) -> bool {
+    if tokens.is_empty() || tokens[tokens.len() - 1].kind != TokenKind::RParen {
+        return false
+    } else {};
+    let mut index = tokens.len() - 1;
+    let mut depth = 0;
+    loop {
+        let kind = tokens[index].kind;
+        if kind == TokenKind::RParen {
+            depth += 1;
+        } else if kind == TokenKind::LParen {
+            depth -= 1;
+            if depth == 0 {
+                if index == 0 {
+                    return false
+                } else {};
+                return match tokens[index - 1].kind {
+                    IfKeyword | WhileKeyword | ForKeyword | WithKeyword | SwitchKeyword | CatchKeyword => true,
+                    _ => false,
+                }
+            } else {}
+        } else {};
+        if index == 0 {
+            return false
+        } else {
+            index -= 1;
+        }
+    }
+}
+
+fn declaration_prefix(tokens: Vec[Token], index: int) -> bool {
+    if index == 0 {
+        true
+    } else {
+        match tokens[index - 1].kind {
+            Semicolon | LBrace | RBrace => true,
+            _ => false,
+        }
+    }
+}
+
+fn function_before_body(tokens: Vec[Token], brace: int) -> Option[int] {
+    if brace == 0 || tokens[brace - 1].kind != TokenKind::RParen {
+        return Option::None
+    } else {};
+    let mut index = brace - 1;
+    let mut depth = 0;
+    loop {
+        let kind = tokens[index].kind;
+        if kind == TokenKind::RParen {
+            depth += 1;
+        } else if kind == TokenKind::LParen {
+            depth -= 1;
+            if depth == 0 {
+                if index > 0 && tokens[index - 1].kind == TokenKind::FunctionKeyword {
+                    return Option::Some(index - 1)
+                } else if index > 1 && tokens[index - 1].kind == TokenKind::Identifier
+                    && tokens[index - 2].kind == TokenKind::FunctionKeyword {
+                    return Option::Some(index - 2)
+                } else {
+                    return Option::None
+                }
+            } else {}
+        } else {};
+        if index == 0 {
+            return Option::None
+        } else {
+            index -= 1;
+        }
+    }
+}
+
+fn class_before_body(tokens: Vec[Token], brace: int) -> Option[int] {
+    if brace == 0 {
+        return Option::None
+    } else {};
+    let mut index = brace - 1;
+    let mut parentheses = 0;
+    let mut brackets = 0;
+    loop {
+        let kind = tokens[index].kind;
+        if kind == TokenKind::RParen {
+            parentheses += 1;
+        } else if kind == TokenKind::LParen {
+            parentheses -= 1;
+        } else if kind == TokenKind::RBracket {
+            brackets += 1;
+        } else if kind == TokenKind::LBracket {
+            brackets -= 1;
+        } else if parentheses == 0 && brackets == 0 && kind == TokenKind::ClassKeyword {
+            return Option::Some(index)
+        } else if parentheses == 0 && brackets == 0
+            && match kind {
+                Semicolon | LBrace | RBrace => true,
+                _ => false,
+            } {
+            return Option::None
+        } else {};
+        if index == 0 {
+            return Option::None
+        } else {
+            index -= 1;
+        }
+    }
+}
+
+fn closing_brace_allows_regexp(tokens: Vec[Token]) -> bool {
+    let mut index = tokens.len() - 1;
+    let mut depth = 0;
+    loop {
+        let kind = tokens[index].kind;
+        if kind == TokenKind::RBrace {
+            depth += 1;
+        } else if kind == TokenKind::LBrace {
+            depth -= 1;
+            if depth == 0 {
+                if index == 0 {
+                    return true
+                } else {};
+                if tokens[index - 1].kind == TokenKind::Arrow {
+                    return false
+                } else {};
+                match function_before_body(tokens, index) {
+                    Some(function) => return declaration_prefix(tokens, function),
+                    None => (),
+                };
+                match class_before_body(tokens, index) {
+                    Some(class) => return declaration_prefix(tokens, class),
+                    None => (),
+                };
+                return match tokens[index - 1].kind {
+                    Assign | LParen | LBracket | Comma | Colon | ReturnKeyword => false,
+                    _ => true,
+                }
+            } else {}
+        } else {};
+        if index == 0 {
+            return false
+        } else {
+            index -= 1;
+        }
+    }
+}
+
+fn regexp_allowed(tokens: Vec[Token]) -> bool {
+    if tokens.is_empty() {
+        true
+    } else {
+        match tokens[tokens.len() - 1].kind {
+            Identifier | PrivateIdentifier | Number | BigInt | String | RegExp | NoSubstitutionTemplate | TemplateTail | ThisKeyword | NullKeyword | FalseKeyword | TrueKeyword | RBracket | Increment | Decrement => false,
+            RParen => control_parenthesis(tokens),
+            RBrace => closing_brace_allows_regexp(tokens),
+            _ => true,
+        }
+    }
+}
+
+fn scan_token(
+    tables: unicode::IdentifierTables,
+    tokens: Vec[Token],
+    errors: Vec[LexError],
+    source: string,
+    start: int,
+    line_break_before: bool,
+    allow_regexp: bool,
+) -> int {
+    let value = source.byte_get(start);
+    if value == b'/' && allow_regexp {
+        let scanned = scan_regexp(tables, source, start);
+        if !scanned.valid {
+            push_error(errors, "unterminated regular expression literal", start, scanned.end);
+            push_token(tokens, source, TokenKind::Error, "", start, scanned.end, line_break_before)
+        } else {
+            tokens.push(
+                Token {
+                    kind: TokenKind::RegExp,
+                    lexeme: source.byte_slice(start, scanned.end),
+                    value: scanned.pattern,
+                    regex_flags: scanned.flags,
+                    span: span(start, scanned.end),
+                    line_break_before,
+                    has_escape: false,
+                    is_reserved: false,
+                    template_errors: Vec::[],
+                },
+            )
+        };
+        scanned.end
+    } else if value == b'\'' || value == b'"' {
+        let scanned = scan_string(source, start, value, errors);
+        push_token(
+            tokens,
+            source,
+            TokenKind::String,
+            scanned.value,
+            start,
+            scanned.end,
+            line_break_before,
+        );
+        scanned.end
+    } else if value == b'#' {
+        let name_start = start + 1;
+        let scanned = scan_identifier(tables, source, name_start, errors);
+        if scanned.end == name_start {
+            let next = start + 1;
+            push_error(errors, "invalid private identifier", start, next);
+            push_token(tokens, source, TokenKind::Error, "", start, next, line_break_before);
+            next
+        } else if !scanned.valid {
+            push_identifier_token(
+                tokens,
+                source,
+                TokenKind::Error,
+                scanned.value,
+                start,
+                scanned.end,
+                line_break_before,
+                scanned.has_escape,
+                false,
+            );
+            scanned.end
+        } else {
+            push_identifier_token(
+                tokens,
+                source,
+                TokenKind::PrivateIdentifier,
+                scanned.value,
+                start,
+                scanned.end,
+                line_break_before,
+                scanned.has_escape,
+                false,
+            );
+            scanned.end
+        }
+    } else {
+        let starts_identifier = identifier_width(tables, source, start, true) > 0
+            || value == b'\\' && start + 1 < source.byte_len() && source.byte_get(start + 1) == b'u';
+        if starts_identifier {
+            let scanned = scan_identifier(tables, source, start, errors);
+            let keyword = keyword_kind(scanned.value);
+            let escaped_reserved = scanned.has_escape && keyword != TokenKind::Identifier;
+            push_identifier_token(
+                tokens,
+                source,
+                if scanned.valid {
+                    if escaped_reserved {
+                        TokenKind::Identifier
+                    } else {
+                        keyword
+                    }
+                } else {
+                    TokenKind::Error
+                },
+                scanned.value,
+                start,
+                scanned.end,
+                line_break_before,
+                scanned.has_escape,
+                scanned.valid && escaped_reserved,
+            );
+            scanned.end
+        } else if ascii::is_digit(value)
+            || value == b'.' && start + 1 < source.byte_len()
+                && ascii::is_digit(source.byte_get(start + 1)) {
+            let scanned = scan_number(tables, source, start);
+            if !scanned.valid {
+                push_error(errors, "invalid numeric literal", start, scanned.end)
+            } else {};
+            push_token(
+                tokens,
+                source,
+                scanned.kind,
+                source.byte_slice(start, scanned.end),
+                start,
+                scanned.end,
+                line_break_before,
+            );
+            scanned.end
+        } else {
+            match scan_symbol(source, start) {
+                Some((kind, end)) => {
+                    push_token(
+                        tokens,
+                        source,
+                        kind,
+                        source.byte_slice(start, end),
+                        start,
+                        end,
+                        line_break_before,
+                    );
+                    end
+                },
+                None => if value < 128 {
+                    let end = start + 1;
+                    push_error(
+                        errors,
+                        "unexpected character `" + source.byte_slice(start, end) + "`",
+                        start,
+                        end,
+                    );
+                    push_token(
+                        tokens,
+                        source,
+                        TokenKind::Error,
+                        source.byte_slice(start, end),
+                        start,
+                        end,
+                        line_break_before,
+                    );
+                    end
+                } else {
+                    match source.decode_at(start) {
+                        Some((character, width)) => {
+                            let end = start + width;
+                            push_error(
+                                errors,
+                                "unexpected character `" + character.to_string() + "`",
+                                start,
+                                end,
+                            );
+                            push_token(
+                                tokens,
+                                source,
+                                TokenKind::Error,
+                                character.to_string(),
+                                start,
+                                end,
+                                line_break_before,
+                            );
+                            end
+                        },
+                        None => {
+                            let end = start + 1;
+                            push_error(errors, "invalid UTF-8 sequence", start, end);
+                            push_token(
+                                tokens,
+                                source,
+                                TokenKind::Error,
+                                "",
+                                start,
+                                end,
+                                line_break_before,
+                            );
+                            end
+                        },
+                    }
+                },
+            }
+        }
+    }
+}
+
+pub fn lex(source: string) -> LexResult {
+    let tables = unicode::IdentifierTables::new();
+    let tokens: Vec[Token] = Vec::[];
+    let errors: Vec[LexError] = Vec::[];
+    let template_depths: Vec[int] = Vec::[];
+    let mut index = if text::starts_with_at(source, 0, "#!") {
+        scan_line_comment_end(source, 0)
+    } else {
+        0
+    };
+    let mut eof_line_break = false;
+    while index < source.byte_len() {
+        let trivia = scan_trivia(source, index, errors);
+        index = trivia.end;
+        eof_line_break = trivia.line_break;
+        if index < source.byte_len() {
+            let value = source.byte_get(index);
+            if value == b'`' {
+                let scanned = scan_template(source, index, true, errors);
+                push_template_token(tokens, source, scanned, index, trivia.line_break);
+                index = scanned.end;
+                if scanned.opens_substitution {
+                    template_depths.push(0)
+                } else {}
+            } else if value == b'}' && !template_depths.is_empty()
+                && template_depths[template_depths.len() - 1] == 0 {
+                let scanned = scan_template(source, index, false, errors);
+                push_template_token(tokens, source, scanned, index, false);
+                index = scanned.end;
+                if !scanned.opens_substitution {
+                    let _ = template_depths.pop();
+                } else {}
+            } else {
+                if !template_depths.is_empty() && value == b'{' {
+                    let top = template_depths.len() - 1;
+                    template_depths.set(top, template_depths[top] + 1)
+                } else if !template_depths.is_empty() && value == b'}' {
+                    let top = template_depths.len() - 1;
+                    template_depths.set(top, template_depths[top] - 1)
+                } else {};
+                let allow_regexp = regexp_allowed(tokens);
+                index = scan_token(
+                    tables,
+                    tokens,
+                    errors,
+                    source,
+                    index,
+                    trivia.line_break,
+                    allow_regexp,
+                );
+            }
+        } else {}
+    }
+    if !template_depths.is_empty() {
+        push_error(errors, "unterminated template literal", source.byte_len(), source.byte_len())
+    } else {};
+    push_token(
+        tokens,
+        source,
+        TokenKind::Eof,
+        "",
+        source.byte_len(),
+        source.byte_len(),
+        eof_line_break,
+    );
+    LexResult { tokens, errors }
+}

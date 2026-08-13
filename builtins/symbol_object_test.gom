@@ -1,0 +1,68 @@
+package builtins;
+
+use gomlang::quickjs::runtime;
+use gomlang::quickjs::vm;
+use std::testing;
+
+fn expect_symbol(value: runtime::Value) -> runtime::Symbol {
+    match value {
+        runtime::Value::Symbol(value) => value,
+        _ => {
+            testing::fail("expected symbol");
+            runtime::Symbol::new(0, Option::None)
+        },
+    }
+}
+
+#[test]
+fn symbol_constructor_creates_unique_values_and_preserves_utf16_description() -> unit {
+    let context = vm::Context::new(runtime::Heap::new());
+    let realm = expect_realm(install(context));
+    let constructor = property(context.heap(), realm.global_object(), "Symbol");
+    let description = runtime::JsString::from_code_units(Vec::[0xd800]);
+    let first = expect_symbol(
+        expect_value(invoke(context, constructor, Vec::[runtime::Value::String(description)])),
+    );
+    let second = expect_symbol(
+        expect_value(invoke(context, constructor, Vec::[runtime::Value::String(description)])),
+    );
+    testing::assert(first != second);
+    match first.description() {
+        Some(value) => testing::assert(value == description),
+        None => testing::fail("expected symbol description"),
+    }
+}
+
+#[test]
+fn symbol_registry_round_trips_keys_and_well_known_values_are_stable() -> unit {
+    let context = vm::Context::new(runtime::Heap::new());
+    let realm = expect_realm(install(context));
+    let constructor = match property(context.heap(), realm.global_object(), "Symbol") {
+        runtime::Value::Object(value) => value,
+        _ => {
+            testing::fail("expected Symbol constructor");
+            realm.global_object()
+        },
+    };
+    let symbol_for = property(context.heap(), constructor, "for");
+    let key = runtime::Value::String(js_string("shared"));
+    let first = expect_symbol(expect_value(invoke(context, symbol_for, Vec::[key])));
+    let second = expect_symbol(expect_value(invoke(context, symbol_for, Vec::[key])));
+    testing::assert(first == second);
+    let key_for = property(context.heap(), constructor, "keyFor");
+    assert_value(
+        expect_value(invoke(context, key_for, Vec::[runtime::Value::Symbol(first)])),
+        runtime::Value::String(js_string("shared")),
+    );
+    let local = expect_symbol(
+        expect_value(invoke(context, runtime::Value::Object(constructor), Vec::[])),
+    );
+    assert_value(
+        expect_value(invoke(context, key_for, Vec::[runtime::Value::Symbol(local)])),
+        runtime::Value::Undefined,
+    );
+    let iterator = expect_symbol(property(context.heap(), constructor, "iterator"));
+    let async_iterator = expect_symbol(property(context.heap(), constructor, "asyncIterator"));
+    testing::assert(iterator != async_iterator);
+    testing::assert(expect_symbol(property(context.heap(), constructor, "iterator")) == iterator)
+}

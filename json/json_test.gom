@@ -1,0 +1,379 @@
+package json;
+
+use gomlang::quickjs::runtime;
+use std::math;
+use std::num;
+use std::testing;
+
+fn js_string(value: string) -> runtime::JsString {
+    let bytes = value.to_bytes();
+    runtime::JsString::from_utf8(bytes.slice(0, bytes.len()))
+}
+
+fn expect_parse(heap: runtime::Heap, value: runtime::JsString) -> runtime::Value {
+    match parse(heap, value) {
+        Ok(value) => value,
+        Err(value) => {
+            testing::fail(value.to_string());
+            runtime::Value::Undefined
+        },
+    }
+}
+
+fn expect_object(value: runtime::Value) -> runtime::ObjectId {
+    match value {
+        runtime::Value::Object(value) => value,
+        _ => {
+            testing::fail("expected object");
+            expect_object(runtime::Value::Object(expect_new_object(runtime::Heap::new())))
+        },
+    }
+}
+
+fn expect_new_object(heap: runtime::Heap) -> runtime::ObjectId {
+    match runtime::new_ordinary_object(heap, Option::None) {
+        Ok(value) => value,
+        Err(value) => {
+            testing::fail(value.message);
+            expect_new_object(runtime::Heap::new())
+        },
+    }
+}
+
+fn expect_new_kind(
+    heap: runtime::Heap,
+    kind: runtime::ObjectKind,
+    prototype: Option[runtime::ObjectId],
+) -> runtime::ObjectId {
+    match runtime::new_object(heap, kind, prototype) {
+        Ok(value) => value,
+        Err(value) => {
+            testing::fail(value.message);
+            expect_new_object(runtime::Heap::new())
+        },
+    }
+}
+
+fn expect_property(heap: runtime::Heap, object: runtime::ObjectId, name: string) -> runtime::Value {
+    match runtime::get_property(heap, object, runtime::string_property_key(name)) {
+        Ok(Some(value)) => value,
+        Ok(None) => {
+            testing::fail("missing property " + name);
+            runtime::Value::Undefined
+        },
+        Err(value) => {
+            testing::fail(value.message);
+            runtime::Value::Undefined
+        },
+    }
+}
+
+fn expect_stringify(heap: runtime::Heap, value: runtime::Value) -> runtime::JsString {
+    match stringify(heap, value) {
+        Ok(value) => value,
+        Err(value) => {
+            testing::fail(value.to_string());
+            js_string("")
+        },
+    }
+}
+
+fn expect_host(value: runtime::JsString) -> string {
+    match value.to_host_string() {
+        Ok(value) => value,
+        Err(value) => {
+            testing::fail(value.to_string());
+            ""
+        },
+    }
+}
+
+fn define(
+    heap: runtime::Heap,
+    object: runtime::ObjectId,
+    key: runtime::PropertyKey,
+    value: runtime::Value,
+    enumerable: bool,
+) -> unit {
+    testing::assert(
+        runtime::define_own_property(
+            heap,
+            object,
+            key,
+            runtime::data_descriptor(value, true, enumerable, true),
+        ),
+    )
+}
+
+fn define_name(heap: runtime::Heap, object: runtime::ObjectId, name: string, value: runtime::Value) -> unit {
+    define(heap, object, runtime::string_property_key(name), value, true)
+}
+
+fn define_length(heap: runtime::Heap, object: runtime::ObjectId, length: int32) -> unit {
+    testing::assert(
+        runtime::define_own_property(
+            heap,
+            object,
+            runtime::string_property_key("length"),
+            runtime::data_descriptor(runtime::Value::Int(length), true, false, false),
+        ),
+    )
+}
+
+fn assert_syntax_error(heap: runtime::Heap, value: runtime::JsString) -> unit {
+    match parse(heap, value) {
+        Err(error) => testing::assert(error.kind == JsonErrorKind::Syntax),
+        Ok(_) => testing::fail("expected JSON syntax error"),
+    }
+}
+
+#[test]
+fn parses_json_primitives_and_number_boundaries() -> unit {
+    let heap = runtime::Heap::new();
+    match expect_parse(heap, js_string(" \t\r\nnull ")) {
+        runtime::Value::Null => (),
+        _ => testing::fail("expected null"),
+    };
+    match expect_parse(heap, js_string("true")) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected boolean"),
+    };
+    match expect_parse(heap, js_string("2147483647")) {
+        runtime::Value::Float(value) => testing::assert_eq(value, 2147483647.0),
+        _ => testing::fail("expected JSON number"),
+    };
+    match expect_parse(heap, js_string("2147483648")) {
+        runtime::Value::Float(value) => testing::assert_eq(value, 2147483648.0),
+        _ => testing::fail("expected JSON number"),
+    };
+    match expect_parse(heap, js_string("-0")) {
+        runtime::Value::Float(value) => testing::assert(1.0 / value < 0.0),
+        _ => testing::fail("expected negative zero"),
+    };
+    match expect_parse(heap, js_string("1.25e-2")) {
+        runtime::Value::Float(value) => testing::assert_eq(value, 0.0125),
+        _ => testing::fail("expected exponent number"),
+    };
+    match expect_parse(heap, js_string("1e400")) {
+        runtime::Value::Float(value) => testing::assert(math::is_infinite(value) && value > 0.0),
+        _ => testing::fail("expected overflow to infinity"),
+    }
+}
+
+#[test]
+fn rejects_non_json_tokens_and_whitespace() -> unit {
+    let heap = runtime::Heap::new();
+    let invalid = [
+        "",
+        "+1",
+        ".1",
+        "01",
+        "-",
+        "1.",
+        "1e",
+        "1e+",
+        "NaN",
+        "Infinity",
+        "true false",
+        "[1,]",
+        "[1 2]",
+        "{\"a\":1,}",
+        "{'a':1}",
+    ];
+    for value in invalid {
+        assert_syntax_error(heap, js_string(value))
+    }
+    assert_syntax_error(heap, runtime::JsString::from_code_units(Vec::[0x00a0, 49]));
+    assert_syntax_error(heap, runtime::JsString::from_code_units(Vec::[49, 0x00a0]));
+    assert_syntax_error(heap, runtime::JsString::from_code_units(Vec::[34, 10, 34]));
+    assert_syntax_error(heap, runtime::JsString::from_code_units(Vec::[34, 92, 120, 50, 48, 34]));
+    assert_syntax_error(
+        heap,
+        runtime::JsString::from_code_units(Vec::[34, 92, 117, 49, 50, 120, 52, 34]),
+    )
+}
+
+#[test]
+fn parses_escapes_and_preserves_utf16_code_units() -> unit {
+    let heap = runtime::Heap::new();
+    let escaped = expect_parse(heap, js_string("\"A\\\"\\\\\\/\\b\\f\\n\\r\\t\\u0042\""));
+    match escaped {
+        runtime::Value::String(value) => testing::assert(
+            value.code_units() == Vec::[65, 34, 92, 47, 8, 12, 10, 13, 9, 66],
+        ),
+        _ => testing::fail("expected escaped string"),
+    };
+    let surrogate = expect_parse(heap, js_string("\"\\ud83d\\ude00\\ud800\\udc00\\ud801\""));
+    match surrogate {
+        runtime::Value::String(value) => {
+            testing::assert(value.code_units() == Vec::[0xd83d, 0xde00, 0xd800, 0xdc00, 0xd801])
+        },
+        _ => testing::fail("expected surrogate string"),
+    };
+    let raw = runtime::JsString::from_code_units(Vec::[34, 0xd800, 34]);
+    match expect_parse(heap, raw) {
+        runtime::Value::String(value) => testing::assert(value.code_units() == Vec::[0xd800]),
+        _ => testing::fail("expected raw surrogate string"),
+    }
+}
+
+#[test]
+fn parses_nested_values_and_keeps_last_duplicate_property() -> unit {
+    let heap = runtime::Heap::new();
+    let root = expect_object(
+        expect_parse(heap, js_string("{\"b\":1,\"2\":\"two\",\"a\":[true,null,\"x\"],\"b\":9}")),
+    );
+    match expect_property(heap, root, "b") {
+        runtime::Value::Float(value) => testing::assert_eq(value, 9.0),
+        _ => testing::fail("expected duplicate key replacement"),
+    };
+    let array = expect_object(expect_property(heap, root, "a"));
+    match heap.get(array) {
+        Some(value) => match value.kind() {
+            runtime::ObjectKind::Array => (),
+            _ => testing::fail("expected array object kind"),
+        },
+        None => testing::fail("missing array"),
+    };
+    match expect_property(heap, array, "length") {
+        runtime::Value::Int(value) => testing::assert_eq(value, 3),
+        _ => testing::fail("expected array length"),
+    };
+    testing::assert_eq(
+        expect_host(expect_stringify(heap, runtime::Value::Object(root))),
+        "{\"2\":\"two\",\"b\":9,\"a\":[true,null,\"x\"]}",
+    )
+}
+
+#[test]
+fn stringifies_quickjs_compatible_utf16_escaping() -> unit {
+    let heap = runtime::Heap::new();
+    let value = runtime::JsString::from_code_units(
+        Vec::[34, 92, 8, 9, 10, 12, 13, 0, 0x1f, 0xd800, 0xd83d, 0xde00, 0xdc00, 0x2028, 0x2029],
+    );
+    let encoded = expect_stringify(heap, runtime::Value::String(value));
+    let prefix = js_string("\"\\\"\\\\\\b\\t\\n\\f\\r\\u0000\\u001f\\ud800");
+    let pair = runtime::JsString::from_code_units(Vec::[0xd83d, 0xde00]);
+    let suffix = js_string("\\udc00").concat(
+        runtime::JsString::from_code_units(Vec::[0x2028, 0x2029, 34]),
+    );
+    testing::assert(encoded == prefix.concat(pair).concat(suffix));
+    match expect_parse(heap, encoded) {
+        runtime::Value::String(decoded) => testing::assert(decoded == value),
+        _ => testing::fail("expected string round trip"),
+    }
+}
+
+#[test]
+fn stringifies_arrays_with_holes_and_unsupported_values_as_null() -> unit {
+    let heap = runtime::Heap::new();
+    let array = expect_new_kind(heap, runtime::ObjectKind::Array, Option::None);
+    define_length(heap, array, 6);
+    define_name(heap, array, "0", runtime::Value::Undefined);
+    define_name(heap, array, "1", runtime::Value::Float(num::parse_float64("NaN").unwrap_or(0.0)));
+    define_name(
+        heap,
+        array,
+        "2",
+        runtime::Value::Float(num::parse_float64("Infinity").unwrap_or(0.0)),
+    );
+    define_name(heap, array, "3", runtime::Value::Symbol(runtime::Symbol::new(1, Option::None)));
+    define_name(heap, array, "4", runtime::Value::Object(expect_new_object(heap)));
+    testing::assert_eq(
+        expect_host(expect_stringify(heap, runtime::Value::Object(array))),
+        "[null,null,null,null,{},null]",
+    )
+}
+
+#[test]
+fn stringifies_enumerable_string_properties_in_ecmascript_order() -> unit {
+    let heap = runtime::Heap::new();
+    let object = expect_new_object(heap);
+    define_name(heap, object, "b", runtime::Value::Int(1));
+    define_name(heap, object, "10", runtime::Value::Int(10));
+    define_name(heap, object, "2", runtime::Value::Int(2));
+    define_name(heap, object, "a", runtime::Value::Int(3));
+    define_name(heap, object, "missing", runtime::Value::Undefined);
+    define_name(
+        heap,
+        object,
+        "function",
+        runtime::Value::Object(expect_new_kind(heap, runtime::ObjectKind::Function, Option::None)),
+    );
+    define(heap, object, runtime::string_property_key("hidden"), runtime::Value::Int(7), false);
+    define(
+        heap,
+        object,
+        runtime::PropertyKey::Symbol(runtime::Symbol::new(2, Option::None)),
+        runtime::Value::Int(8),
+        true,
+    );
+    testing::assert_eq(
+        expect_host(expect_stringify(heap, runtime::Value::Object(object))),
+        "{\"2\":2,\"10\":10,\"b\":1,\"a\":3}",
+    )
+}
+
+#[test]
+fn stringifies_inherited_array_elements() -> unit {
+    let heap = runtime::Heap::new();
+    let prototype = expect_new_object(heap);
+    define_name(heap, prototype, "0", runtime::Value::Int(42));
+    let array = expect_new_kind(heap, runtime::ObjectKind::Array, Option::Some(prototype));
+    define_length(heap, array, 1);
+    testing::assert_eq(expect_host(expect_stringify(heap, runtime::Value::Object(array))), "[42]")
+}
+
+#[test]
+fn detects_active_cycles_but_allows_shared_subobjects() -> unit {
+    let heap = runtime::Heap::new();
+    let child = expect_new_object(heap);
+    let root = expect_new_object(heap);
+    define_name(heap, root, "left", runtime::Value::Object(child));
+    define_name(heap, root, "right", runtime::Value::Object(child));
+    testing::assert_eq(
+        expect_host(expect_stringify(heap, runtime::Value::Object(root))),
+        "{\"left\":{},\"right\":{}}",
+    );
+    define_name(heap, child, "self", runtime::Value::Object(child));
+    match stringify(heap, runtime::Value::Object(root)) {
+        Err(value) => testing::assert(value.kind == JsonErrorKind::CircularReference),
+        Ok(_) => testing::fail("expected circular reference error"),
+    }
+}
+
+#[test]
+fn reports_unsupported_top_level_and_bigint_values() -> unit {
+    let heap = runtime::Heap::new();
+    match stringify(heap, runtime::Value::Undefined) {
+        Err(value) => testing::assert(value.kind == JsonErrorKind::UnsupportedType),
+        Ok(_) => testing::fail("expected top-level undefined error"),
+    };
+    let object = expect_new_object(heap);
+    define_name(heap, object, "value", runtime::Value::BigInt(runtime::BigInt::new(false, "1")));
+    match stringify(heap, runtime::Value::Object(object)) {
+        Err(value) => testing::assert(value.kind == JsonErrorKind::UnsupportedType),
+        Ok(_) => testing::fail("expected BigInt error"),
+    }
+}
+
+#[test]
+fn reports_callable_accessors_that_require_the_vm() -> unit {
+    let heap = runtime::Heap::new();
+    let object = expect_new_object(heap);
+    let getter = runtime::Value::Object(
+        expect_new_kind(heap, runtime::ObjectKind::Function, Option::None),
+    );
+    testing::assert(
+        runtime::define_own_property(
+            heap,
+            object,
+            runtime::string_property_key("value"),
+            runtime::accessor_descriptor(Option::Some(getter), Option::None, true, true),
+        ),
+    );
+    match stringify(heap, runtime::Value::Object(object)) {
+        Err(value) => testing::assert(value.kind == JsonErrorKind::Accessor),
+        Ok(_) => testing::fail("expected accessor error"),
+    }
+}

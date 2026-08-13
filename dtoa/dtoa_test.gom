@@ -1,0 +1,221 @@
+package dtoa;
+
+use std::math;
+use std::testing;
+
+fn require_string(value: Result[string, DtoaError]) -> string {
+    match value {
+        Ok(value) => value,
+        Err(error) => {
+            testing::fail(error.debug());
+            ""
+        },
+    }
+}
+
+#[test]
+fn formats_integer_radices_without_host_conversion() -> unit {
+    testing::assert_eq(require_string(u64_to_string_radix(0, 10)), "0");
+    testing::assert_eq(require_string(u64_to_string_radix(0xdeadbeef, 16)), "deadbeef");
+    testing::assert_eq(require_string(u64_to_string_radix(35, 36)), "z");
+    testing::assert_eq(
+        require_string(u64_to_string_radix(18446744073709551615, 10)),
+        "18446744073709551615",
+    );
+    testing::assert_eq(
+        require_string(i64_to_string_radix(-9223372036854775807 - 1, 10)),
+        "-9223372036854775808",
+    );
+    testing::assert(u64_to_string_radix(1, 1).is_err());
+    testing::assert(u64_to_string_radix(1, 37).is_err())
+}
+
+#[test]
+fn formats_ecmascript_decimal_thresholds() -> unit {
+    testing::assert_eq(number_to_string(0.0), "0");
+    testing::assert_eq(number_to_string(-0.0), "0");
+    testing::assert_eq(number_to_string(0.000001), "0.000001");
+    testing::assert_eq(number_to_string(0.0000001), "1e-7");
+    testing::assert_eq(number_to_string(100000000000000000000.0), "100000000000000000000");
+    testing::assert_eq(number_to_string(1e21), "1e+21");
+    testing::assert_eq(number_to_string(1000000000000000100.0), "1000000000000000100")
+}
+
+#[test]
+fn formats_special_and_round_trip_values() -> unit {
+    testing::assert_eq(number_to_string(parse_number("NaN")), "NaN");
+    testing::assert_eq(number_to_string(parse_number("Infinity")), "Infinity");
+    testing::assert_eq(number_to_string(parse_number("-Infinity")), "-Infinity");
+    for value in Vec::[
+        parse_number("5e-324"),
+        parse_number("2.2250738585072014e-308"),
+        1.2345678901234567,
+        9007199254740991.0,
+        parse_number("1.7976931348623157e308"),
+    ] {
+        let text = number_to_string(value);
+        match try_parse_number(text) {
+            Some(parsed) => testing::assert_eq(parsed, value),
+            None => testing::fail("formatted number did not parse"),
+        }
+    }
+}
+
+#[test]
+fn parses_string_numeric_literal_whitespace_and_radices() -> unit {
+    testing::assert_eq(parse_number(" \t\n42\r"), 42.0);
+    let (_, prefix) = string_from_utf8(Vec::[0xc2, 0xa0, 0xe3, 0x80, 0x80]);
+    let (_, suffix) = string_from_utf8(Vec::[0xef, 0xbb, 0xbf]);
+    testing::assert_eq(parse_number(prefix + "-1.25e2" + suffix), -125.0);
+    testing::assert_eq(parse_number(""), 0.0);
+    testing::assert_eq(parse_number("0b101"), 5.0);
+    testing::assert_eq(parse_number("0o17"), 15.0);
+    testing::assert_eq(parse_number("0x10"), 16.0);
+    let negative_zero = parse_number("-0");
+    testing::assert(math::is_infinite(1.0 / negative_zero));
+    testing::assert(1.0 / negative_zero < 0.0)
+}
+
+#[test]
+fn rejects_non_string_numeric_literal_forms() -> unit {
+    for value in Vec::["NaN", "inf", "+0x1", "0x", "1_0", ".", "1e", "12px", "\u180e1"] {
+        testing::assert(math::is_nan(parse_number(value)))
+    }
+}
+
+#[test]
+fn matches_quickjs_number_to_string_boundary_oracle() -> unit {
+    for value in Vec::[
+        "5e-324",
+        "1e-323",
+        "1.5e-323",
+        "2.2250738585072e-308",
+        "2.2250738585072004e-308",
+        "2.225073858507201e-308",
+        "2.2250738585072014e-308",
+        "2.225073858507202e-308",
+        "0.9999999999999998",
+        "0.9999999999999999",
+        "1",
+        "1.0000000000000002",
+        "1.0000000000000004",
+        "9.999999999999998e-8",
+        "1e-7",
+        "1.0000000000000001e-7",
+        "9.999999999999997e-7",
+        "0.000001",
+        "0.0000010000000000000002",
+        "99999999999999980000",
+        "100000000000000000000",
+        "100000000000000020000",
+        "999999999999999900000",
+        "1e+21",
+        "1.0000000000000001e+21",
+        "1000000000000000100",
+        "19686109595169230000",
+        "1.7976931348623153e+308",
+        "1.7976931348623155e+308",
+        "1.7976931348623157e+308",
+        "-5e-324",
+        "-0.9999999999999999",
+        "-1.7976931348623157e+308",
+    ] {
+        testing::assert_eq(number_to_string(parse_number(value)), value)
+    }
+}
+
+fn assert_parses_to(input: string, expected: string) -> unit {
+    testing::assert_eq(number_to_string(parse_number(input)), expected)
+}
+
+#[test]
+fn rounds_string_numeric_literals_at_quickjs_boundaries() -> unit {
+    assert_parses_to("1e309", "Infinity");
+    assert_parses_to("-1e309", "-Infinity");
+    assert_parses_to("1e-4000", "0");
+    assert_parses_to("2.4703282292062327e-324", "0");
+    assert_parses_to("2.4703282292062328e-324", "5e-324");
+    assert_parses_to("1.7976931348623158e308", "1.7976931348623157e+308");
+    assert_parses_to("1.7976931348623159e308", "Infinity");
+    assert_parses_to("9007199254740993", "9007199254740992");
+    assert_parses_to("9007199254740995", "9007199254740996");
+    assert_parses_to("1000000000000000128", "1000000000000000100")
+}
+
+#[test]
+fn rounds_non_decimal_literals_once_at_quickjs_boundaries() -> unit {
+    assert_parses_to("0x1000000000000080", "1152921504606847000");
+    assert_parses_to("0x1000000000000081", "1152921504606847200");
+    assert_parses_to("0x100000000000017f", "1152921504606847200");
+    assert_parses_to("0x1000000000000180", "1152921504606847500");
+    assert_parses_to("0xffffffffffffffff", "18446744073709552000");
+    assert_parses_to("0xffffffffffffffffffffffffffffffffffff", "2.2300745198530623e+43");
+    assert_parses_to(
+        "0b1000000000000000000000000000000000000000000000000000010000000",
+        "1152921504606847000",
+    );
+    assert_parses_to(
+        "0b1000000000000000000000000000000000000000000000000000010000001",
+        "1152921504606847200",
+    );
+    assert_parses_to("0o100000000000000000200", "1152921504606847000");
+    assert_parses_to("0o100000000000000000201", "1152921504606847200")
+}
+
+#[test]
+fn formats_fixed_decimal_values_with_exact_rounding() -> unit {
+    testing::assert_eq(number_to_fixed(2.5, 0), "3");
+    testing::assert_eq(number_to_fixed(1.25, 1), "1.3");
+    testing::assert_eq(number_to_fixed(2.55, 1), "2.5");
+    testing::assert_eq(number_to_fixed(2.55, 20), "2.54999999999999982236");
+    testing::assert_eq(number_to_fixed(-0.0001, 2), "-0.00");
+    testing::assert_eq(number_to_fixed(-0.0, 2), "0.00");
+    testing::assert_eq(number_to_fixed(1000000000000000100.0, 0), "1000000000000000128");
+    testing::assert_eq(number_to_fixed(1e21, 20), "1e+21")
+}
+
+#[test]
+fn formats_exponential_and_precision_values_like_quickjs() -> unit {
+    testing::assert_eq(number_to_exponential(1.0, Option::None), "1e+0");
+    testing::assert_eq(number_to_exponential(9.99, Option::Some(1)), "1.0e+1");
+    testing::assert_eq(number_to_exponential(2.55, Option::Some(20)), "2.54999999999999982236e+0");
+    testing::assert_eq(
+        number_to_exponential(parse_number("5e-324"), Option::Some(6)),
+        "4.940656e-324",
+    );
+    testing::assert_eq(number_to_precision(9.99, Option::Some(2)), "10");
+    testing::assert_eq(number_to_precision(0.00000123, Option::Some(2)), "0.0000012");
+    testing::assert_eq(number_to_precision(0.000000123, Option::Some(2)), "1.2e-7");
+    testing::assert_eq(
+        number_to_precision(1000000000000000100.0, Option::Some(20)),
+        "1000000000000000128.0",
+    )
+}
+
+#[test]
+fn formats_fractional_radices_with_shortest_round_trip_digits() -> unit {
+    testing::assert_eq(
+        require_string(number_to_string_radix(1.1, 2)),
+        "1.000110011001100110011001100110011001100110011001101",
+    );
+    testing::assert_eq(
+        require_string(number_to_string_radix(0.1, 3)),
+        "0.0022002200220022002200220022002201",
+    );
+    testing::assert_eq(
+        require_string(number_to_string_radix(parse_number("0.3333333333333333"), 16)),
+        "0.55555555555554",
+    );
+    testing::assert_eq(require_string(number_to_string_radix(255.5, 16)), "ff.8");
+    testing::assert_eq(require_string(number_to_string_radix(-10.25, 2)), "-1010.01");
+    testing::assert_eq(
+        require_string(number_to_string_radix(1152921504606847000.0, 3)),
+        "21200101122222021102111220121120000000",
+    );
+    testing::assert_eq(
+        require_string(number_to_string_radix(1152921504606847000.0, 36)),
+        "8rc4kbdvss00",
+    );
+    testing::assert(number_to_string_radix(1.0, 1).is_err());
+    testing::assert(number_to_string_radix(1.0, 37).is_err())
+}

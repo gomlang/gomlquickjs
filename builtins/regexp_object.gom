@@ -1,0 +1,960 @@
+package builtins;
+
+use gomlang::quickjs::dtoa;
+use gomlang::quickjs::regexp;
+use gomlang::quickjs::runtime;
+use gomlang::quickjs::vm;
+use std::math;
+use std::num;
+
+struct RegExpState {
+    pattern: runtime::JsString,
+    source: runtime::JsString,
+    flags: runtime::JsString,
+    compiled: regexp::Regex,
+    has_indices: bool,
+    global: bool,
+    ignore_case: bool,
+    multiline: bool,
+    dot_all: bool,
+    unicode: bool,
+    unicode_sets: bool,
+    sticky: bool,
+}
+
+struct LocatedMatch {
+    start: int,
+    end: int,
+    captures: Vec[Option[regexp::RegexCapture]],
+    capture_names: Vec[Option[runtime::JsString]],
+}
+
+struct RegExpInstall {
+    constructor: runtime::Value,
+    prototype: runtime::ObjectId,
+    states: HashMap[runtime::ObjectId, RegExpState],
+}
+
+fn regexp_compile_error(value: regexp::RegexError) -> vm::NativeError {
+    native_error(
+        "SyntaxError: invalid regular expression at UTF-16 offset " + value.offset.to_string()
+            + ": "
+            + value.message,
+    )
+}
+
+fn regexp_builtin_error(message: string) -> BuiltinError {
+    BuiltinError { message }
+}
+
+fn regexp_object(value: runtime::Value) -> Result[runtime::ObjectId, vm::NativeError] {
+    match value {
+        runtime::Value::Object(value) => Result::Ok(value),
+        _ => Result::Err(native_error("RegExp method called on incompatible receiver")),
+    }
+}
+
+fn regexp_state(states: HashMap[runtime::ObjectId, RegExpState], value: runtime::Value) -> Result[
+    (runtime::ObjectId, RegExpState),
+    vm::NativeError,
+] {
+    let object = regexp_object(value)?;
+    match states.get(object) {
+        Some(state) => Result::Ok((object, state)),
+        None => Result::Err(native_error("RegExp method called on incompatible receiver")),
+    }
+}
+
+fn append_source_escape(output: Vec[uint16], value: uint16) -> unit {
+    output.push(92);
+    if value == 10 {
+        output.push(110)
+    } else if value == 13 {
+        output.push(114)
+    } else if value == 0x2028 {
+        output.push(117);
+        output.push(50);
+        output.push(48);
+        output.push(50);
+        output.push(56)
+    } else if value == 0x2029 {
+        output.push(117);
+        output.push(50);
+        output.push(48);
+        output.push(50);
+        output.push(57)
+    } else {
+        output.push(value)
+    }
+}
+
+fn regexp_source(pattern: runtime::JsString) -> runtime::JsString {
+    if pattern.len() == 0 {
+        return js_string("(?:)")
+    } else {};
+    let output: Vec[uint16] = Vec::with_capacity(pattern.len());
+    let mut index = 0;
+    while index < pattern.len() {
+        let value = pattern.get(index);
+        if value == 47 || value == 10 || value == 13 || value == 0x2028 || value == 0x2029 {
+            append_source_escape(output, value)
+        } else {
+            output.push(value)
+        };
+        index += 1;
+    }
+    runtime::JsString::from_code_units(output)
+}
+
+fn canonical_flags(flags: regexp::RegexFlags) -> string {
+    let mut output = "";
+    if flags.has_indices {
+        output += "d";
+    } else {};
+    if flags.global {
+        output += "g";
+    } else {};
+    if flags.ignore_case {
+        output += "i";
+    } else {};
+    if flags.multiline {
+        output += "m";
+    } else {};
+    if flags.dot_all {
+        output += "s";
+    } else {};
+    if flags.unicode {
+        output += "u";
+    } else {};
+    if flags.unicode_sets {
+        output += "v";
+    } else {};
+    if flags.sticky {
+        output += "y";
+    } else {};
+    output
+}
+
+fn flags_text(value: runtime::JsString) -> Result[string, vm::NativeError] {
+    match value.to_host_string() {
+        Ok(value) => Result::Ok(value),
+        Err(_) => Result::Err(native_error("SyntaxError: invalid regular expression flags")),
+    }
+}
+
+fn new_regexp_state(pattern: runtime::JsString, requested_flags: runtime::JsString) -> Result[
+    RegExpState,
+    vm::NativeError,
+] {
+    let requested = flags_text(requested_flags)?;
+    let parsed = match regexp::parse_flags(requested) {
+        Ok(value) => value,
+        Err(value) => return Result::Err(regexp_compile_error(value)),
+    };
+    let compiled = match regexp::compile_with_flags(pattern, requested) {
+        Ok(value) => value,
+        Err(value) => return Result::Err(regexp_compile_error(value)),
+    };
+    let flags_host = canonical_flags(parsed);
+    Result::Ok(
+        RegExpState {
+            pattern,
+            source: regexp_source(pattern),
+            flags: js_string(flags_host),
+            compiled,
+            has_indices: parsed.has_indices,
+            global: parsed.global,
+            ignore_case: parsed.ignore_case,
+            multiline: parsed.multiline,
+            dot_all: parsed.dot_all,
+            unicode: parsed.unicode,
+            unicode_sets: parsed.unicode_sets,
+            sticky: parsed.sticky,
+        },
+    )
+}
+
+fn define_regexp_instance(heap: runtime::Heap, object: runtime::ObjectId, state: RegExpState) -> Result[
+    unit,
+    vm::NativeError,
+] {
+    let _ = state;
+    define_data(
+        heap,
+        object,
+        runtime::string_property_key("lastIndex"),
+        runtime::Value::Int(0),
+        true,
+        false,
+        false,
+    )
+}
+
+fn regexp_argument_pattern(
+    heap: runtime::Heap,
+    states: HashMap[runtime::ObjectId, RegExpState],
+    value: runtime::Value,
+) -> Result[(runtime::JsString, Option[runtime::ObjectId]), vm::NativeError] {
+    match value {
+        runtime::Value::Undefined => Result::Ok((js_string(""), Option::None)),
+        runtime::Value::Object(object) => match states.get(object) {
+            Some(state) => Result::Ok((state.pattern, Option::Some(object))),
+            None => Result::Ok((value_string(heap, value)?, Option::None)),
+        },
+        _ => Result::Ok((value_string(heap, value)?, Option::None)),
+    }
+}
+
+fn regexp_argument_flags(
+    heap: runtime::Heap,
+    states: HashMap[runtime::ObjectId, RegExpState],
+    source_object: Option[runtime::ObjectId],
+    arguments: Vec[runtime::Value],
+) -> Result[runtime::JsString, vm::NativeError] {
+    match argument(arguments, 1) {
+        runtime::Value::Undefined => match source_object {
+            Some(object) => match states.get(object) {
+                Some(state) => Result::Ok(state.flags),
+                None => Result::Ok(js_string("")),
+            },
+            None => Result::Ok(js_string("")),
+        },
+        value => value_string(heap, value),
+    }
+}
+
+fn regexp_construct(
+    heap: runtime::Heap,
+    states: HashMap[runtime::ObjectId, RegExpState],
+    prototype: runtime::ObjectId,
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+) -> Result[runtime::Value, vm::NativeError] {
+    let _ = this_value;
+    let (pattern, source_object) = regexp_argument_pattern(heap, states, argument(arguments, 0))?;
+    if source_object.is_some()
+        && match argument(arguments, 1) {
+            runtime::Value::Undefined => true,
+            _ => false,
+        } {
+        return Result::Ok(runtime::Value::Object(source_object.unwrap_or(prototype)))
+    } else {};
+    let flags = regexp_argument_flags(heap, states, source_object, arguments)?;
+    let state = new_regexp_state(pattern, flags)?;
+    let object = allocate_ordinary(heap, Option::Some(prototype))?;
+    define_regexp_instance(heap, object, state)?;
+    states[object] = state;
+    Result::Ok(runtime::Value::Object(object))
+}
+
+fn regexp_compile_instance(
+    heap: runtime::Heap,
+    states: HashMap[runtime::ObjectId, RegExpState],
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+) -> Result[runtime::Value, vm::NativeError] {
+    let (object, _) = regexp_state(states, this_value)?;
+    let (pattern, source_object) = regexp_argument_pattern(heap, states, argument(arguments, 0))?;
+    if source_object.is_some()
+        && match argument(arguments, 1) {
+            runtime::Value::Undefined => false,
+            _ => true,
+        } {
+        return Result::Err(native_error("TypeError: flags must be undefined"))
+    } else {};
+    let flags = regexp_argument_flags(heap, states, source_object, arguments)?;
+    let state = new_regexp_state(pattern, flags)?;
+    define_regexp_instance(heap, object, state)?;
+    states[object] = state;
+    Result::Ok(runtime::Value::Object(object))
+}
+
+fn regexp_state_property(
+    states: HashMap[runtime::ObjectId, RegExpState],
+    property: string,
+    heap: runtime::Heap,
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+) -> Result[runtime::Value, vm::NativeError] {
+    let _ = heap;
+    let _ = arguments;
+    let (_, state) = regexp_state(states, this_value)?;
+    if property == "source" {
+        Result::Ok(runtime::Value::String(state.source))
+    } else if property == "hasIndices" {
+        Result::Ok(runtime::Value::Bool(state.has_indices))
+    } else if property == "global" {
+        Result::Ok(runtime::Value::Bool(state.global))
+    } else if property == "ignoreCase" {
+        Result::Ok(runtime::Value::Bool(state.ignore_case))
+    } else if property == "multiline" {
+        Result::Ok(runtime::Value::Bool(state.multiline))
+    } else if property == "dotAll" {
+        Result::Ok(runtime::Value::Bool(state.dot_all))
+    } else if property == "unicode" {
+        Result::Ok(runtime::Value::Bool(state.unicode))
+    } else if property == "unicodeSets" {
+        Result::Ok(runtime::Value::Bool(state.unicode_sets))
+    } else {
+        Result::Ok(runtime::Value::Bool(state.sticky))
+    }
+}
+
+fn regexp_flags_at_depth(
+    context: vm::Context,
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+    depth: int,
+) -> Result[runtime::Value, vm::VmError] {
+    let _ = arguments;
+    match this_value {
+        runtime::Value::Object(_) => (),
+        _ => return Result::Err(function_vm_error("RegExp flags getter requires an object")),
+    };
+    let mut output = "";
+    for (name, flag) in Vec::[
+        ("hasIndices", "d"),
+        ("global", "g"),
+        ("ignoreCase", "i"),
+        ("multiline", "m"),
+        ("dotAll", "s"),
+        ("unicode", "u"),
+        ("unicodeSets", "v"),
+        ("sticky", "y"),
+    ] {
+        if runtime::to_boolean(
+            context.read_property_at_depth(
+                this_value,
+                runtime::Value::String(js_string(name)),
+                depth,
+            )?,
+        ) {
+            output += flag;
+        } else {}
+    }
+    Result::Ok(runtime::Value::String(js_string(output)))
+}
+
+fn regexp_to_string_at_depth(
+    context: vm::Context,
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+    depth: int,
+) -> Result[runtime::Value, vm::VmError] {
+    let _ = arguments;
+    match this_value {
+        runtime::Value::Object(_) => (),
+        _ => return Result::Err(function_vm_error("RegExp toString requires an object")),
+    };
+    let source = match string_value_at_depth(
+        context,
+        context.read_property_at_depth(
+            this_value,
+            runtime::Value::String(js_string("source")),
+            depth,
+        )?,
+        depth,
+    )? {
+        runtime::Value::String(value) => value,
+        _ => return Result::Err(function_vm_error("RegExp source is not a string")),
+    };
+    let flags = match string_value_at_depth(
+        context,
+        context.read_property_at_depth(
+            this_value,
+            runtime::Value::String(js_string("flags")),
+            depth,
+        )?,
+        depth,
+    )? {
+        runtime::Value::String(value) => value,
+        _ => return Result::Err(function_vm_error("RegExp flags are not a string")),
+    };
+    Result::Ok(
+        runtime::Value::String(js_string("/").concat(source).concat(js_string("/")).concat(flags)),
+    )
+}
+
+fn define_regexp_getter(
+    heap: runtime::Heap,
+    prototype: runtime::ObjectId,
+    name: string,
+    getter: runtime::Value,
+) -> Result[unit, BuiltinError] {
+    if runtime::define_own_property(
+        heap,
+        prototype,
+        runtime::string_property_key(name),
+        runtime::accessor_descriptor(Option::Some(getter), Option::None, false, true),
+    ) {
+        Result::Ok(())
+    } else {
+        Result::Err(regexp_builtin_error("cannot define RegExp getter " + name))
+    }
+}
+
+fn regexp_last_index(heap: runtime::Heap, object: runtime::ObjectId, input_length: int) -> Result[
+    int,
+    vm::NativeError,
+] {
+    let value = match runtime::get_property(heap, object, runtime::string_property_key("lastIndex")) {
+        Ok(Some(value)) => value,
+        Ok(None) => runtime::Value::Undefined,
+        Err(value) => return Result::Err(native_error(value.message)),
+    };
+    let number = match runtime::primitive_to_number(value) {
+        Ok(value) => value,
+        Err(value) => return Result::Err(native_error(value.message)),
+    };
+    if math::is_nan(number) || number <= 0.0 {
+        Result::Ok(0)
+    } else if math::is_infinite(number)
+        || number > num::parse_float64(input_length.to_string()).unwrap_or(0.0) {
+        Result::Ok(input_length + 1)
+    } else {
+        Result::Ok(num::parse_int(dtoa::number_to_string(math::floor(number))).unwrap_or(0))
+    }
+}
+
+fn set_regexp_last_index(heap: runtime::Heap, object: runtime::ObjectId, value: int) -> Result[
+    unit,
+    vm::NativeError,
+] {
+    if runtime::set_existing_data_property(
+        heap,
+        object,
+        runtime::string_property_key("lastIndex"),
+        array_length_value(value),
+    ) {
+        Result::Ok(())
+    } else {
+        Result::Err(native_error("cannot update RegExp lastIndex"))
+    }
+}
+
+fn located_match(regex: regexp::Regex, value: regexp::RegexMatch, start: int) -> LocatedMatch {
+    let captures: Vec[Option[regexp::RegexCapture]] = Vec::with_capacity(value.capture_count() + 1);
+    let capture_names: Vec[Option[runtime::JsString]] = Vec::with_capacity(
+        value.capture_count() + 1,
+    );
+    captures.push(Option::Some(regexp::RegexCapture { start, end: value.end }));
+    capture_names.push(Option::None);
+    let mut index = 1;
+    while index <= value.capture_count() {
+        captures.push(value.capture(index));
+        capture_names.push(regex.capture_name(index));
+        index += 1;
+    }
+    LocatedMatch { start, end: value.end, captures, capture_names }
+}
+
+fn match_at(state: RegExpState, input: runtime::JsString, offset: int) -> Result[
+    Option[LocatedMatch],
+    vm::NativeError,
+] {
+    match state.compiled.match_at(input, offset) {
+        Some(value) => Result::Ok(Option::Some(located_match(state.compiled, value, offset))),
+        None => Result::Ok(Option::None),
+    }
+}
+
+fn find_regexp_match(state: RegExpState, input: runtime::JsString, last_index: int) -> Result[
+    Option[LocatedMatch],
+    vm::NativeError,
+] {
+    if !state.global && !state.sticky {
+        match state.compiled.search(input) {
+            Some(value) => {
+                Result::Ok(Option::Some(located_match(state.compiled, value, value.start)))
+            },
+            None => Result::Ok(Option::None),
+        }
+    } else if last_index < 0 || last_index > input.len() {
+        Result::Ok(Option::None)
+    } else if state.sticky {
+        match_at(state, input, last_index)
+    } else {
+        let mut offset = last_index;
+        while offset <= input.len() {
+            match match_at(state, input, offset)? {
+                Some(value) => return Result::Ok(Option::Some(value)),
+                None => {
+                    offset += 1;
+                },
+            }
+        }
+        Result::Ok(Option::None)
+    }
+}
+
+fn regexp_unicode_start(state: RegExpState, input: runtime::JsString, index: int) -> int {
+    if (state.unicode || state.unicode_sets) && index > 0 && index < input.len() {
+        let current = input.get(index);
+        let previous = input.get(index - 1);
+        if current >= 0xdc00 && current <= 0xdfff && previous >= 0xd800 && previous <= 0xdbff {
+            index - 1
+        } else {
+            index
+        }
+    } else {
+        index
+    }
+}
+
+fn regexp_groups_value(heap: runtime::Heap, input: runtime::JsString, found: LocatedMatch) -> Result[
+    runtime::Value,
+    vm::NativeError,
+] {
+    let mut has_named_captures = false;
+    let mut name_index = 1;
+    while name_index < found.capture_names.len() {
+        if found.capture_names[name_index].is_some() {
+            has_named_captures = true;
+        } else {};
+        name_index += 1;
+    }
+    if has_named_captures {
+        let groups = match runtime::new_null_prototype_object(heap) {
+            Ok(value) => value,
+            Err(value) => return Result::Err(native_error(value.message)),
+        };
+        let mut index = 1;
+        while index < found.capture_names.len() {
+            match found.capture_names[index] {
+                Some(name) => {
+                    let value = match found.captures[index] {
+                        Some(capture) => {
+                            runtime::Value::String(input.slice(capture.start, capture.end))
+                        },
+                        None => runtime::Value::Undefined,
+                    };
+                    let key = runtime::js_string_property_key(name);
+                    let should_define = match value {
+                        runtime::Value::Undefined => match heap.get(groups) {
+                            Some(object) => object.own_property(key).is_none(),
+                            None => false,
+                        },
+                        _ => true,
+                    };
+                    if should_define {
+                        define_data(heap, groups, key, value, true, true, true)?
+                    } else {}
+                },
+                None => {},
+            };
+            index += 1;
+        }
+        Result::Ok(runtime::Value::Object(groups))
+    } else {
+        Result::Ok(runtime::Value::Undefined)
+    }
+}
+
+fn regexp_capture_index_value(heap: runtime::Heap, capture: Option[regexp::RegexCapture]) -> Result[
+    runtime::Value,
+    vm::NativeError,
+] {
+    match capture {
+        Some(value) => {
+            let values = Vec::[array_length_value(value.start), array_length_value(value.end)];
+            Result::Ok(runtime::Value::Object(allocate_array(heap, values, 2)?))
+        },
+        None => Result::Ok(runtime::Value::Undefined),
+    }
+}
+
+fn regexp_index_groups_value(heap: runtime::Heap, found: LocatedMatch, values: Vec[runtime::Value]) -> Result[
+    runtime::Value,
+    vm::NativeError,
+] {
+    if !string_has_named_captures(found) {
+        return Result::Ok(runtime::Value::Undefined)
+    } else {};
+    let groups = match runtime::new_null_prototype_object(heap) {
+        Ok(value) => value,
+        Err(value) => return Result::Err(native_error(value.message)),
+    };
+    let mut index = 1;
+    while index < found.capture_names.len() {
+        match found.capture_names[index] {
+            Some(name) => {
+                let key = runtime::js_string_property_key(name);
+                let should_define = match values[index] {
+                    runtime::Value::Undefined => match heap.get(groups) {
+                        Some(object) => object.own_property(key).is_none(),
+                        None => false,
+                    },
+                    _ => true,
+                };
+                if should_define {
+                    define_data(heap, groups, key, values[index], true, true, true)?
+                } else {}
+            },
+            None => {},
+        };
+        index += 1;
+    }
+    Result::Ok(runtime::Value::Object(groups))
+}
+
+fn regexp_indices_value(heap: runtime::Heap, found: LocatedMatch) -> Result[
+    runtime::Value,
+    vm::NativeError,
+] {
+    let values: Vec[runtime::Value] = Vec::with_capacity(found.captures.len());
+    let mut index = 0;
+    while index < found.captures.len() {
+        values.push(regexp_capture_index_value(heap, found.captures[index])?);
+        index += 1;
+    }
+    let object = allocate_array(heap, values, values.len())?;
+    let groups = regexp_index_groups_value(heap, found, values)?;
+    define_data(heap, object, runtime::string_property_key("groups"), groups, true, true, true)?;
+    Result::Ok(runtime::Value::Object(object))
+}
+
+fn regexp_match_array(
+    heap: runtime::Heap,
+    input: runtime::JsString,
+    found: LocatedMatch,
+    has_indices: bool,
+) -> Result[runtime::Value, vm::NativeError] {
+    let values: Vec[runtime::Value] = Vec::with_capacity(found.captures.len());
+    let mut index = 0;
+    while index < found.captures.len() {
+        match found.captures[index] {
+            Some(capture) => values.push(
+                runtime::Value::String(input.slice(capture.start, capture.end)),
+            ),
+            None => values.push(runtime::Value::Undefined),
+        };
+        index += 1;
+    }
+    let object = allocate_array(heap, values, values.len())?;
+    define_data(
+        heap,
+        object,
+        runtime::string_property_key("index"),
+        array_length_value(found.start),
+        true,
+        true,
+        true,
+    )?;
+    define_data(
+        heap,
+        object,
+        runtime::string_property_key("input"),
+        runtime::Value::String(input),
+        true,
+        true,
+        true,
+    )?;
+    let groups = regexp_groups_value(heap, input, found)?;
+    define_data(heap, object, runtime::string_property_key("groups"), groups, true, true, true)?;
+    if has_indices {
+        let indices = regexp_indices_value(heap, found)?;
+        define_data(
+            heap,
+            object,
+            runtime::string_property_key("indices"),
+            indices,
+            true,
+            true,
+            true,
+        )?
+    } else {};
+    Result::Ok(runtime::Value::Object(object))
+}
+
+fn regexp_execute(
+    heap: runtime::Heap,
+    states: HashMap[runtime::ObjectId, RegExpState],
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+) -> Result[runtime::Value, vm::NativeError] {
+    let (object, state) = regexp_state(states, this_value)?;
+    let input = value_string(heap, argument(arguments, 0))?;
+    let indexed = state.global || state.sticky;
+    let last_index = if indexed {
+        regexp_last_index(heap, object, input.len())?
+    } else {
+        0
+    };
+    let last_index = regexp_unicode_start(state, input, last_index);
+    match find_regexp_match(state, input, last_index)? {
+        Some(found) => {
+            if indexed {
+                set_regexp_last_index(heap, object, found.end)?
+            } else {};
+            regexp_match_array(heap, input, found, state.has_indices)
+        },
+        None => {
+            if indexed {
+                set_regexp_last_index(heap, object, 0)?
+            } else {};
+            Result::Ok(runtime::Value::Null)
+        },
+    }
+}
+
+fn regexp_test(
+    heap: runtime::Heap,
+    states: HashMap[runtime::ObjectId, RegExpState],
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+) -> Result[runtime::Value, vm::NativeError] {
+    match regexp_execute(heap, states, this_value, arguments)? {
+        runtime::Value::Null => Result::Ok(runtime::Value::Bool(false)),
+        _ => Result::Ok(runtime::Value::Bool(true)),
+    }
+}
+
+fn regexp_escape_hex_digit(value: uint16) -> uint16 {
+    if value < 10 {
+        48 + value
+    } else {
+        87 + value
+    }
+}
+
+fn regexp_escape_hex2(output: Vec[uint16], value: uint16) -> unit {
+    output.push(92);
+    output.push(120);
+    output.push(regexp_escape_hex_digit((value >> 4) & 15));
+    output.push(regexp_escape_hex_digit(value & 15));
+}
+
+fn regexp_escape_hex4(output: Vec[uint16], value: uint16) -> unit {
+    output.push(92);
+    output.push(117);
+    output.push(regexp_escape_hex_digit((value >> 12) & 15));
+    output.push(regexp_escape_hex_digit((value >> 8) & 15));
+    output.push(regexp_escape_hex_digit((value >> 4) & 15));
+    output.push(regexp_escape_hex_digit(value & 15));
+}
+
+fn regexp_escape_space(value: uint16) -> bool {
+    value == 0x00a0 || value == 0x1680 || value >= 0x2000 && value <= 0x200a || value == 0x2028
+        || value == 0x2029
+        || value == 0x202f
+        || value == 0x205f
+        || value == 0x3000
+        || value == 0xfeff
+}
+
+fn regexp_escape_syntax(value: uint16) -> bool {
+    value == 36 || value == 40 || value == 41 || value == 42 || value == 43 || value == 46
+        || value == 47
+        || value == 63
+        || value == 91
+        || value == 92
+        || value == 93
+        || value == 94
+        || value == 123
+        || value == 124
+        || value == 125
+        || value == 127
+}
+
+fn regexp_escape_punctuator(value: uint16) -> bool {
+    value == 34 || value == 35 || value == 37 || value == 38 || value == 39 || value == 44
+        || value == 45
+        || value == 58
+        || value == 59
+        || value == 60
+        || value == 61
+        || value == 62
+        || value == 64
+        || value == 96
+        || value == 126
+        || value == 33
+}
+
+fn regexp_escape_static(
+    heap: runtime::Heap,
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+) -> Result[runtime::Value, vm::NativeError] {
+    let _ = heap;
+    let _ = this_value;
+    let input = match argument(arguments, 0) {
+        runtime::Value::String(value) => value,
+        _ => return Result::Err(native_error("not a string")),
+    };
+    let output: Vec[uint16] = Vec::with_capacity(input.len());
+    let mut index = 0;
+    while index < input.len() {
+        let value = input.get(index);
+        let ascii_alphanumeric = value >= 48 && value <= 57 || value >= 65 && value <= 90
+            || value >= 97 && value <= 122;
+        if value < 33 {
+            if value >= 9 && value <= 13 {
+                output.push(92);
+                output.push(Vec::[116, 110, 118, 102, 114][(value - 9).to_int()])
+            } else {
+                regexp_escape_hex2(output, value)
+            }
+        } else if value < 128 {
+            if index == 0 && ascii_alphanumeric || regexp_escape_punctuator(value) {
+                regexp_escape_hex2(output, value)
+            } else {
+                if regexp_escape_syntax(value) {
+                    output.push(92)
+                } else {};
+                output.push(value)
+            }
+        } else if value < 256 {
+            regexp_escape_hex2(output, value)
+        } else if value >= 0xd800 && value <= 0xdbff && index + 1 < input.len()
+            && input.get(index + 1) >= 0xdc00
+            && input.get(index + 1) <= 0xdfff {
+            output.push(value);
+            index += 1;
+            output.push(input.get(index))
+        } else if value >= 0xd800 && value <= 0xdfff || regexp_escape_space(value) {
+            regexp_escape_hex4(output, value)
+        } else {
+            output.push(value)
+        };
+        index += 1;
+    }
+    Result::Ok(runtime::Value::String(runtime::JsString::from_code_units(output)))
+}
+
+fn install_regexp_runtime(context: vm::Context) -> Result[RegExpInstall, BuiltinError] {
+    let heap = context.heap();
+    let prototype = match runtime::new_ordinary_object(heap, Option::None) {
+        Ok(value) => value,
+        Err(value) => return Result::Err(regexp_builtin_error(value.message)),
+    };
+    let states: HashMap[runtime::ObjectId, RegExpState] = HashMap::{};
+    let prototype_state = match new_regexp_state(js_string(""), js_string("")) {
+        Ok(value) => value,
+        Err(value) => return Result::Err(regexp_builtin_error(value.message)),
+    };
+    states[prototype] = prototype_state;
+    let flags_getter = allocate_vm_function(
+        context,
+        "get RegExp.prototype.flags",
+        |this_value, arguments, depth| {
+            regexp_flags_at_depth(context, this_value, arguments, depth)
+        },
+    )?;
+    define_regexp_getter(heap, prototype, "flags", flags_getter)?;
+    for name in Vec::[
+        "source",
+        "global",
+        "ignoreCase",
+        "multiline",
+        "dotAll",
+        "unicode",
+        "unicodeSets",
+        "sticky",
+        "hasIndices",
+    ] {
+        let property = name;
+        let getter = allocate_function(
+            context,
+            "get RegExp.prototype." + property,
+            |heap, this_value, arguments| {
+                regexp_state_property(states, property, heap, this_value, arguments)
+            },
+        )?;
+        define_regexp_getter(heap, prototype, property, getter)?
+    }
+    let exec = allocate_function(
+        context,
+        "RegExp.prototype.exec",
+        |heap, this_value, arguments| regexp_execute(heap, states, this_value, arguments),
+    )?;
+    let test = allocate_function(
+        context,
+        "RegExp.prototype.test",
+        |heap, this_value, arguments| regexp_test(heap, states, this_value, arguments),
+    )?;
+    let compile_method = allocate_function(
+        context,
+        "RegExp.prototype.compile",
+        |heap, this_value, arguments| {
+            regexp_compile_instance(heap, states, this_value, arguments)
+        },
+    )?;
+    let to_string = allocate_vm_function(
+        context,
+        "RegExp.prototype.toString",
+        |this_value, arguments, depth| {
+            regexp_to_string_at_depth(context, this_value, arguments, depth)
+        },
+    )?;
+    define_value(heap, prototype, "exec", exec, true, true)?;
+    define_value(heap, prototype, "test", test, true, true)?;
+    define_value(heap, prototype, "compile", compile_method, true, true)?;
+    define_value(heap, prototype, "toString", to_string, true, true)?;
+    let constructor = allocate_function(
+        context,
+        "RegExp",
+        |heap, this_value, arguments| {
+            let result = regexp_construct(heap, states, prototype, this_value, arguments)?;
+            match result {
+                runtime::Value::Object(object) => if context.set_object_builtin_tag(
+                    object,
+                    js_string("RegExp"),
+                ) {
+                    Result::Ok(result)
+                } else {
+                    Result::Err(native_error("cannot register RegExp instance"))
+                },
+                _ => Result::Ok(result),
+            }
+        },
+    )?;
+    if !context.set_object_builtin_tag(prototype, js_string("RegExp")) {
+        return Result::Err(regexp_builtin_error("cannot register RegExp prototype"))
+    } else {};
+    let constructor_object = function_object(constructor, "RegExp")?;
+    define_value(
+        heap,
+        constructor_object,
+        "escape",
+        allocate_function(context, "RegExp.escape", regexp_escape_static)?,
+        true,
+        true,
+    )?;
+    define_value(
+        heap,
+        constructor_object,
+        "prototype",
+        runtime::Value::Object(prototype),
+        false,
+        false,
+    )?;
+    match context.well_known_symbol(vm::WellKnownSymbolKind::Species) {
+        Some(symbol) => {
+            let getter = allocate_function_with_length(
+                context,
+                "get [Symbol.species]",
+                0,
+                array_species_getter,
+            )?;
+            if !runtime::define_own_property(
+                heap,
+                constructor_object,
+                runtime::PropertyKey::Symbol(symbol),
+                runtime::accessor_descriptor(Option::Some(getter), Option::None, false, true),
+            ) {
+                return Result::Err(regexp_builtin_error("cannot define RegExp species"))
+            } else {}
+        },
+        None => (),
+    };
+    define_value(heap, prototype, "constructor", constructor, true, true)?;
+    match context.set_regexp_constructor(constructor) {
+        Ok(()) => (),
+        Err(_) => return Result::Err(regexp_builtin_error("cannot register RegExp constructor")),
+    };
+    Result::Ok(RegExpInstall { constructor, prototype, states })
+}
+
+pub fn install_regexp(context: vm::Context) -> Result[runtime::Value, BuiltinError] {
+    Result::Ok(install_regexp_runtime(context)?.constructor)
+}

@@ -1,0 +1,842 @@
+package arraybuffer;
+
+use gomlang::quickjs::bigint;
+use std::math;
+use std::testing;
+
+fn expect_buffer(value: Result[ArrayBuffer, BufferError]) -> ArrayBuffer {
+    match value {
+        Ok(value) => value,
+        Err(error) => {
+            testing::fail(error.to_string());
+            loop {}
+        },
+    }
+}
+
+fn expect_view(value: Result[DataView, BufferError]) -> DataView {
+    match value {
+        Ok(value) => value,
+        Err(error) => {
+            testing::fail(error.to_string());
+            loop {}
+        },
+    }
+}
+
+fn expect_uint8_array(value: Result[Uint8Array, BufferError]) -> Uint8Array {
+    match value {
+        Ok(value) => value,
+        Err(error) => {
+            testing::fail(error.to_string());
+            loop {}
+        },
+    }
+}
+
+fn expect_int32_array(value: Result[Int32Array, BufferError]) -> Int32Array {
+    match value {
+        Ok(value) => value,
+        Err(error) => {
+            testing::fail(error.to_string());
+            loop {}
+        },
+    }
+}
+
+fn expect_float64_array(value: Result[Float64Array, BufferError]) -> Float64Array {
+    match value {
+        Ok(value) => value,
+        Err(error) => {
+            testing::fail(error.to_string());
+            loop {}
+        },
+    }
+}
+
+fn expect_numeric_array(value: Result[NumericArray, BufferError]) -> NumericArray {
+    match value {
+        Ok(value) => value,
+        Err(error) => {
+            testing::fail(error.to_string());
+            loop {}
+        },
+    }
+}
+
+fn expect_bigint_array(value: Result[BigIntArray, BufferError]) -> BigIntArray {
+    match value {
+        Ok(value) => value,
+        Err(error) => {
+            testing::fail(error.to_string());
+            loop {}
+        },
+    }
+}
+
+fn expect_unit(value: Result[unit, BufferError]) -> unit {
+    match value {
+        Ok(()) => (),
+        Err(error) => testing::fail(error.to_string()),
+    }
+}
+
+fn expect_int(value: Result[int, BufferError]) -> int {
+    match value {
+        Ok(value) => value,
+        Err(error) => {
+            testing::fail(error.to_string());
+            0
+        },
+    }
+}
+
+fn expect_int8(value: Result[int8, BufferError]) -> int8 {
+    match value {
+        Ok(value) => value,
+        Err(error) => {
+            testing::fail(error.to_string());
+            0
+        },
+    }
+}
+
+fn expect_uint8(value: Result[uint8, BufferError]) -> uint8 {
+    match value {
+        Ok(value) => value,
+        Err(error) => {
+            testing::fail(error.to_string());
+            0
+        },
+    }
+}
+
+fn expect_int16(value: Result[int16, BufferError]) -> int16 {
+    match value {
+        Ok(value) => value,
+        Err(error) => {
+            testing::fail(error.to_string());
+            0
+        },
+    }
+}
+
+fn expect_uint16(value: Result[uint16, BufferError]) -> uint16 {
+    match value {
+        Ok(value) => value,
+        Err(error) => {
+            testing::fail(error.to_string());
+            0
+        },
+    }
+}
+
+fn expect_int32(value: Result[int32, BufferError]) -> int32 {
+    match value {
+        Ok(value) => value,
+        Err(error) => {
+            testing::fail(error.to_string());
+            0
+        },
+    }
+}
+
+fn expect_uint32(value: Result[uint32, BufferError]) -> uint32 {
+    match value {
+        Ok(value) => value,
+        Err(error) => {
+            testing::fail(error.to_string());
+            0
+        },
+    }
+}
+
+fn expect_float32(value: Result[float32, BufferError]) -> float32 {
+    match value {
+        Ok(value) => value,
+        Err(error) => {
+            testing::fail(error.to_string());
+            0.0
+        },
+    }
+}
+
+fn expect_float64(value: Result[float64, BufferError]) -> float64 {
+    match value {
+        Ok(value) => value,
+        Err(error) => {
+            testing::fail(error.to_string());
+            0.0
+        },
+    }
+}
+
+fn expect_bytes(value: Result[Vec[byte], BufferError]) -> Vec[byte] {
+    match value {
+        Ok(value) => value,
+        Err(error) => {
+            testing::fail(error.to_string());
+            Vec::[]
+        },
+    }
+}
+
+fn expect_error[T](
+    value: Result[T, BufferError],
+    class: BufferErrorClass,
+    reason: BufferErrorReason,
+) -> BufferError {
+    match value {
+        Err(error) => {
+            testing::assert(error.class == class);
+            testing::assert(error.reason == reason);
+            error
+        },
+        Ok(_) => {
+            testing::fail("expected buffer error");
+            BufferError { class, reason, value: 0, limit: 0 }
+        },
+    }
+}
+
+fn buffer_from_bytes(values: Vec[byte]) -> ArrayBuffer {
+    expect_buffer(ArrayBuffer::from_bytes(values.slice(0, values.len())))
+}
+
+fn assert_bytes(actual: Vec[byte], expected: Vec[byte]) -> unit {
+    testing::assert_eq(actual.len(), expected.len());
+    let mut index = 0;
+    while index < expected.len() {
+        testing::assert_eq(actual[index], expected[index]);
+        index += 1;
+    }
+}
+
+fn byte_range(values: Vec[byte], start: int, end: int) -> Vec[byte] {
+    let result: Vec[byte] = Vec::with_capacity(end - start);
+    let mut index = start;
+    while index < end {
+        result.push(values[index]);
+        index += 1;
+    }
+    result
+}
+
+fn small_number(value: int) -> float64 {
+    match value {
+        1 => 1.0,
+        2 => 2.0,
+        3 => 3.0,
+        4 => 4.0,
+        5 => 5.0,
+        _ => 0.0,
+    }
+}
+
+#[test]
+fn array_buffer_creation_is_zeroed_and_validates_lengths() -> unit {
+    let buffer = expect_buffer(ArrayBuffer::new(4));
+    testing::assert_eq(buffer.byte_length(), 4);
+    testing::assert(!buffer.is_detached());
+    assert_bytes(expect_bytes(buffer.to_bytes()), Vec::[0, 0, 0, 0]);
+    let _ = expect_error(
+        ArrayBuffer::new(-1),
+        BufferErrorClass::RangeError,
+        BufferErrorReason::NegativeLength,
+    );
+    let _ = expect_error(
+        ArrayBuffer::new(MAX_BUFFER_BYTE_LENGTH + 1),
+        BufferErrorClass::RangeError,
+        BufferErrorReason::LengthOutOfRange,
+    );
+}
+
+#[test]
+fn array_buffer_slice_uses_relative_indices_and_copies() -> unit {
+    let buffer = buffer_from_bytes(Vec::[0, 1, 2, 3, 4, 5]);
+    let sliced = expect_buffer(buffer.slice(-4, -1));
+    assert_bytes(expect_bytes(sliced.to_bytes()), Vec::[2, 3, 4]);
+    let minimum: int = -9223372036854775807 - 1;
+    let clamped = expect_buffer(buffer.slice(minimum, 2));
+    assert_bytes(expect_bytes(clamped.to_bytes()), Vec::[0, 1]);
+    let original = expect_uint8_array(Uint8Array::from_buffer(buffer, 0, Option::None));
+    expect_unit(original.set(2, 99.0));
+    assert_bytes(expect_bytes(sliced.to_bytes()), Vec::[2, 3, 4]);
+    let empty = expect_buffer(buffer.slice(5, 2));
+    testing::assert_eq(empty.byte_length(), 0)
+}
+
+#[test]
+fn transfer_moves_storage_and_detaches_all_old_views() -> unit {
+    let source = buffer_from_bytes(Vec::[1, 2, 3, 4]);
+    let old_view = expect_view(DataView::new(source, 1, Option::Some(2)));
+    let target = expect_buffer(source.transfer(Option::None));
+    testing::assert(source.is_detached());
+    testing::assert_eq(source.byte_length(), 0);
+    assert_bytes(expect_bytes(target.to_bytes()), Vec::[1, 2, 3, 4]);
+    let _ = expect_error(
+        old_view.get_uint8(0),
+        BufferErrorClass::TypeError,
+        BufferErrorReason::DetachedBuffer,
+    );
+    let _ = expect_error(
+        source.to_bytes(),
+        BufferErrorClass::TypeError,
+        BufferErrorReason::DetachedBuffer,
+    );
+}
+
+#[test]
+fn transfer_can_grow_or_shrink_and_validates_before_detaching() -> unit {
+    let grow_source = buffer_from_bytes(Vec::[1, 2, 3]);
+    let grown = expect_buffer(grow_source.transfer(Option::Some(5)));
+    assert_bytes(expect_bytes(grown.to_bytes()), Vec::[1, 2, 3, 0, 0]);
+    let shrunk = expect_buffer(grown.transfer(Option::Some(2)));
+    assert_bytes(expect_bytes(shrunk.to_bytes()), Vec::[1, 2]);
+    let source = buffer_from_bytes(Vec::[7]);
+    let _ = expect_error(
+        source.transfer(Option::Some(-1)),
+        BufferErrorClass::RangeError,
+        BufferErrorReason::NegativeLength,
+    );
+    testing::assert(!source.is_detached());
+    assert_bytes(expect_bytes(source.to_bytes()), Vec::[7])
+}
+
+#[test]
+fn transfer_preserves_resizability_and_can_force_fixed_length() -> unit {
+    let source = expect_buffer(ArrayBuffer::new_resizable(4, 8));
+    expect_unit(source.write_bytes(0, Vec::[1, 2, 3, 4].slice(0, 4)));
+    let transferred = expect_buffer(source.transfer(Option::Some(6)));
+    testing::assert(source.is_detached());
+    testing::assert(transferred.is_resizable());
+    testing::assert_eq(transferred.max_byte_length(), 8);
+    assert_bytes(expect_bytes(transferred.to_bytes()), Vec::[1, 2, 3, 4, 0, 0]);
+    let fixed = expect_buffer(transferred.transfer_to_fixed_length(Option::Some(3)));
+    testing::assert(transferred.is_detached());
+    testing::assert(!fixed.is_resizable());
+    testing::assert_eq(fixed.max_byte_length(), 3);
+    assert_bytes(expect_bytes(fixed.to_bytes()), Vec::[1, 2, 3]);
+    let limited = expect_buffer(ArrayBuffer::new_resizable(2, 4));
+    let _ = expect_error(
+        limited.transfer(Option::Some(5)),
+        BufferErrorClass::TypeError,
+        BufferErrorReason::LengthOutOfRange,
+    );
+    testing::assert(!limited.is_detached());
+    let expanded = expect_buffer(limited.transfer_to_fixed_length(Option::Some(5)));
+    testing::assert_eq(expanded.byte_length(), 5)
+}
+
+#[test]
+fn growable_shared_buffers_preserve_bytes_and_reject_shrinking() -> unit {
+    let buffer = expect_buffer(ArrayBuffer::new_growable_shared(2, 8));
+    testing::assert(buffer.is_shared());
+    testing::assert(buffer.is_growable());
+    testing::assert(!buffer.is_resizable());
+    expect_unit(buffer.write_bytes(0, Vec::[5, 6].slice(0, 2)));
+    expect_unit(buffer.grow(5));
+    testing::assert_eq(buffer.byte_length(), 5);
+    testing::assert_eq(buffer.max_byte_length(), 8);
+    assert_bytes(expect_bytes(buffer.to_bytes()), Vec::[5, 6, 0, 0, 0]);
+    let _ = expect_error(
+        buffer.grow(4),
+        BufferErrorClass::RangeError,
+        BufferErrorReason::LengthOutOfRange,
+    );
+    let fixed = expect_buffer(ArrayBuffer::new_shared(2));
+    let _ = expect_error(
+        fixed.grow(3),
+        BufferErrorClass::TypeError,
+        BufferErrorReason::LengthOutOfRange,
+    );
+}
+
+#[test]
+fn resizable_buffer_views_track_lengths_and_fixed_views_recover() -> unit {
+    let buffer = expect_buffer(ArrayBuffer::new_resizable(4, 8));
+    let tracking = expect_uint8_array(Uint8Array::from_buffer(buffer, 0, Option::None));
+    let fixed = expect_uint8_array(Uint8Array::from_buffer(buffer, 1, Option::Some(2)));
+    let tracking_view = expect_view(DataView::new(buffer, 1, Option::None));
+    let fixed_view = expect_view(DataView::new(buffer, 1, Option::Some(2)));
+    testing::assert(tracking.is_length_tracking());
+    testing::assert(!fixed.is_length_tracking());
+    testing::assert(!tracking.is_out_of_bounds());
+    testing::assert(!fixed.is_out_of_bounds());
+    expect_unit(buffer.resize(6));
+    testing::assert_eq(tracking.length(), 6);
+    testing::assert_eq(fixed.length(), 2);
+    testing::assert_eq(expect_int(tracking_view.byte_length()), 5);
+    testing::assert_eq(expect_int(fixed_view.byte_length()), 2);
+    expect_unit(buffer.resize(1));
+    testing::assert_eq(tracking.length(), 1);
+    testing::assert_eq(fixed.length(), 0);
+    testing::assert_eq(fixed.byte_offset(), 0);
+    testing::assert(!tracking.is_out_of_bounds());
+    testing::assert(fixed.is_out_of_bounds());
+    testing::assert_eq(expect_int(tracking_view.byte_length()), 0);
+    let _ = expect_error(
+        fixed_view.byte_length(),
+        BufferErrorClass::TypeError,
+        BufferErrorReason::LengthOutOfRange,
+    );
+    expect_unit(buffer.resize(4));
+    testing::assert_eq(tracking.length(), 4);
+    testing::assert_eq(fixed.length(), 2);
+    testing::assert_eq(fixed.byte_offset(), 1);
+    testing::assert(!fixed.is_out_of_bounds());
+    testing::assert_eq(expect_int(fixed_view.byte_length()), 2);
+    let shared = expect_buffer(ArrayBuffer::new_growable_shared(4, 8));
+    let shared_values = expect_numeric_array(
+        NumericArray::from_buffer(NumericArrayKind::Uint16, shared, 0, Option::None),
+    );
+    let shared_view = expect_view(DataView::new(shared, 1, Option::None));
+    expect_unit(shared.grow(8));
+    testing::assert(shared_values.is_length_tracking());
+    testing::assert(!shared_values.is_out_of_bounds());
+    testing::assert_eq(shared_values.length(), 4);
+    testing::assert_eq(expect_int(shared_view.byte_length()), 7)
+}
+
+#[test]
+fn explicit_detach_updates_aliases_and_rejects_repeated_detach() -> unit {
+    let buffer = expect_buffer(ArrayBuffer::new(2));
+    let alias = buffer;
+    expect_unit(buffer.detach());
+    testing::assert(alias.is_detached());
+    testing::assert_eq(alias.byte_length(), 0);
+    let _ = expect_error(
+        alias.detach(),
+        BufferErrorClass::TypeError,
+        BufferErrorReason::DetachedBuffer,
+    );
+}
+
+#[test]
+fn data_view_metadata_and_bounds_are_checked_against_its_window() -> unit {
+    let buffer = expect_buffer(ArrayBuffer::new(8));
+    let view = expect_view(DataView::new(buffer, 2, Option::Some(4)));
+    testing::assert_eq(expect_int(view.byte_offset()), 2);
+    testing::assert_eq(expect_int(view.byte_length()), 4);
+    expect_unit(view.set_uint32(0, 1.0, Option::None));
+    let _ = expect_error(
+        view.get_uint16(3, Option::None),
+        BufferErrorClass::RangeError,
+        BufferErrorReason::LengthOutOfRange,
+    );
+    let _ = expect_error(
+        DataView::new(buffer, 9, Option::None),
+        BufferErrorClass::RangeError,
+        BufferErrorReason::OffsetOutOfRange,
+    );
+}
+
+#[test]
+fn data_view_integers_default_to_big_endian_and_support_little_endian() -> unit {
+    let buffer = expect_buffer(ArrayBuffer::new(8));
+    let view = expect_view(DataView::new(buffer, 0, Option::None));
+    expect_unit(view.set_uint32(0, 305419896.0, Option::None));
+    assert_bytes(expect_bytes(buffer.to_bytes()), Vec::[0x12, 0x34, 0x56, 0x78, 0, 0, 0, 0]);
+    testing::assert_eq(expect_uint32(view.get_uint32(0, Option::None)), 0x12345678.to_uint32());
+    testing::assert_eq(
+        expect_uint32(view.get_uint32(0, Option::Some(true))),
+        0x78563412.to_uint32(),
+    );
+    expect_unit(view.set_uint16(4, 4660.0, Option::Some(true)));
+    testing::assert_eq(expect_uint16(view.get_uint16(4, Option::Some(true))), 0x1234.to_uint16());
+    testing::assert_eq(expect_uint16(view.get_uint16(4, Option::None)), 0x3412.to_uint16())
+}
+
+#[test]
+fn data_view_bigint_methods_use_twos_complement_and_endianness() -> unit {
+    let buffer = expect_buffer(ArrayBuffer::new(16));
+    let view = expect_view(DataView::new(buffer, 0, Option::None));
+    expect_unit(
+        view.set_big_int64(
+            0,
+            bigint::parse("-2").unwrap_or(bigint::BigInteger::zero()),
+            Option::None,
+        ),
+    );
+    expect_unit(
+        view.set_big_uint64(
+            8,
+            bigint::parse("18446744073709551615").unwrap_or(bigint::BigInteger::zero()),
+            Option::Some(true),
+        ),
+    );
+    assert_bytes(
+        expect_bytes(buffer.to_bytes()),
+        Vec::[
+            0xff,
+            0xff,
+            0xff,
+            0xff,
+            0xff,
+            0xff,
+            0xff,
+            0xfe,
+            0xff,
+            0xff,
+            0xff,
+            0xff,
+            0xff,
+            0xff,
+            0xff,
+            0xff,
+        ],
+    );
+    match view.get_big_int64(0, Option::None) {
+        Ok(value) => testing::assert_eq(value.to_string(), "-2"),
+        Err(value) => testing::fail(value.to_string()),
+    };
+    match view.get_big_uint64(0, Option::None) {
+        Ok(value) => testing::assert_eq(value.to_string(), "18446744073709551614"),
+        Err(value) => testing::fail(value.to_string()),
+    };
+    match view.get_big_int64(8, Option::Some(true)) {
+        Ok(value) => testing::assert_eq(value.to_string(), "-1"),
+        Err(value) => testing::fail(value.to_string()),
+    }
+}
+
+#[test]
+fn data_view_integer_setters_apply_javascript_number_truncation() -> unit {
+    let view = expect_view(DataView::new(expect_buffer(ArrayBuffer::new(12)), 0, Option::None));
+    expect_unit(view.set_uint8(0, 257.9));
+    expect_unit(view.set_int8(1, 255.9));
+    expect_unit(view.set_int16(2, 65535.9, Option::None));
+    expect_unit(view.set_int32(4, 4294967295.0, Option::None));
+    let zero = 0.0;
+    expect_unit(view.set_uint32(8, zero / zero, Option::None));
+    testing::assert_eq(expect_uint8(view.get_uint8(0)), 1.to_uint8());
+    testing::assert_eq(expect_int8(view.get_int8(1)), (-1).to_int8());
+    testing::assert_eq(expect_int16(view.get_int16(2, Option::None)), (-1).to_int16());
+    testing::assert_eq(expect_int32(view.get_int32(4, Option::None)), (-1).to_int32());
+    testing::assert_eq(expect_uint32(view.get_uint32(8, Option::None)), 0.to_uint32())
+}
+
+#[test]
+fn data_view_float_codecs_preserve_endianness_nan_and_negative_zero() -> unit {
+    let buffer = expect_buffer(ArrayBuffer::new(24));
+    let view = expect_view(DataView::new(buffer, 0, Option::None));
+    let zero = 0.0;
+    let negative_zero_input = -1.0 / (1.0 / zero);
+    expect_unit(view.set_float32(0, 1.5, Option::None));
+    expect_unit(view.set_float32(4, 1.5, Option::Some(true)));
+    expect_unit(view.set_float64(8, negative_zero_input, Option::None));
+    expect_unit(view.set_float64(16, zero / zero, Option::Some(true)));
+    let bytes = expect_bytes(buffer.to_bytes());
+    assert_bytes(byte_range(bytes, 0, 8), Vec::[0x3f, 0xc0, 0, 0, 0, 0, 0xc0, 0x3f]);
+    testing::assert_eq(expect_float32(view.get_float32(0, Option::None)), 1.5);
+    testing::assert_eq(expect_float32(view.get_float32(4, Option::Some(true))), 1.5);
+    let negative_zero = expect_float64(view.get_float64(8, Option::None));
+    testing::assert(negative_zero == 0.0);
+    testing::assert(1.0 / negative_zero < 0.0);
+    testing::assert(math::is_nan(expect_float64(view.get_float64(16, Option::Some(true)))))
+}
+
+#[test]
+fn data_view_float16_rounds_and_preserves_endianness() -> unit {
+    let buffer = expect_buffer(ArrayBuffer::new(6));
+    let view = expect_view(DataView::new(buffer, 0, Option::None));
+    expect_unit(view.set_float16(0, 1.337, Option::None));
+    expect_unit(view.set_float16(2, 1.337, Option::Some(true)));
+    let zero = 0.0;
+    expect_unit(view.set_float16(4, -1.0 / (1.0 / zero), Option::None));
+    assert_bytes(expect_bytes(buffer.to_bytes()), Vec::[0x3d, 0x59, 0x59, 0x3d, 0x80, 0x00]);
+    testing::assert_eq(expect_float64(view.get_float16(0, Option::None)), 1.3369140625);
+    testing::assert_eq(expect_float64(view.get_float16(2, Option::Some(true))), 1.3369140625);
+    testing::assert(1.0 / expect_float64(view.get_float16(4, Option::None)) < 0.0)
+}
+
+#[test]
+fn data_view_allows_unaligned_multibyte_access() -> unit {
+    let view = expect_view(DataView::new(expect_buffer(ArrayBuffer::new(6)), 1, Option::Some(5)));
+    expect_unit(view.set_uint32(1, 16909060.0, Option::None));
+    testing::assert_eq(expect_uint32(view.get_uint32(1, Option::None)), 0x01020304.to_uint32())
+}
+
+#[test]
+fn uint8_array_aliases_storage_and_converts_numbers_modulo_256() -> unit {
+    let buffer = expect_buffer(ArrayBuffer::new(6));
+    let array = expect_uint8_array(Uint8Array::from_buffer(buffer, 1, Option::Some(4)));
+    testing::assert_eq(array.length(), 4);
+    testing::assert_eq(array.byte_length(), 4);
+    testing::assert_eq(array.byte_offset(), 1);
+    expect_unit(array.set(0, -1.9));
+    expect_unit(array.set(1, 257.9));
+    let zero = 0.0;
+    expect_unit(array.set(2, 1.0 / zero));
+    testing::assert_eq(expect_uint8(array.get(0)), 255.to_uint8());
+    testing::assert_eq(expect_uint8(array.get(1)), 1.to_uint8());
+    testing::assert_eq(expect_uint8(array.get(2)), 0.to_uint8());
+    let view = expect_view(DataView::new(buffer, 0, Option::None));
+    testing::assert_eq(expect_uint8(view.get_uint8(1)), 255.to_uint8())
+}
+
+#[test]
+fn int32_array_enforces_alignment_uses_little_endian_and_converts_numbers() -> unit {
+    let buffer = expect_buffer(ArrayBuffer::new(12));
+    let array = expect_int32_array(Int32Array::from_buffer(buffer, 4, Option::Some(2)));
+    expect_unit(array.set(0, 4294967295.0));
+    expect_unit(array.set(1, 4294967297.0));
+    testing::assert_eq(expect_int32(array.get(0)), (-1).to_int32());
+    testing::assert_eq(expect_int32(array.get(1)), 1.to_int32());
+    let bytes = expect_bytes(buffer.to_bytes());
+    assert_bytes(byte_range(bytes, 4, 12), Vec::[0xff, 0xff, 0xff, 0xff, 1, 0, 0, 0]);
+    let _ = expect_error(
+        Int32Array::from_buffer(buffer, 2, Option::Some(1)),
+        BufferErrorClass::RangeError,
+        BufferErrorReason::MisalignedOffset,
+    );
+    let odd = expect_buffer(ArrayBuffer::new(5));
+    let _ = expect_error(
+        Int32Array::from_buffer(odd, 0, Option::None),
+        BufferErrorClass::RangeError,
+        BufferErrorReason::LengthOutOfRange,
+    );
+}
+
+#[test]
+fn float64_array_preserves_nan_negative_zero_and_data_view_aliasing() -> unit {
+    let buffer = expect_buffer(ArrayBuffer::new(16));
+    let array = expect_float64_array(Float64Array::from_buffer(buffer, 0, Option::None));
+    let zero = 0.0;
+    let negative_zero_input = -1.0 / (1.0 / zero);
+    expect_unit(array.set(0, negative_zero_input));
+    expect_unit(array.set(1, zero / zero));
+    let negative_zero = expect_float64(array.get(0));
+    testing::assert(negative_zero == 0.0 && 1.0 / negative_zero < 0.0);
+    testing::assert(math::is_nan(expect_float64(array.get(1))));
+    let view = expect_view(DataView::new(buffer, 0, Option::None));
+    testing::assert(1.0 / expect_float64(view.get_float64(0, Option::Some(true))) < 0.0);
+    testing::assert(math::is_nan(expect_float64(view.get_float64(8, Option::Some(true)))))
+}
+
+#[test]
+fn typed_subarray_uses_relative_indices_and_aliases_the_parent() -> unit {
+    let array = expect_uint8_array(Uint8Array::new(5));
+    let mut index = 0;
+    while index < 5 {
+        expect_unit(array.set(index, small_number(index + 1)));
+        index += 1;
+    }
+    let subarray = expect_uint8_array(array.subarray(-4, -1));
+    testing::assert_eq(subarray.length(), 3);
+    testing::assert_eq(subarray.byte_offset(), 1);
+    expect_unit(subarray.set(0, 99.0));
+    testing::assert_eq(expect_uint8(array.get(1)), 99.to_uint8())
+}
+
+#[test]
+fn uint8_array_set_from_snapshots_overlapping_sources() -> unit {
+    let array = expect_uint8_array(Uint8Array::new(5));
+    let mut index = 0;
+    while index < 5 {
+        expect_unit(array.set(index, small_number(index + 1)));
+        index += 1;
+    }
+    let source = expect_uint8_array(array.subarray(0, 4));
+    expect_unit(array.set_from(source, 1));
+    let mut expected: Vec[byte] = Vec::[1, 1, 2, 3, 4];
+    index = 0;
+    while index < expected.len() {
+        testing::assert_eq(expect_uint8(array.get(index)), expected[index]);
+        index += 1;
+    }
+    let reverse_source = expect_uint8_array(array.subarray(1, 5));
+    expect_unit(array.set_from(reverse_source, 0));
+    expected = Vec::[1, 2, 3, 4, 4];
+    index = 0;
+    while index < expected.len() {
+        testing::assert_eq(expect_uint8(array.get(index)), expected[index]);
+        index += 1;
+    }
+}
+
+#[test]
+fn int32_and_float64_set_from_preserve_overlapping_values() -> unit {
+    let integers = expect_int32_array(Int32Array::new(4));
+    expect_unit(integers.set(0, 10.0));
+    expect_unit(integers.set(1, 20.0));
+    expect_unit(integers.set(2, 30.0));
+    let integer_source = expect_int32_array(integers.subarray(0, 3));
+    expect_unit(integers.set_from(integer_source, 1));
+    testing::assert_eq(expect_int32(integers.get(1)), 10.to_int32());
+    testing::assert_eq(expect_int32(integers.get(2)), 20.to_int32());
+    testing::assert_eq(expect_int32(integers.get(3)), 30.to_int32());
+    let floats = expect_float64_array(Float64Array::new(3));
+    let zero = 0.0;
+    let negative_zero_input = -1.0 / (1.0 / zero);
+    expect_unit(floats.set(0, 1.25));
+    expect_unit(floats.set(1, negative_zero_input));
+    let float_source = expect_float64_array(floats.subarray(0, 2));
+    expect_unit(floats.set_from(float_source, 1));
+    testing::assert_eq(expect_float64(floats.get(1)), 1.25);
+    let negative_zero = expect_float64(floats.get(2));
+    testing::assert(negative_zero == 0.0 && 1.0 / negative_zero < 0.0)
+}
+
+#[test]
+fn typed_array_bounds_and_bulk_copy_fail_without_partial_writes() -> unit {
+    let target = expect_uint8_array(Uint8Array::new(3));
+    expect_unit(target.set(0, 9.0));
+    let source = expect_uint8_array(Uint8Array::new(2));
+    expect_unit(source.set(0, 1.0));
+    expect_unit(source.set(1, 2.0));
+    let _ = expect_error(
+        target.get(3),
+        BufferErrorClass::RangeError,
+        BufferErrorReason::IndexOutOfRange,
+    );
+    let _ = expect_error(
+        target.set_from(source, 2),
+        BufferErrorClass::RangeError,
+        BufferErrorReason::LengthOutOfRange,
+    );
+    testing::assert_eq(expect_uint8(target.get(0)), 9.to_uint8());
+    testing::assert_eq(expect_uint8(target.get(1)), 0.to_uint8())
+}
+
+#[test]
+fn detachment_zeros_typed_metadata_and_invalidates_all_operations() -> unit {
+    let integers = expect_int32_array(Int32Array::new(2));
+    let buffer = integers.buffer();
+    let view = expect_view(DataView::new(buffer, 0, Option::None));
+    expect_unit(buffer.detach());
+    testing::assert_eq(integers.length(), 0);
+    testing::assert_eq(integers.byte_length(), 0);
+    testing::assert_eq(integers.byte_offset(), 0);
+    let _ = expect_error(
+        integers.get(0),
+        BufferErrorClass::TypeError,
+        BufferErrorReason::DetachedBuffer,
+    );
+    let _ = expect_error(
+        view.byte_length(),
+        BufferErrorClass::TypeError,
+        BufferErrorReason::DetachedBuffer,
+    );
+}
+
+#[test]
+fn numeric_array_kinds_apply_ecmascript_conversions_and_alias_buffers() -> unit {
+    let clamped = expect_numeric_array(NumericArray::new(NumericArrayKind::Uint8Clamped, 7));
+    let zero = 0.0;
+    for (index, value) in Vec::[
+        (0, zero / zero),
+        (1, -1.0),
+        (2, 0.5),
+        (3, 1.5),
+        (4, 2.5),
+        (5, 254.6),
+        (6, 300.0),
+    ] {
+        expect_unit(clamped.set(index, value))
+    }
+    for (index, expected) in Vec::[
+        (0, 0.0),
+        (1, 0.0),
+        (2, 0.0),
+        (3, 2.0),
+        (4, 2.0),
+        (5, 255.0),
+        (6, 255.0),
+    ] {
+        testing::assert_eq(expect_float64(clamped.get(index)), expected)
+    }
+    let signed = expect_numeric_array(NumericArray::new(NumericArrayKind::Int8, 1));
+    expect_unit(signed.set(0, 255.0));
+    testing::assert_eq(expect_float64(signed.get(0)), -1.0);
+    let signed16 = expect_numeric_array(NumericArray::new(NumericArrayKind::Int16, 1));
+    expect_unit(signed16.set(0, 65535.0));
+    testing::assert_eq(expect_float64(signed16.get(0)), -1.0);
+    let unsigned16 = expect_numeric_array(NumericArray::new(NumericArrayKind::Uint16, 1));
+    expect_unit(unsigned16.set(0, -1.0));
+    testing::assert_eq(expect_float64(unsigned16.get(0)), 65535.0);
+    let unsigned32 = expect_numeric_array(NumericArray::new(NumericArrayKind::Uint32, 1));
+    expect_unit(unsigned32.set(0, -1.0));
+    testing::assert_eq(expect_float64(unsigned32.get(0)), 4294967295.0);
+    let buffer = expect_buffer(ArrayBuffer::new(4));
+    let single_precision = expect_numeric_array(
+        NumericArray::from_buffer(NumericArrayKind::Float32, buffer, 0, Option::None),
+    );
+    expect_unit(single_precision.set(0, 1.337));
+    let view = expect_view(DataView::new(buffer, 0, Option::None));
+    testing::assert_eq(
+        expect_float64(single_precision.get(0)),
+        widen_float32(expect_float32(view.get_float32(0, Option::Some(true)))),
+    )
+}
+
+#[test]
+fn float16_array_rounds_values_and_aliases_data_view() -> unit {
+    let buffer = expect_buffer(ArrayBuffer::new(8));
+    let values = expect_numeric_array(
+        NumericArray::from_buffer(NumericArrayKind::Float16, buffer, 0, Option::None),
+    );
+    for (index, value) in Vec::[(0, 1.337), (1, 1.00048828125), (2, 65520.0)] {
+        expect_unit(values.set(index, value))
+    }
+    let zero = 0.0;
+    expect_unit(values.set(3, -1.0 / (1.0 / zero)));
+    testing::assert_eq(expect_float64(values.get(0)), 1.3369140625);
+    testing::assert_eq(expect_float64(values.get(1)), 1.0);
+    testing::assert(math::is_infinite(expect_float64(values.get(2))));
+    testing::assert(1.0 / expect_float64(values.get(3)) < 0.0);
+    let view = expect_view(DataView::new(buffer, 0, Option::None));
+    testing::assert_eq(expect_float64(view.get_float16(0, Option::Some(true))), 1.3369140625)
+}
+
+#[test]
+fn bigint_array_kinds_truncate_to_64_bit_twos_complement() -> unit {
+    let signed = expect_bigint_array(BigIntArray::new(BigIntArrayKind::Signed, 5));
+    let signed_values = Vec::[
+        bigint::parse("0").unwrap_or(bigint::BigInteger::zero()),
+        bigint::parse("9223372036854775807").unwrap_or(bigint::BigInteger::zero()),
+        bigint::parse("9223372036854775808").unwrap_or(bigint::BigInteger::zero()),
+        bigint::parse("-1").unwrap_or(bigint::BigInteger::zero()),
+        bigint::parse("-9223372036854775809").unwrap_or(bigint::BigInteger::zero()),
+    ];
+    let signed_expected = Vec::[
+        "0",
+        "9223372036854775807",
+        "-9223372036854775808",
+        "-1",
+        "9223372036854775807",
+    ];
+    let mut index = 0;
+    while index < signed_values.len() {
+        expect_unit(signed.set(index, signed_values[index]));
+        match signed.get(index) {
+            Ok(value) => testing::assert_eq(value.to_string(), signed_expected[index]),
+            Err(value) => testing::fail(value.to_string()),
+        };
+        index += 1;
+    }
+    let unsigned = expect_bigint_array(BigIntArray::new(BigIntArrayKind::Unsigned, 3));
+    let unsigned_values = Vec::[
+        bigint::parse("-1").unwrap_or(bigint::BigInteger::zero()),
+        bigint::parse("18446744073709551616").unwrap_or(bigint::BigInteger::zero()),
+        bigint::parse("18446744073709551617").unwrap_or(bigint::BigInteger::zero()),
+    ];
+    let unsigned_expected = Vec::["18446744073709551615", "0", "1"];
+    index = 0;
+    while index < unsigned_values.len() {
+        expect_unit(unsigned.set(index, unsigned_values[index]));
+        match unsigned.get(index) {
+            Ok(value) => testing::assert_eq(value.to_string(), unsigned_expected[index]),
+            Err(value) => testing::fail(value.to_string()),
+        };
+        index += 1;
+    }
+    let aliased = expect_bigint_array(
+        BigIntArray::from_buffer(BigIntArrayKind::Unsigned, signed.buffer(), 0, Option::Some(1)),
+    );
+    expect_unit(signed.set(0, bigint::BigInteger::from_int64(-1)));
+    match aliased.get(0) {
+        Ok(value) => testing::assert_eq(value.to_string(), "18446744073709551615"),
+        Err(value) => testing::fail(value.to_string()),
+    }
+}

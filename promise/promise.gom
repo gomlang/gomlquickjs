@@ -1,0 +1,653 @@
+package promise;
+
+use gomlang::quickjs::runtime;
+
+pub type PromiseJob = () -> unit;
+
+pub struct JobQueue {
+    jobs_value: Vec[PromiseJob],
+}
+
+impl JobQueue {
+    pub fn new() -> JobQueue {
+        JobQueue { jobs_value: Vec::[] }
+    }
+
+    pub fn len(self: JobQueue) -> int {
+        self.jobs_value.len()
+    }
+
+    pub fn is_empty(self: JobQueue) -> bool {
+        self.jobs_value.is_empty()
+    }
+
+    pub fn enqueue(self: JobQueue, job: PromiseJob) -> unit {
+        self.jobs_value.push(job)
+    }
+
+    pub fn run_one(self: JobQueue) -> bool {
+        if self.jobs_value.is_empty() {
+            false
+        } else {
+            let job = self.jobs_value.remove(0);
+            job();
+            true
+        }
+    }
+
+    pub fn run_all(self: JobQueue) -> int {
+        let mut count = 0;
+        while self.run_one() {
+            count += 1;
+        }
+        count
+    }
+}
+
+pub struct AggregateFailure {
+    pub errors: Vec[PromiseFailure],
+}
+
+pub enum PromiseFailure {
+    Rejection(runtime::Value),
+    TypeError(string),
+    Aggregate(AggregateFailure),
+}
+
+pub enum PromiseSettlement {
+    Fulfilled(runtime::Value),
+    Rejected(PromiseFailure),
+}
+
+pub enum PromiseFulfillment {
+    Value(runtime::Value),
+    Values(Vec[runtime::Value]),
+    Settlements(Vec[PromiseSettlement]),
+}
+
+pub type PromiseHandlerResult = Result[PromiseResolution, PromiseFailure];
+
+pub type FulfillHandler = (PromiseFulfillment) -> PromiseHandlerResult;
+
+pub type RejectHandler = (PromiseFailure) -> PromiseHandlerResult;
+
+pub type FinallyHandler = () -> PromiseHandlerResult;
+
+pub type ThenableExecutor = (PromiseCapability) -> Result[unit, PromiseFailure];
+
+pub enum PromiseResolution {
+    Fulfillment(PromiseFulfillment),
+    Promise(Promise),
+    Thenable(ThenableExecutor),
+}
+
+pub enum PromiseState {
+    Pending,
+    Fulfilled(PromiseFulfillment),
+    Rejected(PromiseFailure),
+}
+
+enum ReactionInput {
+    Fulfilled(PromiseFulfillment),
+    Rejected(PromiseFailure),
+}
+
+struct PromiseReaction {
+    on_fulfilled: Option[FulfillHandler],
+    on_rejected: Option[RejectHandler],
+    capability: PromiseCapability,
+}
+
+pub struct Promise {
+    identity_value: Ref[bool],
+    state_value: Ref[PromiseState],
+    reactions_value: Vec[PromiseReaction],
+    queue_value: JobQueue,
+    resolution_locked_value: Ref[bool],
+}
+
+pub struct PromiseCapability {
+    promise_value: Promise,
+    already_resolved_value: Ref[bool],
+    continuation_value: bool,
+}
+
+fn promise_pending(queue: JobQueue) -> Promise {
+    Promise {
+        identity_value: Ref::new(false),
+        state_value: Ref::new(PromiseState::Pending),
+        reactions_value: Vec::[],
+        queue_value: queue,
+        resolution_locked_value: Ref::new(false),
+    }
+}
+
+fn continuation_capability(promise: Promise) -> PromiseCapability {
+    PromiseCapability {
+        promise_value: promise,
+        already_resolved_value: Ref::new(false),
+        continuation_value: true,
+    }
+}
+
+fn primary_capability(promise: Promise) -> PromiseCapability {
+    PromiseCapability {
+        promise_value: promise,
+        already_resolved_value: Ref::new(false),
+        continuation_value: false,
+    }
+}
+
+fn promise_is_pending(promise: Promise) -> bool {
+    match promise.state_value.get() {
+        PromiseState::Pending => true,
+        _ => false,
+    }
+}
+
+fn run_reaction(reaction: PromiseReaction, input: ReactionInput) -> unit {
+    match input {
+        ReactionInput::Fulfilled(value) => match reaction.on_fulfilled {
+            Some(handler) => match handler(value) {
+                Ok(resolution) => {
+                    let _ = reaction.capability.resolve(resolution);
+                },
+                Err(error) => {
+                    let _ = reaction.capability.reject(error);
+                },
+            },
+            None => {
+                let _ = reaction.capability.resolve(PromiseResolution::Fulfillment(value));
+            },
+        },
+        ReactionInput::Rejected(error) => match reaction.on_rejected {
+            Some(handler) => match handler(error) {
+                Ok(resolution) => {
+                    let _ = reaction.capability.resolve(resolution);
+                },
+                Err(error) => {
+                    let _ = reaction.capability.reject(error);
+                },
+            },
+            None => {
+                let _ = reaction.capability.reject(error);
+            },
+        },
+    }
+}
+
+fn enqueue_reaction(queue: JobQueue, reaction: PromiseReaction, input: ReactionInput) -> unit {
+    queue.enqueue(|| run_reaction(reaction, input))
+}
+
+fn drain_reactions(promise: Promise, input: ReactionInput) -> unit {
+    while !promise.reactions_value.is_empty() {
+        let reaction = promise.reactions_value.remove(0);
+        enqueue_reaction(promise.queue_value, reaction, input)
+    }
+}
+
+fn fulfill_internal(promise: Promise, value: PromiseFulfillment) -> bool {
+    if !promise_is_pending(promise) {
+        false
+    } else {
+        promise.state_value.set(PromiseState::Fulfilled(value));
+        drain_reactions(promise, ReactionInput::Fulfilled(value));
+        true
+    }
+}
+
+fn reject_internal(promise: Promise, error: PromiseFailure) -> bool {
+    if !promise_is_pending(promise) {
+        false
+    } else {
+        promise.state_value.set(PromiseState::Rejected(error));
+        drain_reactions(promise, ReactionInput::Rejected(error));
+        true
+    }
+}
+
+fn adopt_promise(target: Promise, source: Promise) -> unit {
+    let capability = continuation_capability(target);
+    let reaction = PromiseReaction {
+        on_fulfilled: Option::None,
+        on_rejected: Option::None,
+        capability,
+    };
+    match source.state_value.get() {
+        PromiseState::Pending => source.reactions_value.push(reaction),
+        PromiseState::Fulfilled(value) => {
+            enqueue_reaction(source.queue_value, reaction, ReactionInput::Fulfilled(value))
+        },
+        PromiseState::Rejected(error) => {
+            enqueue_reaction(source.queue_value, reaction, ReactionInput::Rejected(error))
+        },
+    }
+}
+
+fn execute_thenable(executor: ThenableExecutor, capability: PromiseCapability) -> unit {
+    match executor(capability) {
+        Ok(()) => (),
+        Err(error) => {
+            let _ = capability.reject(error);
+        },
+    }
+}
+
+fn continue_resolution(promise: Promise, resolution: PromiseResolution) -> bool {
+    match resolution {
+        PromiseResolution::Fulfillment(value) => fulfill_internal(promise, value),
+        PromiseResolution::Promise(source) => if promise.same(source) {
+            reject_internal(promise, PromiseFailure::TypeError("promise cannot resolve itself"))
+        } else {
+            adopt_promise(promise, source);
+            true
+        },
+        PromiseResolution::Thenable(executor) => {
+            let capability = continuation_capability(promise);
+            promise.queue_value.enqueue(|| execute_thenable(executor, capability));
+            true
+        },
+    }
+}
+
+fn begin_resolution(promise: Promise, resolution: PromiseResolution) -> bool {
+    if promise.resolution_locked_value.get() || !promise_is_pending(promise) {
+        false
+    } else {
+        promise.resolution_locked_value.set(true);
+        continue_resolution(promise, resolution)
+    }
+}
+
+fn begin_rejection(promise: Promise, error: PromiseFailure) -> bool {
+    if promise.resolution_locked_value.get() || !promise_is_pending(promise) {
+        false
+    } else {
+        promise.resolution_locked_value.set(true);
+        reject_internal(promise, error)
+    }
+}
+
+fn register_reaction(promise: Promise, reaction: PromiseReaction) -> unit {
+    match promise.state_value.get() {
+        PromiseState::Pending => promise.reactions_value.push(reaction),
+        PromiseState::Fulfilled(value) => {
+            enqueue_reaction(promise.queue_value, reaction, ReactionInput::Fulfilled(value))
+        },
+        PromiseState::Rejected(error) => {
+            enqueue_reaction(promise.queue_value, reaction, ReactionInput::Rejected(error))
+        },
+    }
+}
+
+fn finally_fulfilled(queue: JobQueue, handler: FinallyHandler, original: PromiseFulfillment) -> PromiseHandlerResult {
+    let resolution = handler()?;
+    let awaited = Promise::resolved(queue, resolution);
+    let preserved = awaited.then(
+        Option::Some(|_| Result::Ok(PromiseResolution::Fulfillment(original))),
+        Option::None,
+    );
+    Result::Ok(PromiseResolution::Promise(preserved))
+}
+
+fn finally_rejected(queue: JobQueue, handler: FinallyHandler, original: PromiseFailure) -> PromiseHandlerResult {
+    let resolution = handler()?;
+    let awaited = Promise::resolved(queue, resolution);
+    let preserved = awaited.then(Option::Some(|_| Result::Err(original)), Option::None);
+    Result::Ok(PromiseResolution::Promise(preserved))
+}
+
+impl PromiseCapability {
+    pub fn new(queue: JobQueue) -> PromiseCapability {
+        primary_capability(promise_pending(queue))
+    }
+
+    pub fn promise(self: PromiseCapability) -> Promise {
+        self.promise_value
+    }
+
+    pub fn resolve(self: PromiseCapability, resolution: PromiseResolution) -> bool {
+        if self.already_resolved_value.get() {
+            false
+        } else {
+            self.already_resolved_value.set(true);
+            if self.continuation_value {
+                continue_resolution(self.promise_value, resolution)
+            } else {
+                begin_resolution(self.promise_value, resolution)
+            }
+        }
+    }
+
+    pub fn reject(self: PromiseCapability, error: PromiseFailure) -> bool {
+        if self.already_resolved_value.get() {
+            false
+        } else {
+            self.already_resolved_value.set(true);
+            if self.continuation_value {
+                reject_internal(self.promise_value, error)
+            } else {
+                begin_rejection(self.promise_value, error)
+            }
+        }
+    }
+}
+
+impl Promise {
+    pub fn pending(queue: JobQueue) -> Promise {
+        promise_pending(queue)
+    }
+
+    pub fn fulfilled(queue: JobQueue, value: runtime::Value) -> Promise {
+        Promise::resolved(queue, PromiseResolution::Fulfillment(PromiseFulfillment::Value(value)))
+    }
+
+    pub fn rejected(queue: JobQueue, error: PromiseFailure) -> Promise {
+        let promise = promise_pending(queue);
+        let _ = begin_rejection(promise, error);
+        promise
+    }
+
+    pub fn resolved(queue: JobQueue, resolution: PromiseResolution) -> Promise {
+        let promise = promise_pending(queue);
+        let _ = begin_resolution(promise, resolution);
+        promise
+    }
+
+    pub fn queue(self: Promise) -> JobQueue {
+        self.queue_value
+    }
+
+    pub fn state(self: Promise) -> PromiseState {
+        self.state_value.get()
+    }
+
+    pub fn is_pending(self: Promise) -> bool {
+        promise_is_pending(self)
+    }
+
+    pub fn same(self: Promise, other: Promise) -> bool {
+        self.identity_value == other.identity_value
+    }
+
+    pub fn resolve(self: Promise, resolution: PromiseResolution) -> bool {
+        begin_resolution(self, resolution)
+    }
+
+    pub fn reject(self: Promise, error: PromiseFailure) -> bool {
+        begin_rejection(self, error)
+    }
+
+    pub fn then(
+        self: Promise,
+        on_fulfilled: Option[FulfillHandler],
+        on_rejected: Option[RejectHandler],
+    ) -> Promise {
+        let capability = PromiseCapability::new(self.queue_value);
+        let child = capability.promise();
+        register_reaction(self, PromiseReaction { on_fulfilled, on_rejected, capability });
+        child
+    }
+
+    pub fn catch(self: Promise, on_rejected: RejectHandler) -> Promise {
+        self.then(Option::None, Option::Some(on_rejected))
+    }
+
+    pub fn finally(self: Promise, handler: FinallyHandler) -> Promise {
+        let queue = self.queue_value;
+        self.then(
+            Option::Some(|value| finally_fulfilled(queue, handler, value)),
+            Option::Some(|error| finally_rejected(queue, handler, error)),
+        )
+    }
+}
+
+fn scalar_value(value: PromiseFulfillment) -> Result[runtime::Value, PromiseFailure] {
+    match value {
+        PromiseFulfillment::Value(value) => Result::Ok(value),
+        _ => Result::Err(PromiseFailure::TypeError("combinator input is not a scalar value")),
+    }
+}
+
+fn undefined_resolution() -> PromiseHandlerResult {
+    Result::Ok(PromiseResolution::Fulfillment(PromiseFulfillment::Value(runtime::Value::Undefined)))
+}
+
+fn fill_optional_values(length: int) -> Vec[Option[runtime::Value]] {
+    let values: Vec[Option[runtime::Value]] = Vec::with_capacity(length);
+    for _ in 0..length {
+        values.push(Option::None)
+    }
+    values
+}
+
+fn collect_values(values: Vec[Option[runtime::Value]]) -> Vec[runtime::Value] {
+    let output: Vec[runtime::Value] = Vec::with_capacity(values.len());
+    let mut index = 0;
+    while index < values.len() {
+        match values[index] {
+            Some(value) => output.push(value),
+            None => output.push(runtime::Value::Undefined),
+        };
+        index += 1;
+    }
+    output
+}
+
+pub fn all(queue: JobQueue, inputs: Vec[PromiseResolution]) -> Promise {
+    let capability = PromiseCapability::new(queue);
+    let promise = capability.promise();
+    if inputs.is_empty() {
+        let _ = capability.resolve(
+            PromiseResolution::Fulfillment(PromiseFulfillment::Values(Vec::[])),
+        );
+        return promise
+    } else {};
+    let values = fill_optional_values(inputs.len());
+    let remaining = Ref::new(inputs.len());
+    let mut index = 0;
+    while index < inputs.len() {
+        let current = Promise::resolved(queue, inputs[index]);
+        let current_index = index;
+        let _ = current.then(
+            Option::Some(
+                |value| match scalar_value(value) {
+                    Ok(scalar) => {
+                        values[current_index] = Option::Some(scalar);
+                        remaining.set(remaining.get() - 1);
+                        if remaining.get() == 0 {
+                            let _ = capability.resolve(
+                                PromiseResolution::Fulfillment(
+                                    PromiseFulfillment::Values(collect_values(values)),
+                                ),
+                            );
+                        } else {};
+                        undefined_resolution()
+                    },
+                    Err(error) => {
+                        let _ = capability.reject(error);
+                        undefined_resolution()
+                    },
+                },
+            ),
+            Option::Some(
+                |error| {
+                    let _ = capability.reject(error);
+                    undefined_resolution()
+                },
+            ),
+        );
+        index += 1;
+    }
+    promise
+}
+
+pub fn race(queue: JobQueue, inputs: Vec[PromiseResolution]) -> Promise {
+    let capability = PromiseCapability::new(queue);
+    let promise = capability.promise();
+    for input in inputs {
+        let current = Promise::resolved(queue, input);
+        let _ = current.then(
+            Option::Some(
+                |value| {
+                    let _ = capability.resolve(PromiseResolution::Fulfillment(value));
+                    undefined_resolution()
+                },
+            ),
+            Option::Some(
+                |error| {
+                    let _ = capability.reject(error);
+                    undefined_resolution()
+                },
+            ),
+        );
+    }
+    promise
+}
+
+fn fill_optional_settlements(length: int) -> Vec[Option[PromiseSettlement]] {
+    let values: Vec[Option[PromiseSettlement]] = Vec::with_capacity(length);
+    for _ in 0..length {
+        values.push(Option::None)
+    }
+    values
+}
+
+fn collect_settlements(values: Vec[Option[PromiseSettlement]]) -> Vec[PromiseSettlement] {
+    let output: Vec[PromiseSettlement] = Vec::with_capacity(values.len());
+    let mut index = 0;
+    while index < values.len() {
+        match values[index] {
+            Some(value) => output.push(value),
+            None => output.push(PromiseSettlement::Fulfilled(runtime::Value::Undefined)),
+        };
+        index += 1;
+    }
+    output
+}
+
+pub fn all_settled(queue: JobQueue, inputs: Vec[PromiseResolution]) -> Promise {
+    let capability = PromiseCapability::new(queue);
+    let promise = capability.promise();
+    if inputs.is_empty() {
+        let _ = capability.resolve(
+            PromiseResolution::Fulfillment(PromiseFulfillment::Settlements(Vec::[])),
+        );
+        return promise
+    } else {};
+    let values = fill_optional_settlements(inputs.len());
+    let remaining = Ref::new(inputs.len());
+    let mut index = 0;
+    while index < inputs.len() {
+        let current = Promise::resolved(queue, inputs[index]);
+        let current_index = index;
+        let _ = current.then(
+            Option::Some(
+                |value| match scalar_value(value) {
+                    Ok(scalar) => {
+                        values[current_index] = Option::Some(PromiseSettlement::Fulfilled(scalar));
+                        remaining.set(remaining.get() - 1);
+                        if remaining.get() == 0 {
+                            let _ = capability.resolve(
+                                PromiseResolution::Fulfillment(
+                                    PromiseFulfillment::Settlements(collect_settlements(values)),
+                                ),
+                            );
+                        } else {};
+                        undefined_resolution()
+                    },
+                    Err(error) => {
+                        let _ = capability.reject(error);
+                        undefined_resolution()
+                    },
+                },
+            ),
+            Option::Some(
+                |error| {
+                    values[current_index] = Option::Some(PromiseSettlement::Rejected(error));
+                    remaining.set(remaining.get() - 1);
+                    if remaining.get() == 0 {
+                        let _ = capability.resolve(
+                            PromiseResolution::Fulfillment(
+                                PromiseFulfillment::Settlements(collect_settlements(values)),
+                            ),
+                        );
+                    } else {};
+                    undefined_resolution()
+                },
+            ),
+        );
+        index += 1;
+    }
+    promise
+}
+
+fn fill_optional_failures(length: int) -> Vec[Option[PromiseFailure]] {
+    let values: Vec[Option[PromiseFailure]] = Vec::with_capacity(length);
+    for _ in 0..length {
+        values.push(Option::None)
+    }
+    values
+}
+
+fn collect_failures(values: Vec[Option[PromiseFailure]]) -> Vec[PromiseFailure] {
+    let output: Vec[PromiseFailure] = Vec::with_capacity(values.len());
+    let mut index = 0;
+    while index < values.len() {
+        match values[index] {
+            Some(value) => output.push(value),
+            None => output.push(PromiseFailure::Rejection(runtime::Value::Undefined)),
+        };
+        index += 1;
+    }
+    output
+}
+
+pub fn any(queue: JobQueue, inputs: Vec[PromiseResolution]) -> Promise {
+    let capability = PromiseCapability::new(queue);
+    let promise = capability.promise();
+    if inputs.is_empty() {
+        let _ = capability.reject(PromiseFailure::Aggregate(AggregateFailure { errors: Vec::[] }));
+        return promise
+    } else {};
+    let errors = fill_optional_failures(inputs.len());
+    let remaining = Ref::new(inputs.len());
+    let mut index = 0;
+    while index < inputs.len() {
+        let current = Promise::resolved(queue, inputs[index]);
+        let current_index = index;
+        let _ = current.then(
+            Option::Some(
+                |value| {
+                    let _ = capability.resolve(PromiseResolution::Fulfillment(value));
+                    undefined_resolution()
+                },
+            ),
+            Option::Some(
+                |error| {
+                    errors[current_index] = Option::Some(error);
+                    remaining.set(remaining.get() - 1);
+                    if remaining.get() == 0 {
+                        let _ = capability.reject(
+                            PromiseFailure::Aggregate(
+                                AggregateFailure { errors: collect_failures(errors) },
+                            ),
+                        );
+                    } else {};
+                    undefined_resolution()
+                },
+            ),
+        );
+        index += 1;
+    }
+    promise
+}
+
+pub fn value(value: runtime::Value) -> PromiseResolution {
+    PromiseResolution::Fulfillment(PromiseFulfillment::Value(value))
+}
+
+pub fn rejected_value(value: runtime::Value) -> PromiseFailure {
+    PromiseFailure::Rejection(value)
+}

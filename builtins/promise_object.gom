@@ -1,0 +1,1950 @@
+package builtins;
+
+use gomlang::quickjs::bytecode;
+use gomlang::quickjs::promise;
+use gomlang::quickjs::runtime;
+use gomlang::quickjs::vm;
+
+fn promise_object_state(states: HashMap[runtime::ObjectId, promise::Promise], value: runtime::Value) -> Result[
+    promise::Promise,
+    vm::NativeError,
+] {
+    match value {
+        runtime::Value::Object(object) => match states.get(object) {
+            Some(value) => Result::Ok(value),
+            None => Result::Err(native_error("Promise method called on incompatible receiver")),
+        },
+        _ => Result::Err(native_error("Promise method called on incompatible receiver")),
+    }
+}
+
+fn promise_object_callable(value: runtime::Value) -> bool {
+    match value {
+        runtime::Value::Object(object) => object.is_callable(),
+        _ => false,
+    }
+}
+
+fn promise_object_invoke(
+    context: vm::Context,
+    callable: runtime::Value,
+    arguments: Vec[runtime::Value],
+) -> Result[runtime::Value, vm::VmError] {
+    let code: Vec[bytecode::Instruction] = Vec::[bytecode::Instruction::GetLoc(0)];
+    let mut index = 0;
+    while index < arguments.len() {
+        code.push(bytecode::Instruction::GetLoc(index + 1));
+        index += 1;
+    }
+    code.push(bytecode::Instruction::Call(arguments.len()));
+    code.push(bytecode::Instruction::Return);
+    let locals: Vec[runtime::Value] = Vec::with_capacity(arguments.len() + 1);
+    locals.push(callable);
+    for value in arguments {
+        locals.push(value)
+    }
+    context.execute_with_locals(bytecode::Function::new(Vec::[], code, locals.len()), locals)
+}
+
+fn promise_object_invoke_method(
+    context: vm::Context,
+    receiver: runtime::Value,
+    callable: runtime::Value,
+    arguments: Vec[runtime::Value],
+) -> Result[runtime::Value, vm::VmError] {
+    let code: Vec[bytecode::Instruction] = Vec::[
+        bytecode::Instruction::GetLoc(0),
+        bytecode::Instruction::GetLoc(1),
+    ];
+    let mut index = 0;
+    while index < arguments.len() {
+        code.push(bytecode::Instruction::GetLoc(index + 2));
+        index += 1;
+    }
+    code.push(bytecode::Instruction::CallMethod(arguments.len()));
+    code.push(bytecode::Instruction::Return);
+    let locals: Vec[runtime::Value] = Vec::with_capacity(arguments.len() + 2);
+    locals.push(receiver);
+    locals.push(callable);
+    for value in arguments {
+        locals.push(value)
+    }
+    context.execute_with_locals(bytecode::Function::new(Vec::[], code, locals.len()), locals)
+}
+
+fn promise_object_vm_failure(error: vm::VmError) -> promise::PromiseFailure {
+    match error.kind {
+        vm::VmErrorKind::Thrown(value) => promise::PromiseFailure::Rejection(value),
+        vm::VmErrorKind::TypeError(message) => promise::PromiseFailure::Rejection(
+            runtime::Value::String(js_string("TypeError: " + message)),
+        ),
+        vm::VmErrorKind::RangeError(message) => promise::PromiseFailure::Rejection(
+            runtime::Value::String(js_string("RangeError: " + message)),
+        ),
+        vm::VmErrorKind::CallDepthExceeded => promise::PromiseFailure::Rejection(
+            runtime::Value::String(js_string("InternalError: call depth exceeded")),
+        ),
+        value => promise::PromiseFailure::Rejection(
+            runtime::Value::String(js_string("RuntimeError: " + value.debug())),
+        ),
+    }
+}
+
+fn promise_object_failure_value(heap: runtime::Heap, failure: promise::PromiseFailure) -> Result[
+    runtime::Value,
+    vm::NativeError,
+] {
+    match failure {
+        promise::PromiseFailure::Rejection(value) => Result::Ok(value),
+        promise::PromiseFailure::TypeError(message) => {
+            promise_object_named_error(heap, "TypeError", message)
+        },
+        promise::PromiseFailure::Aggregate(aggregate) => {
+            let errors: Vec[runtime::Value] = Vec::with_capacity(aggregate.errors.len());
+            for error in aggregate.errors {
+                errors.push(promise_object_failure_value(heap, error)?)
+            }
+            let errors_object = allocate_array(heap, errors, errors.len())?;
+            let object = allocate_ordinary(heap, Option::None)?;
+            define_data(
+                heap,
+                object,
+                runtime::string_property_key("name"),
+                runtime::Value::String(js_string("AggregateError")),
+                true,
+                false,
+                true,
+            )?;
+            define_data(
+                heap,
+                object,
+                runtime::string_property_key("message"),
+                runtime::Value::String(js_string("All promises were rejected")),
+                true,
+                false,
+                true,
+            )?;
+            define_data(
+                heap,
+                object,
+                runtime::string_property_key("errors"),
+                runtime::Value::Object(errors_object),
+                true,
+                false,
+                true,
+            )?;
+            Result::Ok(runtime::Value::Object(object))
+        },
+    }
+}
+
+fn promise_object_named_error(heap: runtime::Heap, name: string, message: string) -> Result[
+    runtime::Value,
+    vm::NativeError,
+] {
+    let object = allocate_ordinary(heap, Option::None)?;
+    define_data(
+        heap,
+        object,
+        runtime::string_property_key("name"),
+        runtime::Value::String(js_string(name)),
+        true,
+        false,
+        true,
+    )?;
+    define_data(
+        heap,
+        object,
+        runtime::string_property_key("message"),
+        runtime::Value::String(js_string(message)),
+        true,
+        false,
+        true,
+    )?;
+    Result::Ok(runtime::Value::Object(object))
+}
+
+fn promise_object_settlement_value(heap: runtime::Heap, settlement: promise::PromiseSettlement) -> Result[
+    runtime::Value,
+    vm::NativeError,
+] {
+    let object = allocate_ordinary(heap, Option::None)?;
+    match settlement {
+        promise::PromiseSettlement::Fulfilled(value) => {
+            define_data(
+                heap,
+                object,
+                runtime::string_property_key("status"),
+                runtime::Value::String(js_string("fulfilled")),
+                true,
+                true,
+                true,
+            )?;
+            define_data(
+                heap,
+                object,
+                runtime::string_property_key("value"),
+                value,
+                true,
+                true,
+                true,
+            )?
+        },
+        promise::PromiseSettlement::Rejected(error) => {
+            define_data(
+                heap,
+                object,
+                runtime::string_property_key("status"),
+                runtime::Value::String(js_string("rejected")),
+                true,
+                true,
+                true,
+            )?;
+            define_data(
+                heap,
+                object,
+                runtime::string_property_key("reason"),
+                promise_object_failure_value(heap, error)?,
+                true,
+                true,
+                true,
+            )?
+        },
+    };
+    Result::Ok(runtime::Value::Object(object))
+}
+
+fn promise_object_fulfillment_value(heap: runtime::Heap, fulfillment: promise::PromiseFulfillment) -> Result[
+    runtime::Value,
+    vm::NativeError,
+] {
+    match fulfillment {
+        promise::PromiseFulfillment::Value(value) => Result::Ok(value),
+        promise::PromiseFulfillment::Values(values) => {
+            let object = allocate_array(heap, values, values.len())?;
+            Result::Ok(runtime::Value::Object(object))
+        },
+        promise::PromiseFulfillment::Settlements(settlements) => {
+            let values: Vec[runtime::Value] = Vec::with_capacity(settlements.len());
+            for settlement in settlements {
+                values.push(promise_object_settlement_value(heap, settlement)?)
+            }
+            let object = allocate_array(heap, values, values.len())?;
+            Result::Ok(runtime::Value::Object(object))
+        },
+    }
+}
+
+fn promise_object_wrap(
+    heap: runtime::Heap,
+    states: HashMap[runtime::ObjectId, promise::Promise],
+    prototype: runtime::ObjectId,
+    value: promise::Promise,
+) -> Result[runtime::Value, vm::NativeError] {
+    let object = allocate_ordinary(heap, Option::Some(prototype))?;
+    states[object] = value;
+    Result::Ok(runtime::Value::Object(object))
+}
+
+fn promise_object_new_native(
+    context: vm::Context,
+    callback: (runtime::Heap, runtime::Value, Vec[runtime::Value]) -> Result[
+        runtime::Value,
+        vm::NativeError,
+    ],
+) -> Result[runtime::Value, vm::NativeError] {
+    match context.new_native_function(callback) {
+        Ok(value) => Result::Ok(value),
+        Err(error) => Result::Err(native_error(error.kind.debug())),
+    }
+}
+
+fn promise_object_reject_capability(
+    capability: promise::PromiseCapability,
+    arguments: Vec[runtime::Value],
+) -> Result[runtime::Value, vm::NativeError] {
+    let _ = capability.reject(promise::PromiseFailure::Rejection(argument(arguments, 0)));
+    Result::Ok(runtime::Value::Undefined)
+}
+
+fn promise_object_thenable_execute(
+    context: vm::Context,
+    states: HashMap[runtime::ObjectId, promise::Promise],
+    prototype: runtime::ObjectId,
+    receiver: runtime::Value,
+    then_function: runtime::Value,
+    capability: promise::PromiseCapability,
+) -> Result[unit, promise::PromiseFailure] {
+    let resolve = match promise_object_new_native(
+        context,
+        |heap, _, arguments| {
+            match promise_object_resolution(
+                context,
+                heap,
+                states,
+                prototype,
+                argument(arguments, 0),
+            ) {
+                Ok(resolution) => {
+                    let _ = capability.resolve(resolution);
+                },
+                Err(error) => {
+                    let _ = capability.reject(error);
+                },
+            };
+            Result::Ok(runtime::Value::Undefined)
+        },
+    ) {
+        Ok(value) => value,
+        Err(error) => return Result::Err(promise::PromiseFailure::TypeError(error.message)),
+    };
+    let reject = match promise_object_new_native(
+        context,
+        |_, _, arguments| promise_object_reject_capability(capability, arguments),
+    ) {
+        Ok(value) => value,
+        Err(error) => return Result::Err(promise::PromiseFailure::TypeError(error.message)),
+    };
+    match promise_object_invoke_method(context, receiver, then_function, Vec::[resolve, reject]) {
+        Ok(_) => Result::Ok(()),
+        Err(error) => Result::Err(promise_object_vm_failure(error)),
+    }
+}
+
+fn promise_object_resolution(
+    context: vm::Context,
+    heap: runtime::Heap,
+    states: HashMap[runtime::ObjectId, promise::Promise],
+    prototype: runtime::ObjectId,
+    value: runtime::Value,
+) -> Result[promise::PromiseResolution, promise::PromiseFailure] {
+    match value {
+        runtime::Value::Object(object) => match states.get(object) {
+            Some(value) => Result::Ok(promise::PromiseResolution::Promise(value)),
+            None => {
+                let then_function = match context.read_property_at_depth(
+                    runtime::Value::Object(object),
+                    runtime::Value::String(js_string("then")),
+                    0,
+                ) {
+                    Ok(value) => value,
+                    Err(error) => return Result::Err(promise_object_vm_failure(error)),
+                };
+                if promise_object_callable(then_function) {
+                    Result::Ok(
+                        promise::PromiseResolution::Thenable(
+                            |capability| {
+                                promise_object_thenable_execute(
+                                    context,
+                                    states,
+                                    prototype,
+                                    runtime::Value::Object(object),
+                                    then_function,
+                                    capability,
+                                )
+                            },
+                        ),
+                    )
+                } else {
+                    Result::Ok(promise::value(runtime::Value::Object(object)))
+                }
+            },
+        },
+        _ => Result::Ok(promise::value(value)),
+    }
+}
+
+fn promise_object_async_resume(
+    context: vm::Context,
+    states: HashMap[runtime::ObjectId, promise::Promise],
+    queue: promise::JobQueue,
+    prototype: runtime::ObjectId,
+    capability: promise::PromiseCapability,
+    generator: runtime::Value,
+    input: runtime::Value,
+    throwing: bool,
+    depth: int,
+) -> unit {
+    let result = if throwing {
+        context.throw_generator_raw_at_depth(generator, input, depth)
+    } else {
+        context.resume_generator_raw_at_depth(generator, input, depth)
+    };
+    let value = match result {
+        Ok(vm::GeneratorCompletion::Await(value)) => value,
+        Ok(vm::GeneratorCompletion::Return(value)) => {
+            context.release_async_function(generator);
+            match promise_object_resolution(context, context.heap(), states, prototype, value) {
+                Ok(resolution) => {
+                    let _ = capability.resolve(resolution);
+                },
+                Err(error) => {
+                    let _ = capability.reject(error);
+                },
+            };
+            return
+        },
+        Ok(vm::GeneratorCompletion::Yield(_)) => {
+            context.release_async_function(generator);
+            let _ = capability.reject(
+                promise::PromiseFailure::TypeError("yield escaped an async function frame"),
+            );
+            return
+        },
+        Err(error) => {
+            context.release_async_function(generator);
+            let _ = capability.reject(promise_object_vm_failure(error));
+            return
+        },
+    };
+    let awaited = match promise_object_resolution(context, context.heap(), states, prototype, value) {
+        Ok(resolution) => promise::Promise::resolved(queue, resolution),
+        Err(error) => promise::Promise::rejected(queue, error),
+    };
+    let on_fulfilled: Option[
+        (promise::PromiseFulfillment) -> Result[promise::PromiseResolution, promise::PromiseFailure],
+    ] = Option::Some(
+        |fulfillment| {
+            match promise_object_fulfillment_value(context.heap(), fulfillment) {
+                Ok(value) => {
+                    promise_object_async_resume(
+                        context,
+                        states,
+                        queue,
+                        prototype,
+                        capability,
+                        generator,
+                        value,
+                        false,
+                        depth,
+                    )
+                },
+                Err(error) => {
+                    let _ = capability.reject(promise::PromiseFailure::TypeError(error.message));
+                },
+            };
+            Result::Ok(promise::value(runtime::Value::Undefined))
+        },
+    );
+    let on_rejected: Option[
+        (promise::PromiseFailure) -> Result[promise::PromiseResolution, promise::PromiseFailure],
+    ] = Option::Some(
+        |failure| {
+            match promise_object_failure_value(context.heap(), failure) {
+                Ok(value) => {
+                    promise_object_async_resume(
+                        context,
+                        states,
+                        queue,
+                        prototype,
+                        capability,
+                        generator,
+                        value,
+                        true,
+                        depth,
+                    )
+                },
+                Err(error) => {
+                    let _ = capability.reject(promise::PromiseFailure::TypeError(error.message));
+                },
+            };
+            Result::Ok(promise::value(runtime::Value::Undefined))
+        },
+    );
+    let _ = awaited.then(on_fulfilled, on_rejected);
+}
+
+fn promise_object_async_runner(
+    context: vm::Context,
+    states: HashMap[runtime::ObjectId, promise::Promise],
+    queue: promise::JobQueue,
+    prototype: runtime::ObjectId,
+    generator: runtime::Value,
+    depth: int,
+) -> Result[runtime::Value, vm::VmError] {
+    let capability = promise::PromiseCapability::new(queue);
+    let result = match promise_object_wrap(context.heap(), states, prototype, capability.promise()) {
+        Ok(value) => value,
+        Err(error) => return Result::Err(
+            vm::VmError { offset: -1, kind: vm::VmErrorKind::TypeError(error.message) },
+        ),
+    };
+    context.link_async_function(result, generator)?;
+    promise_object_async_resume(
+        context,
+        states,
+        queue,
+        prototype,
+        capability,
+        generator,
+        runtime::Value::Undefined,
+        false,
+        depth,
+    );
+    Result::Ok(result)
+}
+
+enum AsyncGeneratorRequestKind {
+    Next,
+    Throw,
+    Return,
+}
+
+struct AsyncGeneratorRequest {
+    kind: AsyncGeneratorRequestKind,
+    value: runtime::Value,
+    capability: promise::PromiseCapability,
+    promise_value: runtime::Value,
+    depth: int,
+}
+
+struct AsyncGeneratorState {
+    requests: Vec[AsyncGeneratorRequest],
+    running: Ref[bool],
+}
+
+fn async_generator_update_roots(
+    context: vm::Context,
+    generator: runtime::Value,
+    state: AsyncGeneratorState,
+) -> unit {
+    let roots: Vec[runtime::Value] = Vec::[];
+    for request in state.requests {
+        roots.push(request.value);
+        roots.push(request.promise_value)
+    }
+    context.set_generator_request_roots(generator, roots)
+}
+
+fn async_generator_iteration_result(heap: runtime::Heap, value: runtime::Value, done: bool) -> Result[
+    runtime::Value,
+    promise::PromiseFailure,
+] {
+    let object = match allocate_ordinary(heap, heap.object_prototype()) {
+        Ok(value) => value,
+        Err(error) => return Result::Err(promise::PromiseFailure::TypeError(error.message)),
+    };
+    match define_data(heap, object, runtime::string_property_key("value"), value, true, true, true) {
+        Ok(()) => (),
+        Err(error) => return Result::Err(promise::PromiseFailure::TypeError(error.message)),
+    };
+    match define_data(
+        heap,
+        object,
+        runtime::string_property_key("done"),
+        runtime::Value::Bool(done),
+        true,
+        true,
+        true,
+    ) {
+        Ok(()) => Result::Ok(runtime::Value::Object(object)),
+        Err(error) => Result::Err(promise::PromiseFailure::TypeError(error.message)),
+    }
+}
+
+fn async_generator_process(
+    context: vm::Context,
+    promise_states: HashMap[runtime::ObjectId, promise::Promise],
+    queue: promise::JobQueue,
+    promise_prototype: runtime::ObjectId,
+    generators: HashMap[runtime::ObjectId, AsyncGeneratorState],
+    generator: runtime::Value,
+) -> unit {
+    let object = match generator {
+        runtime::Value::Object(value) => value,
+        _ => return,
+    };
+    let state = match generators.get(object) {
+        Some(value) => value,
+        None => return,
+    };
+    if state.running.get() || state.requests.is_empty() {
+        return
+    } else {};
+    state.running.set(true);
+    let request = state.requests[0];
+    async_generator_resume(
+        context,
+        promise_states,
+        queue,
+        promise_prototype,
+        generators,
+        generator,
+        request,
+        request.kind,
+        request.value,
+    )
+}
+
+fn async_generator_finish(
+    context: vm::Context,
+    promise_states: HashMap[runtime::ObjectId, promise::Promise],
+    queue: promise::JobQueue,
+    promise_prototype: runtime::ObjectId,
+    generators: HashMap[runtime::ObjectId, AsyncGeneratorState],
+    generator: runtime::Value,
+) -> unit {
+    let object = match generator {
+        runtime::Value::Object(value) => value,
+        _ => return,
+    };
+    match generators.get(object) {
+        Some(state) => {
+            if !state.requests.is_empty() {
+                let _ = state.requests.remove(0);
+            } else {};
+            state.running.set(false);
+            async_generator_update_roots(context, generator, state);
+            if state.requests.is_empty() {
+                context.release_async_function(generator)
+            } else {};
+            async_generator_process(
+                context,
+                promise_states,
+                queue,
+                promise_prototype,
+                generators,
+                generator,
+            )
+        },
+        None => (),
+    }
+}
+
+fn async_generator_reject(
+    context: vm::Context,
+    promise_states: HashMap[runtime::ObjectId, promise::Promise],
+    queue: promise::JobQueue,
+    promise_prototype: runtime::ObjectId,
+    generators: HashMap[runtime::ObjectId, AsyncGeneratorState],
+    generator: runtime::Value,
+    request: AsyncGeneratorRequest,
+    failure: promise::PromiseFailure,
+) -> unit {
+    let _ = request.capability.reject(failure);
+    async_generator_finish(context, promise_states, queue, promise_prototype, generators, generator)
+}
+
+fn async_generator_resolve(
+    context: vm::Context,
+    promise_states: HashMap[runtime::ObjectId, promise::Promise],
+    queue: promise::JobQueue,
+    promise_prototype: runtime::ObjectId,
+    generators: HashMap[runtime::ObjectId, AsyncGeneratorState],
+    generator: runtime::Value,
+    request: AsyncGeneratorRequest,
+    value: runtime::Value,
+    done: bool,
+) -> unit {
+    match async_generator_iteration_result(context.heap(), value, done) {
+        Ok(result) => {
+            let _ = request.capability.resolve(promise::value(result));
+        },
+        Err(error) => {
+            let _ = request.capability.reject(error);
+        },
+    };
+    async_generator_finish(context, promise_states, queue, promise_prototype, generators, generator)
+}
+
+fn async_generator_await_resume(
+    context: vm::Context,
+    promise_states: HashMap[runtime::ObjectId, promise::Promise],
+    queue: promise::JobQueue,
+    promise_prototype: runtime::ObjectId,
+    generators: HashMap[runtime::ObjectId, AsyncGeneratorState],
+    generator: runtime::Value,
+    request: AsyncGeneratorRequest,
+    awaited: runtime::Value,
+) -> unit {
+    let promise = match promise_object_resolution(
+        context,
+        context.heap(),
+        promise_states,
+        promise_prototype,
+        awaited,
+    ) {
+        Ok(resolution) => promise::Promise::resolved(queue, resolution),
+        Err(error) => promise::Promise::rejected(queue, error),
+    };
+    let on_fulfilled: Option[
+        (promise::PromiseFulfillment) -> Result[promise::PromiseResolution, promise::PromiseFailure],
+    ] = Option::Some(
+        |fulfillment| {
+            match promise_object_fulfillment_value(context.heap(), fulfillment) {
+                Ok(value) => async_generator_resume(
+                    context,
+                    promise_states,
+                    queue,
+                    promise_prototype,
+                    generators,
+                    generator,
+                    request,
+                    AsyncGeneratorRequestKind::Next,
+                    value,
+                ),
+                Err(error) => async_generator_reject(
+                    context,
+                    promise_states,
+                    queue,
+                    promise_prototype,
+                    generators,
+                    generator,
+                    request,
+                    promise::PromiseFailure::TypeError(error.message),
+                ),
+            };
+            Result::Ok(promise::value(runtime::Value::Undefined))
+        },
+    );
+    let on_rejected: Option[
+        (promise::PromiseFailure) -> Result[promise::PromiseResolution, promise::PromiseFailure],
+    ] = Option::Some(
+        |failure| {
+            match promise_object_failure_value(context.heap(), failure) {
+                Ok(value) => async_generator_resume(
+                    context,
+                    promise_states,
+                    queue,
+                    promise_prototype,
+                    generators,
+                    generator,
+                    request,
+                    AsyncGeneratorRequestKind::Throw,
+                    value,
+                ),
+                Err(error) => async_generator_reject(
+                    context,
+                    promise_states,
+                    queue,
+                    promise_prototype,
+                    generators,
+                    generator,
+                    request,
+                    promise::PromiseFailure::TypeError(error.message),
+                ),
+            };
+            Result::Ok(promise::value(runtime::Value::Undefined))
+        },
+    );
+    let _ = promise.then(on_fulfilled, on_rejected);
+}
+
+fn async_generator_await_yield(
+    context: vm::Context,
+    promise_states: HashMap[runtime::ObjectId, promise::Promise],
+    queue: promise::JobQueue,
+    promise_prototype: runtime::ObjectId,
+    generators: HashMap[runtime::ObjectId, AsyncGeneratorState],
+    generator: runtime::Value,
+    request: AsyncGeneratorRequest,
+    yielded: runtime::Value,
+) -> unit {
+    let promise = match promise_object_resolution(
+        context,
+        context.heap(),
+        promise_states,
+        promise_prototype,
+        yielded,
+    ) {
+        Ok(resolution) => promise::Promise::resolved(queue, resolution),
+        Err(error) => promise::Promise::rejected(queue, error),
+    };
+    let on_fulfilled: Option[
+        (promise::PromiseFulfillment) -> Result[promise::PromiseResolution, promise::PromiseFailure],
+    ] = Option::Some(
+        |fulfillment| {
+            match promise_object_fulfillment_value(context.heap(), fulfillment) {
+                Ok(value) => async_generator_resolve(
+                    context,
+                    promise_states,
+                    queue,
+                    promise_prototype,
+                    generators,
+                    generator,
+                    request,
+                    value,
+                    false,
+                ),
+                Err(error) => async_generator_reject(
+                    context,
+                    promise_states,
+                    queue,
+                    promise_prototype,
+                    generators,
+                    generator,
+                    request,
+                    promise::PromiseFailure::TypeError(error.message),
+                ),
+            };
+            Result::Ok(promise::value(runtime::Value::Undefined))
+        },
+    );
+    let on_rejected: Option[
+        (promise::PromiseFailure) -> Result[promise::PromiseResolution, promise::PromiseFailure],
+    ] = Option::Some(
+        |failure| {
+            match promise_object_failure_value(context.heap(), failure) {
+                Ok(value) => async_generator_resume(
+                    context,
+                    promise_states,
+                    queue,
+                    promise_prototype,
+                    generators,
+                    generator,
+                    request,
+                    AsyncGeneratorRequestKind::Throw,
+                    value,
+                ),
+                Err(error) => async_generator_reject(
+                    context,
+                    promise_states,
+                    queue,
+                    promise_prototype,
+                    generators,
+                    generator,
+                    request,
+                    promise::PromiseFailure::TypeError(error.message),
+                ),
+            };
+            Result::Ok(promise::value(runtime::Value::Undefined))
+        },
+    );
+    let _ = promise.then(on_fulfilled, on_rejected);
+}
+
+fn async_generator_await_return(
+    context: vm::Context,
+    promise_states: HashMap[runtime::ObjectId, promise::Promise],
+    queue: promise::JobQueue,
+    promise_prototype: runtime::ObjectId,
+    generators: HashMap[runtime::ObjectId, AsyncGeneratorState],
+    generator: runtime::Value,
+    request: AsyncGeneratorRequest,
+    returned: runtime::Value,
+) -> unit {
+    let promise = match promise_object_resolution(
+        context,
+        context.heap(),
+        promise_states,
+        promise_prototype,
+        returned,
+    ) {
+        Ok(resolution) => promise::Promise::resolved(queue, resolution),
+        Err(error) => promise::Promise::rejected(queue, error),
+    };
+    let on_fulfilled: Option[
+        (promise::PromiseFulfillment) -> Result[promise::PromiseResolution, promise::PromiseFailure],
+    ] = Option::Some(
+        |fulfillment| {
+            match promise_object_fulfillment_value(context.heap(), fulfillment) {
+                Ok(value) => async_generator_resolve(
+                    context,
+                    promise_states,
+                    queue,
+                    promise_prototype,
+                    generators,
+                    generator,
+                    request,
+                    value,
+                    true,
+                ),
+                Err(error) => async_generator_reject(
+                    context,
+                    promise_states,
+                    queue,
+                    promise_prototype,
+                    generators,
+                    generator,
+                    request,
+                    promise::PromiseFailure::TypeError(error.message),
+                ),
+            };
+            Result::Ok(promise::value(runtime::Value::Undefined))
+        },
+    );
+    let on_rejected: Option[
+        (promise::PromiseFailure) -> Result[promise::PromiseResolution, promise::PromiseFailure],
+    ] = Option::Some(
+        |failure| {
+            async_generator_reject(
+                context,
+                promise_states,
+                queue,
+                promise_prototype,
+                generators,
+                generator,
+                request,
+                failure,
+            );
+            Result::Ok(promise::value(runtime::Value::Undefined))
+        },
+    );
+    let _ = promise.then(on_fulfilled, on_rejected);
+}
+
+fn async_generator_resume(
+    context: vm::Context,
+    promise_states: HashMap[runtime::ObjectId, promise::Promise],
+    queue: promise::JobQueue,
+    promise_prototype: runtime::ObjectId,
+    generators: HashMap[runtime::ObjectId, AsyncGeneratorState],
+    generator: runtime::Value,
+    request: AsyncGeneratorRequest,
+    kind: AsyncGeneratorRequestKind,
+    input: runtime::Value,
+) -> unit {
+    let result = match kind {
+        AsyncGeneratorRequestKind::Next => {
+            context.resume_generator_raw_at_depth(generator, input, request.depth)
+        },
+        AsyncGeneratorRequestKind::Throw => {
+            context.throw_generator_raw_at_depth(generator, input, request.depth)
+        },
+        AsyncGeneratorRequestKind::Return => {
+            context.return_generator_raw_at_depth(generator, input, request.depth)
+        },
+    };
+    match result {
+        Ok(vm::GeneratorCompletion::Await(value)) => async_generator_await_resume(
+            context,
+            promise_states,
+            queue,
+            promise_prototype,
+            generators,
+            generator,
+            request,
+            value,
+        ),
+        Ok(vm::GeneratorCompletion::Yield(value)) => async_generator_await_yield(
+            context,
+            promise_states,
+            queue,
+            promise_prototype,
+            generators,
+            generator,
+            request,
+            value,
+        ),
+        Ok(vm::GeneratorCompletion::Return(value)) => async_generator_await_return(
+            context,
+            promise_states,
+            queue,
+            promise_prototype,
+            generators,
+            generator,
+            request,
+            value,
+        ),
+        Err(error) => async_generator_reject(
+            context,
+            promise_states,
+            queue,
+            promise_prototype,
+            generators,
+            generator,
+            request,
+            promise_object_vm_failure(error),
+        ),
+    }
+}
+
+fn async_generator_enqueue(
+    context: vm::Context,
+    promise_states: HashMap[runtime::ObjectId, promise::Promise],
+    queue: promise::JobQueue,
+    promise_prototype: runtime::ObjectId,
+    generators: HashMap[runtime::ObjectId, AsyncGeneratorState],
+    generator: runtime::Value,
+    value: runtime::Value,
+    kind: AsyncGeneratorRequestKind,
+    depth: int,
+) -> Result[runtime::Value, vm::VmError] {
+    let capability = promise::PromiseCapability::new(queue);
+    let promise_value = match promise_object_wrap(
+        context.heap(),
+        promise_states,
+        promise_prototype,
+        capability.promise(),
+    ) {
+        Ok(value) => value,
+        Err(error) => return Result::Err(
+            vm::VmError { offset: -1, kind: vm::VmErrorKind::TypeError(error.message) },
+        ),
+    };
+    let object = match generator {
+        runtime::Value::Object(value) => value,
+        _ => {
+            let _ = capability.reject(
+                promise::PromiseFailure::TypeError("async generator receiver is incompatible"),
+            );
+            return Result::Ok(promise_value)
+        },
+    };
+    match generators.get(object) {
+        Some(state) => {
+            state.requests.push(
+                AsyncGeneratorRequest { kind, value, capability, promise_value, depth },
+            );
+            match context.link_async_function(promise_value, generator) {
+                Ok(()) => (),
+                Err(error) => {
+                    let _ = capability.reject(promise_object_vm_failure(error));
+                    let _ = state.requests.pop();
+                    return Result::Ok(promise_value)
+                },
+            };
+            async_generator_update_roots(context, generator, state);
+            async_generator_process(
+                context,
+                promise_states,
+                queue,
+                promise_prototype,
+                generators,
+                generator,
+            );
+        },
+        None => {
+            let _ = capability.reject(
+                promise::PromiseFailure::TypeError("async generator receiver is incompatible"),
+            );
+        },
+    };
+    Result::Ok(promise_value)
+}
+
+fn async_generator_runner(
+    generators: HashMap[runtime::ObjectId, AsyncGeneratorState],
+    generator: runtime::Value,
+) -> Result[runtime::Value, vm::VmError] {
+    match generator {
+        runtime::Value::Object(value) => {
+            generators[value] = AsyncGeneratorState { requests: Vec::[], running: Ref::new(false) };
+            Result::Ok(generator)
+        },
+        _ => Result::Err(
+            vm::VmError {
+                offset: -1,
+                kind: vm::VmErrorKind::TypeError("async generator frame is not an object"),
+            },
+        ),
+    }
+}
+
+fn promise_object_resolvers(
+    context: vm::Context,
+    states: HashMap[runtime::ObjectId, promise::Promise],
+    prototype: runtime::ObjectId,
+    capability: promise::PromiseCapability,
+) -> Result[(runtime::Value, runtime::Value), vm::NativeError] {
+    let resolve = promise_object_new_native(
+        context,
+        |heap, _, arguments| {
+            match promise_object_resolution(
+                context,
+                heap,
+                states,
+                prototype,
+                argument(arguments, 0),
+            ) {
+                Ok(resolution) => {
+                    let _ = capability.resolve(resolution);
+                },
+                Err(error) => {
+                    let _ = capability.reject(error);
+                },
+            };
+            Result::Ok(runtime::Value::Undefined)
+        },
+    )?;
+    let reject = promise_object_new_native(
+        context,
+        |_, _, arguments| promise_object_reject_capability(capability, arguments),
+    )?;
+    Result::Ok((resolve, reject))
+}
+
+fn promise_object_host_capability(
+    context: vm::Context,
+    states: HashMap[runtime::ObjectId, promise::Promise],
+    queue: promise::JobQueue,
+    prototype: runtime::ObjectId,
+) -> Result[vm::HostPromiseCapability, vm::VmError] {
+    let capability = promise::PromiseCapability::new(queue);
+    let promise = match promise_object_wrap(context.heap(), states, prototype, capability.promise()) {
+        Ok(value) => value,
+        Err(error) => return Result::Err(
+            vm::VmError { offset: -1, kind: vm::VmErrorKind::TypeError(error.message) },
+        ),
+    };
+    let (resolve, reject) = match promise_object_resolvers(context, states, prototype, capability) {
+        Ok(value) => value,
+        Err(error) => return Result::Err(
+            vm::VmError { offset: -1, kind: vm::VmErrorKind::TypeError(error.message) },
+        ),
+    };
+    Result::Ok(vm::HostPromiseCapability::new(promise, resolve, reject))
+}
+
+fn promise_object_construct(
+    context: vm::Context,
+    states: HashMap[runtime::ObjectId, promise::Promise],
+    queue: promise::JobQueue,
+    prototype: runtime::ObjectId,
+    heap: runtime::Heap,
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+) -> Result[runtime::Value, vm::NativeError] {
+    let _ = this_value;
+    let executor = argument(arguments, 0);
+    if !promise_object_callable(executor) {
+        return Result::Err(native_error("Promise executor is not callable"))
+    } else {};
+    let capability = promise::PromiseCapability::new(queue);
+    let object = promise_object_wrap(heap, states, prototype, capability.promise())?;
+    let (resolve, reject) = promise_object_resolvers(context, states, prototype, capability)?;
+    match promise_object_invoke(context, executor, Vec::[resolve, reject]) {
+        Ok(_) => (),
+        Err(error) => {
+            let _ = capability.reject(promise_object_vm_failure(error));
+        },
+    };
+    Result::Ok(object)
+}
+
+fn promise_object_fulfill_handler(
+    context: vm::Context,
+    states: HashMap[runtime::ObjectId, promise::Promise],
+    prototype: runtime::ObjectId,
+    value: runtime::Value,
+) -> Option[
+    (promise::PromiseFulfillment) -> Result[promise::PromiseResolution, promise::PromiseFailure],
+] {
+    if promise_object_callable(value) {
+        Option::Some(
+            |fulfillment| {
+                let argument_value = match promise_object_fulfillment_value(
+                    context.heap(),
+                    fulfillment,
+                ) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        return Result::Err(promise::PromiseFailure::TypeError(error.message))
+                    },
+                };
+                match promise_object_invoke(context, value, Vec::[argument_value]) {
+                    Ok(result) => {
+                        promise_object_resolution(
+                            context,
+                            context.heap(),
+                            states,
+                            prototype,
+                            result,
+                        )
+                    },
+                    Err(error) => Result::Err(promise_object_vm_failure(error)),
+                }
+            },
+        )
+    } else {
+        Option::None
+    }
+}
+
+fn promise_object_reject_handler(
+    context: vm::Context,
+    states: HashMap[runtime::ObjectId, promise::Promise],
+    prototype: runtime::ObjectId,
+    value: runtime::Value,
+) -> Option[
+    (promise::PromiseFailure) -> Result[promise::PromiseResolution, promise::PromiseFailure],
+] {
+    if promise_object_callable(value) {
+        Option::Some(
+            |failure| {
+                let argument_value = match promise_object_failure_value(context.heap(), failure) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        return Result::Err(promise::PromiseFailure::TypeError(error.message))
+                    },
+                };
+                match promise_object_invoke(context, value, Vec::[argument_value]) {
+                    Ok(result) => {
+                        promise_object_resolution(
+                            context,
+                            context.heap(),
+                            states,
+                            prototype,
+                            result,
+                        )
+                    },
+                    Err(error) => Result::Err(promise_object_vm_failure(error)),
+                }
+            },
+        )
+    } else {
+        Option::None
+    }
+}
+
+fn promise_object_finally_handler(
+    context: vm::Context,
+    states: HashMap[runtime::ObjectId, promise::Promise],
+    prototype: runtime::ObjectId,
+    value: runtime::Value,
+) -> Option[() -> Result[promise::PromiseResolution, promise::PromiseFailure]] {
+    if promise_object_callable(value) {
+        Option::Some(
+            || match promise_object_invoke(context, value, Vec::[]) {
+                Ok(result) => {
+                    promise_object_resolution(context, context.heap(), states, prototype, result)
+                },
+                Err(error) => Result::Err(promise_object_vm_failure(error)),
+            },
+        )
+    } else {
+        Option::None
+    }
+}
+
+fn promise_object_then(
+    context: vm::Context,
+    states: HashMap[runtime::ObjectId, promise::Promise],
+    prototype: runtime::ObjectId,
+    heap: runtime::Heap,
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+) -> Result[runtime::Value, vm::NativeError] {
+    let source = promise_object_state(states, this_value)?;
+    let on_fulfilled: Option[
+        (promise::PromiseFulfillment) -> Result[promise::PromiseResolution, promise::PromiseFailure],
+    ] = promise_object_fulfill_handler(context, states, prototype, argument(arguments, 0));
+    let on_rejected: Option[
+        (promise::PromiseFailure) -> Result[promise::PromiseResolution, promise::PromiseFailure],
+    ] = promise_object_reject_handler(context, states, prototype, argument(arguments, 1));
+    let child = source.then(on_fulfilled, on_rejected);
+    promise_object_wrap(heap, states, prototype, child)
+}
+
+fn promise_object_catch(
+    context: vm::Context,
+    states: HashMap[runtime::ObjectId, promise::Promise],
+    prototype: runtime::ObjectId,
+    heap: runtime::Heap,
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+) -> Result[runtime::Value, vm::NativeError] {
+    let source = promise_object_state(states, this_value)?;
+    let on_fulfilled: Option[
+        (promise::PromiseFulfillment) -> Result[promise::PromiseResolution, promise::PromiseFailure],
+    ] = Option::None;
+    let on_rejected: Option[
+        (promise::PromiseFailure) -> Result[promise::PromiseResolution, promise::PromiseFailure],
+    ] = promise_object_reject_handler(context, states, prototype, argument(arguments, 0));
+    let child = source.then(on_fulfilled, on_rejected);
+    promise_object_wrap(heap, states, prototype, child)
+}
+
+fn promise_object_finally(
+    context: vm::Context,
+    states: HashMap[runtime::ObjectId, promise::Promise],
+    prototype: runtime::ObjectId,
+    heap: runtime::Heap,
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+) -> Result[runtime::Value, vm::NativeError] {
+    let source = promise_object_state(states, this_value)?;
+    let handler: Option[() -> Result[promise::PromiseResolution, promise::PromiseFailure]] = promise_object_finally_handler(
+        context,
+        states,
+        prototype,
+        argument(arguments, 0),
+    );
+    let child = match handler {
+        Some(handler) => source.finally(handler),
+        None => {
+            let on_fulfilled: Option[
+                (promise::PromiseFulfillment) -> Result[
+                    promise::PromiseResolution,
+                    promise::PromiseFailure,
+                ],
+            ] = Option::None;
+            let on_rejected: Option[
+                (promise::PromiseFailure) -> Result[
+                    promise::PromiseResolution,
+                    promise::PromiseFailure,
+                ],
+            ] = Option::None;
+            source.then(on_fulfilled, on_rejected)
+        },
+    };
+    promise_object_wrap(heap, states, prototype, child)
+}
+
+fn promise_object_static_resolve(
+    context: vm::Context,
+    states: HashMap[runtime::ObjectId, promise::Promise],
+    queue: promise::JobQueue,
+    prototype: runtime::ObjectId,
+    heap: runtime::Heap,
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+) -> Result[runtime::Value, vm::NativeError] {
+    let _ = this_value;
+    let input = argument(arguments, 0);
+    match input {
+        runtime::Value::Object(object) => match states.get(object) {
+            Some(_) => return Result::Ok(input),
+            None => (),
+        },
+        _ => (),
+    };
+    let result = match promise_object_resolution(context, heap, states, prototype, input) {
+        Ok(resolution) => promise::Promise::resolved(queue, resolution),
+        Err(error) => promise::Promise::rejected(queue, error),
+    };
+    promise_object_wrap(heap, states, prototype, result)
+}
+
+fn promise_object_static_reject(
+    states: HashMap[runtime::ObjectId, promise::Promise],
+    queue: promise::JobQueue,
+    prototype: runtime::ObjectId,
+    heap: runtime::Heap,
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+) -> Result[runtime::Value, vm::NativeError] {
+    let _ = this_value;
+    promise_object_wrap(
+        heap,
+        states,
+        prototype,
+        promise::Promise::rejected(
+            queue,
+            promise::PromiseFailure::Rejection(argument(arguments, 0)),
+        ),
+    )
+}
+
+fn promise_object_array_values(heap: runtime::Heap, input: runtime::Value) -> Result[
+    Vec[runtime::Value],
+    promise::PromiseFailure,
+] {
+    let object = match input {
+        runtime::Value::Object(object) => object,
+        _ => {
+            return Result::Err(
+                promise::PromiseFailure::TypeError("Promise combinators currently require an Array"),
+            )
+        },
+    };
+    match heap.get(object) {
+        Some(value) => match value.kind() {
+            runtime::ObjectKind::Array => (),
+            _ => {
+                return Result::Err(
+                    promise::PromiseFailure::TypeError(
+                        "Promise combinators currently require an Array",
+                    ),
+                )
+            },
+        },
+        None => {
+            return Result::Err(
+                promise::PromiseFailure::TypeError("Promise combinator input is not live"),
+            )
+        },
+    };
+    let length = match runtime::get_property(heap, object, runtime::string_property_key("length")) {
+        Ok(Some(runtime::Value::Int(value))) => if value >= 0 {
+            value.to_int()
+        } else {
+            return Result::Err(
+                promise::PromiseFailure::TypeError(
+                    "Promise combinator Array length must be an int32",
+                ),
+            )
+        },
+        Ok(_) => {
+            return Result::Err(
+                promise::PromiseFailure::TypeError(
+                    "Promise combinator Array length must be an int32",
+                ),
+            )
+        },
+        Err(error) => return Result::Err(promise::PromiseFailure::TypeError(error.message)),
+    };
+    let values: Vec[runtime::Value] = Vec::with_capacity(length);
+    let mut index = 0;
+    while index < length {
+        match runtime::get_property(heap, object, runtime::string_property_key(index.to_string())) {
+            Ok(Some(value)) => values.push(value),
+            Ok(None) => values.push(runtime::Value::Undefined),
+            Err(error) => return Result::Err(promise::PromiseFailure::TypeError(error.message)),
+        };
+        index += 1;
+    }
+    Result::Ok(values)
+}
+
+fn promise_object_iteration_failure(error: vm::VmError) -> promise::PromiseFailure {
+    match error.kind {
+        vm::VmErrorKind::Thrown(value) => promise::PromiseFailure::Rejection(value),
+        vm::VmErrorKind::TypeError(message) => promise::PromiseFailure::TypeError(message),
+        _ => promise_object_vm_failure(error),
+    }
+}
+
+fn promise_object_iterator_record(context: vm::Context, input: runtime::Value) -> Result[
+    IteratorRecord,
+    vm::VmError,
+] {
+    let symbol = match context.iterator_symbol() {
+        Some(value) => value,
+        None => return Result::Err(function_vm_error("iterator symbol is not installed")),
+    };
+    let method = context.read_property_at_depth(input, runtime::Value::Symbol(symbol), 0)?;
+    let callable = iterator_callable(method, "Promise combinator input is not iterable")?;
+    let arguments: Vec[runtime::Value] = Vec::[];
+    let iterator = context.invoke_with_this_at_depth(callable, arguments, input, 0)?;
+    match iterator {
+        runtime::Value::Object(_) => iterator_record(context, iterator, 0),
+        _ => Result::Err(function_vm_error("iterator result is not an object")),
+    }
+}
+
+fn promise_object_iterable_values(context: vm::Context, input: runtime::Value) -> Result[
+    Vec[runtime::Value],
+    promise::PromiseFailure,
+] {
+    if context.iterator_symbol().is_none() {
+        return promise_object_array_values(context.heap(), input)
+    } else {};
+    let record = match promise_object_iterator_record(context, input) {
+        Ok(value) => value,
+        Err(error) => return Result::Err(promise_object_iteration_failure(error)),
+    };
+    let values: Vec[runtime::Value] = Vec::[];
+    loop {
+        match iterator_step(context, record, 0) {
+            Ok(Some(value)) => values.push(value),
+            Ok(None) => return Result::Ok(values),
+            Err(error) => {
+                return Result::Err(promise_object_iteration_failure(error))
+            },
+        }
+    }
+}
+
+fn promise_object_inputs(
+    context: vm::Context,
+    heap: runtime::Heap,
+    states: HashMap[runtime::ObjectId, promise::Promise],
+    queue: promise::JobQueue,
+    prototype: runtime::ObjectId,
+    input: runtime::Value,
+) -> Result[Vec[promise::PromiseResolution], promise::PromiseFailure] {
+    let values = promise_object_iterable_values(context, input)?;
+    let inputs: Vec[promise::PromiseResolution] = Vec::with_capacity(values.len());
+    for value in values {
+        match promise_object_resolution(context, heap, states, prototype, value) {
+            Ok(resolution) => inputs.push(resolution),
+            Err(error) => inputs.push(
+                promise::PromiseResolution::Promise(promise::Promise::rejected(queue, error)),
+            ),
+        }
+    }
+    Result::Ok(inputs)
+}
+
+fn promise_object_normalize_combinator(
+    heap: runtime::Heap,
+    queue: promise::JobQueue,
+    source: promise::Promise,
+) -> promise::Promise {
+    match source.state() {
+        promise::PromiseState::Fulfilled(fulfillment) => {
+            match promise_object_fulfillment_value(heap, fulfillment) {
+                Ok(value) => promise::Promise::fulfilled(queue, value),
+                Err(error) => {
+                    promise::Promise::rejected(
+                        queue,
+                        promise::PromiseFailure::TypeError(error.message),
+                    )
+                },
+            }
+        },
+        promise::PromiseState::Rejected(_) => source,
+        promise::PromiseState::Pending => {
+            let on_fulfilled: Option[
+                (promise::PromiseFulfillment) -> Result[
+                    promise::PromiseResolution,
+                    promise::PromiseFailure,
+                ],
+            ] = Option::Some(
+                |fulfillment| match promise_object_fulfillment_value(heap, fulfillment) {
+                    Ok(value) => Result::Ok(promise::value(value)),
+                    Err(error) => {
+                        Result::Err(promise::PromiseFailure::TypeError(error.message))
+                    },
+                },
+            );
+            let on_rejected: Option[
+                (promise::PromiseFailure) -> Result[
+                    promise::PromiseResolution,
+                    promise::PromiseFailure,
+                ],
+            ] = Option::None;
+            source.then(on_fulfilled, on_rejected)
+        },
+    }
+}
+
+fn promise_object_combinator_result(
+    context: vm::Context,
+    states: HashMap[runtime::ObjectId, promise::Promise],
+    queue: promise::JobQueue,
+    prototype: runtime::ObjectId,
+    input: runtime::Value,
+    operation: string,
+) -> promise::Promise {
+    match promise_object_inputs(context, context.heap(), states, queue, prototype, input) {
+        Ok(inputs) => {
+            let result = if operation == "all" {
+                promise::all(queue, inputs)
+            } else if operation == "race" {
+                promise::race(queue, inputs)
+            } else if operation == "allSettled" {
+                promise::all_settled(queue, inputs)
+            } else {
+                promise::any(queue, inputs)
+            };
+            promise_object_normalize_combinator(context.heap(), queue, result)
+        },
+        Err(error) => promise::Promise::rejected(queue, error),
+    }
+}
+
+fn promise_object_static_combinator(
+    context: vm::Context,
+    states: HashMap[runtime::ObjectId, promise::Promise],
+    queue: promise::JobQueue,
+    prototype: runtime::ObjectId,
+    operation: string,
+    heap: runtime::Heap,
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+) -> Result[runtime::Value, vm::NativeError] {
+    let _ = this_value;
+    promise_object_wrap(
+        heap,
+        states,
+        prototype,
+        promise_object_combinator_result(
+            context,
+            states,
+            queue,
+            prototype,
+            argument(arguments, 0),
+            operation,
+        ),
+    )
+}
+
+fn promise_object_static_try(
+    context: vm::Context,
+    states: HashMap[runtime::ObjectId, promise::Promise],
+    queue: promise::JobQueue,
+    prototype: runtime::ObjectId,
+    heap: runtime::Heap,
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+) -> Result[runtime::Value, vm::NativeError] {
+    let _ = this_value;
+    let capability = promise::PromiseCapability::new(queue);
+    let result = promise_object_wrap(heap, states, prototype, capability.promise())?;
+    let callback = argument(arguments, 0);
+    let callback_arguments: Vec[runtime::Value] = Vec::[];
+    let mut index = 1;
+    while index < arguments.len() {
+        callback_arguments.push(arguments[index]);
+        index += 1;
+    }
+    match promise_object_invoke(context, callback, callback_arguments) {
+        Ok(value) => match promise_object_resolution(context, heap, states, prototype, value) {
+            Ok(resolution) => {
+                let _ = capability.resolve(resolution);
+            },
+            Err(error) => {
+                let _ = capability.reject(error);
+            },
+        },
+        Err(error) => {
+            let _ = capability.reject(promise_object_vm_failure(error));
+        },
+    };
+    Result::Ok(result)
+}
+
+fn promise_object_with_resolvers(
+    context: vm::Context,
+    states: HashMap[runtime::ObjectId, promise::Promise],
+    queue: promise::JobQueue,
+    prototype: runtime::ObjectId,
+    heap: runtime::Heap,
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+) -> Result[runtime::Value, vm::NativeError] {
+    let _ = this_value;
+    let _ = arguments;
+    let capability = promise::PromiseCapability::new(queue);
+    let promise = promise_object_wrap(heap, states, prototype, capability.promise())?;
+    let (resolve, reject) = promise_object_resolvers(context, states, prototype, capability)?;
+    let result = allocate_ordinary(heap, Option::None)?;
+    define_data(heap, result, runtime::string_property_key("promise"), promise, true, true, true)?;
+    define_data(heap, result, runtime::string_property_key("resolve"), resolve, true, true, true)?;
+    define_data(heap, result, runtime::string_property_key("reject"), reject, true, true, true)?;
+    Result::Ok(runtime::Value::Object(result))
+}
+
+fn promise_object_drain(
+    queue: promise::JobQueue,
+    heap: runtime::Heap,
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+) -> Result[runtime::Value, vm::NativeError] {
+    let _ = heap;
+    let _ = this_value;
+    let _ = arguments;
+    Result::Ok(array_length_value(queue.run_all()))
+}
+
+fn async_generator_identity(this_value: runtime::Value, arguments: Vec[runtime::Value], depth: int) -> Result[
+    runtime::Value,
+    vm::VmError,
+] {
+    let _ = arguments;
+    let _ = depth;
+    Result::Ok(this_value)
+}
+
+fn install_async_generator(
+    context: vm::Context,
+    states: HashMap[runtime::ObjectId, promise::Promise],
+    queue: promise::JobQueue,
+    promise_prototype: runtime::ObjectId,
+) -> Result[unit, BuiltinError] {
+    let heap = context.heap();
+    let prototype = match allocate_ordinary(heap, heap.object_prototype()) {
+        Ok(value) => value,
+        Err(error) => return Result::Err(BuiltinError { message: error.message }),
+    };
+    let generators: HashMap[runtime::ObjectId, AsyncGeneratorState] = HashMap::{};
+    for (name, kind) in Vec::[
+        ("next", AsyncGeneratorRequestKind::Next),
+        ("throw", AsyncGeneratorRequestKind::Throw),
+        ("return", AsyncGeneratorRequestKind::Return),
+    ] {
+        define_value(
+            heap,
+            prototype,
+            name,
+            allocate_vm_function_with_length(
+                context,
+                name,
+                1,
+                |this_value, arguments, depth| {
+                    async_generator_enqueue(
+                        context,
+                        states,
+                        queue,
+                        promise_prototype,
+                        generators,
+                        this_value,
+                        argument(arguments, 0),
+                        kind,
+                        depth,
+                    )
+                },
+            )?,
+            true,
+            true,
+        )?
+    }
+    match context.well_known_symbol(vm::WellKnownSymbolKind::AsyncIterator) {
+        Some(async_iterator) => {
+            let identity = allocate_vm_function_with_length(
+                context,
+                "[Symbol.asyncIterator]",
+                0,
+                async_generator_identity,
+            )?;
+            if !runtime::define_own_property(
+                heap,
+                prototype,
+                runtime::PropertyKey::Symbol(async_iterator),
+                runtime::data_descriptor(identity, true, false, true),
+            ) {
+                return Result::Err(
+                    BuiltinError { message: "cannot initialize async generator iterator" },
+                )
+            } else {}
+        },
+        None => (),
+    };
+    define_to_string_tag(context, prototype, "AsyncGenerator")?;
+    match context.set_async_generator_prototype(prototype) {
+        Ok(()) => (),
+        Err(error) => return Result::Err(BuiltinError { message: error.kind.debug() }),
+    };
+    context.set_async_generator_runner(|generator, _| async_generator_runner(generators, generator));
+    Result::Ok(())
+}
+
+pub fn install_promise_with_queue(context: vm::Context, queue: promise::JobQueue) -> Result[
+    runtime::Value,
+    BuiltinError,
+] {
+    let heap = context.heap();
+    let prototype = match allocate_ordinary(heap, Option::None) {
+        Ok(value) => value,
+        Err(error) => return Result::Err(BuiltinError { message: error.message }),
+    };
+    let states: HashMap[runtime::ObjectId, promise::Promise] = HashMap::{};
+    install_async_generator(context, states, queue, prototype)?;
+    define_to_string_tag(context, prototype, "Promise")?;
+    define_value(
+        heap,
+        prototype,
+        "then",
+        allocate_function(
+            context,
+            "Promise.prototype.then",
+            |heap, this_value, arguments| {
+                promise_object_then(context, states, prototype, heap, this_value, arguments)
+            },
+        )?,
+        true,
+        true,
+    )?;
+    define_value(
+        heap,
+        prototype,
+        "catch",
+        allocate_function(
+            context,
+            "Promise.prototype.catch",
+            |heap, this_value, arguments| {
+                promise_object_catch(context, states, prototype, heap, this_value, arguments)
+            },
+        )?,
+        true,
+        true,
+    )?;
+    define_value(
+        heap,
+        prototype,
+        "finally",
+        allocate_function(
+            context,
+            "Promise.prototype.finally",
+            |heap, this_value, arguments| {
+                promise_object_finally(context, states, prototype, heap, this_value, arguments)
+            },
+        )?,
+        true,
+        true,
+    )?;
+    let constructor = allocate_function(
+        context,
+        "Promise",
+        |heap, this_value, arguments| {
+            promise_object_construct(context, states, queue, prototype, heap, this_value, arguments)
+        },
+    )?;
+    let constructor_object = function_object(constructor, "Promise")?;
+    define_value(heap, prototype, "constructor", constructor, true, true)?;
+    define_value(
+        heap,
+        constructor_object,
+        "resolve",
+        allocate_function(
+            context,
+            "Promise.resolve",
+            |heap, this_value, arguments| {
+                promise_object_static_resolve(
+                    context,
+                    states,
+                    queue,
+                    prototype,
+                    heap,
+                    this_value,
+                    arguments,
+                )
+            },
+        )?,
+        true,
+        true,
+    )?;
+    define_value(
+        heap,
+        constructor_object,
+        "reject",
+        allocate_function(
+            context,
+            "Promise.reject",
+            |heap, this_value, arguments| {
+                promise_object_static_reject(states, queue, prototype, heap, this_value, arguments)
+            },
+        )?,
+        true,
+        true,
+    )?;
+    for operation in Vec::["all", "allSettled", "any"] {
+        let operation_name = operation;
+        define_value(
+            heap,
+            constructor_object,
+            operation_name,
+            allocate_function(
+                context,
+                "Promise." + operation_name,
+                |heap, this_value, arguments| {
+                    promise_object_static_combinator(
+                        context,
+                        states,
+                        queue,
+                        prototype,
+                        operation_name,
+                        heap,
+                        this_value,
+                        arguments,
+                    )
+                },
+            )?,
+            true,
+            true,
+        )?
+    }
+    define_value(
+        heap,
+        constructor_object,
+        "try",
+        allocate_function(
+            context,
+            "Promise.try",
+            |heap, this_value, arguments| {
+                promise_object_static_try(
+                    context,
+                    states,
+                    queue,
+                    prototype,
+                    heap,
+                    this_value,
+                    arguments,
+                )
+            },
+        )?,
+        true,
+        true,
+    )?;
+    define_value(
+        heap,
+        constructor_object,
+        "race",
+        allocate_function(
+            context,
+            "Promise.race",
+            |heap, this_value, arguments| {
+                promise_object_static_combinator(
+                    context,
+                    states,
+                    queue,
+                    prototype,
+                    "race",
+                    heap,
+                    this_value,
+                    arguments,
+                )
+            },
+        )?,
+        true,
+        true,
+    )?;
+    define_value(
+        heap,
+        constructor_object,
+        "withResolvers",
+        allocate_function(
+            context,
+            "Promise.withResolvers",
+            |heap, this_value, arguments| {
+                promise_object_with_resolvers(
+                    context,
+                    states,
+                    queue,
+                    prototype,
+                    heap,
+                    this_value,
+                    arguments,
+                )
+            },
+        )?,
+        true,
+        true,
+    )?;
+    define_value(
+        heap,
+        constructor_object,
+        "prototype",
+        runtime::Value::Object(prototype),
+        false,
+        false,
+    )?;
+    match context.well_known_symbol(vm::WellKnownSymbolKind::Species) {
+        Some(symbol) => {
+            let getter = allocate_function_with_length(
+                context,
+                "get [Symbol.species]",
+                0,
+                array_species_getter,
+            )?;
+            if !runtime::define_own_property(
+                heap,
+                constructor_object,
+                runtime::PropertyKey::Symbol(symbol),
+                runtime::accessor_descriptor(Option::Some(getter), Option::None, false, true),
+            ) {
+                return Result::Err(BuiltinError { message: "cannot define Promise species" })
+            } else {}
+        },
+        None => (),
+    };
+    define_value(
+        heap,
+        constructor_object,
+        "drainJobs",
+        allocate_function(
+            context,
+            "Promise.drainJobs",
+            |heap, this_value, arguments| {
+                promise_object_drain(queue, heap, this_value, arguments)
+            },
+        )?,
+        true,
+        true,
+    )?;
+    context.set_promise_capability_factory(
+        || promise_object_host_capability(context, states, queue, prototype),
+    );
+    context.set_async_function_runner(
+        |generator, depth| {
+            promise_object_async_runner(context, states, queue, prototype, generator, depth)
+        },
+    );
+    Result::Ok(constructor)
+}
+
+pub fn install_promise(context: vm::Context) -> Result[runtime::Value, BuiltinError] {
+    install_promise_with_queue(context, promise::JobQueue::new())
+}

@@ -1,0 +1,1748 @@
+package parser;
+
+use gomlang::quickjs::ast;
+use std::testing;
+
+fn expression_statement(value: ast::Stmt) -> ast::Expr {
+    match value {
+        ast::Stmt::Expression { expression, .. } => expression.get(),
+        _ => {
+            testing::assert(false);
+            ast::Expr::Error { span: ast::span(0, 0) }
+        },
+    }
+}
+
+fn binary_parts(value: ast::Expr, expected: ast::BinaryOperator) -> (ast::Expr, ast::Expr) {
+    match value {
+        ast::Expr::Binary { operator, left, right, .. } => {
+            testing::assert_eq(operator, expected);
+            (left.get(), right.get())
+        },
+        _ => {
+            testing::assert(false);
+            (ast::Expr::Error { span: ast::span(0, 0) }, ast::Expr::Error { span: ast::span(0, 0) })
+        },
+    }
+}
+
+fn assert_identifier(value: ast::Expr, expected: string) -> unit {
+    match value {
+        ast::Expr::Identifier { name, .. } => testing::assert_eq(name, expected),
+        _ => testing::assert(false),
+    }
+}
+
+#[test]
+fn parses_javascript_precedence_and_right_associativity() -> unit {
+    let source = "a = b || c && d + e * f ** g ** h;";
+    let result = parse(source);
+    testing::assert_eq(result.errors.len(), 0);
+    testing::assert_eq(result.program.body.len(), 1);
+    testing::assert_eq(result.program.span, ast::span(0, source.byte_len()));
+    let expression = expression_statement(result.program.body[0]);
+    let (target, value) = match expression {
+        ast::Expr::Assignment { left, right, .. } => (left.get(), right.get()),
+        _ => {
+            testing::assert(false);
+            (ast::Expr::Error { span: ast::span(0, 0) }, ast::Expr::Error { span: ast::span(0, 0) })
+        },
+    };
+    assert_identifier(target, "a");
+    let (b, and_expression) = binary_parts(value, ast::BinaryOperator::LogicalOr);
+    assert_identifier(b, "b");
+    let (c, sum) = binary_parts(and_expression, ast::BinaryOperator::LogicalAnd);
+    assert_identifier(c, "c");
+    let (d, product) = binary_parts(sum, ast::BinaryOperator::Add);
+    assert_identifier(d, "d");
+    let (e, power) = binary_parts(product, ast::BinaryOperator::Multiply);
+    assert_identifier(e, "e");
+    let (f, nested_power) = binary_parts(power, ast::BinaryOperator::Power);
+    assert_identifier(f, "f");
+    let (g, h) = binary_parts(nested_power, ast::BinaryOperator::Power);
+    assert_identifier(g, "g");
+    assert_identifier(h, "h")
+}
+
+#[test]
+fn parses_regexp_literals_without_changing_division_precedence() -> unit {
+    let result = parse("/a[\\/]b+/gi; total / 2; if (ready) /x/.test(value);");
+    testing::assert_eq(result.errors.len(), 0);
+    testing::assert_eq(result.program.body.len(), 3);
+    match expression_statement(result.program.body[0]) {
+        ast::Expr::RegExp { pattern, flags, span } => {
+            testing::assert_eq(pattern, "a[\\/]b+");
+            testing::assert_eq(flags, "gi");
+            testing::assert_eq(span, ast::span(0, 11))
+        },
+        _ => testing::fail("expected regular expression literal"),
+    };
+    let _ = binary_parts(expression_statement(result.program.body[1]), ast::BinaryOperator::Divide);
+    match result.program.body[2] {
+        ast::Stmt::If { consequent, .. } => match expression_statement(consequent.get()) {
+            ast::Expr::Call { .. } => (),
+            _ => testing::fail("expected regular expression method call"),
+        },
+        _ => testing::fail("expected if statement"),
+    }
+}
+
+#[test]
+fn parses_conditional_assignment_and_sequence_precedence() -> unit {
+    let result = parse("a, b = c ? d : e ? f : g;");
+    testing::assert_eq(result.errors.len(), 0);
+    let expressions = match expression_statement(result.program.body[0]) {
+        ast::Expr::Sequence { expressions, span } => {
+            testing::assert_eq(span, ast::span(0, 24));
+            expressions
+        },
+        _ => {
+            testing::assert(false);
+            Vec::[]
+        },
+    };
+    testing::assert_eq(expressions.len(), 2);
+    assert_identifier(expressions[0].get(), "a");
+    let value = match expressions[1].get() {
+        ast::Expr::Assignment { operator, left, right, .. } => {
+            testing::assert_eq(operator, ast::AssignmentOperator::Assign);
+            assert_identifier(left.get(), "b");
+            right.get()
+        },
+        _ => {
+            testing::assert(false);
+            ast::Expr::Error { span: ast::span(0, 0) }
+        },
+    };
+    match value {
+        ast::Expr::Conditional { test, consequent, alternate, .. } => {
+            assert_identifier(test.get(), "c");
+            assert_identifier(consequent.get(), "d");
+            match alternate.get() {
+                ast::Expr::Conditional { test, consequent, alternate, .. } => {
+                    assert_identifier(test.get(), "e");
+                    assert_identifier(consequent.get(), "f");
+                    assert_identifier(alternate.get(), "g")
+                },
+                _ => testing::assert(false),
+            }
+        },
+        _ => testing::assert(false),
+    }
+}
+
+#[test]
+fn parses_compound_assignments_and_updates() -> unit {
+    let sources = Vec::[
+        ("x += 1;", ast::AssignmentOperator::Add),
+        ("x -= 1;", ast::AssignmentOperator::Subtract),
+        ("x *= 1;", ast::AssignmentOperator::Multiply),
+        ("x /= 1;", ast::AssignmentOperator::Divide),
+        ("x %= 1;", ast::AssignmentOperator::Remainder),
+        ("x **= 1;", ast::AssignmentOperator::Power),
+        ("x <<= 1;", ast::AssignmentOperator::ShiftLeft),
+        ("x >>= 1;", ast::AssignmentOperator::ShiftRight),
+        ("x >>>= 1;", ast::AssignmentOperator::ShiftRightUnsigned),
+        ("x &= 1;", ast::AssignmentOperator::BitwiseAnd),
+        ("x |= 1;", ast::AssignmentOperator::BitwiseOr),
+        ("x ^= 1;", ast::AssignmentOperator::BitwiseXor),
+        ("x &&= 1;", ast::AssignmentOperator::LogicalAnd),
+        ("x ||= 1;", ast::AssignmentOperator::LogicalOr),
+        ("x ??= 1;", ast::AssignmentOperator::NullishCoalescing),
+    ];
+    for (source, expected) in sources {
+        let result = parse(source);
+        testing::assert_eq(result.errors.len(), 0);
+        match expression_statement(result.program.body[0]) {
+            ast::Expr::Assignment { operator, .. } => testing::assert_eq(operator, expected),
+            _ => testing::assert(false),
+        }
+    }
+    let result = parse("++left; right--;\n++tail;");
+    testing::assert_eq(result.errors.len(), 0);
+    testing::assert_eq(result.program.body.len(), 3);
+    match expression_statement(result.program.body[0]) {
+        ast::Expr::Update { operator, prefix, .. } => {
+            testing::assert_eq(operator, ast::UpdateOperator::Increment);
+            testing::assert(prefix)
+        },
+        _ => testing::assert(false),
+    };
+    match expression_statement(result.program.body[1]) {
+        ast::Expr::Update { operator, prefix, .. } => {
+            testing::assert_eq(operator, ast::UpdateOperator::Decrement);
+            testing::assert(!prefix)
+        },
+        _ => testing::assert(false),
+    }
+}
+
+#[test]
+fn update_line_break_and_invalid_targets_recover() -> unit {
+    let result = parse("first\n++second; (first + second)++; tail;");
+    testing::assert(result.errors.len() >= 1);
+    testing::assert_eq(result.program.body.len(), 4);
+    assert_identifier(expression_statement(result.program.body[0]), "first");
+    match expression_statement(result.program.body[1]) {
+        ast::Expr::Update { prefix, .. } => testing::assert(prefix),
+        _ => testing::assert(false),
+    };
+    assert_identifier(expression_statement(result.program.body[3]), "tail");
+    testing::assert_eq(result.errors[0].message, "invalid update target")
+}
+
+#[test]
+fn malformed_conditional_and_assignment_expressions_recover() -> unit {
+    let result = parse("first ? : second; third ? fourth; value += ; tail;");
+    testing::assert(result.errors.len() >= 3);
+    testing::assert_eq(result.program.body.len(), 4);
+    assert_identifier(expression_statement(result.program.body[3]), "tail");
+    for error in result.errors {
+        testing::assert(error.span.start >= 0);
+        testing::assert(error.span.end >= error.span.start)
+    }
+}
+
+#[test]
+fn parses_call_and_member_chains() -> unit {
+    let result = parse("root.alpha[0](x, y).omega;");
+    testing::assert_eq(result.errors.len(), 0);
+    let expression = expression_statement(result.program.body[0]);
+    let call = match expression {
+        ast::Expr::Member { object, property, computed, .. } => {
+            testing::assert(!computed);
+            assert_identifier(property.get(), "omega");
+            object.get()
+        },
+        _ => {
+            testing::assert(false);
+            ast::Expr::Error { span: ast::span(0, 0) }
+        },
+    };
+    let computed_member = match call {
+        ast::Expr::Call { callee, arguments, .. } => {
+            testing::assert_eq(arguments.len(), 2);
+            assert_identifier(arguments[0], "x");
+            assert_identifier(arguments[1], "y");
+            callee.get()
+        },
+        _ => {
+            testing::assert(false);
+            ast::Expr::Error { span: ast::span(0, 0) }
+        },
+    };
+    let named_member = match computed_member {
+        ast::Expr::Member { object, property, computed, .. } => {
+            testing::assert(computed);
+            match property.get() {
+                ast::Expr::Number { raw, .. } => testing::assert_eq(raw, "0"),
+                _ => testing::assert(false),
+            };
+            object.get()
+        },
+        _ => {
+            testing::assert(false);
+            ast::Expr::Error { span: ast::span(0, 0) }
+        },
+    };
+    match named_member {
+        ast::Expr::Member { object, property, computed, .. } => {
+            testing::assert(!computed);
+            assert_identifier(object.get(), "root");
+            assert_identifier(property.get(), "alpha")
+        },
+        _ => testing::assert(false),
+    }
+}
+
+#[test]
+fn parses_optional_named_and_computed_member_chains() -> unit {
+    let result = parse("value?.field; value?.['field']; value?.field();");
+    testing::assert_eq(result.errors.len(), 0);
+    match expression_statement(result.program.body[0]) {
+        ast::Expr::Member { optional, computed, .. } => {
+            testing::assert(optional);
+            testing::assert(!computed)
+        },
+        _ => testing::fail("expected optional named member"),
+    };
+    match expression_statement(result.program.body[1]) {
+        ast::Expr::Member { optional, computed, .. } => {
+            testing::assert(optional);
+            testing::assert(computed)
+        },
+        _ => testing::fail("expected optional computed member"),
+    }
+}
+
+#[test]
+fn parses_spread_call_and_construct_arguments() -> unit {
+    let result = parse("consume(1, ...values, 4); new Point(...coordinates);");
+    testing::assert_eq(result.errors.len(), 0);
+    match expression_statement(result.program.body[0]) {
+        ast::Expr::Call { arguments, .. } => match arguments[1] {
+            ast::Expr::Spread { argument, .. } => assert_identifier(argument.get(), "values"),
+            _ => testing::fail("expected spread call argument"),
+        },
+        _ => testing::fail("expected call"),
+    };
+    match expression_statement(result.program.body[1]) {
+        ast::Expr::New { arguments, .. } => match arguments[0] {
+            ast::Expr::Spread { argument, .. } => {
+                assert_identifier(argument.get(), "coordinates")
+            },
+            _ => testing::fail("expected spread construct argument"),
+        },
+        _ => testing::fail("expected construct"),
+    };
+    let malformed = parse("consume(...); let after = 1;");
+    testing::assert(!malformed.errors.is_empty());
+    testing::assert_eq(malformed.program.body.len(), 2)
+}
+
+#[test]
+fn parses_declarations_and_control_flow() -> unit {
+    let result = parse(
+        "let x = 1, y; const z = x + 2; var q; if (x < z) { while (x) x = x - 1; } else return z;",
+    );
+    testing::assert_eq(result.errors.len(), 0);
+    testing::assert_eq(result.program.body.len(), 4);
+    match result.program.body[0] {
+        ast::Stmt::VariableDeclaration { kind, declarations, .. } => {
+            testing::assert_eq(kind, ast::VariableKind::Let);
+            testing::assert_eq(declarations.len(), 2);
+            testing::assert_eq(declarations[0].name, "x");
+            testing::assert(declarations[0].initializer.is_some());
+            testing::assert_eq(declarations[1].name, "y");
+            testing::assert(declarations[1].initializer.is_none())
+        },
+        _ => testing::assert(false),
+    };
+    match result.program.body[1] {
+        ast::Stmt::VariableDeclaration { kind, declarations, .. } => {
+            testing::assert_eq(kind, ast::VariableKind::Const);
+            testing::assert_eq(declarations.len(), 1)
+        },
+        _ => testing::assert(false),
+    };
+    match result.program.body[2] {
+        ast::Stmt::VariableDeclaration { kind, declarations, .. } => {
+            testing::assert_eq(kind, ast::VariableKind::Var);
+            testing::assert_eq(declarations.len(), 1)
+        },
+        _ => testing::assert(false),
+    };
+    match result.program.body[3] {
+        ast::Stmt::If { consequent, alternate, .. } => {
+            match consequent.get() {
+                ast::Stmt::Block { body, .. } => {
+                    testing::assert_eq(body.len(), 1);
+                    match body[0] {
+                        ast::Stmt::While { .. } => (),
+                        _ => testing::assert(false),
+                    }
+                },
+                _ => testing::assert(false),
+            };
+            match alternate {
+                Some(value) => match value.get() {
+                    ast::Stmt::Return { argument, .. } => testing::assert(argument.is_some()),
+                    _ => testing::assert(false),
+                },
+                None => testing::assert(false),
+            }
+        },
+        _ => testing::assert(false),
+    }
+}
+
+#[test]
+fn recovers_at_delimiters_and_statement_boundaries() -> unit {
+    let result = parse("let = ; const value; if (value { return 1; } broken(,); let tail = 3;");
+    testing::assert(result.errors.len() >= 5);
+    testing::assert_eq(result.program.body.len(), 5);
+    match result.program.body[4] {
+        ast::Stmt::VariableDeclaration { declarations, .. } => {
+            testing::assert_eq(declarations.len(), 1);
+            testing::assert_eq(declarations[0].name, "tail");
+            testing::assert(declarations[0].initializer.is_some())
+        },
+        _ => testing::assert(false),
+    };
+    for error in result.errors {
+        testing::assert(error.span.start >= 0);
+        testing::assert(error.span.end >= error.span.start)
+    }
+}
+
+#[test]
+fn parses_for_do_while_break_and_continue() -> unit {
+    let source = "for (let i = 0; i < 3; i = i + 1) { if (i) continue; break; } do i = i - 1; while (i);";
+    let result = parse(source);
+    testing::assert_eq(result.errors.len(), 0);
+    testing::assert_eq(result.program.body.len(), 2);
+    match result.program.body[0] {
+        ast::Stmt::For { initializer, test, update, body, span } => {
+            testing::assert_eq(span.start, 0);
+            testing::assert(test.is_some());
+            testing::assert(update.is_some());
+            match initializer {
+                Some(value) => match value.get() {
+                    ast::Stmt::VariableDeclaration { kind, declarations, .. } => {
+                        testing::assert_eq(kind, ast::VariableKind::Let);
+                        testing::assert_eq(declarations.len(), 1);
+                        testing::assert_eq(declarations[0].name, "i")
+                    },
+                    _ => testing::assert(false),
+                },
+                None => testing::assert(false),
+            };
+            match body.get() {
+                ast::Stmt::Block { body, .. } => {
+                    testing::assert_eq(body.len(), 2);
+                    match body[0] {
+                        ast::Stmt::If { consequent, .. } => match consequent.get() {
+                            ast::Stmt::Continue { .. } => (),
+                            _ => testing::assert(false),
+                        },
+                        _ => testing::assert(false),
+                    };
+                    match body[1] {
+                        ast::Stmt::Break { .. } => (),
+                        _ => testing::assert(false),
+                    }
+                },
+                _ => testing::assert(false),
+            }
+        },
+        _ => testing::assert(false),
+    };
+    match result.program.body[1] {
+        ast::Stmt::DoWhile { body, test, span } => {
+            testing::assert_eq(span.end, source.byte_len());
+            match body.get() {
+                ast::Stmt::Expression { .. } => (),
+                _ => testing::assert(false),
+            };
+            assert_identifier(test.get(), "i")
+        },
+        _ => testing::assert(false),
+    }
+}
+
+#[test]
+fn parses_labelled_statements_and_jump_targets() -> unit {
+    let result = parse("outer: for (;;) { if (true) break outer; continue outer; }");
+    testing::assert_eq(result.errors.len(), 0);
+    match result.program.body[0] {
+        ast::Stmt::Labelled { label, body, .. } => {
+            testing::assert_eq(label, "outer");
+            match body.get() {
+                ast::Stmt::For { body, .. } => match body.get() {
+                    ast::Stmt::Block { body, .. } => {
+                        match body[0] {
+                            ast::Stmt::If { consequent, .. } => match consequent.get() {
+                                ast::Stmt::Break { label: Some(value), .. } => {
+                                    testing::assert_eq(value, "outer")
+                                },
+                                _ => testing::fail("expected labelled break"),
+                            },
+                            _ => testing::fail("expected if statement"),
+                        };
+                        match body[1] {
+                            ast::Stmt::Continue { label: Some(value), .. } => {
+                                testing::assert_eq(value, "outer")
+                            },
+                            _ => testing::fail("expected labelled continue"),
+                        }
+                    },
+                    _ => testing::fail("expected loop block"),
+                },
+                _ => testing::fail("expected labelled for statement"),
+            }
+        },
+        _ => testing::fail("expected labelled statement"),
+    }
+}
+
+#[test]
+fn parses_with_statement_around_labelled_body() -> unit {
+    let result = parse("with ({}) label: { break label; }");
+    testing::assert_eq(result.errors.len(), 0);
+    match result.program.body[0] {
+        ast::Stmt::With { body, .. } => match body.get() {
+            ast::Stmt::Labelled { label, .. } => testing::assert_eq(label, "label"),
+            _ => testing::fail("expected labelled with body"),
+        },
+        _ => testing::fail("expected with statement"),
+    }
+}
+
+#[test]
+fn parses_for_of_variable_declarations() -> unit {
+    let result = parse(
+        "for (let value of values) consume(value); for (const char of text) consume(char); for (var item of source) consume(item);",
+    );
+    testing::assert_eq(result.errors.len(), 0);
+    testing::assert_eq(result.program.body.len(), 3);
+    match result.program.body[0] {
+        ast::Stmt::ForOf { kind, name, iterable, .. } => {
+            testing::assert_eq(kind, ast::VariableKind::Let);
+            testing::assert_eq(name, "value");
+            assert_identifier(iterable.get(), "values")
+        },
+        _ => testing::fail("expected let for-of statement"),
+    };
+    match result.program.body[1] {
+        ast::Stmt::ForOf { kind, name, .. } => {
+            testing::assert_eq(kind, ast::VariableKind::Const);
+            testing::assert_eq(name, "char")
+        },
+        _ => testing::fail("expected const for-of statement"),
+    };
+    match result.program.body[2] {
+        ast::Stmt::ForOf { kind, name, .. } => {
+            testing::assert_eq(kind, ast::VariableKind::Var);
+            testing::assert_eq(name, "item")
+        },
+        _ => testing::fail("expected var for-of statement"),
+    }
+}
+
+#[test]
+fn parses_for_in_variable_declarations() -> unit {
+    let result = parse(
+        "for (let key in object) consume(key); for (const index in array) consume(index); for (var name in source) consume(name);",
+    );
+    testing::assert_eq(result.errors.len(), 0);
+    testing::assert_eq(result.program.body.len(), 3);
+    match result.program.body[0] {
+        ast::Stmt::ForIn { kind, name, object, .. } => {
+            testing::assert_eq(kind, ast::VariableKind::Let);
+            testing::assert_eq(name, "key");
+            assert_identifier(object.get(), "object")
+        },
+        _ => testing::fail("expected let for-in statement"),
+    };
+    match result.program.body[1] {
+        ast::Stmt::ForIn { kind, name, .. } => {
+            testing::assert_eq(kind, ast::VariableKind::Const);
+            testing::assert_eq(name, "index")
+        },
+        _ => testing::fail("expected const for-in statement"),
+    };
+    match result.program.body[2] {
+        ast::Stmt::ForIn { kind, name, .. } => {
+            testing::assert_eq(kind, ast::VariableKind::Var);
+            testing::assert_eq(name, "name")
+        },
+        _ => testing::fail("expected var for-in statement"),
+    }
+}
+
+#[test]
+fn parses_for_in_assignment_targets() -> unit {
+    let result = parse(
+        "for (key in object) {} for (holder.value in object) {} for (holder[0] in object) {} for (var legacy = 2 in object) {}",
+    );
+    testing::assert_eq(result.errors.len(), 0);
+    testing::assert_eq(result.program.body.len(), 4);
+    match result.program.body[0] {
+        ast::Stmt::ForIn { target: Some(target), .. } => assert_identifier(target.get(), "key"),
+        _ => testing::fail("expected identifier for-in target"),
+    };
+    match result.program.body[1] {
+        ast::Stmt::ForIn { target: Some(target), .. } => match target.get() {
+            ast::Expr::Member { computed, .. } => testing::assert(!computed),
+            _ => testing::fail("expected field for-in target"),
+        },
+        _ => testing::fail("expected field for-in statement"),
+    };
+    match result.program.body[2] {
+        ast::Stmt::ForIn { target: Some(target), .. } => match target.get() {
+            ast::Expr::Member { computed, .. } => testing::assert(computed),
+            _ => testing::fail("expected computed for-in target"),
+        },
+        _ => testing::fail("expected computed for-in statement"),
+    };
+    match result.program.body[3] {
+        ast::Stmt::ForIn { name, initializer: Some(_), .. } => {
+            testing::assert_eq(name, "legacy")
+        },
+        _ => testing::fail("expected initialized var for-in statement"),
+    }
+}
+
+#[test]
+fn parses_for_of_assignment_targets() -> unit {
+    let result = parse(
+        "for (value of values) total += value; for (target[index()] of values) {} for (value() of values) tail();",
+    );
+    testing::assert_eq(result.errors.len(), 1);
+    match result.program.body[0] {
+        ast::Stmt::ForOf { target: Some(target), .. } => assert_identifier(target.get(), "value"),
+        _ => testing::fail("expected identifier for-of assignment target"),
+    };
+    match result.program.body[1] {
+        ast::Stmt::ForOf { target: Some(target), .. } => match target.get() {
+            ast::Expr::Member { computed: true, .. } => (),
+            _ => testing::fail("expected indexed for-of assignment target"),
+        },
+        _ => testing::fail("expected indexed for-of statement"),
+    };
+    testing::assert_eq(result.program.body.len(), 3)
+}
+
+#[test]
+fn parses_namespace_imports() -> unit {
+    let result = parse("import * as stdlib from 'std'; import * as system from \"os\";");
+    testing::assert(result.errors.is_empty());
+    testing::assert_eq(result.program.body.len(), 2);
+    match result.program.body[0] {
+        ast::Stmt::ImportNamespace { local, source, .. } => {
+            testing::assert_eq(local, "stdlib");
+            testing::assert_eq(source, "std")
+        },
+        _ => testing::fail("expected namespace import"),
+    };
+    match result.program.body[1] {
+        ast::Stmt::ImportNamespace { local, source, .. } => {
+            testing::assert_eq(local, "system");
+            testing::assert_eq(source, "os")
+        },
+        _ => testing::fail("expected namespace import"),
+    }
+}
+
+#[test]
+fn parses_dynamic_import_with_options_and_trailing_comma() -> unit {
+    let result = parse("let loaded = import('./module.js', {with: {type: 'json'}},);");
+    testing::assert(result.errors.is_empty());
+    match result.program.body[0] {
+        ast::Stmt::VariableDeclaration { declarations, .. } => match declarations[0].initializer {
+            Some(value) => match value.get() {
+                ast::Expr::DynamicImport { specifier, options, .. } => {
+                    match specifier.get() {
+                        ast::Expr::String { value, .. } => {
+                            testing::assert_eq(value, "./module.js")
+                        },
+                        _ => testing::fail("expected dynamic import specifier"),
+                    };
+                    testing::assert(options.is_some())
+                },
+                _ => testing::fail("expected dynamic import expression"),
+            },
+            None => testing::fail("expected variable initializer"),
+        },
+        _ => testing::fail("expected variable declaration"),
+    }
+}
+
+#[test]
+fn parses_static_import_and_reexport_attributes() -> unit {
+    let result = parse(
+        "import data from './data.json' with { type: 'json' }; export {default as data} from './data.json' with {'type': 'json',}; export * from './module.js' with {type: 'javascript'};",
+    );
+    testing::assert(result.errors.is_empty());
+    match result.program.body[0] {
+        ast::Stmt::ImportNamed { attributes, .. } => {
+            testing::assert_eq(attributes.len(), 1);
+            testing::assert_eq(attributes[0].key, "type");
+            testing::assert_eq(attributes[0].value, "json")
+        },
+        _ => testing::fail("expected attributed import"),
+    };
+    match result.program.body[1] {
+        ast::Stmt::ExportNamed { attributes, .. } => {
+            testing::assert_eq(attributes.len(), 1);
+            testing::assert_eq(attributes[0].value, "json")
+        },
+        _ => testing::fail("expected attributed named re-export"),
+    };
+    match result.program.body[2] {
+        ast::Stmt::ExportAll { attributes, .. } => {
+            testing::assert_eq(attributes.len(), 1);
+            testing::assert_eq(attributes[0].value, "javascript")
+        },
+        _ => testing::fail("expected attributed star re-export"),
+    }
+}
+
+#[test]
+fn diagnoses_duplicate_and_non_string_static_import_attributes() -> unit {
+    let result = parse(
+        "import './data.json' with {type: 'json', type: 'json'}; import './data.json' with {type: 1};",
+    );
+    testing::assert_eq(result.errors.len(), 2);
+    testing::assert(result.errors[0].message.contains("duplicate import attribute"));
+    testing::assert_eq(result.errors[1].message, "import attribute value must be a string")
+}
+
+#[test]
+fn parses_import_meta_as_a_primary_expression() -> unit {
+    let result = parse("export const meta = import.meta; let url = import.meta.url;");
+    testing::assert(result.errors.is_empty());
+    match result.program.body[0] {
+        ast::Stmt::ExportDeclaration { declaration, .. } => match declaration.get() {
+            ast::Stmt::VariableDeclaration { declarations, .. } => {
+                match declarations[0].initializer {
+                    Some(value) => match value.get() {
+                        ast::Expr::ImportMeta { .. } => (),
+                        _ => testing::fail("expected import.meta expression"),
+                    },
+                    None => testing::fail("expected import.meta initializer"),
+                }
+            },
+            _ => testing::fail("expected exported declaration"),
+        },
+        _ => testing::fail("expected export declaration"),
+    }
+}
+
+#[test]
+fn recovers_from_malformed_for_and_do_while() -> unit {
+    let result = parse("for (let i = 0; i < 2 i = i + 1) break; do break;");
+    testing::assert(result.errors.len() >= 2);
+    testing::assert_eq(result.program.body.len(), 2);
+    match result.program.body[0] {
+        ast::Stmt::For { body, .. } => match body.get() {
+            ast::Stmt::Break { .. } => (),
+            _ => testing::assert(false),
+        },
+        _ => testing::assert(false),
+    };
+    match result.program.body[1] {
+        ast::Stmt::DoWhile { test, .. } => match test.get() {
+            ast::Expr::Error { .. } => (),
+            _ => testing::assert(false),
+        },
+        _ => testing::assert(false),
+    };
+    for error in result.errors {
+        testing::assert(error.span.start >= 0);
+        testing::assert(error.span.end >= error.span.start)
+    }
+}
+
+#[test]
+fn rejects_escaped_reserved_words_in_binding_and_reference_positions() -> unit {
+    let result = parse("let \\u0069f = 1; \\u0072eturn; object.\\u0069f;");
+    testing::assert_eq(result.errors.len(), 2);
+    testing::assert_eq(result.errors[0].message, "reserved word cannot be used as a variable name");
+    testing::assert_eq(result.errors[1].message, "reserved word cannot be used as an identifier")
+}
+
+#[test]
+fn parses_switch_cases_default_fallthrough_and_throw() -> unit {
+    let source = "switch (kind) { case 1: first; default: second; case 2: break; } throw \"done\";";
+    let result = parse(source);
+    testing::assert_eq(result.errors.len(), 0);
+    testing::assert_eq(result.program.body.len(), 2);
+    match result.program.body[0] {
+        ast::Stmt::Switch { discriminant, cases, span } => {
+            assert_identifier(discriminant.get(), "kind");
+            testing::assert_eq(cases.len(), 3);
+            testing::assert_eq(span.start, 0);
+            testing::assert(cases[0].test.is_some());
+            testing::assert_eq(cases[0].consequent.len(), 1);
+            testing::assert(cases[1].test.is_none());
+            testing::assert_eq(cases[1].consequent.len(), 1);
+            testing::assert(cases[2].test.is_some());
+            match cases[2].consequent[0] {
+                ast::Stmt::Break { .. } => (),
+                _ => testing::assert(false),
+            }
+        },
+        _ => testing::assert(false),
+    };
+    match result.program.body[1] {
+        ast::Stmt::Throw { argument, span } => {
+            testing::assert_eq(span.end, source.byte_len());
+            match argument.get() {
+                ast::Expr::String { value, .. } => testing::assert_eq(value, "done"),
+                _ => testing::assert(false),
+            }
+        },
+        _ => testing::assert(false),
+    }
+}
+
+#[test]
+fn diagnoses_duplicate_default_and_throw_line_break_without_losing_tail() -> unit {
+    let result = parse("switch (1) { default: break; default: break; } throw\nvalue; let tail = 1;");
+    testing::assert_eq(result.errors.len(), 2);
+    testing::assert_eq(result.errors[0].message, "duplicate `default` clause");
+    testing::assert_eq(result.errors[1].message, "line terminator is not allowed after `throw`");
+    testing::assert_eq(result.program.body.len(), 4);
+    match result.program.body[1] {
+        ast::Stmt::Throw { argument, .. } => match argument.get() {
+            ast::Expr::Error { .. } => (),
+            _ => testing::assert(false),
+        },
+        _ => testing::assert(false),
+    };
+    assert_identifier(expression_statement(result.program.body[2]), "value");
+    match result.program.body[3] {
+        ast::Stmt::VariableDeclaration { declarations, .. } => {
+            testing::assert_eq(declarations.len(), 1);
+            testing::assert_eq(declarations[0].name, "tail")
+        },
+        _ => testing::assert(false),
+    }
+}
+
+#[test]
+fn parses_try_catch_binding_optional_catch_and_finally() -> unit {
+    let result = parse(
+        "try { throw 1; } catch (error) { let caught = error; } finally { cleanup; } try {} catch {} try {} finally {}",
+    );
+    testing::assert_eq(result.errors.len(), 0);
+    testing::assert_eq(result.program.body.len(), 3);
+    match result.program.body[0] {
+        ast::Stmt::Try { block, handler: Some(handler), finalizer: Some(finalizer), span } => {
+            testing::assert_eq(block.len(), 1);
+            testing::assert_eq(handler.binding.unwrap_or(""), "error");
+            testing::assert_eq(handler.body.len(), 1);
+            testing::assert_eq(finalizer.len(), 1);
+            testing::assert(span.end > span.start)
+        },
+        _ => testing::fail("expected complete try statement"),
+    };
+    match result.program.body[1] {
+        ast::Stmt::Try { handler: Some(handler), finalizer: None, .. } => {
+            testing::assert(handler.binding.is_none())
+        },
+        _ => testing::fail("expected optional catch binding"),
+    };
+    match result.program.body[2] {
+        ast::Stmt::Try { handler: None, finalizer: Some(_), .. } => (),
+        _ => testing::fail("expected finally-only statement"),
+    }
+}
+
+#[test]
+fn reports_malformed_try_statements_and_recovers() -> unit {
+    let result = parse("try {} let tail = 1; try catch (reserved) {} finally {} let done = 2;");
+    testing::assert(result.errors.len() >= 2);
+    testing::assert_eq(result.program.body.len(), 4)
+}
+
+#[test]
+fn parses_generator_functions_yield_and_delegation() -> unit {
+    let result = parse("function *items() { let input = yield 1; return yield *other(); }");
+    testing::assert(result.errors.is_empty());
+    match result.program.body[0] {
+        ast::Stmt::FunctionDeclaration { generator, body, .. } => {
+            testing::assert(generator);
+            match body[0] {
+                ast::Stmt::VariableDeclaration { declarations, .. } => match declarations[0].initializer {
+                    Some(value) => match value.get() {
+                        ast::Expr::Yield { delegate, .. } => testing::assert(!delegate),
+                        _ => testing::fail("expected yield initializer"),
+                    },
+                    None => testing::fail("expected yield initializer"),
+                },
+                _ => testing::fail("expected generator variable declaration"),
+            };
+            match body[1] {
+                ast::Stmt::Return { argument: Some(value), .. } => match value.get() {
+                    ast::Expr::Yield { delegate, .. } => testing::assert(delegate),
+                    _ => testing::fail("expected delegated yield"),
+                },
+                _ => testing::fail("expected generator return"),
+            }
+        },
+        _ => testing::fail("expected generator declaration"),
+    }
+}
+
+#[test]
+fn parses_function_declarations_and_expressions() -> unit {
+    let result = parse(
+        "function add(left, right) { return left + right; } let identity = function named(value) { return value; };",
+    );
+    testing::assert_eq(result.errors.len(), 0);
+    testing::assert_eq(result.program.body.len(), 2);
+    match result.program.body[0] {
+        ast::Stmt::FunctionDeclaration { name, parameters, body, span, .. } => {
+            testing::assert_eq(name, "add");
+            testing::assert_eq(parameters.len(), 2);
+            testing::assert_eq(parameters[0].name, "left");
+            testing::assert_eq(parameters[1].name, "right");
+            testing::assert_eq(body.len(), 1);
+            testing::assert_eq(span.start, 0);
+            match body[0] {
+                ast::Stmt::Return { argument, .. } => testing::assert(argument.is_some()),
+                _ => testing::assert(false),
+            }
+        },
+        _ => testing::assert(false),
+    };
+    match result.program.body[1] {
+        ast::Stmt::VariableDeclaration { declarations, .. } => match declarations[0].initializer {
+            Some(value) => match value.get() {
+                ast::Expr::Function { name, parameters, body, .. } => {
+                    testing::assert_eq(name.unwrap_or(""), "named");
+                    testing::assert_eq(parameters.len(), 1);
+                    testing::assert_eq(parameters[0].name, "value");
+                    testing::assert_eq(body.len(), 1)
+                },
+                _ => testing::assert(false),
+            },
+            None => testing::assert(false),
+        },
+        _ => testing::assert(false),
+    }
+}
+
+#[test]
+fn parses_default_and_rest_function_parameters() -> unit {
+    let result = parse(
+        "function collect(first, second = first + 1, ...remaining) { return remaining; }",
+    );
+    testing::assert_eq(result.errors.len(), 0);
+    match result.program.body[0] {
+        ast::Stmt::FunctionDeclaration { parameters, .. } => {
+            testing::assert_eq(parameters.len(), 3);
+            testing::assert(parameters[0].initializer.is_none());
+            testing::assert(!parameters[0].rest);
+            testing::assert(parameters[1].initializer.is_some());
+            testing::assert(!parameters[1].rest);
+            testing::assert(parameters[2].initializer.is_none());
+            testing::assert(parameters[2].rest)
+        },
+        _ => testing::fail("expected function declaration"),
+    };
+    let malformed = parse("function invalid(...values = 1, tail) {} let after = 1;");
+    testing::assert(malformed.errors.len() >= 2);
+    testing::assert_eq(malformed.program.body.len(), 2)
+}
+
+#[test]
+fn parses_nested_destructured_function_parameters() -> unit {
+    let result = parse(
+        "function select([first, , {value: renamed = 3}, ...tail], {plain, [key()]: computed, ...rest} = {}) { return tail; }",
+    );
+    testing::assert_eq(result.errors.len(), 0);
+    match result.program.body[0] {
+        ast::Stmt::FunctionDeclaration { parameters, .. } => {
+            testing::assert_eq(parameters.len(), 2);
+            testing::assert_eq(parameters[0].name, "");
+            match parameters[0].pattern.get() {
+                ast::BindingPattern::Array { elements, .. } => {
+                    testing::assert_eq(elements.len(), 4);
+                    match elements[1] {
+                        ast::ArrayBindingElement::Hole => (),
+                        _ => testing::fail("expected binding hole"),
+                    };
+                    match elements[2] {
+                        ast::ArrayBindingElement::Element { pattern, initializer, rest, .. } => {
+                            testing::assert(!rest);
+                            testing::assert(initializer.is_none());
+                            match pattern.get() {
+                                ast::BindingPattern::Object { properties, .. } => {
+                                    testing::assert_eq(properties.len(), 1)
+                                },
+                                _ => testing::fail("expected nested object binding"),
+                            }
+                        },
+                        _ => testing::fail("expected nested binding element"),
+                    };
+                    match elements[3] {
+                        ast::ArrayBindingElement::Element { rest, .. } => testing::assert(rest),
+                        _ => testing::fail("expected rest binding element"),
+                    }
+                },
+                _ => testing::fail("expected array binding pattern"),
+            };
+            testing::assert(parameters[1].initializer.is_some());
+            match parameters[1].pattern.get() {
+                ast::BindingPattern::Object { properties, .. } => {
+                    testing::assert_eq(properties.len(), 3);
+                    match properties[2] {
+                        ast::ObjectBindingProperty::Rest { .. } => (),
+                        _ => testing::fail("expected object rest binding"),
+                    }
+                },
+                _ => testing::fail("expected object binding pattern"),
+            }
+        },
+        _ => testing::fail("expected function declaration"),
+    }
+}
+
+#[test]
+fn diagnoses_invalid_destructured_parameters_and_recovers() -> unit {
+    let result = parse(
+        "function invalid([...tail, next], {...rest, other}, {if}, [value =]) {} let after = 1;",
+    );
+    testing::assert(result.errors.len() >= 4);
+    testing::assert_eq(result.program.body.len(), 2)
+}
+
+#[test]
+fn parses_destructured_declarations_loops_and_catch_bindings() -> unit {
+    let result = parse(
+        "let [first, ...tail] = values; const {value: renamed = 1, ...rest} = source; for (const [key, value] of entries) {} for (let {length} in object) {} try {} catch ({message, ...details}) {}",
+    );
+    testing::assert_eq(result.errors.len(), 0);
+    testing::assert_eq(result.program.body.len(), 5);
+    match result.program.body[0] {
+        ast::Stmt::VariableDeclaration { declarations, .. } => match declarations[0].pattern.get() {
+            ast::BindingPattern::Array { elements, .. } => testing::assert_eq(elements.len(), 2),
+            _ => testing::fail("expected array declaration pattern"),
+        },
+        _ => testing::fail("expected variable declaration"),
+    };
+    match result.program.body[1] {
+        ast::Stmt::VariableDeclaration { declarations, .. } => match declarations[0].pattern.get() {
+            ast::BindingPattern::Object { properties, .. } => {
+                testing::assert_eq(properties.len(), 2)
+            },
+            _ => testing::fail("expected object declaration pattern"),
+        },
+        _ => testing::fail("expected variable declaration"),
+    };
+    match result.program.body[2] {
+        ast::Stmt::ForOf { pattern, .. } => match pattern.get() {
+            ast::BindingPattern::Array { .. } => (),
+            _ => testing::fail("expected for-of array pattern"),
+        },
+        _ => testing::fail("expected for-of statement"),
+    };
+    match result.program.body[3] {
+        ast::Stmt::ForIn { pattern, .. } => match pattern.get() {
+            ast::BindingPattern::Object { .. } => (),
+            _ => testing::fail("expected for-in object pattern"),
+        },
+        _ => testing::fail("expected for-in statement"),
+    };
+    match result.program.body[4] {
+        ast::Stmt::Try { handler: Some(handler), .. } => match handler.pattern {
+            Some(pattern) => match pattern.get() {
+                ast::BindingPattern::Object { .. } => (),
+                _ => testing::fail("expected catch object pattern"),
+            },
+            None => testing::fail("expected catch binding pattern"),
+        },
+        _ => testing::fail("expected try statement"),
+    }
+}
+
+#[test]
+fn parses_nested_array_and_object_destructuring_assignments() -> unit {
+    let result = parse(
+        "[first, holder.value = 2, ...tail] = values; ({plain, [key()]: holder.computed, nested: [inner], ...holder.rest} = source);",
+    );
+    testing::assert_eq(result.errors.len(), 0);
+    testing::assert_eq(result.program.body.len(), 2);
+    match result.program.body[0] {
+        ast::Stmt::Expression { expression, .. } => match expression.get() {
+            ast::Expr::DestructuringAssignment { pattern, .. } => match pattern.get() {
+                ast::AssignmentPattern::Array { elements, .. } => {
+                    testing::assert_eq(elements.len(), 3);
+                    match elements[2] {
+                        ast::ArrayAssignmentElement::Element { rest, .. } => {
+                            testing::assert(rest)
+                        },
+                        _ => testing::fail("expected assignment rest element"),
+                    }
+                },
+                _ => testing::fail("expected array assignment pattern"),
+            },
+            _ => testing::fail("expected destructuring assignment"),
+        },
+        _ => testing::fail("expected expression statement"),
+    };
+    match result.program.body[1] {
+        ast::Stmt::Expression { expression, .. } => match expression.get() {
+            ast::Expr::Parenthesized { expression, .. } => match expression.get() {
+                ast::Expr::DestructuringAssignment { pattern, .. } => match pattern.get() {
+                    ast::AssignmentPattern::Object { properties, .. } => {
+                        testing::assert_eq(properties.len(), 4);
+                        match properties[3] {
+                            ast::ObjectAssignmentProperty::Rest { .. } => (),
+                            _ => testing::fail("expected object assignment rest"),
+                        }
+                    },
+                    _ => testing::fail("expected object assignment pattern"),
+                },
+                _ => testing::fail("expected parenthesized destructuring assignment"),
+            },
+            _ => testing::fail("expected parenthesized expression"),
+        },
+        _ => testing::fail("expected expression statement"),
+    }
+}
+
+#[test]
+fn diagnoses_invalid_destructuring_assignments_and_recovers() -> unit {
+    let result = parse(
+        "[...tail, next] = values; ({...{nested}} = source); [value =] = source; let after = 1;",
+    );
+    testing::assert(result.errors.len() >= 3);
+    testing::assert_eq(result.program.body.len(), 4)
+}
+
+#[test]
+fn parses_arrow_functions_with_expression_and_block_bodies() -> unit {
+    let result = parse(
+        "let add = (left, right = 1, ...remaining) => left + right + remaining.length; let identity = value => value; let block = () => { return 3; }; let nested = left => right => left + right;",
+    );
+    testing::assert_eq(result.errors.len(), 0);
+    testing::assert_eq(result.program.body.len(), 4);
+    match result.program.body[0] {
+        ast::Stmt::VariableDeclaration { declarations, .. } => match declarations[0].initializer {
+            Some(value) => match value.get() {
+                ast::Expr::Arrow { parameters, body, .. } => {
+                    testing::assert_eq(parameters.len(), 3);
+                    testing::assert(parameters[1].initializer.is_some());
+                    testing::assert(parameters[2].rest);
+                    testing::assert_eq(body.len(), 1)
+                },
+                _ => testing::fail("expected arrow function"),
+            },
+            None => testing::fail("expected initializer"),
+        },
+        _ => testing::fail("expected variable declaration"),
+    };
+    let line_break = parse("let invalid = value\n=> value; let after = 1;");
+    testing::assert(!line_break.errors.is_empty());
+    testing::assert_eq(line_break.program.body.len(), 2)
+}
+
+#[test]
+fn parses_async_function_arrow_and_await_syntax() -> unit {
+    let result = parse(
+        "async function declared(value) { return await value; } let expression = async function(value) { return await value; }; let first = async value => await value; let second = async (left, right) => await left + right;",
+    );
+    testing::assert_eq(result.errors.len(), 0);
+    testing::assert_eq(result.program.body.len(), 4);
+    match result.program.body[0] {
+        ast::Stmt::FunctionDeclaration { asynchronous, body, .. } => {
+            testing::assert(asynchronous);
+            match body[0] {
+                ast::Stmt::Return { argument: Some(value), .. } => match value.get() {
+                    ast::Expr::Await { .. } => (),
+                    _ => testing::fail("expected await expression"),
+                },
+                _ => testing::fail("expected async return"),
+            }
+        },
+        _ => testing::fail("expected async declaration"),
+    };
+    match result.program.body[1] {
+        ast::Stmt::VariableDeclaration { declarations, .. } => match declarations[0].initializer {
+            Some(value) => match value.get() {
+                ast::Expr::Function { asynchronous, .. } => testing::assert(asynchronous),
+                _ => testing::fail("expected async function expression"),
+            },
+            None => testing::fail("expected async initializer"),
+        },
+        _ => testing::fail("expected variable declaration"),
+    };
+    match result.program.body[2] {
+        ast::Stmt::VariableDeclaration { declarations, .. } => match declarations[0].initializer {
+            Some(value) => match value.get() {
+                ast::Expr::Arrow { asynchronous, .. } => testing::assert(asynchronous),
+                _ => testing::fail("expected async arrow"),
+            },
+            None => testing::fail("expected async arrow initializer"),
+        },
+        _ => testing::fail("expected variable declaration"),
+    }
+}
+
+#[test]
+fn terminates_block_arrow_expressions_before_line_break_continuations() -> unit {
+    let result = parse("() => {}\n() => {}; () => {}\n+1;");
+    testing::assert_eq(result.errors.len(), 0);
+    testing::assert_eq(result.program.body.len(), 4);
+    match result.program.body[0] {
+        ast::Stmt::Expression { expression, .. } => match expression.get() {
+            ast::Expr::Arrow { expression_body, .. } => testing::assert(!expression_body),
+            _ => testing::fail("expected block arrow function"),
+        },
+        _ => testing::fail("expected arrow expression statement"),
+    }
+}
+
+#[test]
+fn parses_class_constructors_methods_and_accessors() -> unit {
+    let result = parse(
+        "class Example { constructor(value = 1) { this.value = value; } method() { return this.value; } static create(value) { return new Example(value); } get doubled() { return this.value * 2; } set doubled(value) { this.value = value / 2; } static() { return 9; } ; }",
+    );
+    testing::assert_eq(result.errors.len(), 0);
+    match result.program.body[0] {
+        ast::Stmt::ClassDeclaration { name, elements, span, .. } => {
+            testing::assert_eq(name, "Example");
+            testing::assert_eq(elements.len(), 6);
+            testing::assert_eq(elements[0].name, "constructor");
+            testing::assert(elements[0].parameters[0].initializer.is_some());
+            testing::assert(elements[2].static_member);
+            testing::assert(elements[3].kind == ast::ClassElementKind::Getter);
+            testing::assert(elements[4].kind == ast::ClassElementKind::Setter);
+            testing::assert_eq(elements[5].name, "static");
+            testing::assert(!elements[5].static_member);
+            testing::assert(span.end > span.start)
+        },
+        _ => testing::fail("expected class declaration"),
+    };
+    let invalid = parse(
+        "class Derived extends Base {} class Fields { value = 1; constructor() {} constructor() {} } let after = 1;",
+    );
+    testing::assert(!invalid.errors.is_empty());
+    testing::assert_eq(invalid.program.body.len(), 3)
+}
+
+#[test]
+fn parses_instance_and_static_public_class_fields() -> unit {
+    let result = parse(
+        "class Fields { value = 1; empty; static count = 2; static = 3; line = 4\nnext = 5; [fieldName] = 6; static [methodName]() { return 7; } get [accessorName]() { return 8; } }",
+    );
+    testing::assert_eq(result.errors.len(), 0);
+    match result.program.body[0] {
+        ast::Stmt::ClassDeclaration { elements, .. } => {
+            testing::assert_eq(elements.len(), 9);
+            testing::assert(elements[0].kind == ast::ClassElementKind::Field);
+            testing::assert(elements[0].initializer.is_some());
+            testing::assert(elements[1].initializer.is_none());
+            testing::assert(elements[2].static_member);
+            testing::assert_eq(elements[3].name, "static");
+            testing::assert(!elements[3].static_member);
+            testing::assert_eq(elements[5].name, "next");
+            testing::assert(elements[6].computed_name.is_some());
+            testing::assert(elements[6].kind == ast::ClassElementKind::Field);
+            testing::assert(elements[7].computed_name.is_some());
+            testing::assert(elements[7].static_member);
+            testing::assert(elements[8].kind == ast::ClassElementKind::Getter)
+        },
+        _ => testing::fail("expected class fields"),
+    };
+    let invalid = parse("class Invalid { constructor = 1; [] = 2; }");
+    testing::assert(invalid.errors.len() >= 2)
+}
+
+#[test]
+fn parses_class_static_initialization_blocks_and_rejects_return() -> unit {
+    let result = parse(
+        "class Blocks { static { let value = 1; function read() { return value; } this.value = read(); } static {} }",
+    );
+    testing::assert_eq(result.errors.len(), 0);
+    match result.program.body[0] {
+        ast::Stmt::ClassDeclaration { elements, .. } => {
+            testing::assert_eq(elements.len(), 2);
+            testing::assert(elements[0].kind == ast::ClassElementKind::StaticBlock);
+            testing::assert(elements[0].static_member);
+            testing::assert_eq(elements[0].body.len(), 3);
+            testing::assert(elements[1].kind == ast::ClassElementKind::StaticBlock)
+        },
+        _ => testing::fail("expected static blocks"),
+    };
+    let invalid = parse(
+        "class Invalid { static { if (true) { return; } function allowed() { return 1; } } }",
+    );
+    testing::assert_eq(invalid.errors.len(), 1);
+    testing::assert(invalid.errors[0].message.contains("static block"))
+}
+
+#[test]
+fn parses_private_class_elements_access_and_brand_checks() -> unit {
+    let result = parse(
+        "class Secret { #value = 1; static #count; #method() { return this.#value; } get #current() { return this.#value; } set #current(value) { this.#value = value; } read(other) { return #value in other; } static read() { return this.#count; } }",
+    );
+    testing::assert_eq(result.errors.len(), 0);
+    match result.program.body[0] {
+        ast::Stmt::ClassDeclaration { elements, .. } => {
+            testing::assert_eq(elements.len(), 7);
+            testing::assert(elements[0].private_member);
+            testing::assert(elements[0].kind == ast::ClassElementKind::Field);
+            testing::assert(elements[1].private_member && elements[1].static_member);
+            testing::assert(elements[2].kind == ast::ClassElementKind::Method);
+            testing::assert(elements[3].kind == ast::ClassElementKind::Getter);
+            testing::assert(elements[4].kind == ast::ClassElementKind::Setter)
+        },
+        _ => testing::fail("expected private class elements"),
+    }
+}
+
+#[test]
+fn rejects_duplicate_private_class_elements() -> unit {
+    let duplicate = parse("class Invalid { #value; #value() {} }");
+    testing::assert_eq(duplicate.errors.len(), 1);
+    testing::assert(duplicate.errors[0].message.contains("duplicate private"));
+    let pair = parse("class Valid { get #value() {} set #value(next) {} }");
+    testing::assert_eq(pair.errors.len(), 0);
+    let mixed = parse("class Invalid { static get #value() {} set #value(next) {} }");
+    testing::assert_eq(mixed.errors.len(), 1)
+}
+
+#[test]
+fn parses_class_heritage_and_super_expressions() -> unit {
+    let result = parse(
+        "class Derived extends namespace.Base { constructor(value) { super(value); } method() { return super.method(); } computed() { return super['value']; } }",
+    );
+    testing::assert_eq(result.errors.len(), 0);
+    match result.program.body[0] {
+        ast::Stmt::ClassDeclaration { heritage, elements, .. } => {
+            match heritage {
+                Some(value) => match value.get() {
+                    ast::Expr::Member { .. } => (),
+                    _ => testing::fail("expected member heritage"),
+                },
+                None => testing::fail("expected class heritage"),
+            };
+            match elements[0].body[0] {
+                ast::Stmt::Expression { expression, .. } => match expression.get() {
+                    ast::Expr::Call { callee, .. } => match callee.get() {
+                        ast::Expr::Super { .. } => (),
+                        _ => testing::fail("expected super constructor call"),
+                    },
+                    _ => testing::fail("expected call expression"),
+                },
+                _ => testing::fail("expected constructor expression"),
+            };
+            match elements[1].body[0] {
+                ast::Stmt::Return { argument, .. } => match argument {
+                    Some(value) => match value.get() {
+                        ast::Expr::Call { callee, .. } => match callee.get() {
+                            ast::Expr::Member { object, .. } => match object.get() {
+                                ast::Expr::Super { .. } => (),
+                                _ => testing::fail("expected super method receiver"),
+                            },
+                            _ => testing::fail("expected super member"),
+                        },
+                        _ => testing::fail("expected super method call"),
+                    },
+                    None => testing::fail("expected return value"),
+                },
+                _ => testing::fail("expected return statement"),
+            }
+        },
+        _ => testing::fail("expected derived class declaration"),
+    };
+    let malformed = parse("class Missing extends");
+    testing::assert(!malformed.errors.is_empty())
+}
+
+#[test]
+fn parses_anonymous_and_named_class_expressions() -> unit {
+    let result = parse(
+        "let Anonymous = class { method() { return 1; } }; let Named = class Inner { static self() { return Inner; } };",
+    );
+    testing::assert_eq(result.errors.len(), 0);
+    testing::assert_eq(result.program.body.len(), 2);
+    match result.program.body[0] {
+        ast::Stmt::VariableDeclaration { declarations, .. } => match declarations[0].initializer {
+            Some(value) => match value.get() {
+                ast::Expr::Class { name, elements, .. } => {
+                    testing::assert(name.is_none());
+                    testing::assert_eq(elements.len(), 1)
+                },
+                _ => testing::fail("expected anonymous class expression"),
+            },
+            None => testing::fail("expected class initializer"),
+        },
+        _ => testing::fail("expected variable declaration"),
+    };
+    match result.program.body[1] {
+        ast::Stmt::VariableDeclaration { declarations, .. } => match declarations[0].initializer {
+            Some(value) => match value.get() {
+                ast::Expr::Class { name, elements, .. } => {
+                    match name {
+                        Some(value) => testing::assert_eq(value, "Inner"),
+                        None => testing::fail("expected named class expression"),
+                    };
+                    testing::assert(elements[0].static_member)
+                },
+                _ => testing::fail("expected named class expression"),
+            },
+            None => testing::fail("expected class initializer"),
+        },
+        _ => testing::fail("expected variable declaration"),
+    };
+    let derived = parse("let Derived = class extends Base {}; let after = 1;");
+    testing::assert(derived.errors.is_empty());
+    testing::assert_eq(derived.program.body.len(), 2)
+}
+
+#[test]
+fn parses_anonymous_function_calls() -> unit {
+    let result = parse("(function (value) { return value; })(42);");
+    testing::assert_eq(result.errors.len(), 0);
+    match expression_statement(result.program.body[0]) {
+        ast::Expr::Call { callee, arguments, .. } => {
+            testing::assert_eq(arguments.len(), 1);
+            match callee.get() {
+                ast::Expr::Parenthesized { expression, .. } => match expression.get() {
+                    ast::Expr::Function { name, parameters, .. } => {
+                        testing::assert(name.is_none());
+                        testing::assert_eq(parameters.len(), 1)
+                    },
+                    _ => testing::assert(false),
+                },
+                _ => testing::assert(false),
+            }
+        },
+        _ => testing::assert(false),
+    }
+}
+
+#[test]
+fn recovers_from_malformed_function_headers() -> unit {
+    let result = parse("function (first second) { return first; } let tail = 1;");
+    testing::assert(result.errors.len() >= 2);
+    testing::assert_eq(result.program.body.len(), 2);
+    match result.program.body[1] {
+        ast::Stmt::VariableDeclaration { declarations, .. } => {
+            testing::assert_eq(declarations[0].name, "tail")
+        },
+        _ => testing::assert(false),
+    }
+}
+
+#[test]
+fn parses_object_and_array_literals_with_static_keys_and_holes() -> unit {
+    let result = parse(
+        "let shorthand = 1; return {name: 2, \"quoted\": 3, 1e2: 4, shorthand, ['dynamic']: 5}; return [1,,3,];",
+    );
+    testing::assert_eq(result.errors.len(), 0);
+    match result.program.body[1] {
+        ast::Stmt::Return { argument: Some(value), .. } => match value.get() {
+            ast::Expr::Object { properties, .. } => {
+                testing::assert_eq(properties.len(), 5);
+                match properties[0].key {
+                    ast::ObjectPropertyKey::Identifier(value) => {
+                        testing::assert_eq(value, "name")
+                    },
+                    _ => testing::assert(false),
+                };
+                match properties[1].key {
+                    ast::ObjectPropertyKey::String(value) => {
+                        testing::assert_eq(value, "quoted")
+                    },
+                    _ => testing::assert(false),
+                };
+                match properties[2].key {
+                    ast::ObjectPropertyKey::Number(value) => {
+                        testing::assert_eq(value, "1e2")
+                    },
+                    _ => testing::assert(false),
+                };
+                match properties[3].value.get() {
+                    ast::Expr::Identifier { name, .. } => {
+                        testing::assert_eq(name, "shorthand")
+                    },
+                    _ => testing::assert(false),
+                };
+                match properties[4].key {
+                    ast::ObjectPropertyKey::Computed(value) => match value.get() {
+                        ast::Expr::String { value, .. } => testing::assert_eq(value, "dynamic"),
+                        _ => testing::assert(false),
+                    },
+                    _ => testing::assert(false),
+                }
+            },
+            _ => testing::assert(false),
+        },
+        _ => testing::assert(false),
+    };
+    match result.program.body[2] {
+        ast::Stmt::Return { argument: Some(value), .. } => match value.get() {
+            ast::Expr::Array { elements, .. } => {
+                testing::assert_eq(elements.len(), 3);
+                match elements[0] {
+                    ast::ArrayElement::Value(_) => (),
+                    _ => testing::fail("expected array value"),
+                };
+                match elements[1] {
+                    ast::ArrayElement::Hole => (),
+                    _ => testing::fail("expected array hole"),
+                };
+                match elements[2] {
+                    ast::ArrayElement::Value(_) => (),
+                    _ => testing::fail("expected array value"),
+                }
+            },
+            _ => testing::assert(false),
+        },
+        _ => testing::assert(false),
+    }
+}
+
+#[test]
+fn parses_object_literals_as_assignment_values() -> unit {
+    let result = parse(
+        "let value; value = {}; value = {get item() { return 4; }, set item(input) { this.saved = input; }}; if (true) value = {id: 1}; else value = {};",
+    );
+    testing::assert_eq(result.errors.len(), 0);
+    testing::assert_eq(result.program.body.len(), 4);
+    match expression_statement(result.program.body[1]) {
+        ast::Expr::Assignment { right, .. } => match right.get() {
+            ast::Expr::Object { properties, .. } => testing::assert_eq(properties.len(), 0),
+            _ => testing::fail("expected empty object assignment value"),
+        },
+        _ => testing::fail("expected object assignment"),
+    };
+    match expression_statement(result.program.body[2]) {
+        ast::Expr::Assignment { right, .. } => match right.get() {
+            ast::Expr::Object { properties, .. } => {
+                testing::assert_eq(properties.len(), 2);
+                testing::assert(properties[0].kind == ast::ObjectPropertyKind::Getter);
+                testing::assert(properties[1].kind == ast::ObjectPropertyKind::Setter)
+            },
+            _ => testing::fail("expected accessor object assignment value"),
+        },
+        _ => testing::fail("expected accessor object assignment"),
+    }
+}
+
+#[test]
+fn reports_unsupported_literal_forms_and_recovers() -> unit {
+    let object = parse(
+        "return {[key]: 1, ...other, method() { return 1; }, tail: 2}; let done = 1;",
+    );
+    testing::assert_eq(object.errors.len(), 0);
+    testing::assert_eq(object.program.body.len(), 2);
+    match object.program.body[0] {
+        ast::Stmt::Return { argument: Some(value), .. } => match value.get() {
+            ast::Expr::Object { properties, .. } => match properties[1].key {
+                ast::ObjectPropertyKey::Spread => (),
+                _ => testing::fail("expected object spread"),
+            },
+            _ => testing::fail("expected object literal"),
+        },
+        _ => testing::fail("expected return statement"),
+    };
+    let array = parse("return [...items]; let done = 1;");
+    testing::assert_eq(array.errors.len(), 0);
+    testing::assert_eq(array.program.body.len(), 2);
+    match array.program.body[0] {
+        ast::Stmt::Return { argument: Some(value), .. } => match value.get() {
+            ast::Expr::Array { elements, .. } => match elements[0] {
+                ast::ArrayElement::Spread(_) => (),
+                _ => testing::fail("expected array spread"),
+            },
+            _ => testing::fail("expected array literal"),
+        },
+        _ => testing::fail("expected return statement"),
+    }
+}
+
+#[test]
+fn parses_static_and_computed_object_methods() -> unit {
+    let result = parse(
+        "return {double(value) { return value * 2; }, ['read']() { return this.value; }, get current() { return this.value; }, set current(value) { this.value = value; }, get ['computed']() { return 1; }, set ['computed'](value) {}};",
+    );
+    testing::assert_eq(result.errors.len(), 0);
+    match result.program.body[0] {
+        ast::Stmt::Return { argument: Some(value), .. } => match value.get() {
+            ast::Expr::Object { properties, .. } => {
+                testing::assert_eq(properties.len(), 6);
+                match properties[0].value.get() {
+                    ast::Expr::Function { parameters, body, .. } => {
+                        testing::assert_eq(parameters.len(), 1);
+                        testing::assert_eq(body.len(), 1)
+                    },
+                    _ => testing::fail("expected static object method"),
+                };
+                match properties[1].key {
+                    ast::ObjectPropertyKey::Computed(_) => (),
+                    _ => testing::fail("expected computed object method"),
+                };
+                testing::assert(properties[0].kind == ast::ObjectPropertyKind::Method);
+                testing::assert(properties[1].kind == ast::ObjectPropertyKind::Method);
+                testing::assert(properties[2].kind == ast::ObjectPropertyKind::Getter);
+                testing::assert(properties[3].kind == ast::ObjectPropertyKind::Setter);
+                testing::assert(properties[4].kind == ast::ObjectPropertyKind::Getter);
+                testing::assert(properties[5].kind == ast::ObjectPropertyKind::Setter);
+                match properties[4].key {
+                    ast::ObjectPropertyKey::Computed(_) => (),
+                    _ => testing::fail("expected computed getter"),
+                }
+            },
+            _ => testing::fail("expected object literal"),
+        },
+        _ => testing::fail("expected return statement"),
+    }
+}
+
+#[test]
+fn parses_plain_interpolated_and_nested_template_literals() -> unit {
+    let result = parse("return [`plain`, `head ${value} middle ${`nested ${other}`} tail`];");
+    testing::assert_eq(result.errors.len(), 0);
+    match result.program.body[0] {
+        ast::Stmt::Return { argument: Some(value), .. } => match value.get() {
+            ast::Expr::Array { elements, .. } => {
+                testing::assert_eq(elements.len(), 2);
+                match elements[0] {
+                    ast::ArrayElement::Value(value) => match value.get() {
+                        ast::Expr::String { value, .. } => testing::assert_eq(value, "plain"),
+                        _ => testing::fail("expected plain template string"),
+                    },
+                    _ => testing::fail("expected template array value"),
+                };
+                match elements[1] {
+                    ast::ArrayElement::Value(value) => match value.get() {
+                        ast::Expr::Binary { operator, .. } => {
+                            testing::assert(operator == ast::BinaryOperator::Add)
+                        },
+                        _ => testing::fail("expected interpolated template expression"),
+                    },
+                    _ => testing::fail("expected template array value"),
+                }
+            },
+            _ => testing::fail("expected template array"),
+        },
+        _ => testing::fail("expected template return statement"),
+    }
+}
+
+#[test]
+fn parses_tagged_templates_with_cooked_raw_and_substitutions() -> unit {
+    let result = parse("return receiver.tag`a\\n${first + 1}b${second}c`;");
+    testing::assert_eq(result.errors.len(), 0);
+    match result.program.body[0] {
+        ast::Stmt::Return { argument: Some(value), .. } => match value.get() {
+            ast::Expr::TaggedTemplate { tag, cooked, raw, substitutions, .. } => {
+                testing::assert_eq(cooked.len(), 3);
+                testing::assert(cooked[0] == Option::Some("a\n"));
+                testing::assert(cooked[1] == Option::Some("b"));
+                testing::assert(cooked[2] == Option::Some("c"));
+                testing::assert_eq(raw.len(), 3);
+                testing::assert_eq(raw[0], "a\\n");
+                testing::assert_eq(raw[1], "b");
+                testing::assert_eq(raw[2], "c");
+                testing::assert_eq(substitutions.len(), 2);
+                match tag.get() {
+                    ast::Expr::Member { object, property, computed, .. } => {
+                        testing::assert(!computed);
+                        assert_identifier(object.get(), "receiver");
+                        assert_identifier(property.get(), "tag")
+                    },
+                    _ => testing::fail("expected member tag"),
+                };
+                let _ = binary_parts(substitutions[0].get(), ast::BinaryOperator::Add);
+                assert_identifier(substitutions[1].get(), "second")
+            },
+            _ => testing::fail("expected tagged template"),
+        },
+        _ => testing::fail("expected return statement"),
+    };
+    let normalized = parse("return tag`a\r\nb`; ");
+    testing::assert_eq(normalized.errors.len(), 0);
+    match normalized.program.body[0] {
+        ast::Stmt::Return { argument: Some(value), .. } => match value.get() {
+            ast::Expr::TaggedTemplate { cooked, raw, .. } => {
+                testing::assert(cooked[0] == Option::Some("a\nb"));
+                testing::assert_eq(raw[0], "a\nb")
+            },
+            _ => testing::fail("expected normalized tagged template"),
+        },
+        _ => testing::fail("expected normalized return statement"),
+    }
+}
+
+#[test]
+fn tagged_templates_preserve_invalid_escape_raw_and_undefined_cooked() -> unit {
+    let tagged = parse("return tag`bad\\unicode`; ");
+    testing::assert_eq(tagged.errors.len(), 0);
+    match tagged.program.body[0] {
+        ast::Stmt::Return { argument: Some(value), .. } => match value.get() {
+            ast::Expr::TaggedTemplate { cooked, raw, .. } => {
+                testing::assert(cooked[0] == Option::None);
+                testing::assert_eq(raw[0], "bad\\unicode")
+            },
+            _ => testing::fail("expected invalid-escape tagged template"),
+        },
+        _ => testing::fail("expected invalid-escape return statement"),
+    };
+    let untagged = parse("return `bad\\unicode`; ");
+    testing::assert_eq(untagged.errors.len(), 1);
+    testing::assert_eq(untagged.errors[0].message, "invalid Unicode escape")
+}
+
+#[test]
+fn diagnoses_invalid_object_accessor_parameters() -> unit {
+    let result = parse("return {get value(input) {}, set value() {}};");
+    testing::assert_eq(result.errors.len(), 2);
+    testing::assert_eq(result.errors[0].message, "getter must not have parameters");
+    testing::assert_eq(result.errors[1].message, "setter must have exactly one parameter")
+}
+
+#[test]
+fn parses_this_as_a_primary_member_receiver() -> unit {
+    let result = parse("return this.value;");
+    testing::assert_eq(result.errors.len(), 0);
+    match result.program.body[0] {
+        ast::Stmt::Return { argument: Some(value), .. } => match value.get() {
+            ast::Expr::Member { object, property, computed, .. } => {
+                testing::assert(!computed);
+                match object.get() {
+                    ast::Expr::This { span } => testing::assert_eq(span, ast::span(7, 11)),
+                    _ => testing::fail("expected this expression"),
+                };
+                match property.get() {
+                    ast::Expr::Identifier { name, .. } => testing::assert_eq(name, "value"),
+                    _ => testing::fail("expected member name"),
+                }
+            },
+            _ => testing::fail("expected member expression"),
+        },
+        _ => testing::fail("expected return statement"),
+    }
+}
+
+#[test]
+fn parses_new_with_member_callee_arguments_and_result_chain() -> unit {
+    let result = parse("return new namespace.Point(1, 2).value;");
+    testing::assert_eq(result.errors.len(), 0);
+    match result.program.body[0] {
+        ast::Stmt::Return { argument: Some(value), .. } => match value.get() {
+            ast::Expr::Member { object, .. } => match object.get() {
+                ast::Expr::New { callee, arguments, span } => {
+                    testing::assert_eq(arguments.len(), 2);
+                    testing::assert_eq(span, ast::span(7, 32));
+                    match callee.get() {
+                        ast::Expr::Member { .. } => (),
+                        _ => testing::fail("expected member constructor"),
+                    }
+                },
+                _ => testing::fail("expected new expression"),
+            },
+            _ => testing::fail("expected member access on constructed value"),
+        },
+        _ => testing::fail("expected return statement"),
+    }
+}
+
+#[test]
+fn parses_new_target_meta_property() -> unit {
+    let result = parse("function value() { return new.target; }");
+    testing::assert_eq(result.errors.len(), 0);
+    match result.program.body[0] {
+        ast::Stmt::FunctionDeclaration { body, .. } => match body[0] {
+            ast::Stmt::Return { argument: Some(value), .. } => match value.get() {
+                ast::Expr::NewTarget { .. } => (),
+                _ => testing::fail("expected new.target expression"),
+            },
+            _ => testing::fail("expected return statement"),
+        },
+        _ => testing::fail("expected function declaration"),
+    }
+}
+
+#[test]
+fn parses_debugger_as_an_empty_effect_statement() -> unit {
+    let result = parse("debugger; debugger\nlet value = 1;");
+    testing::assert_eq(result.errors.len(), 0);
+    testing::assert_eq(result.program.body.len(), 3);
+    match result.program.body[0] {
+        ast::Stmt::Debugger { span } => testing::assert_eq(span, ast::span(0, 9)),
+        _ => testing::fail("expected debugger statement"),
+    };
+    match result.program.body[1] {
+        ast::Stmt::Debugger { .. } => (),
+        _ => testing::fail("expected debugger statement before ASI"),
+    }
+}

@@ -1,0 +1,839 @@
+package unicode;
+
+use std::testing;
+
+fn unwrap_encoded(result: Result[Vec[byte], Utf8Error]) -> Vec[byte] {
+    match result {
+        Result::Ok(value) => value,
+        Result::Err(error) => {
+            testing::fail(error.to_string());
+            Vec::[]
+        },
+    }
+}
+
+fn unwrap_decoded(result: Result[Utf8Decoded, Utf8Error]) -> Utf8Decoded {
+    match result {
+        Result::Ok(value) => value,
+        Result::Err(error) => {
+            testing::fail(error.to_string());
+            Utf8Decoded { code_point_value: 0.to_uint32(), length_value: 0 }
+        },
+    }
+}
+
+fn unwrap_range(result: Result[CharRange, CharRangeError]) -> CharRange {
+    match result {
+        Result::Ok(value) => value,
+        Result::Err(error) => {
+            testing::fail(error.to_string());
+            CharRange::new()
+        },
+    }
+}
+
+fn require_ok(result: Result[unit, CharRangeError]) -> unit {
+    match result {
+        Result::Ok(()) => (),
+        Result::Err(error) => testing::fail(error.to_string()),
+    }
+}
+
+fn check_round_trip(code_point: uint32, expected: Vec[byte]) -> unit {
+    let encoded = unwrap_encoded(unicode_to_utf8(code_point));
+    testing::assert(encoded == expected);
+    let decoded = unwrap_decoded(unicode_from_utf8(encoded.slice(0, encoded.len())));
+    testing::assert_eq(decoded.code_point(), code_point);
+    testing::assert_eq(decoded.length(), expected.len())
+}
+
+#[test]
+fn quickjs_utf8_boundary_vectors_round_trip() -> unit {
+    check_round_trip(0.to_uint32(), Vec::[0]);
+    check_round_trip(0x7f.to_uint32(), Vec::[0x7f]);
+    check_round_trip(0x80.to_uint32(), Vec::[0xc2, 0x80]);
+    check_round_trip(0x7ff.to_uint32(), Vec::[0xdf, 0xbf]);
+    check_round_trip(0x800.to_uint32(), Vec::[0xe0, 0xa0, 0x80]);
+    check_round_trip(0xffff.to_uint32(), Vec::[0xef, 0xbf, 0xbf]);
+    check_round_trip(0x10000.to_uint32(), Vec::[0xf0, 0x90, 0x80, 0x80]);
+    check_round_trip(0x1fffff.to_uint32(), Vec::[0xf7, 0xbf, 0xbf, 0xbf]);
+    check_round_trip(0x200000.to_uint32(), Vec::[0xf8, 0x88, 0x80, 0x80, 0x80]);
+    check_round_trip(0x3ffffff.to_uint32(), Vec::[0xfb, 0xbf, 0xbf, 0xbf, 0xbf]);
+    check_round_trip(0x4000000.to_uint32(), Vec::[0xfc, 0x84, 0x80, 0x80, 0x80, 0x80]);
+    check_round_trip(QUICKJS_UTF8_MAX, Vec::[0xfd, 0xbf, 0xbf, 0xbf, 0xbf, 0xbf])
+}
+
+#[test]
+fn quickjs_utf8_accepts_non_scalar_31_bit_values() -> unit {
+    check_round_trip(0xd800.to_uint32(), Vec::[0xed, 0xa0, 0x80]);
+    check_round_trip(0x110000.to_uint32(), Vec::[0xf4, 0x90, 0x80, 0x80]);
+    testing::assert(unicode_to_utf8(CHAR_RANGE_LIMIT).is_err());
+    testing::assert(try_unicode_to_utf8(CHAR_RANGE_LIMIT).is_none())
+}
+
+#[test]
+fn quickjs_utf8_decoder_rejects_malformed_sequences() -> unit {
+    let empty: Vec[byte] = Vec::[];
+    let overlong_two = Vec::[0xc0, 0x80];
+    let overlong_three = Vec::[0xe0, 0x80, 0x80];
+    let truncated = Vec::[0xf8, 0x88, 0x80];
+    let bad_continuation = Vec::[0xf0, 0x90, 0x40, 0x80];
+    let invalid_leading = Vec::[0xfe, 0x80, 0x80, 0x80, 0x80, 0x80];
+    testing::assert(unicode_from_utf8(empty.slice(0, 0)).is_err());
+    testing::assert(unicode_from_utf8(overlong_two.slice(0, overlong_two.len())).is_err());
+    testing::assert(unicode_from_utf8(overlong_three.slice(0, overlong_three.len())).is_err());
+    testing::assert(unicode_from_utf8(truncated.slice(0, truncated.len())).is_err());
+    testing::assert(unicode_from_utf8(bad_continuation.slice(0, bad_continuation.len())).is_err());
+    testing::assert(unicode_from_utf8(invalid_leading.slice(0, invalid_leading.len())).is_err());
+    testing::assert(try_unicode_from_utf8(overlong_two.slice(0, overlong_two.len())).is_none())
+}
+
+#[test]
+fn quickjs_utf8_decoder_reports_consumed_length_at_offset() -> unit {
+    let input = Vec::[0x41, 0xf8, 0x88, 0x80, 0x80, 0x80, 0x42];
+    let decoded = unwrap_decoded(unicode_from_utf8_at(input.slice(0, input.len()), 1));
+    testing::assert_eq(decoded.code_point(), 0x200000.to_uint32());
+    testing::assert_eq(decoded.length(), 5);
+    testing::assert(unicode_from_utf8_at(input.slice(0, input.len()), -1).is_err());
+    testing::assert(unicode_from_utf8_at(input.slice(0, input.len()), input.len()).is_err())
+}
+
+#[test]
+fn character_ranges_merge_adjacent_and_overlapping_ranges() -> unit {
+    let range = CharRange::new();
+    require_ok(range.add_range(10.to_uint32(), 20.to_uint32()));
+    require_ok(range.add_range(30.to_uint32(), 40.to_uint32()));
+    require_ok(range.add_range(21.to_uint32(), 29.to_uint32()));
+    require_ok(range.add_char(9.to_uint32()));
+    testing::assert_eq(range.range_count(), 1);
+    testing::assert(range.range_at(0).unwrap_or((0.to_uint32(), 0.to_uint32())) == (9, 40));
+    testing::assert(range.contains(9.to_uint32()));
+    testing::assert(range.contains(25.to_uint32()));
+    testing::assert(range.contains(40.to_uint32()));
+    testing::assert(!range.contains(8.to_uint32()));
+    testing::assert(!range.contains(41.to_uint32()))
+}
+
+#[test]
+fn character_range_union_and_intersection_obey_set_algebra() -> unit {
+    let left = unwrap_range(CharRange::from_range(1.to_uint32(), 5.to_uint32()));
+    require_ok(left.add_range(10.to_uint32(), 15.to_uint32()));
+    let right = unwrap_range(CharRange::from_range(4.to_uint32(), 12.to_uint32()));
+    let union = left.union(right);
+    let intersection = left.intersection(right);
+    testing::assert(union.ranges() == Vec::[(1.to_uint32(), 15.to_uint32())]);
+    testing::assert(
+        intersection.ranges()
+            == Vec::[(4.to_uint32(), 5.to_uint32()), (10.to_uint32(), 12.to_uint32())],
+    );
+    testing::assert(left.union(right).ranges() == right.union(left).ranges());
+    testing::assert(left.intersection(right).ranges() == right.intersection(left).ranges());
+    testing::assert(left.union(left).ranges() == left.ranges());
+    testing::assert(left.intersection(left).ranges() == left.ranges())
+}
+
+#[test]
+fn character_range_operations_match_pointwise_sets() -> unit {
+    let left = CharRange::new();
+    require_ok(left.add_range(1.to_uint32(), 4.to_uint32()));
+    require_ok(left.add_range(8.to_uint32(), 10.to_uint32()));
+    let right = CharRange::new();
+    require_ok(right.add_range(3.to_uint32(), 7.to_uint32()));
+    require_ok(right.add_range(10.to_uint32(), 12.to_uint32()));
+    let union = left.union(right);
+    let intersection = left.intersection(right);
+    let difference = left.difference(right);
+    let symmetric_difference = left.symmetric_difference(right);
+    for value in 0..16 {
+        let point = value.to_uint32();
+        let in_left = left.contains(point);
+        let in_right = right.contains(point);
+        testing::assert(union.contains(point) == (in_left || in_right));
+        testing::assert(intersection.contains(point) == (in_left && in_right));
+        testing::assert(difference.contains(point) == (in_left && !in_right));
+        testing::assert(symmetric_difference.contains(point) == (in_left != in_right))
+    }
+}
+
+#[test]
+fn character_range_complement_and_invert_cover_the_31_bit_domain() -> unit {
+    let range = unwrap_range(CharRange::from_range(10.to_uint32(), 20.to_uint32()));
+    let complement = range.complement();
+    testing::assert(complement.contains(0.to_uint32()));
+    testing::assert(complement.contains(9.to_uint32()));
+    testing::assert(!complement.contains(10.to_uint32()));
+    testing::assert(!complement.contains(20.to_uint32()));
+    testing::assert(complement.contains(21.to_uint32()));
+    testing::assert(complement.contains(QUICKJS_UTF8_MAX));
+    testing::assert(range.intersection(complement).is_empty());
+    testing::assert(range.union(complement).ranges() == CharRange::full().ranges());
+    range.invert();
+    testing::assert(range.ranges() == complement.ranges());
+    range.invert();
+    testing::assert(range.ranges() == Vec::[(10.to_uint32(), 20.to_uint32())])
+}
+
+#[test]
+fn character_range_validates_boundaries() -> unit {
+    let range = CharRange::new();
+    testing::assert(range.add_range(4.to_uint32(), 3.to_uint32()).is_err());
+    testing::assert(range.add_char(CHAR_RANGE_LIMIT).is_err());
+    require_ok(range.add_char(QUICKJS_UTF8_MAX));
+    testing::assert(range.contains(QUICKJS_UTF8_MAX));
+    testing::assert(!range.contains(CHAR_RANGE_LIMIT))
+}
+
+#[test]
+fn unicode_17_identifier_tables_match_ecmascript_boundaries() -> unit {
+    let tables = IdentifierTables::new();
+    testing::assert(tables.is_start('A'.to_uint32()));
+    testing::assert(tables.is_start('变'.to_uint32()));
+    testing::assert(tables.is_start(0x10400.to_uint32()));
+    testing::assert(!tables.is_start('0'.to_uint32()));
+    testing::assert(!tables.is_start(0x0300.to_uint32()));
+    testing::assert(!tables.is_start(0x200c.to_uint32()));
+    testing::assert(tables.is_continue('0'.to_uint32()));
+    testing::assert(tables.is_continue('_'.to_uint32()));
+    testing::assert(tables.is_continue(0x0300.to_uint32()));
+    testing::assert(tables.is_continue(0x200c.to_uint32()));
+    testing::assert(!tables.is_continue(0x1f600.to_uint32()))
+}
+
+#[test]
+fn regexp_case_canonicalizers_follow_legacy_and_unicode_rules() -> unit {
+    let legacy = CaseCanonicalizer::new(false);
+    testing::assert_eq(legacy.canonicalize(0x61), 0x41);
+    testing::assert_eq(legacy.canonicalize(0x212a), 0x212a);
+    testing::assert_eq(legacy.canonicalize(0x3c2), 0x3a3);
+    let unicode = CaseCanonicalizer::new(true);
+    testing::assert_eq(unicode.canonicalize(0x41), 0x61);
+    testing::assert_eq(unicode.canonicalize(0x212a), 0x6b);
+    testing::assert_eq(unicode.canonicalize(0x17f), 0x73);
+    testing::assert_eq(unicode.canonicalize(0x10400), 0x10428)
+}
+
+#[test]
+fn regexp_case_canonicalizer_finds_equivalent_range_members() -> unit {
+    let range = CharRange::new();
+    match range.add_char(0x6b) {
+        Ok(()) => (),
+        Err(_) => testing::fail("expected valid range member"),
+    };
+    let unicode = CaseCanonicalizer::new(true);
+    testing::assert(unicode.equivalent_in_range(range, 0x212a));
+    let legacy = CaseCanonicalizer::new(false);
+    testing::assert(!legacy.equivalent_in_range(range, 0x212a))
+}
+
+fn canonicalizer_checksum(value: CaseCanonicalizer) -> (uint64, uint64, uint64, uint64) {
+    let mut count: uint64 = 0;
+    let mut source_sum: uint64 = 0;
+    let mut destination_sum: uint64 = 0;
+    let mut pair_sum: uint64 = 0;
+    let mut source_value = 0;
+    while source_value < 0x110000 {
+        let source = source_value.to_uint32();
+        let destination = value.canonicalize(source);
+        if destination != source {
+            count += 1;
+            source_sum += source.to_uint64();
+            destination_sum += destination.to_uint64();
+            pair_sum += (source.to_uint64() + 1) * (destination.to_uint64() + 3);
+        } else {};
+        source_value += 1;
+    };
+    (count, source_sum, destination_sum, pair_sum)
+}
+
+#[test]
+fn regexp_case_canonicalization_tables_match_quickjs_oracle() -> unit {
+    testing::assert(
+        canonicalizer_checksum(CaseCanonicalizer::new(false))
+            == (1476, 38871962, 36209787, 2417526739500),
+    );
+    testing::assert(
+        canonicalizer_checksum(CaseCanonicalizer::new(true))
+            == (1512, 39674458, 36028939, 2423458550366),
+    )
+}
+
+#[test]
+fn string_case_conversion_matches_quickjs_full_mappings_and_surrogates() -> unit {
+    let unicode = StringUnicode::new();
+    let input = Vec::[
+        0x53,
+        0x74,
+        0x72,
+        0x61,
+        0xdf,
+        0x65,
+        0x20,
+        0x130,
+        0x20,
+        0xfb03,
+        0x20,
+        0xd801,
+        0xdc00,
+        0xd800,
+    ];
+    testing::assert(
+        unicode.lowercase(input.slice(0, input.len()))
+            == Vec::[
+                0x73,
+                0x74,
+                0x72,
+                0x61,
+                0xdf,
+                0x65,
+                0x20,
+                0x69,
+                0x307,
+                0x20,
+                0xfb03,
+                0x20,
+                0xd801,
+                0xdc28,
+                0xd800,
+            ],
+    );
+    testing::assert(
+        unicode.uppercase(input.slice(0, input.len()))
+            == Vec::[
+                0x53,
+                0x54,
+                0x52,
+                0x41,
+                0x53,
+                0x53,
+                0x45,
+                0x20,
+                0x130,
+                0x20,
+                0x46,
+                0x46,
+                0x49,
+                0x20,
+                0xd801,
+                0xdc00,
+                0xd800,
+            ],
+    )
+}
+
+#[test]
+fn string_lowercase_applies_the_final_sigma_context_rule() -> unit {
+    let unicode = StringUnicode::new();
+    let final_sigma = Vec::[0x39f, 0x3a3, 0x301];
+    let medial_sigma = Vec::[0x39f, 0x3a3, 0x391];
+    let no_leading_cased = Vec::[0x3a3, 0x301];
+    testing::assert(
+        unicode.lowercase(final_sigma.slice(0, final_sigma.len())) == Vec::[0x3bf, 0x3c2, 0x301],
+    );
+    testing::assert(
+        unicode.lowercase(medial_sigma.slice(0, medial_sigma.len())) == Vec::[0x3bf, 0x3c3, 0x3b1],
+    );
+    testing::assert(
+        unicode.lowercase(no_leading_cased.slice(0, no_leading_cased.len())) == Vec::[0x3c3, 0x301],
+    )
+}
+
+#[test]
+fn string_normalization_and_locale_compare_match_quickjs_oracles() -> unit {
+    let unicode = StringUnicode::new();
+    let composed = Vec::[0xe9];
+    let decomposed = Vec::[0x65, 0x301];
+    testing::assert(
+        unicode.normalize(composed.slice(0, composed.len()), NormalizationForm::Nfd) == decomposed,
+    );
+    testing::assert(
+        unicode.normalize(decomposed.slice(0, decomposed.len()), NormalizationForm::Nfc) == composed,
+    );
+    let compatibility = Vec::[0xfb03, 0xff21];
+    testing::assert(
+        unicode.normalize(compatibility.slice(0, compatibility.len()), NormalizationForm::Nfkc)
+            == Vec::[0x66, 0x66, 0x69, 0x41],
+    );
+    let reordered = Vec::[0x61, 0x315, 0x300];
+    testing::assert(
+        unicode.normalize(reordered.slice(0, reordered.len()), NormalizationForm::Nfd)
+            == Vec::[0x61, 0x300, 0x315],
+    );
+    let hangul = Vec::[0xac00, 0xac01];
+    testing::assert(
+        unicode.normalize(hangul.slice(0, hangul.len()), NormalizationForm::Nfd)
+            == Vec::[0x1100, 0x1161, 0x1100, 0x1161, 0x11a8],
+    );
+    let hangul_components = Vec::[0x1100, 0x1161, 0x11a8];
+    testing::assert(
+        unicode.normalize(
+            hangul_components.slice(0, hangul_components.len()),
+            NormalizationForm::Nfc,
+        )
+            == Vec::[0xac01],
+    );
+    let exclusion = Vec::[0x344];
+    testing::assert(
+        unicode.normalize(exclusion.slice(0, exclusion.len()), NormalizationForm::Nfc)
+            == Vec::[0x308, 0x301],
+    );
+    let surrogate = Vec::[0xd800];
+    testing::assert(
+        unicode.normalize(surrogate.slice(0, surrogate.len()), NormalizationForm::Nfkd) == surrogate,
+    );
+    testing::assert_eq(
+        unicode.locale_compare(
+            composed.slice(0, composed.len()),
+            decomposed.slice(0, decomposed.len()),
+        ),
+        0,
+    );
+    let supplementary = Vec::[0xd83d, 0xde00];
+    let basic = Vec::[0xffff];
+    testing::assert_eq(
+        unicode.locale_compare(
+            supplementary.slice(0, supplementary.len()),
+            basic.slice(0, basic.len()),
+        ),
+        62977,
+    )
+}
+
+enum StringOracleOperation {
+    Lower,
+    Upper,
+    Normalize(NormalizationForm),
+}
+
+fn string_oracle_mix(hash: uint64, value: uint64) -> uint64 {
+    (hash ^ value) * 1099511628211
+}
+
+fn string_oracle_checksum(strings: StringUnicode, operation: StringOracleOperation) -> (
+    uint64,
+    uint64,
+    uint64,
+) {
+    let mut hash: uint64 = 14695981039346656037;
+    let mut changed: uint64 = 0;
+    let mut total: uint64 = 0;
+    let mut code_point = 0;
+    while code_point < 0x110000 {
+        let input: Vec[uint16] = Vec::with_capacity(2);
+        if code_point <= 0xffff {
+            input.push(code_point.to_uint16())
+        } else {
+            let value = code_point.to_uint32() - 0x10000;
+            input.push((0xd800 + (value >> 10)).to_uint16());
+            input.push((0xdc00 + (value & 0x3ff)).to_uint16());
+        };
+        let output = match operation {
+            StringOracleOperation::Lower => strings.lowercase(input.slice(0, input.len())),
+            StringOracleOperation::Upper => strings.uppercase(input.slice(0, input.len())),
+            StringOracleOperation::Normalize(form) => strings.normalize(
+                input.slice(0, input.len()),
+                form,
+            ),
+        };
+        if output != input {
+            changed += 1;
+        } else {};
+        total += output.len().to_uint64();
+        hash = string_oracle_mix(hash, code_point.to_uint64());
+        hash = string_oracle_mix(hash, output.len().to_uint64());
+        for code_unit in output {
+            hash = string_oracle_mix(hash, code_unit.to_uint64());
+        }
+        code_point += 1;
+    };
+    (changed, total, hash)
+}
+
+#[test]
+fn string_case_conversion_matches_the_complete_quickjs_unicode_oracle() -> unit {
+    let strings = StringUnicode::new();
+    testing::assert(
+        string_oracle_checksum(strings, StringOracleOperation::Lower)
+            == (1488, 2162689, 9895733012189813002),
+    );
+    testing::assert(
+        string_oracle_checksum(strings, StringOracleOperation::Upper)
+            == (1580, 2162806, 14268502886764206167),
+    )
+}
+
+#[test]
+fn string_normalization_matches_the_complete_quickjs_unicode_oracle() -> unit {
+    let strings = StringUnicode::new();
+    testing::assert(
+        string_oracle_checksum(strings, StringOracleOperation::Normalize(NormalizationForm::Nfc))
+            == (1120, 2162376, 9395736026486750030),
+    );
+    testing::assert(
+        string_oracle_checksum(strings, StringOracleOperation::Normalize(NormalizationForm::Nfd))
+            == (13253, 2185629, 13839240408634540075),
+    );
+    testing::assert(
+        string_oracle_checksum(strings, StringOracleOperation::Normalize(NormalizationForm::Nfkc))
+            == (4965, 2162717, 15599644114896141080),
+    );
+    testing::assert(
+        string_oracle_checksum(strings, StringOracleOperation::Normalize(NormalizationForm::Nfkd))
+            == (17086, 2186108, 8891651552957291414),
+    )
+}
+
+#[test]
+fn regexp_properties_cover_identifier_binary_and_general_category_aliases() -> unit {
+    let id_start = regexp_property_range("ID_Start").unwrap_or(CharRange::new());
+    testing::assert(id_start.contains(0x41));
+    testing::assert(id_start.contains(0x10400));
+    testing::assert(!id_start.contains(0x30));
+    let id_continue = regexp_property_range("IDC").unwrap_or(CharRange::new());
+    testing::assert(id_continue.contains(0x30));
+    testing::assert(id_continue.contains(0x301));
+    let ignorable = regexp_property_range("CI").unwrap_or(CharRange::new());
+    testing::assert(ignorable.contains(0x27));
+    testing::assert(ignorable.contains(0x301));
+    testing::assert(!ignorable.contains(0x41));
+    let deprecated = regexp_property_range("Deprecated").unwrap_or(CharRange::new());
+    testing::assert(deprecated.contains(0x149));
+    testing::assert(deprecated.contains(0xe0001));
+    testing::assert(!deprecated.contains(0x14a));
+    let separator = regexp_property_range("General_Category=Space_Separator").unwrap_or(
+        CharRange::new(),
+    );
+    testing::assert(separator.contains(0x20));
+    testing::assert(separator.contains(0x2007));
+    testing::assert(!separator.contains(0x2028));
+    testing::assert(regexp_property_range("ASCII").unwrap_or(CharRange::new()).contains(0x7f));
+    testing::assert(!regexp_property_range("ASCII").unwrap_or(CharRange::new()).contains(0x80));
+    testing::assert(regexp_property_range("Any").unwrap_or(CharRange::new()).contains(0x10ffff))
+}
+
+fn regexp_property_mix(hash: uint32, value: uint32) -> uint32 {
+    (hash ^ value) * 16777619
+}
+
+#[test]
+fn regexp_general_categories_match_the_complete_quickjs_unicode_oracle() -> unit {
+    let names = Vec::[
+        "Cn",
+        "Lu",
+        "Ll",
+        "Lt",
+        "Lm",
+        "Lo",
+        "Mn",
+        "Mc",
+        "Me",
+        "Nd",
+        "Nl",
+        "No",
+        "Sm",
+        "Sc",
+        "Sk",
+        "So",
+        "Pc",
+        "Pd",
+        "Ps",
+        "Pe",
+        "Pi",
+        "Pf",
+        "Po",
+        "Zs",
+        "Zl",
+        "Zp",
+        "Cc",
+        "Cf",
+        "Cs",
+        "Co",
+        "LC",
+        "L",
+        "M",
+        "N",
+        "S",
+        "P",
+        "Z",
+        "C",
+    ];
+    let hashes: Vec[uint32] = Vec::[
+        254296671.to_uint32(),
+        1798054905.to_uint32(),
+        215915556.to_uint32(),
+        156087712.to_uint32(),
+        3150834370.to_uint32(),
+        2377048753.to_uint32(),
+        2102443361.to_uint32(),
+        3333807841.to_uint32(),
+        3511188368.to_uint32(),
+        2465833577.to_uint32(),
+        71408778.to_uint32(),
+        2935349865.to_uint32(),
+        2453132456.to_uint32(),
+        2277000179.to_uint32(),
+        1410199319.to_uint32(),
+        1827573257.to_uint32(),
+        3491305576.to_uint32(),
+        2136899603.to_uint32(),
+        235016124.to_uint32(),
+        1621153257.to_uint32(),
+        389743999.to_uint32(),
+        3810029139.to_uint32(),
+        585729742.to_uint32(),
+        1915048909.to_uint32(),
+        1107790109.to_uint32(),
+        1232961374.to_uint32(),
+        3526033487.to_uint32(),
+        4121768397.to_uint32(),
+        2021249799.to_uint32(),
+        3812131290.to_uint32(),
+        1739490791.to_uint32(),
+        3774383254.to_uint32(),
+        3644297029.to_uint32(),
+        2291741381.to_uint32(),
+        3639840657.to_uint32(),
+        1942432399.to_uint32(),
+        4065463795.to_uint32(),
+        3544826144.to_uint32(),
+        1159565171.to_uint32(),
+        2794470240.to_uint32(),
+        4186759157.to_uint32(),
+        3944960616.to_uint32(),
+        1605896120.to_uint32(),
+        3891222129.to_uint32(),
+        2551459612.to_uint32(),
+        4262009680.to_uint32(),
+        2798867591.to_uint32(),
+        1696450360.to_uint32(),
+        976412871.to_uint32(),
+        884987643.to_uint32(),
+        0.to_uint32(),
+        0.to_uint32(),
+        0.to_uint32(),
+        3525813898.to_uint32(),
+        799572635.to_uint32(),
+        3862322217.to_uint32(),
+        2363399422.to_uint32(),
+        799526600.to_uint32(),
+    ];
+    let mut hash: uint32 = 2166136261;
+    let mut total = 0;
+    for name in names {
+        let ranges = regexp_property_range(name).unwrap_or(CharRange::new()).ranges();
+        for (first, last) in ranges {
+            hash = regexp_property_mix(hash, first);
+            hash = regexp_property_mix(hash, last);
+        }
+        hash = regexp_property_mix(hash, ranges.len().to_uint32());
+        total += ranges.len();
+    }
+    testing::assert_eq(total, 6635);
+    testing::assert(hash == 3109717071.to_uint32());
+    testing::assert(
+        regexp_property_range("General_Category=Uppercase_Letter").unwrap_or(CharRange::new()).ranges()
+            == regexp_property_range("gc=Lu").unwrap_or(CharRange::new()).ranges(),
+    );
+    testing::assert(
+        regexp_property_range("General_Category=Separator").unwrap_or(CharRange::new()).ranges()
+            == regexp_property_range("Z").unwrap_or(CharRange::new()).ranges(),
+    )
+}
+
+#[test]
+fn regexp_scripts_and_extensions_match_quickjs_unicode_oracles() -> unit {
+    let names = Vec::[
+        "Unknown",
+        "Common",
+        "Inherited",
+        "Latin",
+        "Greek",
+        "Han",
+        "Bengali",
+        "Deseret",
+        "SignWriting",
+        "Kirat_Rai",
+        "Beria_Erfe",
+        "Tulu_Tigalari",
+    ];
+    let mut hash: uint32 = 2166136261;
+    let mut total = 0;
+    for prefix in Vec::["Script=", "Script_Extensions="] {
+        for name in names {
+            let ranges = regexp_property_range(prefix + name).unwrap_or(CharRange::new()).ranges();
+            let mut local_hash: uint32 = 2166136261;
+            for (first, last) in ranges {
+                local_hash = regexp_property_mix(local_hash, first);
+                local_hash = regexp_property_mix(local_hash, last);
+                hash = regexp_property_mix(hash, first);
+                hash = regexp_property_mix(hash, last);
+            }
+            local_hash = regexp_property_mix(local_hash, ranges.len().to_uint32());
+            testing::assert(local_hash == hashes[index]);
+            hash = regexp_property_mix(hash, ranges.len().to_uint32());
+            total += ranges.len();
+        }
+    }
+    testing::assert_eq(total, 2182);
+    testing::assert(hash == 3351902210.to_uint32());
+    testing::assert(
+        regexp_property_range("sc=Latn").unwrap_or(CharRange::new()).ranges()
+            == regexp_property_range("Script=Latin").unwrap_or(CharRange::new()).ranges(),
+    );
+    testing::assert(
+        regexp_property_range("scx=Qaai").unwrap_or(CharRange::new()).ranges()
+            == regexp_property_range("Script_Extensions=Inherited").unwrap_or(CharRange::new()).ranges(),
+    )
+}
+
+#[test]
+fn regexp_binary_properties_match_the_complete_quickjs_unicode_oracle() -> unit {
+    let names = Vec::[
+        "ASCII_Hex_Digit",
+        "Bidi_Control",
+        "Dash",
+        "Deprecated",
+        "Diacritic",
+        "Extender",
+        "Hex_Digit",
+        "IDS_Unary_Operator",
+        "IDS_Binary_Operator",
+        "IDS_Trinary_Operator",
+        "Ideographic",
+        "Join_Control",
+        "Logical_Order_Exception",
+        "Modifier_Combining_Mark",
+        "Noncharacter_Code_Point",
+        "Pattern_Syntax",
+        "Pattern_White_Space",
+        "Quotation_Mark",
+        "Radical",
+        "Regional_Indicator",
+        "Sentence_Terminal",
+        "Soft_Dotted",
+        "Terminal_Punctuation",
+        "Unified_Ideograph",
+        "Variation_Selector",
+        "White_Space",
+        "Bidi_Mirrored",
+        "Emoji",
+        "Emoji_Component",
+        "Emoji_Modifier",
+        "Emoji_Modifier_Base",
+        "Emoji_Presentation",
+        "Extended_Pictographic",
+        "Default_Ignorable_Code_Point",
+        "ID_Start",
+        "Case_Ignorable",
+        "ASCII",
+        "Alphabetic",
+        "Any",
+        "Assigned",
+        "Cased",
+        "Changes_When_Casefolded",
+        "Changes_When_Casemapped",
+        "Changes_When_Lowercased",
+        "Changes_When_NFKC_Casefolded",
+        "Changes_When_Titlecased",
+        "Changes_When_Uppercased",
+        "Grapheme_Base",
+        "Grapheme_Extend",
+        "ID_Continue",
+        "ID_Compat_Math_Start",
+        "ID_Compat_Math_Continue",
+        "InCB",
+        "Lowercase",
+        "Math",
+        "Uppercase",
+        "XID_Continue",
+        "XID_Start",
+    ];
+    let counts = Vec::[
+        3,
+        4,
+        24,
+        8,
+        220,
+        43,
+        6,
+        1,
+        3,
+        1,
+        21,
+        1,
+        7,
+        9,
+        18,
+        28,
+        5,
+        13,
+        3,
+        1,
+        88,
+        34,
+        116,
+        16,
+        4,
+        10,
+        114,
+        151,
+        10,
+        1,
+        40,
+        81,
+        156,
+        17,
+        684,
+        464,
+        1,
+        761,
+        1,
+        736,
+        158,
+        630,
+        131,
+        618,
+        848,
+        633,
+        634,
+        905,
+        383,
+        799,
+        0,
+        0,
+        0,
+        677,
+        141,
+        660,
+        806,
+        691,
+    ];
+    let mut hash: uint32 = 2166136261;
+    let mut total = 0;
+    for index in 0..names.len() {
+        let property = regexp_property_range(names[index]);
+        if index >= 50 && index <= 52 {
+            testing::assert(property.is_none())
+        } else {
+            let ranges = property.unwrap_or(CharRange::new()).ranges();
+            testing::assert_eq(ranges.len(), counts[index]);
+            for (first, last) in ranges {
+                hash = regexp_property_mix(hash, first);
+                hash = regexp_property_mix(hash, last);
+            }
+            hash = regexp_property_mix(hash, ranges.len().to_uint32());
+            total += ranges.len();
+        }
+    }
+    testing::assert_eq(total, 12618);
+    testing::assert(hash == 323156813.to_uint32());
+    for (alias, index) in binary_property_aliases() {
+        if index >= 50 && index <= 52 {
+            testing::assert(regexp_property_range(alias).is_none())
+        } else {
+            testing::assert(
+                regexp_property_range(alias).unwrap_or(CharRange::new()).ranges()
+                    == regexp_property_range(names[index]).unwrap_or(CharRange::new()).ranges(),
+            )
+        }
+    }
+}

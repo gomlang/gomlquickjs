@@ -1,0 +1,629 @@
+package modules;
+
+use gomlang::quickjs::builtins;
+use gomlang::quickjs::compiler;
+use gomlang::quickjs::runtime;
+use gomlang::quickjs::vm;
+use std::fs;
+use std::num;
+use std::testing;
+
+fn module_test_context() -> (vm::Context, runtime::ObjectId) {
+    let context = vm::Context::new(runtime::Heap::new());
+    compiler::install_dynamic_function_compiler(context);
+    let fallback = match runtime::new_ordinary_object(context.heap(), Option::None) {
+        Ok(value) => value,
+        Err(_) => return module_test_context(),
+    };
+    match builtins::install(context) {
+        Ok(realm) => (context, realm.global_object()),
+        Err(error) => {
+            testing::fail(error.message);
+            (context, fallback)
+        },
+    }
+}
+
+fn module_write(path: string, source: string) -> unit {
+    match fs::write_file(path, source) {
+        Ok(()) => (),
+        Err(message) => testing::fail(message),
+    }
+}
+
+fn module_read(context: vm::Context, namespace: runtime::Value, name: string) -> runtime::Value {
+    match context.read_property_at_depth(
+        namespace,
+        runtime::Value::String(
+            runtime::JsString::from_utf8(name.to_bytes().slice(0, name.byte_len())),
+        ),
+        0,
+    ) {
+        Ok(value) => value,
+        Err(error) => {
+            testing::fail(error.kind.debug());
+            runtime::Value::Undefined
+        },
+    }
+}
+
+fn module_expect_number(value: runtime::Value, expected: int32) -> unit {
+    match value {
+        runtime::Value::Int(value) => testing::assert_eq(value, expected),
+        runtime::Value::Float(value) => {
+            testing::assert_eq(value, num::parse_float64(expected.to_string()).unwrap_or(0.0))
+        },
+        _ => testing::fail("expected number"),
+    }
+}
+
+fn module_expect_string(value: runtime::Value, expected: string) -> unit {
+    match value {
+        runtime::Value::String(value) => match value.to_host_string() {
+            Ok(value) => testing::assert_eq(value, expected),
+            Err(_) => testing::fail("expected host string"),
+        },
+        _ => testing::fail("expected string"),
+    }
+}
+
+#[test]
+fn in_memory_modules_preserve_separate_source_display_names() -> unit {
+    let (context, global) = module_test_context();
+    let namespace = match execute_source_with_source_name(
+        context,
+        global,
+        "__gomlquickjs_source_name_b0a1__.mjs",
+        "export function f(){}; export const metadata = f.fileName + '|' + f.lineNumber + '|' + f.columnNumber;",
+        "<cmdline>",
+    ) {
+        Ok(value) => value,
+        Err(error) => {
+            testing::fail(error.path + ": " + error.message);
+            runtime::Value::Undefined
+        },
+    };
+    match module_read(context, namespace, "metadata") {
+        runtime::Value::String(value) => match value.to_host_string() {
+            Ok(value) => testing::assert_eq(value, "<cmdline>|1|8"),
+            Err(value) => testing::fail(value.debug()),
+        },
+        _ => testing::fail("expected module source metadata"),
+    }
+}
+
+#[test]
+fn named_imports_aliases_and_live_bindings_execute() -> unit {
+    let directory = "__gomlquickjs_modules_named_7d31__";
+    let _ = fs::remove_dir_all(directory);
+    let _ = fs::create_dir_all(directory);
+    module_write(
+        directory + "/dependency.js",
+        "export let counter = 1; export function increment() { counter += 1; }",
+    );
+    module_write(
+        directory + "/entry.js",
+        "import {counter, increment as bump} from './dependency.js'; bump(); export const result = counter;",
+    );
+    let (context, global) = module_test_context();
+    let namespace = match execute_file(context, global, directory + "/entry.js") {
+        Ok(value) => value,
+        Err(error) => {
+            testing::fail(error.path + ": " + error.message);
+            runtime::Value::Undefined
+        },
+    };
+    module_expect_number(module_read(context, namespace, "result"), 2);
+    let _ = fs::remove_dir_all(directory);
+}
+
+#[test]
+fn cyclic_namespace_imports_observe_initialized_exports() -> unit {
+    let directory = "__gomlquickjs_modules_cycle_62ac__";
+    let _ = fs::remove_dir_all(directory);
+    let _ = fs::create_dir_all(directory);
+    module_write(
+        directory + "/entry.js",
+        "import * as dependency from './dependency.js'; export let value = 1; export function read() { return dependency.read(); } value = 3; export const result = read();",
+    );
+    module_write(
+        directory + "/dependency.js",
+        "import * as entry from './entry.js'; export function read() { return entry.value; }",
+    );
+    let (context, global) = module_test_context();
+    let namespace = match execute_file(context, global, directory + "/entry.js") {
+        Ok(value) => value,
+        Err(error) => {
+            testing::fail(error.path + ": " + error.message);
+            runtime::Value::Undefined
+        },
+    };
+    module_expect_number(module_read(context, namespace, "result"), 3);
+    let _ = fs::remove_dir_all(directory);
+}
+
+#[test]
+fn reexports_resolve_through_dependency_graph() -> unit {
+    let directory = "__gomlquickjs_modules_reexport_0e45__";
+    let _ = fs::remove_dir_all(directory);
+    let _ = fs::create_dir_all(directory);
+    module_write(directory + "/source.js", "export const value = 42;");
+    module_write(directory + "/middle.js", "export {value as answer} from './source.js';");
+    module_write(
+        directory + "/entry.js",
+        "import {answer} from './middle.js'; export const result = answer;",
+    );
+    let (context, global) = module_test_context();
+    let namespace = match execute_file(context, global, directory + "/entry.js") {
+        Ok(value) => value,
+        Err(error) => {
+            testing::fail(error.path + ": " + error.message);
+            runtime::Value::Undefined
+        },
+    };
+    module_expect_number(module_read(context, namespace, "result"), 42);
+    let _ = fs::remove_dir_all(directory);
+}
+
+#[test]
+fn missing_named_exports_fail_during_instantiation() -> unit {
+    let directory = "__gomlquickjs_modules_missing_171e__";
+    let _ = fs::remove_dir_all(directory);
+    let _ = fs::create_dir_all(directory);
+    module_write(directory + "/source.js", "export const present = 1;");
+    module_write(directory + "/entry.js", "import {missing} from './source.js'; export {missing};");
+    let (context, global) = module_test_context();
+    match execute_file(context, global, directory + "/entry.js") {
+        Err(error) => testing::assert(error.message.contains("no export named `missing`")),
+        Ok(_) => testing::fail("expected module instantiation error"),
+    };
+    let _ = fs::remove_dir_all(directory);
+}
+
+#[test]
+fn default_exports_and_star_exports_link() -> unit {
+    let directory = "__gomlquickjs_modules_default_e83b__";
+    let _ = fs::remove_dir_all(directory);
+    let _ = fs::create_dir_all(directory);
+    module_write(
+        directory + "/source.js",
+        "export const named = 21; export default function(value) { return value * 2; }",
+    );
+    module_write(directory + "/middle.js", "export * from './source.js';");
+    module_write(
+        directory + "/entry.js",
+        "import twice from './source.js'; import {named} from './middle.js'; export default twice(named);",
+    );
+    let (context, global) = module_test_context();
+    let namespace = match execute_file(context, global, directory + "/entry.js") {
+        Ok(value) => value,
+        Err(error) => {
+            testing::fail(error.path + ": " + error.message);
+            runtime::Value::Undefined
+        },
+    };
+    module_expect_number(module_read(context, namespace, "default"), 42);
+    let _ = fs::remove_dir_all(directory);
+}
+
+#[test]
+fn exported_async_functions_resume_in_their_module_realm() -> unit {
+    let directory = "__gomlquickjs_modules_async_5f29__";
+    let _ = fs::remove_dir_all(directory);
+    let _ = fs::create_dir_all(directory);
+    module_write(
+        directory + "/dependency.js",
+        "export async function increment(value) { return await Promise.resolve(value) + 1; } export default async function double(value) { return await value * 2; }",
+    );
+    module_write(
+        directory + "/entry.js",
+        "import double from './dependency.js'; import {increment} from './dependency.js'; export let result = 0; Promise.all([increment(20), double(10)]).then(values => result = values[0] + values[1] + 1);",
+    );
+    let (context, global) = module_test_context();
+    let namespace = match execute_file(context, global, directory + "/entry.js") {
+        Ok(value) => value,
+        Err(error) => {
+            testing::fail(error.path + ": " + error.message);
+            runtime::Value::Undefined
+        },
+    };
+    module_expect_number(module_read(context, namespace, "result"), 42);
+    let _ = fs::remove_dir_all(directory);
+}
+
+#[test]
+fn top_level_await_blocks_dependents_and_dynamic_imports() -> unit {
+    let directory = "__gomlquickjs_modules_tla_4ac2__";
+    let _ = fs::remove_dir_all(directory);
+    let _ = fs::create_dir_all(directory);
+    module_write(
+        directory + "/dependency.js",
+        "export let order = 'd'; let value = await Promise.resolve(40); order += 'x'; export const answer = value + 2;",
+    );
+    module_write(
+        directory + "/dynamic.js",
+        "let value = await Promise.resolve(21); export const answer = value * 2;",
+    );
+    module_write(
+        directory + "/entry.js",
+        "import {answer, order} from './dependency.js'; export const staticAnswer = answer; export const dependencyOrder = order; export let dynamicAnswer = 0; import('./dynamic.js').then(namespace => dynamicAnswer = namespace.answer);",
+    );
+    let (context, global) = module_test_context();
+    let namespace = match execute_file(context, global, directory + "/entry.js") {
+        Ok(value) => value,
+        Err(error) => {
+            testing::fail(error.path + ": " + error.message);
+            runtime::Value::Undefined
+        },
+    };
+    module_expect_number(module_read(context, namespace, "staticAnswer"), 42);
+    module_expect_number(module_read(context, namespace, "dynamicAnswer"), 42);
+    match module_read(context, namespace, "dependencyOrder") {
+        runtime::Value::String(value) => match value.to_host_string() {
+            Ok(value) => testing::assert_eq(value, "dx"),
+            Err(_) => testing::fail("expected dependency order string"),
+        },
+        _ => testing::fail("expected dependency order"),
+    };
+    let _ = fs::remove_dir_all(directory);
+}
+
+#[test]
+fn top_level_await_rejection_propagates_from_dependencies() -> unit {
+    let directory = "__gomlquickjs_modules_tla_reject_913b__";
+    let _ = fs::remove_dir_all(directory);
+    let _ = fs::create_dir_all(directory);
+    module_write(
+        directory + "/dependency.js",
+        "await Promise.reject(new TypeError('top-level boom')); export const answer = 42;",
+    );
+    module_write(
+        directory + "/entry.js",
+        "import {answer} from './dependency.js'; export const result = answer;",
+    );
+    let (context, global) = module_test_context();
+    match execute_file(context, global, directory + "/entry.js") {
+        Err(error) => {
+            if !error.path.ends_with("/dependency.js") {
+                testing::fail("unexpected rejection path: " + error.path)
+            } else {};
+            if !error.message.contains("top-level boom") {
+                testing::fail("unexpected rejection message: " + error.message)
+            } else {}
+        },
+        Ok(_) => testing::fail("expected top-level await rejection"),
+    };
+    let _ = fs::remove_dir_all(directory);
+}
+
+#[test]
+fn sibling_top_level_await_modules_start_before_jobs_resume() -> unit {
+    let directory = "__gomlquickjs_modules_tla_siblings_a187__";
+    let _ = fs::remove_dir_all(directory);
+    let _ = fs::create_dir_all(directory);
+    module_write(
+        directory + "/a.js",
+        "globalThis.tlaLog = (globalThis.tlaLog || '') + 'a0,'; await Promise.resolve(); globalThis.tlaLog += 'a1,';",
+    );
+    module_write(
+        directory + "/b.js",
+        "globalThis.tlaLog = (globalThis.tlaLog || '') + 'b0,'; await Promise.resolve(); globalThis.tlaLog += 'b1,';",
+    );
+    module_write(
+        directory + "/entry.js",
+        "import './a.js'; import './b.js'; export const order = globalThis.tlaLog + 'entry';",
+    );
+    let (context, global) = module_test_context();
+    let namespace = match execute_file(context, global, directory + "/entry.js") {
+        Ok(value) => value,
+        Err(error) => {
+            testing::fail(error.path + ": " + error.message);
+            runtime::Value::Undefined
+        },
+    };
+    module_expect_string(module_read(context, namespace, "order"), "a0,b0,a1,b1,entry");
+    let _ = fs::remove_dir_all(directory);
+}
+
+#[test]
+fn cyclic_top_level_await_components_resume_in_dependency_order() -> unit {
+    let directory = "__gomlquickjs_modules_tla_cycle_c941__";
+    let _ = fs::remove_dir_all(directory);
+    let _ = fs::create_dir_all(directory);
+    module_write(
+        directory + "/a.js",
+        "import './b.js'; globalThis.tlaLog = (globalThis.tlaLog || '') + 'a0,'; await Promise.resolve(); globalThis.tlaLog += 'a1,';",
+    );
+    module_write(
+        directory + "/b.js",
+        "import './a.js'; globalThis.tlaLog = (globalThis.tlaLog || '') + 'b0,'; await Promise.resolve(); globalThis.tlaLog += 'b1,';",
+    );
+    module_write(
+        directory + "/entry.js",
+        "import './a.js'; export const order = globalThis.tlaLog + 'entry';",
+    );
+    let (context, global) = module_test_context();
+    let namespace = match execute_file(context, global, directory + "/entry.js") {
+        Ok(value) => value,
+        Err(error) => {
+            testing::fail(error.path + ": " + error.message);
+            runtime::Value::Undefined
+        },
+    };
+    module_expect_string(module_read(context, namespace, "order"), "b0,b1,a0,a1,entry");
+    let _ = fs::remove_dir_all(directory);
+}
+
+#[test]
+fn cyclic_top_level_await_rejection_preserves_value_and_skips_ancestors() -> unit {
+    let directory = "__gomlquickjs_modules_tla_cycle_reject_851e__";
+    let _ = fs::remove_dir_all(directory);
+    let _ = fs::create_dir_all(directory);
+    module_write(directory + "/a.js", "import './b.js'; globalThis.tlaLog += 'a';");
+    module_write(
+        directory + "/b.js",
+        "import './a.js'; globalThis.tlaLog = 'b'; globalThis.tlaMarker = {}; await Promise.reject(globalThis.tlaMarker);",
+    );
+    module_write(
+        directory + "/entry.js",
+        "export let same = false; export let order = ''; import('./a.js').catch(error => { same = error === globalThis.tlaMarker; order = globalThis.tlaLog; });",
+    );
+    let (context, global) = module_test_context();
+    let namespace = match execute_file(context, global, directory + "/entry.js") {
+        Ok(value) => value,
+        Err(error) => {
+            testing::fail(error.path + ": " + error.message);
+            runtime::Value::Undefined
+        },
+    };
+    match module_read(context, namespace, "same") {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected rejection identity status"),
+    };
+    module_expect_string(module_read(context, namespace, "order"), "b");
+    let _ = fs::remove_dir_all(directory);
+}
+
+#[test]
+fn bare_module_specifiers_load_from_the_process_working_directory() -> unit {
+    let directory = "__gomlquickjs_modules_bare_entry_f39b__";
+    let dependency = "__gomlquickjs_bare_dependency_49da__.js";
+    let dynamic = "__gomlquickjs_bare_dynamic_682c__.js";
+    let data = "__gomlquickjs_bare_data_318f__.json";
+    let _ = fs::remove_dir_all(directory);
+    let _ = fs::remove_file(dependency);
+    let _ = fs::remove_file(dynamic);
+    let _ = fs::remove_file(data);
+    let _ = fs::create_dir_all(directory);
+    module_write(dependency, "export default 39;");
+    module_write(dynamic, "export default 1;");
+    module_write(data, "{\"value\":2}");
+    module_write(
+        directory + "/entry.js",
+        "import base from '__gomlquickjs_bare_dependency_49da__.js'; import data from '__gomlquickjs_bare_data_318f__.json' with {type: 'json'}; export const staticTotal = base + data.value; export let dynamicTotal = 0; import('__gomlquickjs_bare_dynamic_682c__.js').then(namespace => dynamicTotal = staticTotal + namespace.default);",
+    );
+    let (context, global) = module_test_context();
+    let namespace = match execute_file(context, global, directory + "/entry.js") {
+        Ok(value) => value,
+        Err(error) => {
+            testing::fail(error.path + ": " + error.message);
+            runtime::Value::Undefined
+        },
+    };
+    module_expect_number(module_read(context, namespace, "staticTotal"), 41);
+    module_expect_number(module_read(context, namespace, "dynamicTotal"), 42);
+    let _ = fs::remove_dir_all(directory);
+    let _ = fs::remove_file(dependency);
+    let _ = fs::remove_file(dynamic);
+    let _ = fs::remove_file(data);
+}
+
+#[test]
+fn ambiguous_star_exports_fail_resolution() -> unit {
+    let directory = "__gomlquickjs_modules_ambiguous_e621__";
+    let _ = fs::remove_dir_all(directory);
+    let _ = fs::create_dir_all(directory);
+    module_write(directory + "/left.js", "export const value = 1;");
+    module_write(directory + "/right.js", "export const value = 2;");
+    module_write(directory + "/middle.js", "export * from './left.js'; export * from './right.js';");
+    module_write(directory + "/entry.js", "import {value} from './middle.js'; export {value};");
+    let (context, global) = module_test_context();
+    match execute_file(context, global, directory + "/entry.js") {
+        Err(error) => testing::assert(error.message.contains("ambiguous star export `value`")),
+        Ok(_) => testing::fail("expected ambiguous star export error"),
+    };
+    let _ = fs::remove_dir_all(directory);
+}
+
+#[test]
+fn worker_modules_use_isolated_realms_and_share_shared_array_buffers() -> unit {
+    let directory = "__gomlquickjs_modules_worker_9a4e__";
+    let _ = fs::remove_dir_all(directory);
+    let _ = fs::create_dir_all(directory);
+    module_write(
+        directory + "/child.js",
+        "import * as os from 'os'; let parent = os.Worker.parent; parent.onmessage = function(e) { e.data.buf[2] = 10; parent.postMessage({buf: e.data.buf}); }; parent.postMessage({ready: true});",
+    );
+    module_write(
+        directory + "/entry.js",
+        "import * as os from 'os'; export let result = 0; let worker = new os.Worker('./child.js'); worker.onmessage = function(e) { if (e.data.ready) { let shared = new SharedArrayBuffer(8); worker.postMessage({buf: new Uint8Array(shared)}); } else { result = e.data.buf[2]; worker.onmessage = null; } };",
+    );
+    let (context, global) = module_test_context();
+    let namespace = match execute_file(context, global, directory + "/entry.js") {
+        Ok(value) => value,
+        Err(error) => {
+            testing::fail(error.path + ": " + error.message);
+            runtime::Value::Undefined
+        },
+    };
+    module_expect_number(module_read(context, namespace, "result"), 10);
+    let _ = fs::remove_dir_all(directory);
+}
+
+#[test]
+fn dynamic_import_resolves_cached_namespaces_and_rejects_failures() -> unit {
+    let directory = "__gomlquickjs_modules_dynamic_4d17__";
+    let _ = fs::remove_dir_all(directory);
+    let _ = fs::create_dir_all(directory);
+    module_write(directory + "/dependency.js", "export const answer = 42;");
+    module_write(directory + "/throws.js", "throw globalThis.dynamicImportMarker;");
+    module_write(
+        directory + "/entry.js",
+        "export let result = 0; export let converted = 0; export let lateResult = 0; export let rejected = false; export let invalidOptions = false; export let invalidAttributes = false; export let thrownSame = false; export let evaluationThrownSame = false; export function loadLater() { import('./dependency.js').then(function(namespace) { lateResult = namespace.answer; }); } let first = import('./dependency.js'); let second = import('./dependency.js', {with: {type: 'javascript'}}); Promise.all([first, second]).then(function(values) { result = values[0] === values[1] && values[0].answer === 42 ? 42 : -1; }); import({toString() { return './dependency.js'; }}).then(function(namespace) { converted = namespace.answer; }); import('./missing.js').catch(function(error) { rejected = error instanceof ReferenceError; }); import('./dependency.js', 1).catch(function(error) { invalidOptions = error instanceof TypeError; }); import('./dependency.js', {with: {type: 1}}).catch(function(error) { invalidAttributes = error instanceof TypeError; }); let marker = {}; globalThis.dynamicImportMarker = marker; import({toString() { throw marker; }}).catch(function(error) { thrownSame = error === marker; }); import('./throws.js').catch(function(error) { evaluationThrownSame = error === marker; });",
+    );
+    let (context, global) = module_test_context();
+    let namespace = match execute_file(context, global, directory + "/entry.js") {
+        Ok(value) => value,
+        Err(error) => {
+            testing::fail(error.path + ": " + error.message);
+            runtime::Value::Undefined
+        },
+    };
+    module_expect_number(module_read(context, namespace, "result"), 42);
+    module_expect_number(module_read(context, namespace, "converted"), 42);
+    let load_later = module_read(context, namespace, "loadLater");
+    let arguments: Vec[runtime::Value] = Vec::[];
+    match context.invoke_with_this_at_depth(load_later, arguments, runtime::Value::Undefined, 0) {
+        Ok(_) => (),
+        Err(error) => testing::fail(error.kind.debug()),
+    };
+    match context.run_pending_jobs() {
+        Ok(_) => (),
+        Err(error) => testing::fail(error.kind.debug()),
+    };
+    module_expect_number(module_read(context, namespace, "lateResult"), 42);
+    for name in Vec::[
+        "rejected",
+        "invalidOptions",
+        "invalidAttributes",
+        "thrownSame",
+        "evaluationThrownSame",
+    ] {
+        match module_read(context, namespace, name) {
+            runtime::Value::Bool(value) => testing::assert(value),
+            _ => testing::fail("expected dynamic import rejection status"),
+        }
+    }
+    let _ = fs::remove_dir_all(directory);
+}
+
+#[test]
+fn static_and_dynamic_json_modules_share_default_exports() -> unit {
+    let directory = "__gomlquickjs_modules_json_71be__";
+    let _ = fs::remove_dir_all(directory);
+    let _ = fs::create_dir_all(directory);
+    module_write(directory + "/data.json", "{\"answer\":42,\"items\":[1,2,3]}");
+    module_write(directory + "/other.json", "{\"name\":\"other\"}");
+    module_write(
+        directory + "/entry.js",
+        "import data from './data.json' with {type: 'json'}; export {default as other} from './other.json' with {type: 'json'}; export const answer = data.answer; export let dynamicAnswer = 0; export let same = false; export let wrongTypeRejected = false; export let unknownRejected = false; import('./data.json', {with: {type: 'json'}}).then(function(namespace) { dynamicAnswer = namespace.default.answer; same = namespace.default === data; }); import('./data.json').catch(function(error) { wrongTypeRejected = error instanceof TypeError; }); import('./data.json', {with: {unknown: 'x'}}).catch(function(error) { unknownRejected = error instanceof TypeError; });",
+    );
+    let (context, global) = module_test_context();
+    let namespace = match execute_file(context, global, directory + "/entry.js") {
+        Ok(value) => value,
+        Err(error) => {
+            testing::fail(error.path + ": " + error.message);
+            runtime::Value::Undefined
+        },
+    };
+    module_expect_number(module_read(context, namespace, "answer"), 42);
+    module_expect_number(module_read(context, namespace, "dynamicAnswer"), 42);
+    for name in Vec::["same", "wrongTypeRejected", "unknownRejected"] {
+        match module_read(context, namespace, name) {
+            runtime::Value::Bool(value) => testing::assert(value),
+            _ => testing::fail("expected JSON module status"),
+        }
+    }
+    let other = module_read(context, namespace, "other");
+    match module_read(context, other, "name") {
+        runtime::Value::String(value) => match value.to_host_string() {
+            Ok(value) => testing::assert_eq(value, "other"),
+            Err(_) => testing::fail("expected JSON string"),
+        },
+        _ => testing::fail("expected JSON re-export"),
+    };
+    module_write(
+        directory + "/invalid.js",
+        "import data from './data.json' with {unknown: 'x'}; export default data;",
+    );
+    match execute_file(context, global, directory + "/invalid.js") {
+        Err(error) => {
+            testing::assert(error.kind == ModuleErrorKind::Type);
+            testing::assert(error.message.contains("not supported"))
+        },
+        Ok(_) => testing::fail("expected unsupported static import attribute"),
+    };
+    let _ = fs::remove_dir_all(directory);
+}
+
+#[test]
+fn import_meta_is_stable_null_prototype_and_module_specific() -> unit {
+    let directory = "__gomlquickjs_modules_meta_2c81__";
+    let _ = fs::remove_dir_all(directory);
+    let _ = fs::create_dir_all(directory);
+    module_write(
+        directory + "/dependency.js",
+        "export const meta = import.meta; export function readMeta() { return import.meta; }",
+    );
+    module_write(
+        directory + "/entry.js",
+        "import {meta as dependencyMeta, readMeta} from './dependency.js'; import * as dependencyNamespace from './dependency.js'; export {readMeta}; export const meta = import.meta; export const dependency = dependencyMeta; export const dependencyStable = dependencyMeta === readMeta(); export const namespaceTag = Object.prototype.toString.call(dependencyNamespace); export const namespaceExtensible = Object.isExtensible(dependencyNamespace); export let evalRejected = false; try { eval('import.meta'); } catch (error) { evalRejected = error instanceof SyntaxError; }",
+    );
+    let (context, global) = module_test_context();
+    let namespace = match execute_file(context, global, directory + "/entry.js") {
+        Ok(value) => value,
+        Err(error) => {
+            testing::fail(error.path + ": " + error.message);
+            runtime::Value::Undefined
+        },
+    };
+    let entry_meta = module_read(context, namespace, "meta");
+    let dependency_meta = module_read(context, namespace, "dependency");
+    testing::assert(!runtime::same_value(entry_meta, dependency_meta));
+    match module_read(context, namespace, "dependencyStable") {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected stable dependency import.meta"),
+    };
+    match module_read(context, namespace, "evalRejected") {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected direct eval import.meta rejection"),
+    };
+    match module_read(context, namespace, "namespaceTag") {
+        runtime::Value::String(value) => match value.to_host_string() {
+            Ok(value) => testing::assert_eq(value, "[object Module]"),
+            Err(_) => testing::fail("expected module namespace tag string"),
+        },
+        _ => testing::fail("expected module namespace tag"),
+    };
+    match module_read(context, namespace, "namespaceExtensible") {
+        runtime::Value::Bool(value) => testing::assert(!value),
+        _ => testing::fail("expected non-extensible module namespace"),
+    };
+    let read_meta = module_read(context, namespace, "readMeta");
+    let arguments: Vec[runtime::Value] = Vec::[];
+    match context.invoke_with_this_at_depth(read_meta, arguments, runtime::Value::Undefined, 0) {
+        Ok(value) => testing::assert(runtime::same_value(value, dependency_meta)),
+        Err(error) => testing::fail(error.kind.debug()),
+    };
+    match module_read(context, entry_meta, "main") {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected entry import.meta.main"),
+    };
+    match module_read(context, dependency_meta, "main") {
+        runtime::Value::Bool(value) => testing::assert(!value),
+        _ => testing::fail("expected dependency import.meta.main"),
+    };
+    match module_read(context, entry_meta, "url") {
+        runtime::Value::String(value) => match value.to_host_string() {
+            Ok(value) => testing::assert(value.ends_with("/entry.js")),
+            Err(_) => testing::fail("expected import.meta.url string"),
+        },
+        _ => testing::fail("expected entry import.meta.url"),
+    };
+    match context.get_prototype_of_at_depth(entry_meta, 0) {
+        Ok(runtime::Value::Null) => (),
+        Ok(_) => testing::fail("expected null import.meta prototype"),
+        Err(error) => testing::fail(error.kind.debug()),
+    };
+    let _ = fs::remove_dir_all(directory);
+}

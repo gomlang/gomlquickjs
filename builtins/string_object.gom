@@ -1,0 +1,2230 @@
+package builtins;
+
+use gomlang::quickjs::dtoa;
+use gomlang::quickjs::regexp;
+use gomlang::quickjs::runtime;
+use gomlang::quickjs::stringx;
+use gomlang::quickjs::unicode;
+use gomlang::quickjs::vm;
+use std::math;
+use std::num;
+
+const STRING_LENGTH_LIMIT: int = 16777216;
+
+struct StringPattern {
+    state: RegExpState,
+    object: Option[runtime::ObjectId],
+}
+
+type LocatedMatches = Vec[LocatedMatch];
+
+type StringNativeBuiltin = (runtime::Heap, runtime::Value, Vec[runtime::Value]) -> Result[
+    runtime::Value,
+    vm::NativeError,
+];
+
+enum StringArgumentConversion {
+    Number(int),
+    OptionalNumber(int),
+    String(int),
+    OptionalString(int),
+}
+
+fn string_receiver(heap: runtime::Heap, value: runtime::Value) -> Result[
+    runtime::JsString,
+    vm::NativeError,
+] {
+    match value {
+        runtime::Value::String(value) => Result::Ok(value),
+        runtime::Value::Object(object) => match runtime::primitive_value(heap, object) {
+            Some(runtime::Value::String(value)) => Result::Ok(value),
+            _ => Result::Err(native_error("String method requires a string receiver")),
+        },
+        _ => Result::Err(native_error("String method requires a string receiver")),
+    }
+}
+
+fn string_value(value: runtime::JsString) -> runtime::Value {
+    runtime::Value::String(value)
+}
+
+fn string_truncated_int(value: float64, fallback: int) -> int {
+    num::parse_int(dtoa::number_to_string(math::trunc(value))).unwrap_or(fallback)
+}
+
+fn string_number_or_default(arguments: Vec[runtime::Value], index: int, default_value: float64) -> Result[
+    float64,
+    vm::NativeError,
+] {
+    match argument(arguments, index) {
+        runtime::Value::Undefined => Result::Ok(default_value),
+        _ => number_argument(arguments, index),
+    }
+}
+
+fn string_code_unit_index(value: float64, length: int) -> int {
+    if math::is_nan(value) {
+        0
+    } else if value <= -1.0 || value == -infinity() {
+        -length - 1
+    } else if value >= int_float(length) || value == infinity() {
+        length
+    } else {
+        string_truncated_int(value, 0)
+    }
+}
+
+fn string_at_index(value: float64, length: int) -> int {
+    if math::is_nan(value) {
+        0
+    } else if value == infinity() || value == -infinity() || value >= int_float(length)
+        || value < -int_float(length) {
+        length
+    } else {
+        string_truncated_int(value, 0)
+    }
+}
+
+fn string_relative_index(value: float64, length: int) -> int {
+    if math::is_nan(value) || value == -infinity() || value <= -int_float(length) {
+        0
+    } else if value == infinity() || value >= int_float(length) {
+        length
+    } else {
+        let integer = string_truncated_int(value, 0);
+        if integer < 0 {
+            length + integer
+        } else {
+            integer
+        }
+    }
+}
+
+fn string_clamped_index(value: float64, length: int, nan_value: int) -> int {
+    if math::is_nan(value) {
+        nan_value
+    } else if value == -infinity() || value <= 0.0 {
+        0
+    } else if value == infinity() || value >= int_float(length) {
+        length
+    } else {
+        string_truncated_int(value, nan_value)
+    }
+}
+
+fn string_failure(value: stringx::StringError) -> vm::NativeError {
+    match value {
+        stringx::StringError::InvalidCount => {
+            native_error("RangeError: invalid string repetition count")
+        },
+        stringx::StringError::LengthLimit => {
+            native_error("RangeError: string length limit exceeded")
+        },
+    }
+}
+
+fn string_vm_type_error(message: string) -> vm::VmError {
+    vm::VmError { offset: -1, kind: vm::VmErrorKind::TypeError(message) }
+}
+
+fn string_vm_range_error(message: string) -> vm::VmError {
+    vm::VmError { offset: -1, kind: vm::VmErrorKind::RangeError(message) }
+}
+
+fn string_vm_native_error(value: vm::NativeError) -> vm::VmError {
+    if value.message.starts_with("SyntaxError: ") {
+        vm::VmError {
+            offset: -1,
+            kind: vm::VmErrorKind::SyntaxError(
+                value.message.byte_slice(13, value.message.byte_len()),
+            ),
+        }
+    } else {
+        string_vm_type_error(value.message)
+    }
+}
+
+fn string_method_receiver_at_depth(context: vm::Context, value: runtime::Value, depth: int) -> Result[
+    runtime::Value,
+    vm::VmError,
+] {
+    match value {
+        runtime::Value::Undefined | runtime::Value::Null => {
+            return Result::Err(string_vm_type_error("String method called on null or undefined"))
+        },
+        _ => (),
+    };
+    string_value_at_depth(context, value, depth)
+}
+
+fn string_require_receiver(value: runtime::Value) -> Result[runtime::Value, vm::VmError] {
+    match value {
+        runtime::Value::Undefined | runtime::Value::Null => {
+            Result::Err(string_vm_type_error("String method called on null or undefined"))
+        },
+        _ => Result::Ok(value),
+    }
+}
+
+fn string_convert_argument_at_depth(
+    context: vm::Context,
+    arguments: Vec[runtime::Value],
+    conversion: StringArgumentConversion,
+    depth: int,
+) -> Result[unit, vm::VmError] {
+    match conversion {
+        StringArgumentConversion::Number(index) => {
+            while arguments.len() <= index {
+                arguments.push(runtime::Value::Undefined)
+            }
+            arguments[index] = number_value_at_depth(context, arguments[index], depth)?;
+        },
+        StringArgumentConversion::OptionalNumber(index) => if index < arguments.len() {
+            match arguments[index] {
+                runtime::Value::Undefined => (),
+                value => {
+                    arguments[index] = number_value_at_depth(context, value, depth)?;
+                },
+            }
+        } else {},
+        StringArgumentConversion::String(index) => {
+            while arguments.len() <= index {
+                arguments.push(runtime::Value::Undefined)
+            }
+            arguments[index] = string_value_at_depth(context, arguments[index], depth)?;
+        },
+        StringArgumentConversion::OptionalString(index) => if index < arguments.len() {
+            match arguments[index] {
+                runtime::Value::Undefined => (),
+                value => {
+                    arguments[index] = string_value_at_depth(context, value, depth)?;
+                },
+            }
+        } else {},
+    };
+    Result::Ok(())
+}
+
+fn string_invoke_native_method(
+    context: vm::Context,
+    callback: StringNativeBuiltin,
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+) -> Result[runtime::Value, vm::VmError] {
+    match callback(context.heap(), this_value, arguments) {
+        Ok(value) => Result::Ok(value),
+        Err(value) => Result::Err(function_native_error(value)),
+    }
+}
+
+fn string_define_method(
+    context: vm::Context,
+    prototype: runtime::ObjectId,
+    name: string,
+    callback: StringNativeBuiltin,
+    conversions: Vec[StringArgumentConversion],
+    rest_string: Option[int],
+) -> Result[unit, BuiltinError] {
+    define_value(
+        context.heap(),
+        prototype,
+        name,
+        allocate_vm_function(
+            context,
+            name,
+            |this_value, arguments, depth| {
+                let receiver = string_method_receiver_at_depth(context, this_value, depth)?;
+                for conversion in conversions {
+                    string_convert_argument_at_depth(context, arguments, conversion, depth)?
+                }
+                match rest_string {
+                    Some(start) => {
+                        let mut index = start;
+                        while index < arguments.len() {
+                            arguments[index] = string_value_at_depth(
+                                context,
+                                arguments[index],
+                                depth,
+                            )?;
+                            index += 1;
+                        }
+                    },
+                    None => (),
+                };
+                string_invoke_native_method(context, callback, receiver, arguments)
+            },
+        )?,
+        true,
+        true,
+    )
+}
+
+fn string_define_pad_method(
+    context: vm::Context,
+    prototype: runtime::ObjectId,
+    name: string,
+    callback: StringNativeBuiltin,
+) -> Result[unit, BuiltinError] {
+    define_value(
+        context.heap(),
+        prototype,
+        name,
+        allocate_vm_function(
+            context,
+            name,
+            |this_value, arguments, depth| {
+                let receiver = string_method_receiver_at_depth(context, this_value, depth)?;
+                string_convert_argument_at_depth(
+                    context,
+                    arguments,
+                    StringArgumentConversion::Number(0),
+                    depth,
+                )?;
+                let value = match receiver {
+                    runtime::Value::String(value) => value,
+                    _ => return Result::Err(string_vm_type_error("string receiver is invalid")),
+                };
+                let target = match arguments[0] {
+                    runtime::Value::Float(value) => value,
+                    _ => return Result::Err(string_vm_type_error("padding length is invalid")),
+                };
+                if !(math::is_nan(target) || target <= int_float(value.len())
+                    || target == -infinity()) {
+                    string_convert_argument_at_depth(
+                        context,
+                        arguments,
+                        StringArgumentConversion::OptionalString(1),
+                        depth,
+                    )?
+                } else {};
+                string_invoke_native_method(context, callback, receiver, arguments)
+            },
+        )?,
+        true,
+        true,
+    )
+}
+
+fn string_define_search_method(
+    context: vm::Context,
+    prototype: runtime::ObjectId,
+    name: string,
+    callback: StringNativeBuiltin,
+) -> Result[unit, BuiltinError] {
+    let states: HashMap[runtime::ObjectId, RegExpState] = HashMap::new();
+    define_value(
+        context.heap(),
+        prototype,
+        name,
+        allocate_vm_function(
+            context,
+            name,
+            |this_value, arguments, depth| {
+                let receiver = string_method_receiver_at_depth(context, this_value, depth)?;
+                if string_is_regexp(context, states, argument(arguments, 0), depth)? {
+                    return Result::Err(
+                        string_vm_type_error(name + " does not accept a regular expression"),
+                    )
+                } else {};
+                string_convert_argument_at_depth(
+                    context,
+                    arguments,
+                    StringArgumentConversion::String(0),
+                    depth,
+                )?;
+                string_convert_argument_at_depth(
+                    context,
+                    arguments,
+                    StringArgumentConversion::OptionalNumber(1),
+                    depth,
+                )?;
+                string_invoke_native_method(context, callback, receiver, arguments)
+            },
+        )?,
+        true,
+        true,
+    )
+}
+
+fn string_pattern(
+    context: vm::Context,
+    states: HashMap[runtime::ObjectId, RegExpState],
+    value: runtime::Value,
+    depth: int,
+) -> Result[StringPattern, vm::VmError] {
+    match value {
+        runtime::Value::Undefined => match new_regexp_state(js_string(""), js_string("")) {
+            Ok(state) => Result::Ok(StringPattern { state, object: Option::None }),
+            Err(value) => Result::Err(string_vm_native_error(value)),
+        },
+        runtime::Value::Object(object) => match states.get(object) {
+            Some(state) => Result::Ok(StringPattern { state, object: Option::Some(object) }),
+            None => {
+                let pattern = match string_value_at_depth(context, value, depth)? {
+                    runtime::Value::String(value) => value,
+                    _ => return Result::Err(string_vm_type_error("pattern is not a string")),
+                };
+                match new_regexp_state(pattern, js_string("")) {
+                    Ok(state) => Result::Ok(StringPattern { state, object: Option::None }),
+                    Err(value) => Result::Err(string_vm_native_error(value)),
+                }
+            },
+        },
+        value => {
+            let pattern = match string_value_at_depth(context, value, depth)? {
+                runtime::Value::String(value) => value,
+                _ => return Result::Err(string_vm_type_error("pattern is not a string")),
+            };
+            match new_regexp_state(pattern, js_string("")) {
+                Ok(state) => Result::Ok(StringPattern { state, object: Option::None }),
+                Err(value) => Result::Err(string_vm_native_error(value)),
+            }
+        },
+    }
+}
+
+fn string_advance_index(value: runtime::JsString, index: int, unicode: bool) -> int {
+    if unicode && index + 1 < value.len() && runtime::is_high_surrogate(value.get(index))
+        && runtime::is_low_surrogate(value.get(index + 1)) {
+        index + 2
+    } else {
+        index + 1
+    }
+}
+
+fn string_set_last_index(heap: runtime::Heap, object: Option[runtime::ObjectId], value: int) -> Result[
+    unit,
+    vm::VmError,
+] {
+    match object {
+        Some(object) => match set_regexp_last_index(heap, object, value) {
+            Ok(()) => Result::Ok(()),
+            Err(value) => Result::Err(string_vm_native_error(value)),
+        },
+        None => Result::Ok(()),
+    }
+}
+
+fn string_find_matches(
+    heap: runtime::Heap,
+    pattern: StringPattern,
+    input: runtime::JsString,
+    all: bool,
+) -> Result[LocatedMatches, vm::VmError] {
+    let matches: Vec[LocatedMatch] = Vec::[];
+    if all {
+        string_set_last_index(heap, pattern.object, 0)?;
+    } else {};
+    let mut offset = if !all && pattern.state.sticky {
+        match pattern.object {
+            Some(object) => match regexp_last_index(heap, object, input.len()) {
+                Ok(value) => value,
+                Err(value) => return Result::Err(string_vm_native_error(value)),
+            },
+            None => 0,
+        }
+    } else {
+        0
+    };
+    while offset <= input.len() {
+        let found = match find_regexp_match(pattern.state, input, offset) {
+            Ok(value) => value,
+            Err(value) => return Result::Err(string_vm_native_error(value)),
+        };
+        match found {
+            Some(found) => {
+                let start = found.start;
+                let end = found.end;
+                matches.push(found);
+                if !all {
+                    if pattern.state.sticky {
+                        string_set_last_index(heap, pattern.object, end)?
+                    } else {};
+                    return Result::Ok(matches)
+                } else if end == start {
+                    offset = string_advance_index(input, end, pattern.state.unicode);
+                } else {
+                    offset = end;
+                }
+            },
+            None => {
+                if all || pattern.state.sticky {
+                    string_set_last_index(heap, pattern.object, 0)?
+                } else {};
+                return Result::Ok(matches)
+            },
+        }
+    }
+    if all {
+        string_set_last_index(heap, pattern.object, 0)?
+    } else {};
+    Result::Ok(matches)
+}
+
+fn string_append_slice(output: Vec[uint16], value: runtime::JsString, start: int, end: int) -> Result[
+    unit,
+    vm::VmError,
+] {
+    if end - start > STRING_LENGTH_LIMIT - output.len() {
+        return Result::Err(string_vm_range_error("string length limit exceeded"))
+    } else {};
+    let mut index = start;
+    while index < end {
+        output.push(value.get(index));
+        index += 1;
+    }
+    Result::Ok(())
+}
+
+fn string_append_capture(
+    output: Vec[uint16],
+    input: runtime::JsString,
+    capture: Option[regexp::RegexCapture],
+) -> Result[unit, vm::VmError] {
+    match capture {
+        Some(value) => string_append_slice(output, input, value.start, value.end),
+        None => Result::Ok(()),
+    }
+}
+
+fn string_has_named_captures(found: LocatedMatch) -> bool {
+    let mut index = 1;
+    while index < found.capture_names.len() {
+        if found.capture_names[index].is_some() {
+            return true
+        } else {};
+        index += 1;
+    }
+    false
+}
+
+fn string_named_capture_index(found: LocatedMatch, name: runtime::JsString) -> int {
+    let mut index = 1;
+    let mut first = 0 - 1;
+    while index < found.capture_names.len() {
+        match found.capture_names[index] {
+            Some(value) => if value == name {
+                if first < 0 {
+                    first = index;
+                } else {};
+                if found.captures[index].is_some() {
+                    return index
+                } else {}
+            } else {},
+            None => {},
+        };
+        index += 1;
+    }
+    first
+}
+
+fn string_replacement_text(
+    input: runtime::JsString,
+    found: LocatedMatch,
+    replacement: runtime::JsString,
+) -> Result[runtime::JsString, vm::VmError] {
+    let output: Vec[uint16] = Vec::[];
+    let mut index = 0;
+    while index < replacement.len() {
+        if replacement.get(index) != 36 || index + 1 >= replacement.len() {
+            output.push(replacement.get(index));
+            index += 1;
+        } else {
+            let next = replacement.get(index + 1);
+            if next == 36 {
+                output.push(36);
+                index += 2;
+            } else if next == 38 {
+                string_append_capture(output, input, found.captures[0])?;
+                index += 2;
+            } else if next == 96 {
+                string_append_slice(output, input, 0, found.start)?;
+                index += 2;
+            } else if next == 39 {
+                string_append_slice(output, input, found.end, input.len())?;
+                index += 2;
+            } else if next >= 49 && next <= 57 {
+                let first = (next - 48).to_int();
+                let mut capture = first;
+                let mut consumed = 2;
+                if index + 2 < replacement.len() {
+                    let second = replacement.get(index + 2);
+                    let combined = first * 10 + (second - 48).to_int();
+                    if second >= 48 && second <= 57 && combined < found.captures.len() {
+                        capture = combined;
+                        consumed = 3;
+                    } else {}
+                } else {};
+                if capture < found.captures.len() {
+                    string_append_capture(output, input, found.captures[capture])?;
+                    index += consumed;
+                } else {
+                    output.push(36);
+                    index += 1;
+                }
+            } else if next == 60 && string_has_named_captures(found) {
+                let mut end = index + 2;
+                while end < replacement.len() && replacement.get(end) != 62 {
+                    end += 1;
+                }
+                if end < replacement.len() {
+                    let name = replacement.slice(index + 2, end);
+                    let capture = string_named_capture_index(found, name);
+                    if capture >= 0 {
+                        string_append_capture(output, input, found.captures[capture])?
+                    } else {};
+                    index = end + 1;
+                } else {
+                    output.push(36);
+                    index += 1;
+                }
+            } else {
+                output.push(36);
+                index += 1;
+            }
+        };
+        if output.len() > STRING_LENGTH_LIMIT {
+            return Result::Err(string_vm_range_error("string length limit exceeded"))
+        } else {}
+    }
+    Result::Ok(runtime::JsString::from_code_units(output))
+}
+
+fn string_callable(value: runtime::Value) -> bool {
+    match value {
+        runtime::Value::Object(value) => value.is_callable(),
+        _ => false,
+    }
+}
+
+fn string_replacement(
+    context: vm::Context,
+    input: runtime::JsString,
+    found: LocatedMatch,
+    replacement: runtime::Value,
+    depth: int,
+) -> Result[runtime::JsString, vm::VmError] {
+    if string_callable(replacement) {
+        let arguments: Vec[runtime::Value] = Vec::with_capacity(found.captures.len() + 3);
+        let mut index = 0;
+        while index < found.captures.len() {
+            match found.captures[index] {
+                Some(value) => arguments.push(
+                    runtime::Value::String(input.slice(value.start, value.end)),
+                ),
+                None => arguments.push(runtime::Value::Undefined),
+            };
+            index += 1;
+        }
+        arguments.push(runtime::Value::Int(found.start.to_int32()));
+        arguments.push(runtime::Value::String(input));
+        if string_has_named_captures(found) {
+            let groups = match regexp_groups_value(context.heap(), input, found) {
+                Ok(value) => value,
+                Err(value) => return Result::Err(string_vm_native_error(value)),
+            };
+            arguments.push(groups)
+        } else {};
+        let result = context.invoke_with_this_at_depth(
+            replacement,
+            arguments,
+            runtime::Value::Undefined,
+            depth,
+        )?;
+        match string_value_at_depth(context, result, depth)? {
+            runtime::Value::String(value) => Result::Ok(value),
+            _ => Result::Err(string_vm_type_error("replacement is not a string")),
+        }
+    } else {
+        let replacement = match string_value_at_depth(context, replacement, depth)? {
+            runtime::Value::String(value) => value,
+            _ => return Result::Err(string_vm_type_error("replacement is not a string")),
+        };
+        string_replacement_text(input, found, replacement)
+    }
+}
+
+fn string_to_string_method(
+    heap: runtime::Heap,
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+) -> Result[runtime::Value, vm::NativeError] {
+    let _ = heap;
+    let _ = arguments;
+    Result::Ok(string_value(string_receiver(heap, this_value)?))
+}
+
+fn string_value_of(heap: runtime::Heap, this_value: runtime::Value, arguments: Vec[runtime::Value]) -> Result[
+    runtime::Value,
+    vm::NativeError,
+] {
+    string_to_string_method(heap, this_value, arguments)
+}
+
+fn string_at_method(heap: runtime::Heap, this_value: runtime::Value, arguments: Vec[runtime::Value]) -> Result[
+    runtime::Value,
+    vm::NativeError,
+] {
+    let _ = heap;
+    let value = string_receiver(heap, this_value)?;
+    let index = string_at_index(number_argument(arguments, 0)?, value.len());
+    match stringx::at(value, index) {
+        Some(value) => Result::Ok(string_value(value)),
+        None => Result::Ok(runtime::Value::Undefined),
+    }
+}
+
+fn string_char_at(heap: runtime::Heap, this_value: runtime::Value, arguments: Vec[runtime::Value]) -> Result[
+    runtime::Value,
+    vm::NativeError,
+] {
+    let _ = heap;
+    let value = string_receiver(heap, this_value)?;
+    let index = string_code_unit_index(number_argument(arguments, 0)?, value.len());
+    Result::Ok(string_value(stringx::char_at(value, index)))
+}
+
+fn string_char_code_at(
+    heap: runtime::Heap,
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+) -> Result[runtime::Value, vm::NativeError] {
+    let _ = heap;
+    let value = string_receiver(heap, this_value)?;
+    let index = string_code_unit_index(number_argument(arguments, 0)?, value.len());
+    match stringx::char_code_at(value, index) {
+        Some(value) => Result::Ok(runtime::Value::Int(value.to_int32())),
+        None => Result::Ok(runtime::Value::Float(nan())),
+    }
+}
+
+fn string_code_point_at(
+    heap: runtime::Heap,
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+) -> Result[runtime::Value, vm::NativeError] {
+    let _ = heap;
+    let value = string_receiver(heap, this_value)?;
+    let index = string_code_unit_index(number_argument(arguments, 0)?, value.len());
+    match stringx::code_point_at(value, index) {
+        Some(value) => Result::Ok(runtime::Value::Int(value.to_int32())),
+        None => Result::Ok(runtime::Value::Undefined),
+    }
+}
+
+fn string_concat(heap: runtime::Heap, this_value: runtime::Value, arguments: Vec[runtime::Value]) -> Result[
+    runtime::Value,
+    vm::NativeError,
+] {
+    let mut result = string_receiver(heap, this_value)?;
+    let mut index = 0;
+    while index < arguments.len() {
+        let next = value_string(heap, arguments[index])?;
+        if next.len() > STRING_LENGTH_LIMIT || result.len() > STRING_LENGTH_LIMIT - next.len() {
+            return Result::Err(native_error("RangeError: string length limit exceeded"))
+        } else {};
+        result = result.concat(next);
+        index += 1;
+    }
+    Result::Ok(string_value(result))
+}
+
+fn string_includes(heap: runtime::Heap, this_value: runtime::Value, arguments: Vec[runtime::Value]) -> Result[
+    runtime::Value,
+    vm::NativeError,
+] {
+    let value = string_receiver(heap, this_value)?;
+    let search = value_string(heap, argument(arguments, 0))?;
+    let position = string_clamped_index(number_argument(arguments, 1)?, value.len(), 0);
+    Result::Ok(runtime::Value::Bool(stringx::includes(value, search, position)))
+}
+
+fn string_starts_with(
+    heap: runtime::Heap,
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+) -> Result[runtime::Value, vm::NativeError] {
+    let value = string_receiver(heap, this_value)?;
+    let search = value_string(heap, argument(arguments, 0))?;
+    let position = string_clamped_index(number_argument(arguments, 1)?, value.len(), 0);
+    Result::Ok(runtime::Value::Bool(stringx::starts_with(value, search, position)))
+}
+
+fn string_ends_with(heap: runtime::Heap, this_value: runtime::Value, arguments: Vec[runtime::Value]) -> Result[
+    runtime::Value,
+    vm::NativeError,
+] {
+    let value = string_receiver(heap, this_value)?;
+    let search = value_string(heap, argument(arguments, 0))?;
+    let position = string_clamped_index(
+        string_number_or_default(arguments, 1, int_float(value.len()))?,
+        value.len(),
+        0,
+    );
+    Result::Ok(runtime::Value::Bool(stringx::ends_with(value, search, position)))
+}
+
+fn string_index_of(heap: runtime::Heap, this_value: runtime::Value, arguments: Vec[runtime::Value]) -> Result[
+    runtime::Value,
+    vm::NativeError,
+] {
+    let value = string_receiver(heap, this_value)?;
+    let search = value_string(heap, argument(arguments, 0))?;
+    let position = string_clamped_index(number_argument(arguments, 1)?, value.len(), 0);
+    Result::Ok(runtime::Value::Int(stringx::index_of(value, search, position).to_int32()))
+}
+
+fn string_last_index_of(
+    heap: runtime::Heap,
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+) -> Result[runtime::Value, vm::NativeError] {
+    let value = string_receiver(heap, this_value)?;
+    let search = value_string(heap, argument(arguments, 0))?;
+    let position = string_clamped_index(
+        string_number_or_default(arguments, 1, infinity())?,
+        value.len(),
+        value.len(),
+    );
+    Result::Ok(runtime::Value::Int(stringx::last_index_of(value, search, position).to_int32()))
+}
+
+fn string_slice(heap: runtime::Heap, this_value: runtime::Value, arguments: Vec[runtime::Value]) -> Result[
+    runtime::Value,
+    vm::NativeError,
+] {
+    let _ = heap;
+    let value = string_receiver(heap, this_value)?;
+    let start = string_relative_index(number_argument(arguments, 0)?, value.len());
+    let end = string_relative_index(
+        string_number_or_default(arguments, 1, int_float(value.len()))?,
+        value.len(),
+    );
+    Result::Ok(string_value(stringx::slice(value, start, end)))
+}
+
+fn string_substring(heap: runtime::Heap, this_value: runtime::Value, arguments: Vec[runtime::Value]) -> Result[
+    runtime::Value,
+    vm::NativeError,
+] {
+    let _ = heap;
+    let value = string_receiver(heap, this_value)?;
+    let start = string_clamped_index(number_argument(arguments, 0)?, value.len(), 0);
+    let end = string_clamped_index(
+        string_number_or_default(arguments, 1, int_float(value.len()))?,
+        value.len(),
+        0,
+    );
+    Result::Ok(string_value(stringx::substring(value, start, end)))
+}
+
+fn string_substr(heap: runtime::Heap, this_value: runtime::Value, arguments: Vec[runtime::Value]) -> Result[
+    runtime::Value,
+    vm::NativeError,
+] {
+    let _ = heap;
+    let value = string_receiver(heap, this_value)?;
+    let start = string_relative_index(number_argument(arguments, 0)?, value.len());
+    let requested = string_number_or_default(arguments, 1, int_float(value.len() - start))?;
+    let count = if math::is_nan(requested) || requested <= 0.0 || requested == -infinity() {
+        0
+    } else if requested == infinity() || requested >= int_float(value.len() - start) {
+        value.len() - start
+    } else {
+        string_truncated_int(requested, 0)
+    };
+    Result::Ok(string_value(value.slice(start, start + count)))
+}
+
+fn string_repeat(heap: runtime::Heap, this_value: runtime::Value, arguments: Vec[runtime::Value]) -> Result[
+    runtime::Value,
+    vm::NativeError,
+] {
+    let _ = heap;
+    let value = string_receiver(heap, this_value)?;
+    let count_value = number_argument(arguments, 0)?;
+    if count_value == infinity() || count_value == -infinity() {
+        return Result::Err(native_error("RangeError: invalid string repetition count"))
+    } else {};
+    let count = if math::is_nan(count_value) {
+        0
+    } else if count_value <= -1.0 {
+        return Result::Err(native_error("RangeError: invalid string repetition count"))
+    } else if value.len() == 0 {
+        0
+    } else if count_value > int_float(STRING_LENGTH_LIMIT / value.len()) {
+        return Result::Err(native_error("RangeError: string length limit exceeded"))
+    } else {
+        string_truncated_int(count_value, 0)
+    };
+    match stringx::repeat(value, count) {
+        Ok(value) => Result::Ok(string_value(value)),
+        Err(value) => Result::Err(string_failure(value)),
+    }
+}
+
+fn string_pad_fill(heap: runtime::Heap, arguments: Vec[runtime::Value]) -> Result[
+    runtime::JsString,
+    vm::NativeError,
+] {
+    match argument(arguments, 1) {
+        runtime::Value::Undefined => Result::Ok(js_string(" ")),
+        value => value_string(heap, value),
+    }
+}
+
+fn string_pad(
+    heap: runtime::Heap,
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+    start: bool,
+) -> Result[runtime::Value, vm::NativeError] {
+    let value = string_receiver(heap, this_value)?;
+    let target_value = number_argument(arguments, 0)?;
+    if math::is_nan(target_value) || target_value <= int_float(value.len())
+        || target_value == -infinity() {
+        return Result::Ok(string_value(value))
+    } else {};
+    let fill = string_pad_fill(heap, arguments)?;
+    if fill.len() == 0 {
+        return Result::Ok(string_value(value))
+    } else if target_value == infinity() || target_value > int_float(STRING_LENGTH_LIMIT) {
+        return Result::Err(native_error("RangeError: string length limit exceeded"))
+    } else {};
+    let target = string_truncated_int(target_value, 0);
+    let result = if start {
+        stringx::pad_start(value, target, fill)
+    } else {
+        stringx::pad_end(value, target, fill)
+    };
+    match result {
+        Ok(value) => Result::Ok(string_value(value)),
+        Err(value) => Result::Err(string_failure(value)),
+    }
+}
+
+fn string_pad_start(heap: runtime::Heap, this_value: runtime::Value, arguments: Vec[runtime::Value]) -> Result[
+    runtime::Value,
+    vm::NativeError,
+] {
+    string_pad(heap, this_value, arguments, true)
+}
+
+fn string_pad_end(heap: runtime::Heap, this_value: runtime::Value, arguments: Vec[runtime::Value]) -> Result[
+    runtime::Value,
+    vm::NativeError,
+] {
+    string_pad(heap, this_value, arguments, false)
+}
+
+fn string_trim_method(
+    heap: runtime::Heap,
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+) -> Result[runtime::Value, vm::NativeError] {
+    let _ = heap;
+    let _ = arguments;
+    Result::Ok(string_value(stringx::trim(string_receiver(heap, this_value)?)))
+}
+
+fn string_trim_start_method(
+    heap: runtime::Heap,
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+) -> Result[runtime::Value, vm::NativeError] {
+    let _ = heap;
+    let _ = arguments;
+    Result::Ok(string_value(stringx::trim_start(string_receiver(heap, this_value)?)))
+}
+
+fn string_trim_end_method(
+    heap: runtime::Heap,
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+) -> Result[runtime::Value, vm::NativeError] {
+    let _ = heap;
+    let _ = arguments;
+    Result::Ok(string_value(stringx::trim_end(string_receiver(heap, this_value)?)))
+}
+
+fn string_is_well_formed(
+    heap: runtime::Heap,
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+) -> Result[runtime::Value, vm::NativeError] {
+    let _ = arguments;
+    let value = string_receiver(heap, this_value)?;
+    let mut index = 0;
+    while index < value.len() {
+        let code_unit = value.get(index);
+        if runtime::is_high_surrogate(code_unit) {
+            if index + 1 >= value.len() || !runtime::is_low_surrogate(value.get(index + 1)) {
+                return Result::Ok(runtime::Value::Bool(false))
+            } else {
+                index += 2;
+            }
+        } else if runtime::is_low_surrogate(code_unit) {
+            return Result::Ok(runtime::Value::Bool(false))
+        } else {
+            index += 1;
+        }
+    }
+    Result::Ok(runtime::Value::Bool(true))
+}
+
+fn string_to_well_formed(
+    heap: runtime::Heap,
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+) -> Result[runtime::Value, vm::NativeError] {
+    let _ = arguments;
+    let value = string_receiver(heap, this_value)?;
+    let output: Vec[uint16] = Vec::with_capacity(value.len());
+    let mut index = 0;
+    while index < value.len() {
+        let code_unit = value.get(index);
+        if runtime::is_high_surrogate(code_unit) && index + 1 < value.len()
+            && runtime::is_low_surrogate(value.get(index + 1)) {
+            output.push(code_unit);
+            output.push(value.get(index + 1));
+            index += 2;
+        } else if runtime::is_surrogate(code_unit) {
+            output.push(0xfffd);
+            index += 1;
+        } else {
+            output.push(code_unit);
+            index += 1;
+        }
+    }
+    Result::Ok(string_value(runtime::JsString::from_code_units(output)))
+}
+
+fn string_change_unicode_case(
+    heap: runtime::Heap,
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+    strings: unicode::StringUnicode,
+    lower: bool,
+) -> Result[runtime::Value, vm::NativeError] {
+    let _ = arguments;
+    let value = string_receiver(heap, this_value)?;
+    let units = value.code_units();
+    let converted = if lower {
+        strings.lowercase(units.slice(0, units.len()))
+    } else {
+        strings.uppercase(units.slice(0, units.len()))
+    };
+    Result::Ok(string_value(runtime::JsString::from_code_units(converted)))
+}
+
+fn string_normalize_unicode(
+    heap: runtime::Heap,
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+    strings: unicode::StringUnicode,
+) -> Result[runtime::Value, vm::NativeError] {
+    let value = string_receiver(heap, this_value)?;
+    let form = match argument(arguments, 0) {
+        runtime::Value::Undefined => unicode::NormalizationForm::Nfc,
+        runtime::Value::String(value) => if value == js_string("NFC") {
+            unicode::NormalizationForm::Nfc
+        } else if value == js_string("NFD") {
+            unicode::NormalizationForm::Nfd
+        } else if value == js_string("NFKC") {
+            unicode::NormalizationForm::Nfkc
+        } else if value == js_string("NFKD") {
+            unicode::NormalizationForm::Nfkd
+        } else {
+            return Result::Err(native_error("RangeError: bad normalization form"))
+        },
+        _ => return Result::Err(native_error("normalization form is not a string")),
+    };
+    let units = value.code_units();
+    Result::Ok(
+        string_value(
+            runtime::JsString::from_code_units(strings.normalize(units.slice(0, units.len()), form)),
+        ),
+    )
+}
+
+fn string_locale_compare_unicode(
+    heap: runtime::Heap,
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+    strings: unicode::StringUnicode,
+) -> Result[runtime::Value, vm::NativeError] {
+    let left = string_receiver(heap, this_value)?;
+    let right = match argument(arguments, 0) {
+        runtime::Value::String(value) => value,
+        _ => return Result::Err(native_error("localeCompare argument is not a string")),
+    };
+    let left_units = left.code_units();
+    let right_units = right.code_units();
+    Result::Ok(
+        runtime::Value::Int(
+            strings.locale_compare(
+                left_units.slice(0, left_units.len()),
+                right_units.slice(0, right_units.len()),
+            ).to_int32(),
+        ),
+    )
+}
+
+fn string_html_attribute(value: runtime::JsString) -> Result[runtime::JsString, vm::NativeError] {
+    let output: Vec[uint16] = Vec::with_capacity(value.len());
+    let replacement = js_string("&quot;");
+    let mut index = 0;
+    while index < value.len() {
+        if value.get(index) == 34 {
+            if output.len() > STRING_LENGTH_LIMIT - replacement.len() {
+                return Result::Err(native_error("RangeError: string length limit exceeded"))
+            } else {};
+            let mut replacement_index = 0;
+            while replacement_index < replacement.len() {
+                output.push(replacement.get(replacement_index));
+                replacement_index += 1;
+            }
+        } else {
+            if output.len() >= STRING_LENGTH_LIMIT {
+                return Result::Err(native_error("RangeError: string length limit exceeded"))
+            } else {};
+            output.push(value.get(index));
+        };
+        index += 1;
+    }
+    Result::Ok(runtime::JsString::from_code_units(output))
+}
+
+fn string_html(
+    heap: runtime::Heap,
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+    tag: string,
+    attribute: Option[string],
+) -> Result[runtime::Value, vm::NativeError] {
+    let value = string_receiver(heap, this_value)?;
+    let opening = match attribute {
+        Some(name) => {
+            let attribute_value = string_html_attribute(value_string(heap, argument(arguments, 0))?)?;
+            js_string("<" + tag + " " + name + "=\"").concat(attribute_value).concat(
+                js_string("\">"),
+            )
+        },
+        None => js_string("<" + tag + ">"),
+    };
+    let closing = js_string("</" + tag + ">");
+    if opening.len() > STRING_LENGTH_LIMIT - value.len()
+        || opening.len() + value.len() > STRING_LENGTH_LIMIT - closing.len() {
+        Result::Err(native_error("RangeError: string length limit exceeded"))
+    } else {
+        Result::Ok(string_value(opening.concat(value).concat(closing)))
+    }
+}
+
+fn string_replace_all(
+    heap: runtime::Heap,
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+) -> Result[runtime::Value, vm::NativeError] {
+    let value = string_receiver(heap, this_value)?;
+    let search = value_string(heap, argument(arguments, 0))?;
+    let replacement = value_string(heap, argument(arguments, 1))?;
+    match stringx::replace_all(value, search, replacement) {
+        Ok(value) => Result::Ok(string_value(value)),
+        Err(value) => Result::Err(string_failure(value)),
+    }
+}
+
+fn string_split(heap: runtime::Heap, this_value: runtime::Value, arguments: Vec[runtime::Value]) -> Result[
+    runtime::Value,
+    vm::NativeError,
+] {
+    let value = string_receiver(heap, this_value)?;
+    let limit = match argument(arguments, 1) {
+        runtime::Value::Undefined => 4294967295,
+        _ => to_uint32(number_argument(arguments, 1)?).to_int(),
+    };
+    let parts = match argument(arguments, 0) {
+        runtime::Value::Undefined => if limit == 0 {
+            Vec::[]
+        } else {
+            Vec::[value]
+        },
+        separator => stringx::split(value, value_string(heap, separator)?, limit),
+    };
+    let values: Vec[runtime::Value] = Vec::with_capacity(parts.len());
+    for part in parts {
+        values.push(string_value(part))
+    }
+    Result::Ok(runtime::Value::Object(allocate_array(heap, values, values.len())?))
+}
+
+fn string_match_internal(
+    context: vm::Context,
+    states: HashMap[runtime::ObjectId, RegExpState],
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+    depth: int,
+) -> Result[runtime::Value, vm::VmError] {
+    let input = match string_receiver(context.heap(), this_value) {
+        Ok(value) => value,
+        Err(value) => return Result::Err(string_vm_native_error(value)),
+    };
+    let pattern = string_pattern(context, states, argument(arguments, 0), depth)?;
+    if pattern.state.global {
+        let matches = string_find_matches(context.heap(), pattern, input, true)?;
+        if matches.is_empty() {
+            Result::Ok(runtime::Value::Null)
+        } else {
+            let values: Vec[runtime::Value] = Vec::with_capacity(matches.len());
+            for found in matches {
+                values.push(runtime::Value::String(input.slice(found.start, found.end)))
+            }
+            match allocate_array(context.heap(), values, values.len()) {
+                Ok(value) => Result::Ok(runtime::Value::Object(value)),
+                Err(value) => Result::Err(string_vm_native_error(value)),
+            }
+        }
+    } else {
+        let matches = string_find_matches(context.heap(), pattern, input, false)?;
+        if matches.is_empty() {
+            Result::Ok(runtime::Value::Null)
+        } else {
+            match regexp_match_array(context.heap(), input, matches[0], pattern.state.has_indices) {
+                Ok(value) => Result::Ok(value),
+                Err(value) => Result::Err(string_vm_native_error(value)),
+            }
+        }
+    }
+}
+
+fn string_search_internal(
+    context: vm::Context,
+    states: HashMap[runtime::ObjectId, RegExpState],
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+    depth: int,
+) -> Result[runtime::Value, vm::VmError] {
+    let input = match string_receiver(context.heap(), this_value) {
+        Ok(value) => value,
+        Err(value) => return Result::Err(string_vm_native_error(value)),
+    };
+    let pattern = string_pattern(context, states, argument(arguments, 0), depth)?;
+    let found = match find_regexp_match(pattern.state, input, 0) {
+        Ok(value) => value,
+        Err(value) => return Result::Err(string_vm_native_error(value)),
+    };
+    match found {
+        Some(value) => Result::Ok(runtime::Value::Int(value.start.to_int32())),
+        None => Result::Ok(runtime::Value::Int(-1)),
+    }
+}
+
+fn string_literal_matches(input: runtime::JsString, search: runtime::JsString, all: bool) -> Vec[
+    LocatedMatch,
+] {
+    let matches: Vec[LocatedMatch] = Vec::[];
+    let mut offset = 0;
+    while offset <= input.len() {
+        let start = stringx::index_of(input, search, offset);
+        if start < 0 {
+            return matches
+        } else {};
+        let end = start + search.len();
+        matches.push(
+            LocatedMatch {
+                start,
+                end,
+                captures: Vec::[Option::Some(regexp::RegexCapture { start, end })],
+                capture_names: Vec::[Option::None],
+            },
+        );
+        if !all {
+            return matches
+        } else if search.len() == 0 {
+            offset = start + 1;
+        } else {
+            offset = end;
+        }
+    }
+    matches
+}
+
+fn string_replace_internal(
+    context: vm::Context,
+    states: HashMap[runtime::ObjectId, RegExpState],
+    replace_all: bool,
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+    depth: int,
+) -> Result[runtime::Value, vm::VmError] {
+    let input = match string_receiver(context.heap(), this_value) {
+        Ok(value) => value,
+        Err(value) => return Result::Err(string_vm_native_error(value)),
+    };
+    let search_value = argument(arguments, 0);
+    let matches = match search_value {
+        runtime::Value::Object(object) => match states.get(object) {
+            Some(state) => {
+                if replace_all && !state.global {
+                    return Result::Err(
+                        string_vm_type_error("replaceAll requires a global regular expression"),
+                    )
+                } else {};
+                string_find_matches(
+                    context.heap(),
+                    StringPattern { state, object: Option::Some(object) },
+                    input,
+                    state.global,
+                )?
+            },
+            None => {
+                let search = match string_value_at_depth(context, search_value, depth)? {
+                    runtime::Value::String(value) => value,
+                    _ => return Result::Err(string_vm_type_error("search value is not a string")),
+                };
+                string_literal_matches(input, search, replace_all)
+            },
+        },
+        value => {
+            let search = match string_value_at_depth(context, value, depth)? {
+                runtime::Value::String(value) => value,
+                _ => return Result::Err(string_vm_type_error("search value is not a string")),
+            };
+            string_literal_matches(input, search, replace_all)
+        },
+    };
+    let replacement = argument(arguments, 1);
+    let replacement = if string_callable(replacement) {
+        replacement
+    } else {
+        string_value_at_depth(context, replacement, depth)?
+    };
+    if matches.is_empty() {
+        return Result::Ok(runtime::Value::String(input))
+    } else {};
+    let output: Vec[uint16] = Vec::[];
+    let mut source_position = 0;
+    for found in matches {
+        if found.start >= source_position {
+            string_append_slice(output, input, source_position, found.start)?;
+            let text = string_replacement(context, input, found, replacement, depth)?;
+            string_append_slice(output, text, 0, text.len())?;
+            source_position = found.end;
+        } else {}
+    }
+    string_append_slice(output, input, source_position, input.len())?;
+    Result::Ok(runtime::Value::String(runtime::JsString::from_code_units(output)))
+}
+
+fn string_split_regexp(
+    context: vm::Context,
+    state: RegExpState,
+    input: runtime::JsString,
+    limit: int,
+) -> Result[runtime::Value, vm::VmError] {
+    let values: Vec[runtime::Value] = Vec::[];
+    if limit == 0 {
+        return match allocate_array(context.heap(), values, 0) {
+            Ok(value) => Result::Ok(runtime::Value::Object(value)),
+            Err(value) => Result::Err(string_vm_native_error(value)),
+        }
+    } else {};
+    if input.len() == 0 {
+        let found = match match_at(state, input, 0) {
+            Ok(value) => value,
+            Err(value) => return Result::Err(string_vm_native_error(value)),
+        };
+        if found.is_none() {
+            values.push(runtime::Value::String(input))
+        } else {};
+    } else {
+        let mut start = 0;
+        let mut offset = 0;
+        while offset < input.len() {
+            let found = match match_at(state, input, offset) {
+                Ok(value) => value,
+                Err(value) => return Result::Err(string_vm_native_error(value)),
+            };
+            match found {
+                Some(found) => if found.end == start && found.end == offset {
+                    offset = string_advance_index(input, offset, state.unicode);
+                } else {
+                    values.push(runtime::Value::String(input.slice(start, found.start)));
+                    if values.len() >= limit {
+                        break
+                    } else {};
+                    let mut capture = 1;
+                    while capture < found.captures.len() && values.len() < limit {
+                        match found.captures[capture] {
+                            Some(value) => values.push(
+                                runtime::Value::String(input.slice(value.start, value.end)),
+                            ),
+                            None => values.push(runtime::Value::Undefined),
+                        };
+                        capture += 1;
+                    }
+                    start = found.end;
+                    offset = found.end;
+                },
+                None => {
+                    offset = string_advance_index(input, offset, state.unicode);
+                },
+            }
+        }
+        if values.len() < limit {
+            values.push(runtime::Value::String(input.slice(start, input.len())))
+        } else {}
+    };
+    match allocate_array(context.heap(), values, values.len()) {
+        Ok(value) => Result::Ok(runtime::Value::Object(value)),
+        Err(value) => Result::Err(string_vm_native_error(value)),
+    }
+}
+
+fn string_split_internal(
+    context: vm::Context,
+    states: HashMap[runtime::ObjectId, RegExpState],
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+    depth: int,
+) -> Result[runtime::Value, vm::VmError] {
+    let input = match string_receiver(context.heap(), this_value) {
+        Ok(value) => value,
+        Err(value) => return Result::Err(string_vm_native_error(value)),
+    };
+    let limit = match argument(arguments, 1) {
+        runtime::Value::Undefined => 4294967295,
+        value => match number_value_at_depth(context, value, depth)? {
+            runtime::Value::Float(value) => {
+                arguments[1] = runtime::Value::Float(value);
+                to_uint32(value).to_int()
+            },
+            _ => return Result::Err(string_vm_type_error("split limit is not a number")),
+        },
+    };
+    match argument(arguments, 0) {
+        runtime::Value::Object(object) => match states.get(object) {
+            Some(state) => string_split_regexp(context, state, input, limit),
+            None => {
+                arguments[0] = string_value_at_depth(context, arguments[0], depth)?;
+                match string_split(context.heap(), this_value, arguments) {
+                    Ok(value) => Result::Ok(value),
+                    Err(value) => Result::Err(string_vm_native_error(value)),
+                }
+            },
+        },
+        runtime::Value::Undefined => match string_split(context.heap(), this_value, arguments) {
+            Ok(value) => Result::Ok(value),
+            Err(value) => Result::Err(string_vm_native_error(value)),
+        },
+        _ => {
+            arguments[0] = string_value_at_depth(context, arguments[0], depth)?;
+            match string_split(context.heap(), this_value, arguments) {
+                Ok(value) => Result::Ok(value),
+                Err(value) => Result::Err(string_vm_native_error(value)),
+            }
+        },
+    }
+}
+
+fn string_symbol_method(
+    context: vm::Context,
+    value: runtime::Value,
+    kind: vm::WellKnownSymbolKind,
+    depth: int,
+) -> Result[Option[runtime::Value], vm::VmError] {
+    match value {
+        runtime::Value::Undefined | runtime::Value::Null => return Result::Ok(Option::None),
+        _ => (),
+    };
+    let symbol = match context.well_known_symbol(kind) {
+        Some(value) => value,
+        None => return Result::Ok(Option::None),
+    };
+    let method = context.read_property_at_depth(value, runtime::Value::Symbol(symbol), depth)?;
+    match method {
+        runtime::Value::Undefined | runtime::Value::Null => Result::Ok(Option::None),
+        runtime::Value::Object(object) => if object.is_callable() {
+            Result::Ok(Option::Some(method))
+        } else {
+            Result::Err(string_vm_type_error("symbol protocol property is not callable"))
+        },
+        _ => Result::Err(string_vm_type_error("symbol protocol property is not callable")),
+    }
+}
+
+fn string_is_regexp(
+    context: vm::Context,
+    states: HashMap[runtime::ObjectId, RegExpState],
+    value: runtime::Value,
+    depth: int,
+) -> Result[bool, vm::VmError] {
+    let object = match value {
+        runtime::Value::Object(value) => value,
+        _ => return Result::Ok(false),
+    };
+    match context.well_known_symbol(vm::WellKnownSymbolKind::Match) {
+        Some(symbol) => {
+            let matcher = context.read_property_at_depth(
+                value,
+                runtime::Value::Symbol(symbol),
+                depth,
+            )?;
+            match matcher {
+                runtime::Value::Undefined => Result::Ok(states.get(object).is_some()),
+                value => Result::Ok(runtime::to_boolean(value)),
+            }
+        },
+        None => Result::Ok(states.get(object).is_some()),
+    }
+}
+
+fn string_global_flag(value: runtime::JsString) -> bool {
+    let mut index = 0;
+    while index < value.len() {
+        if value.get(index) == 103 {
+            return true
+        } else {
+            index += 1;
+        }
+    }
+    false
+}
+
+fn string_match_all_iterator(
+    context: vm::Context,
+    state: RegExpState,
+    input: runtime::JsString,
+    start: int,
+) -> Result[runtime::Value, vm::VmError] {
+    let completed = Ref::new(false);
+    let index = Ref::new(start);
+    let next = context.new_vm_function(
+        |this_value, arguments, depth| {
+            let _ = this_value;
+            let _ = arguments;
+            let _ = depth;
+            if completed.get() {
+                return string_iterator_result(context, runtime::Value::Undefined, true)
+            } else {};
+            let found = match find_regexp_match(state, input, index.get()) {
+                Ok(value) => value,
+                Err(value) => return Result::Err(string_vm_native_error(value)),
+            };
+            match found {
+                Some(found) => {
+                    if state.global {
+                        let next_index = if found.end == found.start {
+                            string_advance_index(input, found.end, state.unicode)
+                        } else {
+                            found.end
+                        };
+                        index.set(next_index)
+                    } else {
+                        completed.set(true)
+                    };
+                    let value = match regexp_match_array(
+                        context.heap(),
+                        input,
+                        found,
+                        state.has_indices,
+                    ) {
+                        Ok(value) => value,
+                        Err(value) => return Result::Err(string_vm_native_error(value)),
+                    };
+                    string_iterator_result(context, value, false)
+                },
+                None => {
+                    completed.set(true);
+                    string_iterator_result(context, runtime::Value::Undefined, true)
+                },
+            }
+        },
+    )?;
+    let iterator = iterator_allocate_object(context)?;
+    if !runtime::define_own_property(
+        context.heap(),
+        iterator,
+        runtime::string_property_key("next"),
+        runtime::data_descriptor(next, true, false, true),
+    ) {
+        return Result::Err(function_vm_error("cannot define RegExp string iterator next"))
+    } else {};
+    let iterator_symbol = match context.iterator_symbol() {
+        Some(value) => value,
+        None => return Result::Err(function_vm_error("iterator symbol is not installed")),
+    };
+    let identity = context.new_native_function(string_iterator_identity)?;
+    if !runtime::define_own_property(
+        context.heap(),
+        iterator,
+        runtime::PropertyKey::Symbol(iterator_symbol),
+        runtime::data_descriptor(identity, true, false, true),
+    ) {
+        Result::Err(function_vm_error("cannot define RegExp string iterator identity"))
+    } else {
+        Result::Ok(runtime::Value::Object(iterator))
+    }
+}
+
+fn string_regexp_match_all(
+    context: vm::Context,
+    states: HashMap[runtime::ObjectId, RegExpState],
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+) -> Result[runtime::Value, vm::VmError] {
+    let (object, state) = match regexp_state(states, this_value) {
+        Ok(value) => value,
+        Err(value) => return Result::Err(string_vm_native_error(value)),
+    };
+    let input = match string_receiver(context.heap(), argument(arguments, 0)) {
+        Ok(value) => value,
+        Err(value) => return Result::Err(string_vm_native_error(value)),
+    };
+    let start = match regexp_last_index(context.heap(), object, input.len()) {
+        Ok(value) => value,
+        Err(value) => return Result::Err(string_vm_native_error(value)),
+    };
+    string_match_all_iterator(context, state, input, start)
+}
+
+fn string_match_all_dispatch(
+    context: vm::Context,
+    states: HashMap[runtime::ObjectId, RegExpState],
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+    depth: int,
+) -> Result[runtime::Value, vm::VmError] {
+    let receiver = string_require_receiver(this_value)?;
+    let pattern = argument(arguments, 0);
+    if string_is_regexp(context, states, pattern, depth)? {
+        let flags = context.read_property_at_depth(
+            pattern,
+            runtime::Value::String(js_string("flags")),
+            depth,
+        )?;
+        let flags = match string_value_at_depth(context, flags, depth)? {
+            runtime::Value::String(value) => value,
+            _ => return Result::Err(string_vm_type_error("RegExp flags are not a string")),
+        };
+        if !string_global_flag(flags) {
+            return Result::Err(
+                string_vm_type_error("matchAll requires a global regular expression"),
+            )
+        } else {}
+    } else {};
+    match string_symbol_method(context, pattern, vm::WellKnownSymbolKind::MatchAll, depth)? {
+        Some(method) => context.invoke_with_this_at_depth(method, Vec::[receiver], pattern, depth),
+        None => {
+            let input = match string_receiver(
+                context.heap(),
+                string_method_receiver_at_depth(context, receiver, depth)?,
+            ) {
+                Ok(value) => value,
+                Err(value) => return Result::Err(string_vm_native_error(value)),
+            };
+            let source = match pattern {
+                runtime::Value::Undefined => js_string(""),
+                value => match string_value_at_depth(context, value, depth)? {
+                    runtime::Value::String(value) => value,
+                    _ => return Result::Err(string_vm_type_error("pattern is not a string")),
+                },
+            };
+            let state = match new_regexp_state(source, js_string("g")) {
+                Ok(value) => value,
+                Err(value) => return Result::Err(string_vm_native_error(value)),
+            };
+            string_match_all_iterator(context, state, input, 0)
+        },
+    }
+}
+
+fn string_match_dispatch(
+    context: vm::Context,
+    states: HashMap[runtime::ObjectId, RegExpState],
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+    depth: int,
+) -> Result[runtime::Value, vm::VmError] {
+    let receiver = string_require_receiver(this_value)?;
+    let pattern = argument(arguments, 0);
+    match string_symbol_method(context, pattern, vm::WellKnownSymbolKind::Match, depth)? {
+        Some(method) => context.invoke_with_this_at_depth(method, Vec::[receiver], pattern, depth),
+        None => string_match_internal(
+            context,
+            states,
+            string_method_receiver_at_depth(context, receiver, depth)?,
+            arguments,
+            depth,
+        ),
+    }
+}
+
+fn string_search_dispatch(
+    context: vm::Context,
+    states: HashMap[runtime::ObjectId, RegExpState],
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+    depth: int,
+) -> Result[runtime::Value, vm::VmError] {
+    let receiver = string_require_receiver(this_value)?;
+    let pattern = argument(arguments, 0);
+    match string_symbol_method(context, pattern, vm::WellKnownSymbolKind::Search, depth)? {
+        Some(method) => context.invoke_with_this_at_depth(method, Vec::[receiver], pattern, depth),
+        None => string_search_internal(
+            context,
+            states,
+            string_method_receiver_at_depth(context, receiver, depth)?,
+            arguments,
+            depth,
+        ),
+    }
+}
+
+fn string_replace_dispatch(
+    context: vm::Context,
+    states: HashMap[runtime::ObjectId, RegExpState],
+    replace_all: bool,
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+    depth: int,
+) -> Result[runtime::Value, vm::VmError] {
+    let receiver = string_require_receiver(this_value)?;
+    let pattern = argument(arguments, 0);
+    if replace_all && string_is_regexp(context, states, pattern, depth)? {
+        let flags = context.read_property_at_depth(
+            pattern,
+            runtime::Value::String(js_string("flags")),
+            depth,
+        )?;
+        let flags = match string_value_at_depth(context, flags, depth)? {
+            runtime::Value::String(value) => value,
+            _ => return Result::Err(string_vm_type_error("RegExp flags are not a string")),
+        };
+        if !string_global_flag(flags) {
+            return Result::Err(
+                string_vm_type_error("replaceAll requires a global regular expression"),
+            )
+        } else {}
+    } else {};
+    match string_symbol_method(context, pattern, vm::WellKnownSymbolKind::Replace, depth)? {
+        Some(method) => context.invoke_with_this_at_depth(
+            method,
+            Vec::[receiver, argument(arguments, 1)],
+            pattern,
+            depth,
+        ),
+        None => string_replace_internal(
+            context,
+            states,
+            replace_all,
+            string_method_receiver_at_depth(context, receiver, depth)?,
+            arguments,
+            depth,
+        ),
+    }
+}
+
+fn string_split_dispatch(
+    context: vm::Context,
+    states: HashMap[runtime::ObjectId, RegExpState],
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+    depth: int,
+) -> Result[runtime::Value, vm::VmError] {
+    let receiver = string_require_receiver(this_value)?;
+    let separator = argument(arguments, 0);
+    match string_symbol_method(context, separator, vm::WellKnownSymbolKind::Split, depth)? {
+        Some(method) => context.invoke_with_this_at_depth(
+            method,
+            Vec::[receiver, argument(arguments, 1)],
+            separator,
+            depth,
+        ),
+        None => string_split_internal(
+            context,
+            states,
+            string_method_receiver_at_depth(context, receiver, depth)?,
+            arguments,
+            depth,
+        ),
+    }
+}
+
+fn define_regexp_symbol_method(
+    heap: runtime::Heap,
+    prototype: runtime::ObjectId,
+    symbol: runtime::Symbol,
+    value: runtime::Value,
+) -> Result[unit, BuiltinError] {
+    if runtime::define_own_property(
+        heap,
+        prototype,
+        runtime::PropertyKey::Symbol(symbol),
+        runtime::data_descriptor(value, true, false, true),
+    ) {
+        Result::Ok(())
+    } else {
+        Result::Err(BuiltinError { message: "cannot define RegExp symbol method" })
+    }
+}
+
+fn install_regexp_string_methods(
+    context: vm::Context,
+    string_prototype: runtime::ObjectId,
+    regexp_prototype: runtime::ObjectId,
+    states: HashMap[runtime::ObjectId, RegExpState],
+) -> Result[unit, BuiltinError] {
+    let match_method = allocate_vm_function(
+        context,
+        "String.prototype.match",
+        |this_value, arguments, depth| {
+            string_match_dispatch(context, states, this_value, arguments, depth)
+        },
+    )?;
+    let match_all_method = allocate_vm_function(
+        context,
+        "String.prototype.matchAll",
+        |this_value, arguments, depth| {
+            string_match_all_dispatch(context, states, this_value, arguments, depth)
+        },
+    )?;
+    let search_method = allocate_vm_function(
+        context,
+        "String.prototype.search",
+        |this_value, arguments, depth| {
+            string_search_dispatch(context, states, this_value, arguments, depth)
+        },
+    )?;
+    let replace_method = allocate_vm_function(
+        context,
+        "String.prototype.replace",
+        |this_value, arguments, depth| {
+            string_replace_dispatch(context, states, false, this_value, arguments, depth)
+        },
+    )?;
+    let replace_all_method = allocate_vm_function(
+        context,
+        "String.prototype.replaceAll",
+        |this_value, arguments, depth| {
+            string_replace_dispatch(context, states, true, this_value, arguments, depth)
+        },
+    )?;
+    let split_method = allocate_vm_function(
+        context,
+        "String.prototype.split",
+        |this_value, arguments, depth| {
+            string_split_dispatch(context, states, this_value, arguments, depth)
+        },
+    )?;
+    for (name, value) in Vec::[
+        ("match", match_method),
+        ("matchAll", match_all_method),
+        ("search", search_method),
+        ("replace", replace_method),
+        ("replaceAll", replace_all_method),
+        ("split", split_method),
+    ] {
+        define_value(context.heap(), string_prototype, name, value, true, true)?
+    }
+    let regexp_match = allocate_vm_function(
+        context,
+        "RegExp.prototype[Symbol.match]",
+        |this_value, arguments, depth| {
+            string_match_internal(context, states, argument(arguments, 0), Vec::[this_value], depth)
+        },
+    )?;
+    let regexp_match_all = allocate_vm_function(
+        context,
+        "RegExp.prototype[Symbol.matchAll]",
+        |this_value, arguments, depth| {
+            let _ = depth;
+            string_regexp_match_all(context, states, this_value, arguments)
+        },
+    )?;
+    let regexp_search = allocate_vm_function(
+        context,
+        "RegExp.prototype[Symbol.search]",
+        |this_value, arguments, depth| {
+            string_search_internal(
+                context,
+                states,
+                argument(arguments, 0),
+                Vec::[this_value],
+                depth,
+            )
+        },
+    )?;
+    let regexp_replace = allocate_vm_function(
+        context,
+        "RegExp.prototype[Symbol.replace]",
+        |this_value, arguments, depth| {
+            string_replace_internal(
+                context,
+                states,
+                false,
+                argument(arguments, 0),
+                Vec::[this_value, argument(arguments, 1)],
+                depth,
+            )
+        },
+    )?;
+    let regexp_split = allocate_vm_function(
+        context,
+        "RegExp.prototype[Symbol.split]",
+        |this_value, arguments, depth| {
+            string_split_internal(
+                context,
+                states,
+                argument(arguments, 0),
+                Vec::[this_value, argument(arguments, 1)],
+                depth,
+            )
+        },
+    )?;
+    let match_symbol = match context.well_known_symbol(vm::WellKnownSymbolKind::Match) {
+        Some(value) => value,
+        None => return Result::Err(BuiltinError { message: "Symbol.match is not installed" }),
+    };
+    let match_all_symbol = match context.well_known_symbol(vm::WellKnownSymbolKind::MatchAll) {
+        Some(value) => value,
+        None => return Result::Err(BuiltinError { message: "Symbol.matchAll is not installed" }),
+    };
+    let search_symbol = match context.well_known_symbol(vm::WellKnownSymbolKind::Search) {
+        Some(value) => value,
+        None => return Result::Err(BuiltinError { message: "Symbol.search is not installed" }),
+    };
+    let replace_symbol = match context.well_known_symbol(vm::WellKnownSymbolKind::Replace) {
+        Some(value) => value,
+        None => return Result::Err(BuiltinError { message: "Symbol.replace is not installed" }),
+    };
+    let split_symbol = match context.well_known_symbol(vm::WellKnownSymbolKind::Split) {
+        Some(value) => value,
+        None => return Result::Err(BuiltinError { message: "Symbol.split is not installed" }),
+    };
+    define_regexp_symbol_method(context.heap(), regexp_prototype, match_symbol, regexp_match)?;
+    define_regexp_symbol_method(
+        context.heap(),
+        regexp_prototype,
+        match_all_symbol,
+        regexp_match_all,
+    )?;
+    define_regexp_symbol_method(context.heap(), regexp_prototype, search_symbol, regexp_search)?;
+    define_regexp_symbol_method(context.heap(), regexp_prototype, replace_symbol, regexp_replace)?;
+    define_regexp_symbol_method(context.heap(), regexp_prototype, split_symbol, regexp_split)?;
+    Result::Ok(())
+}
+
+fn string_iterator_result(context: vm::Context, value: runtime::Value, done: bool) -> Result[
+    runtime::Value,
+    vm::VmError,
+] {
+    let object = match runtime::new_ordinary_object(context.heap(), Option::None) {
+        Ok(value) => value,
+        Err(value) => return Result::Err(function_vm_error(value.message)),
+    };
+    if !runtime::define_own_property(
+        context.heap(),
+        object,
+        runtime::string_property_key("value"),
+        runtime::data_descriptor(value, true, true, true),
+    )
+        || !runtime::define_own_property(
+            context.heap(),
+            object,
+            runtime::string_property_key("done"),
+            runtime::data_descriptor(runtime::Value::Bool(done), true, true, true),
+        ) {
+        Result::Err(function_vm_error("cannot allocate String iterator result"))
+    } else {
+        Result::Ok(runtime::Value::Object(object))
+    }
+}
+
+fn string_iterator_identity(
+    heap: runtime::Heap,
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+) -> Result[runtime::Value, vm::NativeError] {
+    let _ = heap;
+    let _ = arguments;
+    Result::Ok(this_value)
+}
+
+fn string_create_iterator(context: vm::Context, this_value: runtime::Value) -> Result[
+    runtime::Value,
+    vm::VmError,
+] {
+    let value = match string_receiver(context.heap(), this_value) {
+        Ok(value) => value,
+        Err(value) => return Result::Err(function_vm_error(value.message)),
+    };
+    let index = Ref::new(0);
+    let next = context.new_vm_function(
+        |this_value, arguments, depth| {
+            let _ = this_value;
+            let _ = arguments;
+            let _ = depth;
+            let current = index.get();
+            if current >= value.len() {
+                string_iterator_result(context, runtime::Value::Undefined, true)
+            } else {
+                let width = if runtime::is_high_surrogate(value.get(current))
+                    && current + 1 < value.len()
+                    && runtime::is_low_surrogate(value.get(current + 1)) {
+                    2
+                } else {
+                    1
+                };
+                index.set(current + width);
+                string_iterator_result(
+                    context,
+                    runtime::Value::String(value.slice(current, current + width)),
+                    false,
+                )
+            }
+        },
+    )?;
+    let iterator = iterator_allocate_object(context)?;
+    if !runtime::define_own_property(
+        context.heap(),
+        iterator,
+        runtime::string_property_key("next"),
+        runtime::data_descriptor(next, true, false, true),
+    ) {
+        return Result::Err(function_vm_error("cannot define String iterator next"))
+    } else {};
+    let symbol = match context.iterator_symbol() {
+        Some(value) => value,
+        None => return Result::Err(function_vm_error("iterator symbol is not installed")),
+    };
+    let identity = context.new_native_function(string_iterator_identity)?;
+    if !runtime::define_own_property(
+        context.heap(),
+        iterator,
+        runtime::PropertyKey::Symbol(symbol),
+        runtime::data_descriptor(identity, true, false, true),
+    ) {
+        Result::Err(function_vm_error("cannot define String iterator identity"))
+    } else {
+        Result::Ok(runtime::Value::Object(iterator))
+    }
+}
+
+pub fn install_string_prototype(context: vm::Context, constructor: runtime::Value) -> Result[
+    runtime::ObjectId,
+    BuiltinError,
+] {
+    let constructor_object = function_object(constructor, "String")?;
+    let prototype = match allocate_ordinary(context.heap(), Option::None) {
+        Ok(value) => value,
+        Err(value) => return Result::Err(BuiltinError { message: value.message }),
+    };
+    define_value(
+        context.heap(),
+        constructor_object,
+        "prototype",
+        runtime::Value::Object(prototype),
+        false,
+        false,
+    )?;
+    define_value(context.heap(), prototype, "constructor", constructor, true, true)?;
+    define_value(context.heap(), prototype, "length", runtime::Value::Int(0), false, true)?;
+    define_function(context, prototype, "toString", string_to_string_method)?;
+    define_function(context, prototype, "valueOf", string_value_of)?;
+    let unicode_strings = unicode::StringUnicode::new();
+    for (name, lower) in Vec::[
+        ("toLowerCase", true),
+        ("toLocaleLowerCase", true),
+        ("toUpperCase", false),
+        ("toLocaleUpperCase", false),
+    ] {
+        string_define_method(
+            context,
+            prototype,
+            name,
+            |heap, this_value, arguments| {
+                string_change_unicode_case(heap, this_value, arguments, unicode_strings, lower)
+            },
+            Vec::[],
+            Option::None,
+        )?
+    }
+    string_define_method(
+        context,
+        prototype,
+        "normalize",
+        |heap, this_value, arguments| {
+            string_normalize_unicode(heap, this_value, arguments, unicode_strings)
+        },
+        Vec::[StringArgumentConversion::OptionalString(0)],
+        Option::None,
+    )?;
+    string_define_method(
+        context,
+        prototype,
+        "localeCompare",
+        |heap, this_value, arguments| {
+            string_locale_compare_unicode(heap, this_value, arguments, unicode_strings)
+        },
+        Vec::[StringArgumentConversion::String(0)],
+        Option::None,
+    )?;
+    for (name, callback) in Vec::[
+        ("at", string_at_method),
+        ("charAt", string_char_at),
+        ("charCodeAt", string_char_code_at),
+        ("codePointAt", string_code_point_at),
+        ("repeat", string_repeat),
+    ] {
+        string_define_method(
+            context,
+            prototype,
+            name,
+            callback,
+            Vec::[StringArgumentConversion::Number(0)],
+            Option::None,
+        )?
+    }
+    string_define_method(context, prototype, "concat", string_concat, Vec::[], Option::Some(0))?;
+    for (name, callback) in Vec::[
+        ("includes", string_includes),
+        ("startsWith", string_starts_with),
+        ("endsWith", string_ends_with),
+    ] {
+        string_define_search_method(context, prototype, name, callback)?
+    }
+    for (name, callback) in Vec::[
+        ("indexOf", string_index_of),
+        ("lastIndexOf", string_last_index_of),
+    ] {
+        string_define_method(
+            context,
+            prototype,
+            name,
+            callback,
+            Vec::[StringArgumentConversion::String(0), StringArgumentConversion::OptionalNumber(1)],
+            Option::None,
+        )?
+    }
+    for (name, callback) in Vec::[("slice", string_slice), ("substring", string_substring)] {
+        string_define_method(
+            context,
+            prototype,
+            name,
+            callback,
+            Vec::[StringArgumentConversion::Number(0), StringArgumentConversion::OptionalNumber(1)],
+            Option::None,
+        )?
+    }
+    string_define_method(
+        context,
+        prototype,
+        "substr",
+        string_substr,
+        Vec::[StringArgumentConversion::Number(0), StringArgumentConversion::OptionalNumber(1)],
+        Option::None,
+    )?;
+    string_define_pad_method(context, prototype, "padStart", string_pad_start)?;
+    string_define_pad_method(context, prototype, "padEnd", string_pad_end)?;
+    for (name, callback) in Vec::[
+        ("trim", string_trim_method),
+        ("trimStart", string_trim_start_method),
+        ("trimEnd", string_trim_end_method),
+    ] {
+        string_define_method(context, prototype, name, callback, Vec::[], Option::None)?
+    }
+    define_value(
+        context.heap(),
+        prototype,
+        "trimLeft",
+        builtin_own_value(context.heap(), prototype, "trimStart")?,
+        true,
+        true,
+    )?;
+    define_value(
+        context.heap(),
+        prototype,
+        "trimRight",
+        builtin_own_value(context.heap(), prototype, "trimEnd")?,
+        true,
+        true,
+    )?;
+    for (name, tag) in Vec::[
+        ("big", "big"),
+        ("blink", "blink"),
+        ("bold", "b"),
+        ("fixed", "tt"),
+        ("italics", "i"),
+        ("small", "small"),
+        ("strike", "strike"),
+        ("sub", "sub"),
+        ("sup", "sup"),
+    ] {
+        let tag_name = tag;
+        string_define_method(
+            context,
+            prototype,
+            name,
+            |heap, this_value, arguments| {
+                string_html(heap, this_value, arguments, tag_name, Option::None)
+            },
+            Vec::[],
+            Option::None,
+        )?
+    }
+    for (name, tag, attribute) in Vec::[
+        ("anchor", "a", "name"),
+        ("fontcolor", "font", "color"),
+        ("fontsize", "font", "size"),
+        ("link", "a", "href"),
+    ] {
+        let tag_name = tag;
+        let attribute_name = attribute;
+        string_define_method(
+            context,
+            prototype,
+            name,
+            |heap, this_value, arguments| {
+                string_html(heap, this_value, arguments, tag_name, Option::Some(attribute_name))
+            },
+            Vec::[StringArgumentConversion::String(0)],
+            Option::None,
+        )?
+    }
+    for (name, callback) in Vec::[
+        ("isWellFormed", string_is_well_formed),
+        ("toWellFormed", string_to_well_formed),
+    ] {
+        string_define_method(context, prototype, name, callback, Vec::[], Option::None)?
+    }
+    define_function(context, prototype, "replaceAll", string_replace_all)?;
+    define_function(context, prototype, "split", string_split)?;
+    let iterator = allocate_vm_function(
+        context,
+        "String.prototype[Symbol.iterator]",
+        |this_value, arguments, depth| {
+            let _ = arguments;
+            string_create_iterator(
+                context,
+                string_method_receiver_at_depth(context, this_value, depth)?,
+            )
+        },
+    )?;
+    match context.iterator_symbol() {
+        Some(symbol) => if !runtime::define_own_property(
+            context.heap(),
+            prototype,
+            runtime::PropertyKey::Symbol(symbol),
+            runtime::data_descriptor(iterator, true, false, true),
+        ) {
+            return Result::Err(BuiltinError { message: "cannot define String iterator" })
+        } else {},
+        None => (),
+    };
+    match context.set_primitive_prototype(vm::PrimitiveKind::String, prototype) {
+        Ok(()) => Result::Ok(prototype),
+        Err(_) => Result::Err(BuiltinError { message: "cannot install String prototype" }),
+    }
+}

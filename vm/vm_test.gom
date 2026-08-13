@@ -1,0 +1,1092 @@
+package vm;
+
+use gomlang::quickjs::bytecode;
+use gomlang::quickjs::runtime;
+use std::num;
+use std::testing;
+
+fn test_js_string(value: string) -> runtime::JsString {
+    let bytes = value.to_bytes();
+    runtime::JsString::from_utf8(bytes.slice(0, bytes.len()))
+}
+
+fn run(function: bytecode::Function) -> runtime::Value {
+    match execute(function, runtime::Heap::new()) {
+        Ok(value) => value,
+        Err(value) => {
+            testing::fail(value.kind.debug());
+            runtime::Value::Undefined
+        },
+    }
+}
+
+fn expect_number(value: runtime::Value) -> float64 {
+    match runtime::primitive_to_number(value) {
+        Ok(value) => value,
+        Err(value) => {
+            testing::fail(value.message);
+            0.0
+        },
+    }
+}
+
+fn expect_object(value: Result[runtime::ObjectId, runtime::TypeError]) -> runtime::ObjectId {
+    match value {
+        Ok(value) => value,
+        Err(value) => {
+            testing::fail(value.message);
+            let heap = runtime::Heap::new();
+            expect_object(runtime::new_ordinary_object(heap, Option::None))
+        },
+    }
+}
+
+fn native_sum(heap: runtime::Heap, this_value: runtime::Value, arguments: Vec[runtime::Value]) -> Result[
+    runtime::Value,
+    NativeError,
+] {
+    let _ = heap;
+    let _ = this_value;
+    let mut result = 0.0;
+    for argument in arguments {
+        match runtime::primitive_to_number(argument) {
+            Ok(value) => {
+                result += value;
+            },
+            Err(value) => return Result::Err(NativeError { message: value.message }),
+        }
+    }
+    Result::Ok(runtime::Value::Float(result))
+}
+
+fn native_mark_receiver(
+    heap: runtime::Heap,
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+) -> Result[runtime::Value, NativeError] {
+    let value = if arguments.is_empty() {
+        runtime::Value::Undefined
+    } else {
+        arguments[0]
+    };
+    match this_value {
+        runtime::Value::Object(object) => if runtime::define_own_property(
+            heap,
+            object,
+            runtime::string_property_key("marked"),
+            runtime::data_descriptor(value, true, true, true),
+        ) {
+            Result::Ok(runtime::Value::Object(object))
+        } else {
+            Result::Err(NativeError { message: "cannot mark receiver" })
+        },
+        _ => Result::Err(NativeError { message: "receiver is not an object" }),
+    }
+}
+
+fn native_failure(heap: runtime::Heap, this_value: runtime::Value, arguments: Vec[runtime::Value]) -> Result[
+    runtime::Value,
+    NativeError,
+] {
+    let _ = heap;
+    let _ = this_value;
+    let _ = arguments;
+    Result::Err(NativeError { message: "native failure" })
+}
+
+fn expect_native(value: Result[runtime::Value, VmError]) -> runtime::Value {
+    match value {
+        Ok(value) => value,
+        Err(value) => {
+            testing::fail(value.kind.debug());
+            runtime::Value::Undefined
+        },
+    }
+}
+
+#[test]
+fn executes_arithmetic_and_comparison() -> unit {
+    let function = bytecode::Function::new(
+        Vec::[],
+        Vec::[
+            bytecode::Instruction::PushI32(6),
+            bytecode::Instruction::PushI32(7),
+            bytecode::Instruction::Mul,
+            bytecode::Instruction::PushI32(2),
+            bytecode::Instruction::Add,
+            bytecode::Instruction::PushI32(44),
+            bytecode::Instruction::StrictEq,
+            bytecode::Instruction::Return,
+        ],
+        0,
+    );
+    match run(function) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected boolean"),
+    }
+}
+
+fn big(value: string) -> runtime::Value {
+    runtime::Value::BigInt(
+        runtime::BigInt::parse_radix(value, 10).unwrap_or(runtime::BigInt::from_int64(0)),
+    )
+}
+
+fn expect_bigint(value: runtime::Value, expected: string) -> unit {
+    match value {
+        runtime::Value::BigInt(value) => testing::assert_eq(value.to_string(), expected),
+        _ => testing::fail("expected BigInt"),
+    }
+}
+
+fn execute_big_binary(left: string, right: string, instruction: bytecode::Instruction) -> Result[
+    runtime::Value,
+    VmError,
+] {
+    execute_with_locals(
+        bytecode::Function::new(
+            Vec::[],
+            Vec::[
+                bytecode::Instruction::GetLoc(0),
+                bytecode::Instruction::GetLoc(1),
+                instruction,
+                bytecode::Instruction::Return,
+            ],
+            2,
+        ),
+        runtime::Heap::new(),
+        Vec::[big(left), big(right)],
+    )
+}
+
+#[test]
+fn executes_native_bigint_arithmetic_and_bitwise_operations() -> unit {
+    expect_bigint(
+        expect_native(
+            execute_big_binary(
+                "18446744073709551616",
+                "18446744073709551616",
+                bytecode::Instruction::Mul,
+            ),
+        ),
+        "340282366920938463463374607431768211456",
+    );
+    expect_bigint(
+        expect_native(execute_big_binary("-101", "10", bytecode::Instruction::Div)),
+        "-10",
+    );
+    expect_bigint(expect_native(execute_big_binary("-101", "10", bytecode::Instruction::Mod)), "-1");
+    expect_bigint(
+        expect_native(execute_big_binary("-1", "65", bytecode::Instruction::Shl)),
+        "-36893488147419103232",
+    );
+    expect_bigint(expect_native(execute_big_binary("-5", "1", bytecode::Instruction::Sar)), "-3");
+    expect_bigint(
+        expect_native(execute_big_binary("-42", "15", bytecode::Instruction::BitXor)),
+        "-39",
+    )
+}
+
+#[test]
+fn bigint_numeric_dispatch_reports_type_and_range_errors() -> unit {
+    let mixed = execute_with_locals(
+        bytecode::Function::new(
+            Vec::[],
+            Vec::[
+                bytecode::Instruction::GetLoc(0),
+                bytecode::Instruction::PushI32(1),
+                bytecode::Instruction::Add,
+                bytecode::Instruction::Return,
+            ],
+            1,
+        ),
+        runtime::Heap::new(),
+        Vec::[big("1")],
+    );
+    match mixed {
+        Err(VmError { offset, kind: VmErrorKind::TypeError(_) }) => testing::assert_eq(offset, 2),
+        _ => testing::fail("expected mixed numeric TypeError"),
+    };
+    for result in Vec::[
+        execute_big_binary("1", "0", bytecode::Instruction::Div),
+        execute_big_binary("2", "-1", bytecode::Instruction::Pow),
+    ] {
+        match result {
+            Err(VmError { kind: VmErrorKind::RangeError(_), .. }) => (),
+            _ => testing::fail("expected BigInt RangeError"),
+        }
+    }
+}
+
+#[test]
+fn compares_bigints_with_strings_and_numbers_without_loss() -> unit {
+    for (right, expected) in Vec::[
+        (runtime::Value::String(test_js_string("9007199254740993")), true),
+        (runtime::Value::Float(9007199254740992.0), false),
+    ] {
+        let function = bytecode::Function::new(
+            Vec::[],
+            Vec::[
+                bytecode::Instruction::GetLoc(0),
+                bytecode::Instruction::GetLoc(1),
+                bytecode::Instruction::Eq,
+                bytecode::Instruction::Return,
+            ],
+            2,
+        );
+        match execute_with_locals(
+            function,
+            runtime::Heap::new(),
+            Vec::[big("9007199254740993"), right],
+        ) {
+            Ok(runtime::Value::Bool(value)) => testing::assert_eq(value, expected),
+            _ => testing::fail("expected equality result"),
+        }
+    }
+    match execute_big_binary("9007199254740993", "9007199254740992", bytecode::Instruction::Gt) {
+        Ok(runtime::Value::Bool(value)) => testing::assert(value),
+        _ => testing::fail("expected relational result"),
+    }
+}
+
+#[test]
+fn executes_branches_and_loop() -> unit {
+    let function = bytecode::Function::new(
+        Vec::[],
+        Vec::[
+            bytecode::Instruction::PushI32(0),
+            bytecode::Instruction::PutLoc(0),
+            bytecode::Instruction::GetLoc(0),
+            bytecode::Instruction::PushI32(4),
+            bytecode::Instruction::Lt,
+            bytecode::Instruction::IfFalse(12),
+            bytecode::Instruction::GetLoc(0),
+            bytecode::Instruction::PushI32(1),
+            bytecode::Instruction::Add,
+            bytecode::Instruction::PutLoc(0),
+            bytecode::Instruction::Goto(2),
+            bytecode::Instruction::ReturnUndef,
+            bytecode::Instruction::GetLoc(0),
+            bytecode::Instruction::Return,
+        ],
+        1,
+    );
+    testing::assert_eq(expect_number(run(function)), 4.0)
+}
+
+#[test]
+fn preserves_set_local_stack_value() -> unit {
+    let function = bytecode::Function::new(
+        Vec::[],
+        Vec::[
+            bytecode::Instruction::PushI32(9),
+            bytecode::Instruction::SetLoc(0),
+            bytecode::Instruction::GetLoc(0),
+            bytecode::Instruction::Add,
+            bytecode::Instruction::Return,
+        ],
+        1,
+    );
+    testing::assert_eq(expect_number(run(function)), 18.0)
+}
+
+#[test]
+fn concatenates_utf16_strings() -> unit {
+    let function = bytecode::Function::new(
+        Vec::[
+            bytecode::Constant::String(test_js_string("quick")),
+            bytecode::Constant::String(test_js_string("js")),
+        ],
+        Vec::[
+            bytecode::Instruction::PushConst(0),
+            bytecode::Instruction::PushConst(1),
+            bytecode::Instruction::Add,
+            bytecode::Instruction::Return,
+        ],
+        0,
+    );
+    match run(function) {
+        runtime::Value::String(value) => testing::assert(value == test_js_string("quickjs")),
+        _ => testing::fail("expected string"),
+    }
+}
+
+#[test]
+fn concatenates_numbers_with_ecmascript_formatting() -> unit {
+    let function = bytecode::Function::new(
+        Vec::[bytecode::Constant::String(test_js_string("value=")), bytecode::Constant::Float(1e21)],
+        Vec::[
+            bytecode::Instruction::PushConst(0),
+            bytecode::Instruction::PushConst(1),
+            bytecode::Instruction::Add,
+            bytecode::Instruction::Return,
+        ],
+        0,
+    );
+    match run(function) {
+        runtime::Value::String(value) => testing::assert(value == test_js_string("value=1e+21")),
+        _ => testing::fail("expected string"),
+    }
+}
+
+#[test]
+fn reads_and_writes_object_properties() -> unit {
+    let heap = runtime::Heap::new();
+    let object = expect_object(runtime::new_ordinary_object(heap, Option::None));
+    let function = bytecode::Function::new(
+        Vec::[bytecode::Constant::String(test_js_string("answer"))],
+        Vec::[
+            bytecode::Instruction::GetLoc(0),
+            bytecode::Instruction::PushI32(42),
+            bytecode::Instruction::PutField(0),
+            bytecode::Instruction::GetLoc(0),
+            bytecode::Instruction::GetField(0),
+            bytecode::Instruction::Return,
+        ],
+        1,
+    );
+    testing::assert(
+        runtime::define_own_property(
+            heap,
+            object,
+            runtime::string_property_key("seed"),
+            runtime::data_descriptor(runtime::Value::Int(1), true, true, true),
+        ),
+    );
+    let result = execute_with_locals(function, heap, Vec::[runtime::Value::Object(object)]);
+    match result {
+        Ok(value) => testing::assert_eq(expect_number(value), 42.0),
+        Err(value) => testing::fail(value.kind.debug()),
+    }
+}
+
+#[test]
+fn uses_unpaired_surrogates_as_property_keys() -> unit {
+    let heap = runtime::Heap::new();
+    let object = expect_object(runtime::new_ordinary_object(heap, Option::None));
+    let first = runtime::JsString::from_code_units(Vec::[0xd800]);
+    let second = runtime::JsString::from_code_units(Vec::[0xd801]);
+    let function = bytecode::Function::new(
+        Vec::[bytecode::Constant::String(first), bytecode::Constant::String(second)],
+        Vec::[
+            bytecode::Instruction::GetLoc(0),
+            bytecode::Instruction::PushI32(11),
+            bytecode::Instruction::PutField(0),
+            bytecode::Instruction::GetLoc(0),
+            bytecode::Instruction::PushI32(22),
+            bytecode::Instruction::PutField(1),
+            bytecode::Instruction::GetLoc(0),
+            bytecode::Instruction::GetField(0),
+            bytecode::Instruction::Return,
+        ],
+        1,
+    );
+    match execute_with_locals(function, heap, Vec::[runtime::Value::Object(object)]) {
+        Ok(value) => testing::assert_eq(expect_number(value), 11.0),
+        Err(value) => testing::fail(value.kind.debug()),
+    };
+    match runtime::get_property(heap, object, runtime::js_string_property_key(second)) {
+        Ok(Some(value)) => testing::assert_eq(expect_number(value), 22.0),
+        Ok(None) => testing::fail("expected second surrogate property"),
+        Err(value) => testing::fail(value.message),
+    }
+}
+
+#[test]
+fn reads_and_writes_array_element_keys() -> unit {
+    let heap = runtime::Heap::new();
+    let object = expect_object(runtime::new_array(heap, 0));
+    let function = bytecode::Function::new(
+        Vec::[],
+        Vec::[
+            bytecode::Instruction::GetLoc(0),
+            bytecode::Instruction::PushI32(2),
+            bytecode::Instruction::PushI32(17),
+            bytecode::Instruction::PutArrayEl,
+            bytecode::Instruction::GetLoc(0),
+            bytecode::Instruction::PushI32(2),
+            bytecode::Instruction::GetArrayEl,
+            bytecode::Instruction::Return,
+        ],
+        1,
+    );
+    match execute_with_locals(function, heap, Vec::[runtime::Value::Object(object)]) {
+        Ok(value) => testing::assert_eq(expect_number(value), 17.0),
+        Err(value) => testing::fail(value.kind.debug()),
+    }
+}
+
+#[test]
+fn executes_bitwise_and_unsigned_shift_semantics() -> unit {
+    let function = bytecode::Function::new(
+        Vec::[],
+        Vec::[
+            bytecode::Instruction::PushI32(-1),
+            bytecode::Instruction::PushI32(1),
+            bytecode::Instruction::Shr,
+            bytecode::Instruction::PushI32(2147483647),
+            bytecode::Instruction::StrictEq,
+            bytecode::Instruction::Return,
+        ],
+        0,
+    );
+    match run(function) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected boolean"),
+    }
+}
+
+#[test]
+fn relational_nan_results_are_false() -> unit {
+    let nan = num::parse_float64("NaN").unwrap_or(0.0);
+    for instruction in Vec::[
+        bytecode::Instruction::Lt,
+        bytecode::Instruction::Lte,
+        bytecode::Instruction::Gt,
+        bytecode::Instruction::Gte,
+    ] {
+        let function = bytecode::Function::new(
+            Vec::[bytecode::Constant::Float(nan)],
+            Vec::[
+                bytecode::Instruction::PushConst(0),
+                bytecode::Instruction::PushI32(1),
+                instruction,
+                bytecode::Instruction::Return,
+            ],
+            0,
+        );
+        match run(function) {
+            runtime::Value::Bool(value) => testing::assert(!value),
+            _ => testing::fail("expected boolean"),
+        }
+    }
+}
+
+#[test]
+fn reports_verification_and_non_callable_values() -> unit {
+    let invalid = execute(
+        bytecode::Function::new(Vec::[], Vec::[bytecode::Instruction::Add], 0),
+        runtime::Heap::new(),
+    );
+    match invalid {
+        Err(VmError { offset, kind: VmErrorKind::VerificationFailed(errors) }) => {
+            testing::assert_eq(offset, -1);
+            testing::assert(!errors.is_empty());
+        },
+        _ => testing::fail("expected verification failure"),
+    };
+    let non_callable = execute(
+        bytecode::Function::new(
+            Vec::[],
+            Vec::[
+                bytecode::Instruction::Undefined,
+                bytecode::Instruction::Call(0),
+                bytecode::Instruction::Return,
+            ],
+            0,
+        ),
+        runtime::Heap::new(),
+    );
+    match non_callable {
+        Err(VmError { offset, kind: VmErrorKind::TypeError(_) }) => {
+            testing::assert_eq(offset, 1)
+        },
+        _ => testing::fail("expected non-callable type error"),
+    };
+    let negative_locals = execute(
+        bytecode::Function::new(Vec::[], Vec::[bytecode::Instruction::ReturnUndef], -1),
+        runtime::Heap::new(),
+    );
+    match negative_locals {
+        Err(VmError { offset: _, kind: VmErrorKind::VerificationFailed(errors) }) => {
+            testing::assert(!errors.is_empty())
+        },
+        _ => testing::fail("expected negative local verification failure"),
+    }
+}
+
+#[test]
+fn calls_bytecode_functions_with_parameters() -> unit {
+    let child = bytecode::Function::new_with_parameters(
+        Vec::[],
+        Vec::[
+            bytecode::Instruction::GetLoc(0),
+            bytecode::Instruction::GetLoc(1),
+            bytecode::Instruction::Add,
+            bytecode::Instruction::Return,
+        ],
+        2,
+        2,
+    );
+    let parent = bytecode::Function::new(
+        Vec::[bytecode::Constant::Function(Ref::new(child))],
+        Vec::[
+            bytecode::Instruction::PushConst(0),
+            bytecode::Instruction::PushI32(20),
+            bytecode::Instruction::PushI32(22),
+            bytecode::Instruction::Call(2),
+            bytecode::Instruction::Return,
+        ],
+        0,
+    );
+    testing::assert_eq(expect_number(run(parent)), 42.0)
+}
+
+#[test]
+fn fills_missing_parameters_and_discards_extra_arguments() -> unit {
+    let second = bytecode::Function::new_with_parameters(
+        Vec::[],
+        Vec::[bytecode::Instruction::GetLoc(1), bytecode::Instruction::Return],
+        2,
+        2,
+    );
+    let missing = bytecode::Function::new(
+        Vec::[bytecode::Constant::Function(Ref::new(second))],
+        Vec::[
+            bytecode::Instruction::PushConst(0),
+            bytecode::Instruction::PushI32(7),
+            bytecode::Instruction::Call(1),
+            bytecode::Instruction::Return,
+        ],
+        0,
+    );
+    match run(missing) {
+        runtime::Value::Undefined => (),
+        _ => testing::fail("expected undefined missing parameter"),
+    };
+    let first = bytecode::Function::new_with_parameters(
+        Vec::[],
+        Vec::[bytecode::Instruction::GetLoc(0), bytecode::Instruction::Return],
+        1,
+        1,
+    );
+    let extra = bytecode::Function::new(
+        Vec::[bytecode::Constant::Function(Ref::new(first))],
+        Vec::[
+            bytecode::Instruction::PushConst(0),
+            bytecode::Instruction::PushI32(5),
+            bytecode::Instruction::PushI32(6),
+            bytecode::Instruction::PushI32(7),
+            bytecode::Instruction::Call(3),
+            bytecode::Instruction::Return,
+        ],
+        0,
+    );
+    testing::assert_eq(expect_number(run(extra)), 5.0)
+}
+
+#[test]
+fn executes_nested_calls_and_preserves_context_functions() -> unit {
+    let leaf = bytecode::Function::new_with_parameters(
+        Vec::[],
+        Vec::[
+            bytecode::Instruction::GetLoc(0),
+            bytecode::Instruction::PushI32(2),
+            bytecode::Instruction::Mul,
+            bytecode::Instruction::Return,
+        ],
+        1,
+        1,
+    );
+    let middle = bytecode::Function::new_with_parameters(
+        Vec::[bytecode::Constant::Function(Ref::new(leaf))],
+        Vec::[
+            bytecode::Instruction::PushConst(0),
+            bytecode::Instruction::GetLoc(0),
+            bytecode::Instruction::Call(1),
+            bytecode::Instruction::Return,
+        ],
+        1,
+        1,
+    );
+    let producer = bytecode::Function::new(
+        Vec::[bytecode::Constant::Function(Ref::new(middle))],
+        Vec::[bytecode::Instruction::PushConst(0), bytecode::Instruction::Return],
+        0,
+    );
+    let context = Context::new(runtime::Heap::new());
+    let callable = match context.execute(producer) {
+        Ok(value) => value,
+        Err(value) => {
+            testing::fail(value.kind.debug());
+            runtime::Value::Undefined
+        },
+    };
+    let invoker = bytecode::Function::new(
+        Vec::[],
+        Vec::[
+            bytecode::Instruction::GetLoc(0),
+            bytecode::Instruction::PushI32(21),
+            bytecode::Instruction::Call(1),
+            bytecode::Instruction::Return,
+        ],
+        1,
+    );
+    match context.execute_with_locals(invoker, Vec::[callable]) {
+        Ok(value) => testing::assert_eq(expect_number(value), 42.0),
+        Err(value) => testing::fail(value.kind.debug()),
+    }
+}
+
+#[test]
+fn function_constants_keep_stable_identity_in_a_context() -> unit {
+    let child = bytecode::Function::new(Vec::[], Vec::[bytecode::Instruction::ReturnUndef], 0);
+    let function = bytecode::Function::new(
+        Vec::[bytecode::Constant::Function(Ref::new(child))],
+        Vec::[
+            bytecode::Instruction::PushConst(0),
+            bytecode::Instruction::PushConst(0),
+            bytecode::Instruction::StrictEq,
+            bytecode::Instruction::Return,
+        ],
+        0,
+    );
+    let context = Context::new(runtime::Heap::new());
+    match context.execute(function) {
+        Ok(runtime::Value::Bool(value)) => testing::assert(value),
+        Ok(_) => testing::fail("expected boolean function identity result"),
+        Err(value) => testing::fail(value.kind.debug()),
+    }
+}
+
+#[test]
+fn call_method_exposes_receiver_as_this() -> unit {
+    let heap = runtime::Heap::new();
+    let receiver = expect_object(runtime::new_ordinary_object(heap, Option::None));
+    let method = bytecode::Function::new(
+        Vec::[],
+        Vec::[bytecode::Instruction::PushThis, bytecode::Instruction::Return],
+        0,
+    );
+    let caller = bytecode::Function::new(
+        Vec::[bytecode::Constant::Function(Ref::new(method))],
+        Vec::[
+            bytecode::Instruction::GetLoc(0),
+            bytecode::Instruction::PushConst(0),
+            bytecode::Instruction::CallMethod(0),
+            bytecode::Instruction::Return,
+        ],
+        1,
+    );
+    match execute_with_locals(caller, heap, Vec::[runtime::Value::Object(receiver)]) {
+        Ok(runtime::Value::Object(value)) => testing::assert(value == receiver),
+        Ok(_) => testing::fail("expected method receiver"),
+        Err(value) => testing::fail(value.kind.debug()),
+    }
+}
+
+#[test]
+fn protects_against_excessive_call_depth() -> unit {
+    let mut function = bytecode::Function::new(
+        Vec::[],
+        Vec::[bytecode::Instruction::ReturnUndef],
+        0,
+    );
+    for _ in 0..max_call_depth() + 1 {
+        function = bytecode::Function::new(
+            Vec::[bytecode::Constant::Function(Ref::new(function))],
+            Vec::[
+                bytecode::Instruction::PushConst(0),
+                bytecode::Instruction::Call(0),
+                bytecode::Instruction::Return,
+            ],
+            0,
+        );
+    }
+    match execute(function, runtime::Heap::new()) {
+        Err(VmError { offset, kind: VmErrorKind::CallDepthExceeded }) => {
+            testing::assert_eq(offset, 1)
+        },
+        _ => testing::fail("expected call depth protection"),
+    }
+}
+
+#[test]
+fn calls_registered_native_functions_with_ordered_arguments() -> unit {
+    let context = Context::new(runtime::Heap::new());
+    let callable = expect_native(context.new_native_function(native_sum));
+    let caller = bytecode::Function::new(
+        Vec::[],
+        Vec::[
+            bytecode::Instruction::GetLoc(0),
+            bytecode::Instruction::PushI32(10),
+            bytecode::Instruction::PushI32(32),
+            bytecode::Instruction::Call(2),
+            bytecode::Instruction::Return,
+        ],
+        1,
+    );
+    match context.execute_with_locals(caller, Vec::[callable]) {
+        Ok(value) => testing::assert_eq(expect_number(value), 42.0),
+        Err(value) => testing::fail(value.kind.debug()),
+    }
+}
+
+#[test]
+fn native_methods_receive_the_heap_and_this_value() -> unit {
+    let heap = runtime::Heap::new();
+    let receiver = expect_object(runtime::new_ordinary_object(heap, Option::None));
+    let context = Context::new(heap);
+    let callable = expect_native(context.new_native_function(native_mark_receiver));
+    let caller = bytecode::Function::new(
+        Vec::[],
+        Vec::[
+            bytecode::Instruction::GetLoc(0),
+            bytecode::Instruction::GetLoc(1),
+            bytecode::Instruction::PushI32(42),
+            bytecode::Instruction::CallMethod(1),
+            bytecode::Instruction::Return,
+        ],
+        2,
+    );
+    match context.execute_with_locals(caller, Vec::[runtime::Value::Object(receiver), callable]) {
+        Ok(runtime::Value::Object(value)) => testing::assert(value == receiver),
+        Ok(_) => testing::fail("expected native receiver result"),
+        Err(value) => testing::fail(value.kind.debug()),
+    };
+    match runtime::get_property(heap, receiver, runtime::string_property_key("marked")) {
+        Ok(Some(value)) => testing::assert_eq(expect_number(value), 42.0),
+        Ok(None) => testing::fail("expected native property mutation"),
+        Err(value) => testing::fail(value.message),
+    }
+}
+
+#[test]
+fn native_failures_become_call_site_type_errors() -> unit {
+    let context = Context::new(runtime::Heap::new());
+    let callable = expect_native(context.new_native_function(native_failure));
+    let caller = bytecode::Function::new(
+        Vec::[],
+        Vec::[
+            bytecode::Instruction::GetLoc(0),
+            bytecode::Instruction::Call(0),
+            bytecode::Instruction::Return,
+        ],
+        1,
+    );
+    match context.execute_with_locals(caller, Vec::[callable]) {
+        Err(VmError { offset, kind: VmErrorKind::TypeError(message) }) => {
+            testing::assert_eq(offset, 1);
+            testing::assert_eq(message, "native failure");
+        },
+        _ => testing::fail("expected native type error"),
+    }
+}
+
+#[test]
+fn global_instructions_read_and_write_the_installed_object() -> unit {
+    let heap = runtime::Heap::new();
+    let global = expect_object(runtime::new_ordinary_object(heap, Option::None));
+    testing::assert(
+        runtime::define_own_property(
+            heap,
+            global,
+            runtime::string_property_key("answer"),
+            runtime::data_descriptor(runtime::Value::Int(1), true, true, true),
+        ),
+    );
+    let context = Context::new(heap);
+    match context.set_global_object(global) {
+        Ok(()) => (),
+        Err(value) => testing::fail(value.kind.debug()),
+    };
+    let function = bytecode::Function::new(
+        Vec::[bytecode::Constant::String(test_js_string("answer"))],
+        Vec::[
+            bytecode::Instruction::PushI32(42),
+            bytecode::Instruction::SetGlobal(0),
+            bytecode::Instruction::Drop,
+            bytecode::Instruction::GetGlobal(0),
+            bytecode::Instruction::Return,
+        ],
+        0,
+    );
+    match context.execute(function) {
+        Ok(value) => testing::assert_eq(expect_number(value), 42.0),
+        Err(value) => testing::fail(value.kind.debug()),
+    };
+    match runtime::get_property(heap, global, runtime::string_property_key("answer")) {
+        Ok(Some(value)) => testing::assert_eq(expect_number(value), 42.0),
+        _ => testing::fail("expected updated global"),
+    }
+}
+
+#[test]
+fn global_instructions_require_an_installed_object() -> unit {
+    let function = bytecode::Function::new(
+        Vec::[bytecode::Constant::String(test_js_string("missing"))],
+        Vec::[bytecode::Instruction::GetGlobal(0), bytecode::Instruction::Return],
+        0,
+    );
+    match execute(function, runtime::Heap::new()) {
+        Err(VmError { offset, kind: VmErrorKind::TypeError(_) }) => testing::assert_eq(offset, 0),
+        _ => testing::fail("expected missing global object error"),
+    }
+}
+
+#[test]
+fn closures_retain_shared_cells_after_their_parent_returns() -> unit {
+    let increment = bytecode::Function::new_with_parameters_and_upvalues(
+        Vec::[],
+        Vec::[
+            bytecode::Instruction::GetUpvalue(0),
+            bytecode::Instruction::PushI32(1),
+            bytecode::Instruction::Add,
+            bytecode::Instruction::SetUpvalue(0),
+            bytecode::Instruction::Return,
+        ],
+        0,
+        0,
+        Vec::[bytecode::UpvalueSource::Local(0)],
+    );
+    let producer = bytecode::Function::new(
+        Vec::[bytecode::Constant::Function(Ref::new(increment))],
+        Vec::[bytecode::Instruction::PushConst(0), bytecode::Instruction::Return],
+        1,
+    );
+    let context = Context::new(runtime::Heap::new());
+    let first = match context.execute_with_locals(producer, Vec::[runtime::Value::Int(40)]) {
+        Ok(value) => value,
+        Err(value) => {
+            testing::fail(value.kind.debug());
+            runtime::Value::Undefined
+        },
+    };
+    let second = match context.execute_with_locals(producer, Vec::[runtime::Value::Int(40)]) {
+        Ok(value) => value,
+        Err(value) => {
+            testing::fail(value.kind.debug());
+            runtime::Value::Undefined
+        },
+    };
+    testing::assert(!runtime::strict_equal(first, second));
+    let invoke_twice = bytecode::Function::new(
+        Vec::[],
+        Vec::[
+            bytecode::Instruction::GetLoc(0),
+            bytecode::Instruction::Call(0),
+            bytecode::Instruction::GetLoc(0),
+            bytecode::Instruction::Call(0),
+            bytecode::Instruction::Add,
+            bytecode::Instruction::Return,
+        ],
+        1,
+    );
+    match context.execute_with_locals(invoke_twice, Vec::[first]) {
+        Ok(value) => testing::assert_eq(expect_number(value), 83.0),
+        Err(value) => testing::fail(value.kind.debug()),
+    };
+    match context.execute_with_locals(invoke_twice, Vec::[second]) {
+        Ok(value) => testing::assert_eq(expect_number(value), 83.0),
+        Err(value) => testing::fail(value.kind.debug()),
+    }
+}
+
+#[test]
+fn allocates_fresh_object_and_sparse_array_values() -> unit {
+    let heap = runtime::Heap::new();
+    let context = Context::new(heap);
+    let object_function = bytecode::Function::new(
+        Vec::[bytecode::Constant::String(test_js_string("name"))],
+        Vec::[
+            bytecode::Instruction::NewObject,
+            bytecode::Instruction::Dup,
+            bytecode::Instruction::PushI32(7),
+            bytecode::Instruction::PutField(0),
+            bytecode::Instruction::Return,
+        ],
+        0,
+    );
+    let first = match context.execute(object_function) {
+        Ok(runtime::Value::Object(value)) => value,
+        Ok(_) => {
+            testing::fail("expected object");
+            expect_object(runtime::new_ordinary_object(heap, Option::None))
+        },
+        Err(value) => {
+            testing::fail(value.kind.debug());
+            expect_object(runtime::new_ordinary_object(heap, Option::None))
+        },
+    };
+    let second = match context.execute(object_function) {
+        Ok(runtime::Value::Object(value)) => value,
+        _ => {
+            testing::fail("expected second object");
+            first
+        },
+    };
+    testing::assert(first != second);
+    match runtime::get_property(heap, first, runtime::string_property_key("name")) {
+        Ok(Some(runtime::Value::Int(value))) => testing::assert_eq(value, 7),
+        _ => testing::fail("expected object property"),
+    };
+    let array_function = bytecode::Function::new(
+        Vec::[],
+        Vec::[
+            bytecode::Instruction::NewArray(3),
+            bytecode::Instruction::Dup,
+            bytecode::Instruction::PushI32(1),
+            bytecode::Instruction::PushI32(9),
+            bytecode::Instruction::PutArrayEl,
+            bytecode::Instruction::Return,
+        ],
+        0,
+    );
+    let array = match context.execute(array_function) {
+        Ok(runtime::Value::Object(value)) => value,
+        _ => {
+            testing::fail("expected array");
+            first
+        },
+    };
+    match heap.get(array) {
+        Some(value) => match value.kind() {
+            runtime::ObjectKind::Array => (),
+            _ => testing::fail("expected array kind"),
+        },
+        None => testing::fail("expected live array"),
+    };
+    testing::assert(
+        runtime::get_property(heap, array, runtime::string_property_key("0")).unwrap_or(
+            Option::None,
+        ).is_none(),
+    );
+    match runtime::get_property(heap, array, runtime::string_property_key("1")) {
+        Ok(Some(runtime::Value::Int(value))) => testing::assert_eq(value, 9),
+        _ => testing::fail("expected array element"),
+    };
+    match runtime::get_property(heap, array, runtime::string_property_key("length")) {
+        Ok(Some(runtime::Value::Int(value))) => testing::assert_eq(value, 3),
+        _ => testing::fail("expected array length"),
+    }
+}
+
+#[test]
+fn string_virtual_properties_preserve_utf16_code_units() -> unit {
+    let value = runtime::Value::String(runtime::JsString::from_code_units(Vec::[0xd800, 0x61]));
+    let function = bytecode::Function::new(
+        Vec::[],
+        Vec::[
+            bytecode::Instruction::GetLoc(0),
+            bytecode::Instruction::PushI32(0),
+            bytecode::Instruction::GetArrayEl,
+            bytecode::Instruction::Return,
+        ],
+        1,
+    );
+    match execute_with_locals(function, runtime::Heap::new(), Vec::[value]) {
+        Ok(runtime::Value::String(result)) => {
+            testing::assert(result == runtime::JsString::from_code_units(Vec::[0xd800]))
+        },
+        Ok(_) => testing::fail("expected virtual string element"),
+        Err(value) => testing::fail(value.kind.debug()),
+    };
+    let length = bytecode::Function::new(
+        Vec::[bytecode::Constant::String(test_js_string("length"))],
+        Vec::[
+            bytecode::Instruction::GetLoc(0),
+            bytecode::Instruction::GetField(0),
+            bytecode::Instruction::Return,
+        ],
+        1,
+    );
+    match execute_with_locals(length, runtime::Heap::new(), Vec::[value]) {
+        Ok(runtime::Value::Int(result)) => testing::assert_eq(result, 2),
+        _ => testing::fail("expected virtual string length"),
+    }
+}
+
+#[test]
+fn primitive_method_lookup_uses_context_prototype_and_preserves_this() -> unit {
+    let heap = runtime::Heap::new();
+    let context = Context::new(heap);
+    let prototype = expect_object(runtime::new_ordinary_object(heap, Option::None));
+    let callable = match context.new_native_function(
+        |heap, this_value, arguments| {
+            let _ = heap;
+            let _ = arguments;
+            Result::Ok(this_value)
+        },
+    ) {
+        Ok(value) => value,
+        Err(value) => {
+            testing::fail(value.kind.debug());
+            runtime::Value::Undefined
+        },
+    };
+    testing::assert(
+        runtime::define_own_property(
+            heap,
+            prototype,
+            runtime::string_property_key("valueOf"),
+            runtime::data_descriptor(callable, true, false, true),
+        ),
+    );
+    match context.set_primitive_prototype(PrimitiveKind::String, prototype) {
+        Ok(()) => (),
+        Err(value) => testing::fail(value.kind.debug()),
+    };
+    let function = bytecode::Function::new(
+        Vec::[bytecode::Constant::String(test_js_string("valueOf"))],
+        Vec::[
+            bytecode::Instruction::GetLoc(0),
+            bytecode::Instruction::Dup,
+            bytecode::Instruction::GetField(0),
+            bytecode::Instruction::CallMethod(0),
+            bytecode::Instruction::Return,
+        ],
+        1,
+    );
+    let receiver = runtime::Value::String(test_js_string("primitive"));
+    match context.execute_with_locals(function, Vec::[receiver]) {
+        Ok(value) => testing::assert(runtime::same_value(value, receiver)),
+        Err(value) => testing::fail(value.kind.debug()),
+    }
+}
+
+#[test]
+fn inherited_accessor_getter_receives_original_receiver() -> unit {
+    let heap = runtime::Heap::new();
+    let context = Context::new(heap);
+    let getter = bytecode::Function::new(
+        Vec::[],
+        Vec::[bytecode::Instruction::PushThis, bytecode::Instruction::Return],
+        0,
+    );
+    let factory = bytecode::Function::new(
+        Vec::[bytecode::Constant::Function(Ref::new(getter))],
+        Vec::[bytecode::Instruction::PushConst(0), bytecode::Instruction::Return],
+        0,
+    );
+    let callable = match context.execute(factory) {
+        Ok(value) => value,
+        Err(value) => {
+            testing::fail(value.kind.debug());
+            runtime::Value::Undefined
+        },
+    };
+    let prototype = expect_object(runtime::new_ordinary_object(heap, Option::None));
+    testing::assert(
+        runtime::define_own_property(
+            heap,
+            prototype,
+            runtime::string_property_key("receiver"),
+            runtime::accessor_descriptor(Option::Some(callable), Option::None, true, true),
+        ),
+    );
+    let object = expect_object(runtime::new_ordinary_object(heap, Option::Some(prototype)));
+    let caller = bytecode::Function::new(
+        Vec::[bytecode::Constant::String(test_js_string("receiver"))],
+        Vec::[
+            bytecode::Instruction::GetLoc(0),
+            bytecode::Instruction::GetField(0),
+            bytecode::Instruction::Return,
+        ],
+        1,
+    );
+    match context.execute_with_locals(caller, Vec::[runtime::Value::Object(object)]) {
+        Ok(runtime::Value::Object(value)) => testing::assert(value == object),
+        Ok(_) => testing::fail("expected accessor receiver"),
+        Err(value) => testing::fail(value.kind.debug()),
+    }
+}

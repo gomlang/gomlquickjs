@@ -1,0 +1,1466 @@
+package modules;
+
+use gomlang::quickjs::ast;
+use gomlang::quickjs::compiler;
+use gomlang::quickjs::bytecode;
+use gomlang::quickjs::json;
+use gomlang::quickjs::runtime;
+use gomlang::quickjs::vm;
+use std::collections;
+use std::fs;
+use std::path;
+use std::text;
+
+#[derive(PartialEq, Eq, Debug)]
+pub enum ModuleErrorKind {
+    Reference,
+    Syntax,
+    Type,
+}
+
+#[derive(PartialEq, Eq, Debug)]
+pub struct ModuleError {
+    pub kind: ModuleErrorKind,
+    pub path: string,
+    pub message: string,
+}
+
+#[derive(PartialEq, Eq)]
+enum ModuleState {
+    Linked,
+    Evaluating,
+    EvaluatingAsync,
+    Evaluated,
+    Errored,
+}
+
+struct ModuleRecord {
+    path: string,
+    compiled: compiler::CompiledModule,
+    locals: Vec[Ref[runtime::Value]],
+    dependencies: HashMap[string, Ref[ModuleRecord]],
+    namespace: Ref[Option[runtime::ObjectId]],
+    import_meta: Ref[Option[runtime::ObjectId]],
+    main: Ref[bool],
+    state: Ref[ModuleState],
+    evaluation_error: Ref[runtime::Value],
+    evaluation_error_set: Ref[bool],
+    evaluation_error_path: Ref[string],
+    dfs_index: Ref[int],
+    dfs_ancestor_index: Ref[int],
+    pending_async_dependencies: Ref[int],
+    async_evaluation: Ref[bool],
+    async_parents: Vec[Ref[ModuleRecord]],
+    cycle_root: Ref[Option[Ref[ModuleRecord]]],
+    async_timestamp: Ref[int],
+    execution_started: Ref[bool],
+    module_type: string,
+}
+
+struct Loader {
+    context: vm::Context,
+    global: runtime::ObjectId,
+    records: HashMap[string, Ref[ModuleRecord]],
+    sources: HashMap[string, string],
+    source_names: HashMap[string, string],
+    next_async_timestamp: Ref[int],
+}
+
+fn module_error(module_path: string, message: string) -> ModuleError {
+    ModuleError { kind: ModuleErrorKind::Reference, path: module_path, message }
+}
+
+fn module_syntax_error(module_path: string, message: string) -> ModuleError {
+    ModuleError { kind: ModuleErrorKind::Syntax, path: module_path, message }
+}
+
+fn module_type_error(module_path: string, message: string) -> ModuleError {
+    ModuleError { kind: ModuleErrorKind::Type, path: module_path, message }
+}
+
+fn compile_messages(errors: Vec[compiler::CompileError]) -> string {
+    let builder = text::StringBuilder::new();
+    let mut first = true;
+    for error in errors {
+        if !first {
+            builder.write_string("; ")
+        } else {};
+        builder.write_string(error.span.start.to_string());
+        builder.write_char(':');
+        builder.write_string(error.span.end.to_string());
+        builder.write_string(": ");
+        builder.write_string(error.message);
+        first = false;
+    }
+    builder.finish()
+}
+
+fn absolute_clean(module_path: string) -> Result[string, ModuleError] {
+    match path::absolute(path::clean(module_path)) {
+        Ok(value) => Result::Ok(path::clean(value)),
+        Err(message) => Result::Err(module_error(module_path, message)),
+    }
+}
+
+fn resolve_specifier(referrer: string, specifier: string) -> Result[string, ModuleError] {
+    if specifier == "std" || specifier == "os" {
+        return Result::Ok(specifier)
+    } else {};
+    if path::is_absolute(specifier) {
+        return absolute_clean(specifier)
+    } else {};
+    if !specifier.starts_with("./") && !specifier.starts_with("../") {
+        return absolute_clean(specifier)
+    } else {};
+    let parent = match path::parent(referrer) {
+        Some(value) => value,
+        None => return Result::Err(module_error(referrer, "module path has no parent")),
+    };
+    absolute_clean(path::join(parent, specifier))
+}
+
+fn string_vector_contains(values: Vec[string], expected: string) -> bool {
+    for value in values {
+        if value == expected {
+            return true
+        } else {}
+    }
+    false
+}
+
+fn requested_module_type(module_path: string, attributes: Vec[compiler::ModuleAttribute]) -> Result[
+    string,
+    ModuleError,
+] {
+    let mut result = "javascript";
+    for attribute in attributes {
+        if attribute.key != "type" {
+            return Result::Err(
+                module_type_error(
+                    module_path,
+                    "import attribute `" + attribute.key + "` is not supported",
+                ),
+            )
+        } else if attribute.value == "javascript" || attribute.value == "json" {
+            result = attribute.value;
+        } else {
+            return Result::Err(
+                module_type_error(module_path, "unsupported module type `" + attribute.value + "`"),
+            )
+        }
+    }
+    Result::Ok(result)
+}
+
+fn load_record_with_type(loader: Loader, module_path: string, requested_type: string) -> Result[
+    Ref[ModuleRecord],
+    ModuleError,
+] {
+    let canonical = absolute_clean(module_path)?;
+    match loader.records.get(canonical) {
+        Some(value) => if value.get().module_type == requested_type {
+            return Result::Ok(value)
+        } else {
+            return Result::Err(
+                module_type_error(
+                    canonical,
+                    "module was already loaded as `" + value.get().module_type + "`",
+                ),
+            )
+        },
+        None => (),
+    };
+    let source = match loader.sources.get(canonical) {
+        Some(value) => value,
+        None => match fs::read_file(canonical) {
+            Ok(value) => value,
+            Err(message) => return Result::Err(module_error(canonical, message)),
+        },
+    };
+    let mut json_value: Option[runtime::Value] = Option::None;
+    let compiled = if requested_type == "json" {
+        let value = match json::parse(
+            loader.context.heap(),
+            runtime::JsString::from_utf8(source.to_bytes().slice(0, source.byte_len())),
+        ) {
+            Ok(value) => value,
+            Err(error) => return Result::Err(
+                module_syntax_error(canonical, error.offset.to_string() + ": " + error.message),
+            ),
+        };
+        json_value = Option::Some(value);
+        let constants: Vec[bytecode::Constant] = Vec::[];
+        let code: Vec[bytecode::Instruction] = Vec::[bytecode::Instruction::ReturnUndef];
+        let function = bytecode::Function::new(constants, code, 3);
+        let mapped_arguments: Vec[int] = Vec::[];
+        function.set_arguments_semantics(true, mapped_arguments);
+        let imports: Vec[compiler::ModuleImport] = Vec::[];
+        let attributes: Vec[compiler::ModuleAttribute] = Vec::[];
+        compiler::CompiledModule {
+            function,
+            imports,
+            exports: Vec::[
+                compiler::ModuleExport {
+                    exported: "default",
+                    source: Option::None,
+                    imported: "default",
+                    local_index: 0,
+                    attributes,
+                    span: ast::span(0, source.byte_len()),
+                },
+            ],
+            import_meta_index: 1,
+            dynamic_import_referrer_index: 2,
+        }
+    } else if requested_type == "javascript" {
+        let source_name = loader.source_names.get(canonical).unwrap_or(canonical);
+        match compiler::compile_module_with_source_name(source, source_name) {
+            Ok(value) => value,
+            Err(errors) => return Result::Err(
+                module_syntax_error(canonical, compile_messages(errors)),
+            ),
+        }
+    } else {
+        return Result::Err(
+            module_type_error(canonical, "unsupported module type `" + requested_type + "`"),
+        )
+    };
+    let locals: Vec[Ref[runtime::Value]] = Vec::with_capacity(compiled.function.local_count());
+    for _ in 0..compiled.function.local_count() {
+        let cell = Ref::new(runtime::Value::Undefined);
+        locals.push(cell);
+        loader.context.add_external_root(cell);
+    }
+    match json_value {
+        Some(value) => locals[0].set(value),
+        None => (),
+    };
+    let evaluation_error = Ref::new(runtime::Value::Undefined);
+    loader.context.add_external_root(evaluation_error);
+    let record = Ref::new(
+        ModuleRecord {
+            path: canonical,
+            compiled,
+            locals,
+            dependencies: HashMap::{},
+            namespace: Ref::new(Option::None),
+            import_meta: Ref::new(Option::None),
+            main: Ref::new(false),
+            state: Ref::new(ModuleState::Linked),
+            evaluation_error,
+            evaluation_error_set: Ref::new(false),
+            evaluation_error_path: Ref::new(""),
+            dfs_index: Ref::new(-1),
+            dfs_ancestor_index: Ref::new(-1),
+            pending_async_dependencies: Ref::new(0),
+            async_evaluation: Ref::new(false),
+            async_parents: Vec::[],
+            cycle_root: Ref::new(Option::None),
+            async_timestamp: Ref::new(-1),
+            execution_started: Ref::new(false),
+            module_type: requested_type,
+        },
+    );
+    loader.records[canonical] = record;
+    for binding in compiled.imports {
+        load_dependency_request(loader, record, canonical, binding.source, binding.attributes)?
+    }
+    for binding in compiled.exports {
+        match binding.source {
+            Some(source) => load_dependency_request(
+                loader,
+                record,
+                canonical,
+                source,
+                binding.attributes,
+            )?,
+            None => (),
+        }
+    }
+    Result::Ok(record)
+}
+
+fn load_dependency_request(
+    loader: Loader,
+    record: Ref[ModuleRecord],
+    referrer: string,
+    source: string,
+    attributes: Vec[compiler::ModuleAttribute],
+) -> Result[unit, ModuleError] {
+    let requested_type = requested_module_type(referrer, attributes)?;
+    if loader.context.virtual_module(source).is_some() || source == "std" || source == "os" {
+        if requested_type == "javascript" {
+            return Result::Ok(())
+        } else {
+            return Result::Err(
+                module_type_error(source, "virtual modules must use the javascript module type"),
+            )
+        }
+    } else {};
+    let resolved = resolve_specifier(referrer, source)?;
+    let dependency = load_record_with_type(loader, resolved, requested_type)?;
+    record.get().dependencies[source] = dependency;
+    Result::Ok(())
+}
+
+fn load_record(loader: Loader, module_path: string) -> Result[Ref[ModuleRecord], ModuleError] {
+    load_record_with_type(loader, module_path, "javascript")
+}
+
+fn virtual_module_value(loader: Loader, name: string) -> Result[runtime::Value, ModuleError] {
+    match loader.context.virtual_module(name) {
+        Some(value) => return Result::Ok(value),
+        None => (),
+    };
+    match runtime::get_property(
+        loader.context.heap(),
+        loader.global,
+        runtime::string_property_key(name),
+    ) {
+        Ok(Some(value)) => Result::Ok(value),
+        Ok(None) => Result::Err(module_error(name, "builtin module is not installed")),
+        Err(error) => Result::Err(module_error(name, error.message)),
+    }
+}
+
+fn dynamic_import_vm_error(message: string) -> vm::VmError {
+    vm::VmError { offset: -1, kind: vm::VmErrorKind::TypeError(message) }
+}
+
+fn dynamic_import_module_error(error: ModuleError) -> vm::VmError {
+    let message = error.path + ": " + error.message;
+    let kind = match error.kind {
+        ModuleErrorKind::Reference => vm::VmErrorKind::ReferenceError(message),
+        ModuleErrorKind::Syntax => vm::VmErrorKind::SyntaxError(message),
+        ModuleErrorKind::Type => vm::VmErrorKind::TypeError(message),
+    };
+    vm::VmError { offset: -1, kind }
+}
+
+fn dynamic_import_reject(
+    context: vm::Context,
+    capability: vm::HostPromiseCapability,
+    error: vm::VmError,
+    depth: int,
+) -> Result[unit, vm::VmError] {
+    let reason: runtime::Value = context.rejection_value(error);
+    let _ = context.invoke_with_this_at_depth(
+        capability.reject(),
+        Vec::[reason],
+        runtime::Value::Undefined,
+        depth,
+    )?;
+    Result::Ok(())
+}
+
+fn dynamic_import_validate_attributes(
+    context: vm::Context,
+    attributes: runtime::ObjectId,
+    depth: int,
+) -> Result[string, vm::VmError] {
+    let object: runtime::Object = match context.heap().get(attributes) {
+        Some(value) => value,
+        None => return Result::Err(dynamic_import_vm_error("import attributes object is invalid")),
+    };
+    let mut module_type = "javascript";
+    let keys: Vec[runtime::PropertyKey] = runtime::own_property_keys(context.heap(), attributes);
+    for key in keys {
+        let enumerable: bool = match object.own_property(key) {
+            Some(descriptor) => runtime::descriptor_enumerable(descriptor),
+            None => false,
+        };
+        if enumerable {
+            match key {
+                runtime::PropertyKey::String(name) => {
+                    let key = match name.to_host_string() {
+                        Ok(value) => value,
+                        Err(error) => return Result::Err(dynamic_import_vm_error(error.debug())),
+                    };
+                    let value = match context.read_property_at_depth(
+                        runtime::Value::Object(attributes),
+                        runtime::Value::String(name),
+                        depth,
+                    )? {
+                        runtime::Value::String(value) => match value.to_host_string() {
+                            Ok(value) => value,
+                            Err(error) => return Result::Err(dynamic_import_vm_error(error.debug())),
+                        },
+                        _ => return Result::Err(
+                            dynamic_import_vm_error("module attribute values must be strings"),
+                        ),
+                    };
+                    if key != "type" {
+                        return Result::Err(
+                            dynamic_import_vm_error(
+                                "import attribute `" + key + "` is not supported",
+                            ),
+                        )
+                    } else if value == "javascript" || value == "json" {
+                        module_type = value;
+                    } else {
+                        return Result::Err(
+                            dynamic_import_vm_error("unsupported module type `" + value + "`"),
+                        )
+                    }
+                },
+                runtime::PropertyKey::Symbol(_) => (),
+            }
+        } else {}
+    }
+    Result::Ok(module_type)
+}
+
+fn dynamic_import_validate_options(context: vm::Context, options: runtime::Value, depth: int) -> Result[
+    string,
+    vm::VmError,
+] {
+    match options {
+        runtime::Value::Undefined => Result::Ok("javascript"),
+        runtime::Value::Object(_) => {
+            let with_name = "with";
+            let with_bytes = with_name.to_bytes();
+            let attributes: runtime::Value = context.read_property_at_depth(
+                options,
+                runtime::Value::String(
+                    runtime::JsString::from_utf8(with_bytes.slice(0, with_bytes.len())),
+                ),
+                depth,
+            )?;
+            match attributes {
+                runtime::Value::Undefined => Result::Ok("javascript"),
+                runtime::Value::Object(value) => {
+                    dynamic_import_validate_attributes(context, value, depth)
+                },
+                _ => Result::Err(dynamic_import_vm_error("options.with must be an object")),
+            }
+        },
+        _ => Result::Err(dynamic_import_vm_error("options must be an object")),
+    }
+}
+
+fn dynamic_import_namespace(
+    loader: Loader,
+    referrer: string,
+    specifier: string,
+    requested_type: string,
+) -> Result[runtime::Value, ModuleError] {
+    if loader.context.virtual_module(specifier).is_some() || specifier == "std" || specifier == "os" {
+        if requested_type == "javascript" {
+            return virtual_module_value(loader, specifier)
+        } else {
+            return Result::Err(
+                module_type_error(specifier, "virtual modules must use the javascript module type"),
+            )
+        }
+    } else {};
+    let resolved: string = resolve_specifier(referrer, specifier)?;
+    let record: Ref[ModuleRecord] = load_record_with_type(loader, resolved, requested_type)?;
+    instantiate_graph(loader)?;
+    evaluate_record(loader, record)?;
+    Result::Ok(runtime::Value::Object(create_namespace(loader, record)?))
+}
+
+fn dynamic_import_job(
+    loader: Loader,
+    capability: vm::HostPromiseCapability,
+    referrer: string,
+    specifier: string,
+    requested_type: string,
+    depth: int,
+) -> Result[unit, vm::VmError] {
+    match dynamic_import_namespace(loader, referrer, specifier, requested_type) {
+        Ok(namespace) => {
+            let _ = loader.context.invoke_with_this_at_depth(
+                capability.resolve(),
+                Vec::[namespace],
+                runtime::Value::Undefined,
+                depth,
+            )?;
+        },
+        Err(error) => {
+            let evaluation_error = match loader.records.get(error.path) {
+                Some(record) => if record.get().evaluation_error_set.get() {
+                    Option::Some(record.get().evaluation_error.get())
+                } else {
+                    Option::None
+                },
+                None => Option::None,
+            };
+            match evaluation_error {
+                Some(value) => {
+                    let _ = loader.context.invoke_with_this_at_depth(
+                        capability.reject(),
+                        Vec::[value],
+                        runtime::Value::Undefined,
+                        depth,
+                    )?;
+                },
+                None => dynamic_import_reject(
+                    loader.context,
+                    capability,
+                    dynamic_import_module_error(error),
+                    depth,
+                )?,
+            }
+        },
+    };
+    Result::Ok(())
+}
+
+fn dynamic_import(
+    loader: Loader,
+    specifier_value: runtime::Value,
+    options: runtime::Value,
+    referrer_value: runtime::Value,
+    depth: int,
+) -> Result[runtime::Value, vm::VmError] {
+    let capability: vm::HostPromiseCapability = loader.context.new_host_promise_capability()?;
+    let promise: runtime::Value = capability.promise();
+    let specifier_string: runtime::JsString = match loader.context.value_to_string_at_depth(
+        specifier_value,
+        depth,
+    ) {
+        Ok(value) => value,
+        Err(error) => {
+            dynamic_import_reject(loader.context, capability, error, depth)?;
+            return Result::Ok(promise)
+        },
+    };
+    let specifier: string = match specifier_string.to_host_string() {
+        Ok(value) => value,
+        Err(error) => {
+            dynamic_import_reject(
+                loader.context,
+                capability,
+                dynamic_import_vm_error(error.debug()),
+                depth,
+            )?;
+            return Result::Ok(promise)
+        },
+    };
+    let requested_type = match dynamic_import_validate_options(loader.context, options, depth) {
+        Ok(value) => value,
+        Err(error) => {
+            dynamic_import_reject(loader.context, capability, error, depth)?;
+            return Result::Ok(promise)
+        },
+    };
+    let referrer: string = match referrer_value {
+        runtime::Value::String(value) => match value.to_host_string() {
+            Ok(value) => value,
+            Err(error) => {
+                dynamic_import_reject(
+                    loader.context,
+                    capability,
+                    dynamic_import_vm_error(error.debug()),
+                    depth,
+                )?;
+                return Result::Ok(promise)
+            },
+        },
+        _ => match loader.context.current_module_path() {
+            Some(value) => value,
+            None => {
+                dynamic_import_reject(
+                    loader.context,
+                    capability,
+                    dynamic_import_vm_error("no function filename for import()"),
+                    depth,
+                )?;
+                return Result::Ok(promise)
+            },
+        },
+    };
+    let callback: vm::HostTask = |job_depth: int| {
+        dynamic_import_job(loader, capability, referrer, specifier, requested_type, job_depth)
+    };
+    loader.context.enqueue_host_task(
+        callback,
+        Vec::[promise, capability.resolve(), capability.reject()],
+    );
+    Result::Ok(promise)
+}
+
+fn install_dynamic_module_loader(loader: Loader) -> unit {
+    let callback: vm::DynamicModuleLoader = |
+        specifier: runtime::Value,
+        options: runtime::Value,
+        referrer: runtime::Value,
+        depth: int,
+    | dynamic_import(loader, specifier, options, referrer, depth);
+    loader.context.set_dynamic_module_loader(callback)
+}
+
+pub fn install_dynamic_import_loader(context: vm::Context, global: runtime::ObjectId) -> unit {
+    install_dynamic_module_loader(
+        Loader {
+            context,
+            global,
+            records: HashMap::{},
+            sources: HashMap::{},
+            source_names: HashMap::{},
+            next_async_timestamp: Ref::new(0),
+        },
+    )
+}
+
+fn dependency_record(record: Ref[ModuleRecord], source: string) -> Result[
+    Ref[ModuleRecord],
+    ModuleError,
+] {
+    match record.get().dependencies.get(source) {
+        Some(value) => Result::Ok(value),
+        None => Result::Err(
+            module_error(record.get().path, "module dependency `" + source + "` is missing"),
+        ),
+    }
+}
+
+fn local_import(record: Ref[ModuleRecord], index: int) -> Option[compiler::ModuleImport] {
+    for binding in record.get().compiled.imports {
+        if binding.local_index == index && binding.kind == compiler::ModuleImportKind::Named {
+            return Option::Some(binding)
+        } else {}
+    }
+    Option::None
+}
+
+fn try_export_cell(record: Ref[ModuleRecord], name: string, resolving: Vec[string]) -> Result[
+    Option[Ref[runtime::Value]],
+    ModuleError,
+] {
+    let marker = record.get().path + "\n" + name;
+    if string_vector_contains(resolving, marker) {
+        return Result::Ok(Option::None)
+    } else {};
+    resolving.push(marker);
+    for binding in record.get().compiled.exports {
+        if binding.exported == "*" || binding.exported != name {
+            continue
+        } else {};
+        match binding.source {
+            Some(source) => {
+                let dependency = dependency_record(record, source)?;
+                return try_export_cell(dependency, binding.imported, resolving)
+            },
+            None => match local_import(record, binding.local_index) {
+                Some(imported) => {
+                    let dependency = dependency_record(record, imported.source)?;
+                    return try_export_cell(dependency, imported.imported, resolving)
+                },
+                None => if binding.local_index >= 0
+                    && binding.local_index < record.get().locals.len() {
+                    return Result::Ok(Option::Some(record.get().locals[binding.local_index]))
+                } else {
+                    return Result::Err(
+                        module_error(record.get().path, "invalid export binding `" + name + "`"),
+                    )
+                },
+            },
+        }
+    }
+    if name != "default" {
+        let mut candidate: Option[Ref[runtime::Value]] = Option::None;
+        for binding in record.get().compiled.exports {
+            if binding.exported != "*" {
+                continue
+            } else {};
+            let source = match binding.source {
+                Some(value) => value,
+                None => continue,
+            };
+            let dependency = dependency_record(record, source)?;
+            match try_export_cell(dependency, name, resolving)? {
+                Some(value) => match candidate {
+                    Some(previous) => if previous != value {
+                        return Result::Err(
+                            module_error(record.get().path, "ambiguous star export `" + name + "`"),
+                        )
+                    } else {},
+                    None => {
+                        candidate = Option::Some(value);
+                    },
+                },
+                None => (),
+            }
+        }
+        return Result::Ok(candidate)
+    } else {};
+    Result::Ok(Option::None)
+}
+
+fn export_cell(record: Ref[ModuleRecord], name: string, resolving: Vec[string]) -> Result[
+    Ref[runtime::Value],
+    ModuleError,
+] {
+    match try_export_cell(record, name, resolving)? {
+        Some(value) => Result::Ok(value),
+        None => Result::Err(
+            module_error(record.get().path, "module has no export named `" + name + "`"),
+        ),
+    }
+}
+
+fn bind_named_imports(loader: Loader, record: Ref[ModuleRecord]) -> Result[unit, ModuleError] {
+    for binding in record.get().compiled.imports {
+        if binding.kind != compiler::ModuleImportKind::Named {
+            continue
+        } else {};
+        let cell = match loader.context.virtual_module(binding.source) {
+            Some(value) => {
+                let object = match value {
+                    runtime::Value::Object(value) => value,
+                    _ => return Result::Err(
+                        module_error(binding.source, "virtual module namespace is not an object"),
+                    ),
+                };
+                let value = match runtime::get_property(
+                    loader.context.heap(),
+                    object,
+                    runtime::string_property_key(binding.imported),
+                ) {
+                    Ok(Some(value)) => value,
+                    Ok(None) => return Result::Err(
+                        module_error(
+                            binding.source,
+                            "module has no export named `" + binding.imported + "`",
+                        ),
+                    ),
+                    Err(error) => return Result::Err(module_error(binding.source, error.message)),
+                };
+                let cell = Ref::new(value);
+                loader.context.add_external_root(cell);
+                cell
+            },
+            None => {
+                let dependency = dependency_record(record, binding.source)?;
+                export_cell(dependency, binding.imported, Vec::[])?
+            },
+        };
+        if binding.local_index < 0 || binding.local_index >= record.get().locals.len() {
+            return Result::Err(module_error(record.get().path, "invalid import binding"))
+        } else {};
+        record.get().locals[binding.local_index] = cell;
+    }
+    Result::Ok(())
+}
+
+fn string_compare(left: string, right: string) -> int {
+    if left < right {
+        -1
+    } else if left > right {
+        1
+    } else {
+        0
+    }
+}
+
+fn collect_export_names(record: Ref[ModuleRecord], resolving: Vec[string], names: Vec[string]) -> unit {
+    if string_vector_contains(resolving, record.get().path) {
+        return
+    } else {};
+    resolving.push(record.get().path);
+    for binding in record.get().compiled.exports {
+        if binding.exported == "*" {
+            match binding.source {
+                Some(source) => match dependency_record(record, source) {
+                    Ok(dependency) => {
+                        let inherited: Vec[string] = Vec::[];
+                        collect_export_names(dependency, resolving, inherited);
+                        for name in inherited {
+                            if name != "default" && !string_vector_contains(names, name) {
+                                names.push(name)
+                            } else {}
+                        }
+                    },
+                    Err(_) => (),
+                },
+                None => (),
+            }
+        } else if !string_vector_contains(names, binding.exported) {
+            names.push(binding.exported)
+        } else {}
+    }
+}
+
+fn export_names(record: Ref[ModuleRecord]) -> Vec[string] {
+    let names: Vec[string] = Vec::[];
+    collect_export_names(record, Vec::[], names);
+    collections::sort_by(names, string_compare);
+    names
+}
+
+fn create_namespace(loader: Loader, record: Ref[ModuleRecord]) -> Result[
+    runtime::ObjectId,
+    ModuleError,
+] {
+    match record.get().namespace.get() {
+        Some(value) => return Result::Ok(value),
+        None => (),
+    };
+    let object = match runtime::new_null_prototype_object(loader.context.heap()) {
+        Ok(value) => value,
+        Err(error) => return Result::Err(module_error(record.get().path, error.message)),
+    };
+    record.get().namespace.set(Option::Some(object));
+    let root = Ref::new(runtime::Value::Object(object));
+    loader.context.add_external_root(root);
+    for name in export_names(record) {
+        let cell = export_cell(record, name, Vec::[])?;
+        let getter = match loader.context.new_native_function(|_, _, _| Result::Ok(cell.get())) {
+            Ok(value) => value,
+            Err(error) => return Result::Err(module_error(record.get().path, error.kind.debug())),
+        };
+        if !runtime::define_own_property(
+            loader.context.heap(),
+            object,
+            runtime::string_property_key(name),
+            runtime::accessor_descriptor(Option::Some(getter), Option::None, true, false),
+        ) {
+            return Result::Err(
+                module_error(
+                    record.get().path,
+                    "cannot define module namespace export `" + name + "`",
+                ),
+            )
+        } else {}
+    }
+    match loader.context.well_known_symbol(vm::WellKnownSymbolKind::ToStringTag) {
+        Some(symbol) => if !runtime::define_own_property(
+            loader.context.heap(),
+            object,
+            runtime::PropertyKey::Symbol(symbol),
+            runtime::data_descriptor(
+                runtime::Value::String(
+                    runtime::JsString::from_utf8("Module".to_bytes().slice(0, 6)),
+                ),
+                false,
+                false,
+                false,
+            ),
+        ) {
+            return Result::Err(
+                module_error(record.get().path, "cannot define module namespace tag"),
+            )
+        } else {},
+        None => (),
+    };
+    let _ = runtime::prevent_extensions(loader.context.heap(), object);
+    Result::Ok(object)
+}
+
+fn create_import_meta(loader: Loader, record: Ref[ModuleRecord]) -> Result[
+    runtime::ObjectId,
+    ModuleError,
+] {
+    match record.get().import_meta.get() {
+        Some(value) => return Result::Ok(value),
+        None => (),
+    };
+    let object = match runtime::new_null_prototype_object(loader.context.heap()) {
+        Ok(value) => value,
+        Err(error) => return Result::Err(module_error(record.get().path, error.message)),
+    };
+    let path = record.get().path;
+    let url = if path.contains(":") {
+        path
+    } else {
+        "file://" + path
+    };
+    if !runtime::define_own_property(
+        loader.context.heap(),
+        object,
+        runtime::string_property_key("url"),
+        runtime::data_descriptor(
+            runtime::Value::String(
+                runtime::JsString::from_utf8(url.to_bytes().slice(0, url.byte_len())),
+            ),
+            true,
+            true,
+            true,
+        ),
+    )
+        || !runtime::define_own_property(
+            loader.context.heap(),
+            object,
+            runtime::string_property_key("main"),
+            runtime::data_descriptor(
+                runtime::Value::Bool(record.get().main.get()),
+                true,
+                true,
+                true,
+            ),
+        ) {
+        return Result::Err(module_error(path, "cannot initialize import.meta"))
+    } else {};
+    record.get().import_meta.set(Option::Some(object));
+    let root = Ref::new(runtime::Value::Object(object));
+    loader.context.add_external_root(root);
+    Result::Ok(object)
+}
+
+fn bind_namespace_imports(loader: Loader, record: Ref[ModuleRecord]) -> Result[unit, ModuleError] {
+    for binding in record.get().compiled.imports {
+        if binding.kind != compiler::ModuleImportKind::Namespace {
+            continue
+        } else {};
+        let value = if loader.context.virtual_module(binding.source).is_some()
+            || binding.source == "std"
+            || binding.source == "os" {
+            virtual_module_value(loader, binding.source)?
+        } else {
+            let dependency = dependency_record(record, binding.source)?;
+            runtime::Value::Object(create_namespace(loader, dependency)?)
+        };
+        if binding.local_index < 0 || binding.local_index >= record.get().locals.len() {
+            return Result::Err(module_error(record.get().path, "invalid namespace import binding"))
+        } else {};
+        record.get().locals[binding.local_index].set(value);
+    }
+    Result::Ok(())
+}
+
+fn instantiate_graph(loader: Loader) -> Result[unit, ModuleError] {
+    for (_, record) in loader.records.entries() {
+        bind_named_imports(loader, record)?
+    }
+    for (_, record) in loader.records.entries() {
+        let _ = create_namespace(loader, record)?;
+    }
+    for (_, record) in loader.records.entries() {
+        bind_namespace_imports(loader, record)?
+    }
+    Result::Ok(())
+}
+
+fn thrown_message(context: vm::Context, value: runtime::Value) -> string {
+    match value {
+        runtime::Value::String(value) => value.to_host_string().unwrap_or("<invalid string>"),
+        runtime::Value::Object(object) => {
+            for name in Vec::["stack", "message", "name"] {
+                match runtime::get_property(
+                    context.heap(),
+                    object,
+                    runtime::string_property_key(name),
+                ) {
+                    Ok(Some(runtime::Value::String(value))) => match value.to_host_string() {
+                        Ok(value) => if value.byte_len() > 0 {
+                            return value
+                        } else {},
+                        Err(_) => (),
+                    },
+                    _ => (),
+                }
+            }
+            "<object>"
+        },
+        _ => runtime::type_of(value),
+    }
+}
+
+fn runtime_message(context: vm::Context, error: vm::VmError) -> string {
+    let detail = match error.kind {
+        vm::VmErrorKind::Thrown(value) => "Thrown(" + thrown_message(context, value) + ")",
+        value => value.debug(),
+    };
+    "runtime error at bytecode " + error.offset.to_string() + ": " + detail
+}
+
+fn rejection_message(context: vm::Context, value: runtime::Value) -> string {
+    match value {
+        runtime::Value::Object(object) => match runtime::get_property(
+            context.heap(),
+            object,
+            runtime::string_property_key("message"),
+        ) {
+            Ok(Some(runtime::Value::String(value))) => match value.to_host_string() {
+                Ok(value) => if value.byte_len() > 0 {
+                    value
+                } else {
+                    thrown_message(context, runtime::Value::Object(object))
+                },
+                Err(_) => thrown_message(context, runtime::Value::Object(object)),
+            },
+            _ => thrown_message(context, runtime::Value::Object(object)),
+        },
+        _ => thrown_message(context, value),
+    }
+}
+
+fn async_module_argument(arguments: Vec[runtime::Value]) -> runtime::Value {
+    if arguments.is_empty() {
+        runtime::Value::Undefined
+    } else {
+        arguments[0]
+    }
+}
+
+fn record_vector_contains(records: Vec[Ref[ModuleRecord]], expected: Ref[ModuleRecord]) -> bool {
+    for record in records {
+        if record.get().path == expected.get().path {
+            return true
+        } else {}
+    }
+    false
+}
+
+fn push_requested_dependency(
+    record: Ref[ModuleRecord],
+    source: string,
+    dependencies: Vec[Ref[ModuleRecord]],
+) -> unit {
+    match record.get().dependencies.get(source) {
+        Some(value) => if !record_vector_contains(dependencies, value) {
+            dependencies.push(value)
+        } else {},
+        None => (),
+    }
+}
+
+fn requested_dependencies(record: Ref[ModuleRecord]) -> Vec[Ref[ModuleRecord]] {
+    let dependencies: Vec[Ref[ModuleRecord]] = Vec::[];
+    for binding in record.get().compiled.imports {
+        push_requested_dependency(record, binding.source, dependencies)
+    }
+    for binding in record.get().compiled.exports {
+        match binding.source {
+            Some(source) => push_requested_dependency(record, source, dependencies),
+            None => (),
+        }
+    }
+    dependencies
+}
+
+fn cycle_root(record: Ref[ModuleRecord]) -> Ref[ModuleRecord] {
+    record.get().cycle_root.get().unwrap_or(record)
+}
+
+fn rejection_error(loader: Loader, record: Ref[ModuleRecord]) -> ModuleError {
+    let path = if record.get().evaluation_error_path.get() == "" {
+        record.get().path
+    } else {
+        record.get().evaluation_error_path.get()
+    };
+    module_error(
+        path,
+        "module evaluation rejected: "
+            + rejection_message(loader.context, record.get().evaluation_error.get()),
+    )
+}
+
+fn reject_module(record: Ref[ModuleRecord], reason: runtime::Value, origin: string) -> unit {
+    if record.get().state.get() == ModuleState::Errored {
+        return
+    } else {};
+    record.get().evaluation_error.set(reason);
+    record.get().evaluation_error_set.set(true);
+    record.get().evaluation_error_path.set(origin);
+    record.get().async_evaluation.set(false);
+    record.get().state.set(ModuleState::Errored);
+    for parent in record.get().async_parents {
+        reject_module(parent, reason, origin)
+    }
+}
+
+fn reject_module_error(loader: Loader, record: Ref[ModuleRecord], error: ModuleError) -> unit {
+    let message = error.path + ": " + error.message;
+    let bytes = message.to_bytes();
+    reject_module(
+        record,
+        runtime::Value::String(runtime::JsString::from_utf8(bytes.slice(0, bytes.len()))),
+        error.path,
+    )
+}
+
+fn reject_vm_error(loader: Loader, record: Ref[ModuleRecord], error: vm::VmError) -> ModuleError {
+    let result = module_error(record.get().path, runtime_message(loader.context, error));
+    reject_module(record, loader.context.rejection_value(error), record.get().path);
+    result
+}
+
+fn copy_module_rejection(target: Ref[ModuleRecord], source: Ref[ModuleRecord]) -> unit {
+    if source.get().evaluation_error_set.get() {
+        let origin = if source.get().evaluation_error_path.get() == "" {
+            source.get().path
+        } else {
+            source.get().evaluation_error_path.get()
+        };
+        reject_module(target, source.get().evaluation_error.get(), origin)
+    } else {}
+}
+
+fn initialize_module_execution(loader: Loader, record: Ref[ModuleRecord]) -> Result[
+    Option[string],
+    ModuleError,
+] {
+    let previous_path = loader.context.current_module_path();
+    let meta_index = record.get().compiled.import_meta_index;
+    let referrer_index = record.get().compiled.dynamic_import_referrer_index;
+    if meta_index < 0 || meta_index >= record.get().locals.len() || referrer_index < 0
+        || referrer_index >= record.get().locals.len() {
+        return Result::Err(module_error(record.get().path, "invalid import.meta binding"))
+    } else {};
+    let meta = match create_import_meta(loader, record) {
+        Ok(value) => value,
+        Err(error) => return Result::Err(error),
+    };
+    record.get().locals[referrer_index].set(
+        runtime::Value::String(
+            runtime::JsString::from_utf8(
+                record.get().path.to_bytes().slice(0, record.get().path.byte_len()),
+            ),
+        ),
+    );
+    record.get().locals[meta_index].set(runtime::Value::Object(meta));
+    loader.context.set_current_module_path(Option::Some(record.get().path));
+    Result::Ok(previous_path)
+}
+
+fn execute_module_body(loader: Loader, record: Ref[ModuleRecord], asynchronous: bool) -> Result[
+    runtime::Value,
+    ModuleError,
+] {
+    if record.get().execution_started.get() {
+        return Result::Err(module_error(record.get().path, "module execution started twice"))
+    } else {};
+    record.get().execution_started.set(true);
+    let previous_path = match initialize_module_execution(loader, record) {
+        Ok(value) => value,
+        Err(error) => {
+            reject_module_error(loader, record, error);
+            return Result::Err(error)
+        },
+    };
+    let execution = if asynchronous {
+        loader.context.execute_async_with_local_cells(
+            record.get().compiled.function,
+            record.get().locals,
+        )
+    } else {
+        loader.context.execute_with_local_cells(record.get().compiled.function, record.get().locals)
+    };
+    loader.context.set_current_module_path(previous_path);
+    match execution {
+        Ok(value) => Result::Ok(value),
+        Err(error) => Result::Err(reject_vm_error(loader, record, error)),
+    }
+}
+
+fn mark_async_evaluation(loader: Loader, record: Ref[ModuleRecord]) -> unit {
+    if record.get().async_evaluation.get() {
+        return
+    } else {};
+    record.get().async_evaluation.set(true);
+    record.get().async_timestamp.set(loader.next_async_timestamp.get());
+    loader.next_async_timestamp.set(loader.next_async_timestamp.get() + 1)
+}
+
+fn insert_async_record(records: Vec[Ref[ModuleRecord]], record: Ref[ModuleRecord]) -> unit {
+    if record_vector_contains(records, record) {
+        return
+    } else {};
+    let mut index = 0;
+    while index < records.len()
+        && records[index].get().async_timestamp.get() <= record.get().async_timestamp.get() {
+        index += 1;
+    }
+    records.insert(index, record)
+}
+
+fn gather_available_ancestors(module: Ref[ModuleRecord], records: Vec[Ref[ModuleRecord]]) -> unit {
+    for parent in module.get().async_parents {
+        if record_vector_contains(records, parent)
+            || cycle_root(parent).get().state.get() == ModuleState::Errored {
+            continue
+        } else {};
+        if parent.get().pending_async_dependencies.get() > 0 {
+            parent.get().pending_async_dependencies.set(
+                parent.get().pending_async_dependencies.get() - 1,
+            )
+        } else {};
+        if parent.get().pending_async_dependencies.get() == 0 {
+            insert_async_record(records, parent);
+            if !parent.get().compiled.function.asynchronous() {
+                gather_available_ancestors(parent, records)
+            } else {}
+        } else {}
+    }
+}
+
+fn async_module_rejected(record: Ref[ModuleRecord], arguments: Vec[runtime::Value]) -> unit {
+    reject_module(record, async_module_argument(arguments), record.get().path)
+}
+
+fn start_async_module(loader: Loader, record: Ref[ModuleRecord]) -> Result[unit, ModuleError] {
+    let promise = execute_module_body(loader, record, true)?;
+    let fulfilled = match loader.context.new_vm_function(
+        |_, _, _| {
+            async_module_fulfilled(loader, record);
+            Result::Ok(runtime::Value::Undefined)
+        },
+    ) {
+        Ok(value) => value,
+        Err(error) => return Result::Err(reject_vm_error(loader, record, error)),
+    };
+    let rejected = match loader.context.new_vm_function(
+        |_, arguments, _| {
+            async_module_rejected(record, arguments);
+            Result::Ok(runtime::Value::Undefined)
+        },
+    ) {
+        Ok(value) => value,
+        Err(error) => return Result::Err(reject_vm_error(loader, record, error)),
+    };
+    let name = "then";
+    let then = match loader.context.read_property_at_depth(
+        promise,
+        runtime::Value::String(
+            runtime::JsString::from_utf8(name.to_bytes().slice(0, name.byte_len())),
+        ),
+        0,
+    ) {
+        Ok(value) => value,
+        Err(error) => return Result::Err(reject_vm_error(loader, record, error)),
+    };
+    match loader.context.invoke_with_this_at_depth(then, Vec::[fulfilled, rejected], promise, 0) {
+        Ok(_) => Result::Ok(()),
+        Err(error) => Result::Err(reject_vm_error(loader, record, error)),
+    }
+}
+
+fn async_module_fulfilled(loader: Loader, module: Ref[ModuleRecord]) -> unit {
+    if module.get().state.get() == ModuleState::Errored {
+        return
+    } else {};
+    module.get().async_evaluation.set(false);
+    module.get().state.set(ModuleState::Evaluated);
+    let records: Vec[Ref[ModuleRecord]] = Vec::[];
+    gather_available_ancestors(module, records);
+    for record in records {
+        if record.get().state.get() == ModuleState::Errored
+            || cycle_root(record).get().state.get() == ModuleState::Errored {
+            continue
+        } else {};
+        if record.get().compiled.function.asynchronous() {
+            match start_async_module(loader, record) {
+                Ok(()) => (),
+                Err(_) => (),
+            }
+        } else {
+            match execute_module_body(loader, record, false) {
+                Ok(_) => {
+                    record.get().async_evaluation.set(false);
+                    record.get().state.set(ModuleState::Evaluated)
+                },
+                Err(_) => (),
+            }
+        }
+    }
+}
+
+fn inner_module_evaluation(
+    loader: Loader,
+    module: Ref[ModuleRecord],
+    next_index: Ref[int],
+    stack: Vec[Ref[ModuleRecord]],
+) -> Result[unit, ModuleError] {
+    match module.get().state.get() {
+        ModuleState::Evaluating | ModuleState::EvaluatingAsync | ModuleState::Evaluated => {
+            return Result::Ok(())
+        },
+        ModuleState::Errored => return Result::Err(rejection_error(loader, module)),
+        ModuleState::Linked => (),
+    };
+    module.get().state.set(ModuleState::Evaluating);
+    module.get().dfs_index.set(next_index.get());
+    module.get().dfs_ancestor_index.set(next_index.get());
+    module.get().pending_async_dependencies.set(0);
+    next_index.set(next_index.get() + 1);
+    stack.push(module);
+    for dependency in requested_dependencies(module) {
+        match inner_module_evaluation(loader, dependency, next_index, stack) {
+            Ok(()) => (),
+            Err(error) => {
+                copy_module_rejection(module, dependency);
+                return Result::Err(error)
+            },
+        }
+        let async_dependency = if dependency.get().state.get() == ModuleState::Evaluating {
+            if dependency.get().dfs_ancestor_index.get() < module.get().dfs_ancestor_index.get() {
+                module.get().dfs_ancestor_index.set(dependency.get().dfs_ancestor_index.get())
+            } else {};
+            dependency
+        } else {
+            let root = cycle_root(dependency);
+            if root.get().state.get() == ModuleState::Errored {
+                copy_module_rejection(module, root);
+                return Result::Err(rejection_error(loader, root))
+            } else {};
+            root
+        };
+        if async_dependency.get().async_evaluation.get() {
+            module.get().pending_async_dependencies.set(
+                module.get().pending_async_dependencies.get() + 1,
+            );
+            async_dependency.get().async_parents.push(module)
+        } else {}
+    }
+    if module.get().pending_async_dependencies.get() > 0 {
+        mark_async_evaluation(loader, module)
+    } else if module.get().compiled.function.asynchronous() {
+        mark_async_evaluation(loader, module);
+        start_async_module(loader, module)?
+    } else {
+        let _ = execute_module_body(loader, module, false)?;
+    };
+    if module.get().dfs_index.get() == module.get().dfs_ancestor_index.get() {
+        loop {
+            let member = match stack.pop() {
+                Some(value) => value,
+                None => return Result::Err(
+                    module_error(module.get().path, "invalid module DFS stack"),
+                ),
+            };
+            member.get().cycle_root.set(Option::Some(module));
+            if member.get().async_evaluation.get() {
+                member.get().state.set(ModuleState::EvaluatingAsync)
+            } else {
+                member.get().state.set(ModuleState::Evaluated)
+            };
+            if member.get().path == module.get().path {
+                break
+            } else {}
+        }
+    } else {};
+    Result::Ok(())
+}
+
+fn await_graph_evaluation(loader: Loader, record: Ref[ModuleRecord]) -> Result[unit, ModuleError] {
+    let root = cycle_root(record);
+    match root.get().state.get() {
+        ModuleState::Evaluated => return Result::Ok(()),
+        ModuleState::Errored => return Result::Err(rejection_error(loader, root)),
+        _ => (),
+    };
+    match loader.context.run_pending_jobs() {
+        Ok(_) => (),
+        Err(error) => {
+            let result = reject_vm_error(loader, root, error);
+            return Result::Err(result)
+        },
+    };
+    match root.get().state.get() {
+        ModuleState::Evaluated => Result::Ok(()),
+        ModuleState::Errored => Result::Err(rejection_error(loader, root)),
+        _ => Result::Err(
+            module_error(root.get().path, "top-level await remained pending without host jobs"),
+        ),
+    }
+}
+
+fn evaluate_record(loader: Loader, record: Ref[ModuleRecord]) -> Result[unit, ModuleError] {
+    match record.get().state.get() {
+        ModuleState::Evaluated => return Result::Ok(()),
+        ModuleState::Errored => return Result::Err(rejection_error(loader, record)),
+        ModuleState::EvaluatingAsync => return await_graph_evaluation(loader, record),
+        ModuleState::Evaluating => return Result::Ok(()),
+        ModuleState::Linked => (),
+    };
+    let stack: Vec[Ref[ModuleRecord]] = Vec::[];
+    match inner_module_evaluation(loader, record, Ref::new(0), stack) {
+        Ok(()) => await_graph_evaluation(loader, record),
+        Err(error) => {
+            for active in stack {
+                if active.get().state.get() != ModuleState::Errored {
+                    if record.get().evaluation_error_set.get() {
+                        copy_module_rejection(active, record)
+                    } else {
+                        reject_module_error(loader, active, error)
+                    }
+                } else {}
+            }
+            Result::Err(error)
+        },
+    }
+}
+
+fn load_worker_module(context: vm::Context, global: runtime::ObjectId, module_path: string) -> Result[
+    runtime::Value,
+    string,
+] {
+    match execute_file(context, global, module_path) {
+        Ok(value) => Result::Ok(value),
+        Err(error) => Result::Err(error.path + ": " + error.message),
+    }
+}
+
+pub fn install_worker_module_loader(context: vm::Context) -> unit {
+    context.set_worker_module_loader(load_worker_module)
+}
+
+pub fn execute_file(context: vm::Context, global: runtime::ObjectId, module_path: string) -> Result[
+    runtime::Value,
+    ModuleError,
+] {
+    install_worker_module_loader(context);
+    let loader = Loader {
+        context,
+        global,
+        records: HashMap::{},
+        sources: HashMap::{},
+        source_names: HashMap::{},
+        next_async_timestamp: Ref::new(0),
+    };
+    install_dynamic_module_loader(loader);
+    let entry = load_record(loader, module_path)?;
+    entry.get().main.set(true);
+    instantiate_graph(loader)?;
+    evaluate_record(loader, entry)?;
+    let namespace = create_namespace(loader, entry)?;
+    match context.run_pending_jobs() {
+        Ok(_) => Result::Ok(runtime::Value::Object(namespace)),
+        Err(error) => Result::Err(module_error(entry.get().path, runtime_message(context, error))),
+    }
+}
+
+pub fn execute_source(
+    context: vm::Context,
+    global: runtime::ObjectId,
+    module_path: string,
+    source: string,
+) -> Result[runtime::Value, ModuleError] {
+    execute_source_with_source_name(context, global, module_path, source, module_path)
+}
+
+pub fn execute_source_with_source_name(
+    context: vm::Context,
+    global: runtime::ObjectId,
+    module_path: string,
+    source: string,
+    source_name: string,
+) -> Result[runtime::Value, ModuleError] {
+    install_worker_module_loader(context);
+    let canonical = absolute_clean(module_path)?;
+    let sources: HashMap[string, string] = HashMap::{};
+    sources[canonical] = source;
+    let source_names: HashMap[string, string] = HashMap::{};
+    source_names[canonical] = source_name;
+    let loader = Loader {
+        context,
+        global,
+        records: HashMap::{},
+        sources,
+        source_names,
+        next_async_timestamp: Ref::new(0),
+    };
+    install_dynamic_module_loader(loader);
+    let entry = load_record(loader, canonical)?;
+    entry.get().main.set(true);
+    instantiate_graph(loader)?;
+    evaluate_record(loader, entry)?;
+    let namespace = create_namespace(loader, entry)?;
+    match context.run_pending_jobs() {
+        Ok(_) => Result::Ok(runtime::Value::Object(namespace)),
+        Err(error) => Result::Err(module_error(entry.get().path, runtime_message(context, error))),
+    }
+}

@@ -1,0 +1,130 @@
+package builtins;
+
+use gomlang::quickjs::date;
+use gomlang::quickjs::runtime;
+use gomlang::quickjs::vm;
+use std::math;
+use std::num;
+use std::testing;
+
+fn date_property(heap: runtime::Heap, object: runtime::ObjectId, name: string) -> runtime::Value {
+    match runtime::get_property(heap, object, runtime::string_property_key(name)) {
+        Ok(Some(value)) => value,
+        _ => {
+            testing::fail("missing Date property " + name);
+            runtime::Value::Undefined
+        },
+    }
+}
+
+fn date_expect(value: Result[runtime::Value, vm::VmError]) -> runtime::Value {
+    match value {
+        Ok(value) => value,
+        Err(value) => {
+            testing::fail(value.kind.debug());
+            runtime::Value::Undefined
+        },
+    }
+}
+
+fn date_fallback_object(heap: runtime::Heap) -> runtime::ObjectId {
+    match runtime::new_ordinary_object(heap, Option::None) {
+        Ok(value) => value,
+        Err(value) => {
+            testing::fail(value.message);
+            date_fallback_object(heap)
+        },
+    }
+}
+
+#[test]
+fn date_static_helpers_parse_format_normalize_and_decompose_utc() -> unit {
+    let context = vm::Context::new(runtime::Heap::new());
+    let date_value = match install_date(context) {
+        Ok(value) => value,
+        Err(value) => {
+            testing::fail(value.message);
+            runtime::Value::Undefined
+        },
+    };
+    let date_object = match date_value {
+        runtime::Value::Object(value) => value,
+        _ => {
+            testing::fail("expected Date function");
+            date_fallback_object(context.heap())
+        },
+    };
+    let parse = date_property(context.heap(), date_object, "parse");
+    let timestamp = date_expect(
+        invoke(context, parse, Vec::[runtime::Value::String(js_string("1970-01-02T00:00:00.000Z"))]),
+    );
+    testing::assert_eq(expect_number(timestamp), 86400000.0);
+    let to_iso = date_property(context.heap(), date_object, "toISOString");
+    match date_expect(invoke(context, to_iso, Vec::[timestamp])) {
+        runtime::Value::String(value) => testing::assert(
+            value == js_string("1970-01-02T00:00:00.000Z"),
+        ),
+        _ => testing::fail("expected ISO string"),
+    };
+    let utc = date_property(context.heap(), date_object, "UTC");
+    let leap = date_expect(
+        invoke(
+            context,
+            utc,
+            Vec::[runtime::Value::Int(2000), runtime::Value::Int(1), runtime::Value::Int(30)],
+        ),
+    );
+    match date_expect(invoke(context, to_iso, Vec::[leap])) {
+        runtime::Value::String(value) => testing::assert(
+            value == js_string("2000-03-01T00:00:00.000Z"),
+        ),
+        _ => testing::fail("expected normalized ISO string"),
+    };
+    let fields = date_property(context.heap(), date_object, "fields");
+    let result = match date_expect(invoke(context, fields, Vec::[runtime::Value::Float(-1.0)])) {
+        runtime::Value::Object(value) => value,
+        _ => {
+            testing::fail("expected fields object");
+            date_object
+        },
+    };
+    testing::assert_eq(expect_number(date_property(context.heap(), result, "year")), 1969.0);
+    testing::assert_eq(expect_number(date_property(context.heap(), result, "millisecond")), 999.0)
+}
+
+#[test]
+fn date_parse_returns_nan_for_invalid_and_uses_the_host_timezone_for_local_iso_input() -> unit {
+    let context = vm::Context::new(runtime::Heap::new());
+    let date_object = match install_date(context) {
+        Ok(runtime::Value::Object(value)) => value,
+        _ => {
+            testing::fail("expected Date function");
+            date_fallback_object(context.heap())
+        },
+    };
+    let parse = date_property(context.heap(), date_object, "parse");
+    testing::assert(
+        math::is_nan(
+            expect_number(
+                date_expect(
+                    invoke(context, parse, Vec::[runtime::Value::String(js_string("not-a-date"))]),
+                ),
+            ),
+        ),
+    );
+    let unadjusted: int64 = 1577836800000;
+    let expected = unadjusted
+        - date_instance_timezone_offset(date::local_time_zone(), unadjusted).to_int64() * 60000;
+    testing::assert_eq(
+        expect_number(
+            date_expect(
+                invoke(
+                    context,
+                    parse,
+                    Vec::[runtime::Value::String(js_string("2020-01-01T00:00:00"))],
+                ),
+            ),
+        ),
+        num::parse_float64(expected.to_string()).unwrap_or(0.0),
+    )
+}

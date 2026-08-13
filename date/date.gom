@@ -1,0 +1,926 @@
+package date;
+
+use std::math;
+use std::num;
+
+pub const MAX_TIME_MILLISECONDS: int64 = 8640000000000000;
+
+const MILLISECONDS_PER_SECOND: int64 = 1000;
+
+const MILLISECONDS_PER_MINUTE: int64 = 60000;
+
+const MILLISECONDS_PER_HOUR: int64 = 3600000;
+
+const MILLISECONDS_PER_DAY: int64 = 86400000;
+
+const MIN_INT64: int64 = -9223372036854775807 - 1;
+
+const MAX_INT64: int64 = 9223372036854775807;
+
+const MIN_CALENDAR_YEAR: int64 = -1000000;
+
+const MAX_CALENDAR_YEAR: int64 = 1000000;
+
+#[derive(PartialEq, Eq, Debug)]
+pub enum DateErrorKind {
+    NonFiniteTime,
+    TimeOutOfRange,
+    ArithmeticOverflow,
+    InvalidDate,
+    InvalidIsoSyntax,
+    NonAsciiInput,
+    LocalTimeRequiresOffset,
+}
+
+#[derive(PartialEq, Eq, Debug)]
+pub struct DateError {
+    pub kind: DateErrorKind,
+    pub offset: int,
+}
+
+impl ToString for DateError {
+    fn to_string(self: DateError) -> string {
+        let message = match self.kind {
+            DateErrorKind::NonFiniteTime => "non-finite date time",
+            DateErrorKind::TimeOutOfRange => "date time is outside the ECMAScript range",
+            DateErrorKind::ArithmeticOverflow => "date arithmetic overflow",
+            DateErrorKind::InvalidDate => "invalid civil date",
+            DateErrorKind::InvalidIsoSyntax => "invalid ISO date time",
+            DateErrorKind::NonAsciiInput => "non-ASCII ISO date time input",
+            DateErrorKind::LocalTimeRequiresOffset => "local date time requires a time zone",
+        };
+        if self.offset >= 0 {
+            message + " at byte offset " + self.offset.to_string()
+        } else {
+            message
+        }
+    }
+}
+
+#[derive(PartialEq, Eq, Debug)]
+pub struct CivilDate {
+    pub year: int64,
+    pub month: int,
+    pub day: int,
+}
+
+#[derive(PartialEq, Eq, Debug)]
+pub struct DateComponents {
+    pub year: int64,
+    pub month: int,
+    pub day: int,
+    pub hour: int,
+    pub minute: int,
+    pub second: int,
+    pub millisecond: int,
+}
+
+#[derive(PartialEq, Eq, Debug)]
+pub struct CivilFields {
+    pub year: int64,
+    pub month: int,
+    pub day: int,
+    pub hour: int,
+    pub minute: int,
+    pub second: int,
+    pub millisecond: int,
+    pub weekday: int,
+    pub yearday: int,
+}
+
+#[derive(PartialEq, Eq, Debug)]
+pub enum IsoTimeZone {
+    Utc,
+    Offset(int),
+    Local,
+}
+
+#[derive(PartialEq, Eq, Debug)]
+pub struct ParsedIsoDate {
+    pub components: DateComponents,
+    pub time_zone: IsoTimeZone,
+    pub date_only: bool,
+}
+
+struct IsoParser {
+    value: string,
+    index: Ref[int],
+}
+
+fn date_error(kind: DateErrorKind) -> DateError {
+    DateError { kind, offset: -1 }
+}
+
+fn syntax_error(offset: int) -> DateError {
+    DateError { kind: DateErrorKind::InvalidIsoSyntax, offset }
+}
+
+fn floor_div(value: int64, divisor: int64) -> int64 {
+    let remainder = value % divisor;
+    if remainder < 0 {
+        (value - remainder - divisor) / divisor
+    } else {
+        (value - remainder) / divisor
+    }
+}
+
+fn floor_mod(value: int64, divisor: int64) -> int64 {
+    let remainder = value % divisor;
+    if remainder < 0 {
+        remainder + divisor
+    } else {
+        remainder
+    }
+}
+
+fn checked_add(left: int64, right: int64) -> Option[int64] {
+    if right > 0 && left > MAX_INT64 - right {
+        Option::None
+    } else if right < 0 && left < MIN_INT64 - right {
+        Option::None
+    } else {
+        Option::Some(left + right)
+    }
+}
+
+fn checked_subtract(left: int64, right: int64) -> Option[int64] {
+    if right == MIN_INT64 {
+        if left >= 0 {
+            Option::None
+        } else {
+            Option::Some(left - right)
+        }
+    } else {
+        checked_add(left, -right)
+    }
+}
+
+fn checked_multiply_positive(value: int64, factor: int64) -> Option[int64] {
+    if factor <= 0 {
+        Option::None
+    } else if value > MAX_INT64 / factor || value < MIN_INT64 / factor {
+        Option::None
+    } else {
+        Option::Some(value * factor)
+    }
+}
+
+fn require_calendar_year(year: int64) -> Result[unit, DateError] {
+    if year < MIN_CALENDAR_YEAR || year > MAX_CALENDAR_YEAR {
+        Result::Err(date_error(DateErrorKind::TimeOutOfRange))
+    } else {
+        Result::Ok(())
+    }
+}
+
+pub fn is_leap_year(year: int64) -> bool {
+    year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)
+}
+
+pub fn days_in_month(year: int64, month: int) -> Result[int, DateError] {
+    require_calendar_year(year)?;
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => Result::Ok(31),
+        4 | 6 | 9 | 11 => Result::Ok(30),
+        2 => Result::Ok(
+            if is_leap_year(year) {
+                29
+            } else {
+                28
+            },
+        ),
+        _ => Result::Err(date_error(DateErrorKind::InvalidDate)),
+    }
+}
+
+fn days_from_civil_unchecked(year: int64, month: int64, day: int64) -> int64 {
+    let adjusted_year = if month <= 2 {
+        year - 1
+    } else {
+        year
+    };
+    let era = floor_div(adjusted_year, 400);
+    let year_of_era = adjusted_year - era * 400;
+    let adjusted_month = month
+        + if month > 2 {
+            -3
+        } else {
+            9
+        };
+    let day_of_year = (153 * adjusted_month + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    era * 146097 + day_of_era - 719468
+}
+
+pub fn days_from_civil(year: int64, month: int, day: int) -> Result[int64, DateError] {
+    require_calendar_year(year)?;
+    let month_length = days_in_month(year, month)?;
+    if day < 1 || day > month_length {
+        Result::Err(date_error(DateErrorKind::InvalidDate))
+    } else {
+        Result::Ok(days_from_civil_unchecked(year, month.to_int64(), day.to_int64()))
+    }
+}
+
+pub fn civil_from_days(days: int64) -> Result[CivilDate, DateError] {
+    if days < -366242250 || days > 364522972 {
+        return Result::Err(date_error(DateErrorKind::TimeOutOfRange))
+    } else {};
+    let shifted = days + 719468;
+    let era = floor_div(shifted, 146097);
+    let day_of_era = shifted - era * 146097;
+    let year_of_era = (day_of_era - day_of_era / 1460 + day_of_era / 36524 - day_of_era / 146096)
+        / 365;
+    let mut year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_piece = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_piece + 2) / 5 + 1;
+    let month = month_piece
+        + if month_piece < 10 {
+            3
+        } else {
+            -9
+        };
+    if month <= 2 {
+        year += 1;
+    } else {};
+    require_calendar_year(year)?;
+    Result::Ok(CivilDate { year, month: month.to_int(), day: day.to_int() })
+}
+
+fn truncated_float_to_int64(value: float64) -> int64 {
+    let negative = value < 0.0;
+    let mut remaining = if negative {
+        -value
+    } else {
+        value
+    };
+    let mut place = 4503599627370496.0;
+    let mut bit: int64 = 4503599627370496;
+    let mut result: int64 = 0;
+    while bit != 0 {
+        if remaining >= place {
+            result += bit;
+            remaining -= place;
+        } else {};
+        place /= 2.0;
+        bit /= 2;
+    }
+    if negative {
+        -result
+    } else {
+        result
+    }
+}
+
+pub fn time_clip(value: float64) -> Result[int64, DateError] {
+    if !math::is_finite(value) {
+        Result::Err(date_error(DateErrorKind::NonFiniteTime))
+    } else if value < -8640000000000000.0 || value > 8640000000000000.0 {
+        Result::Err(date_error(DateErrorKind::TimeOutOfRange))
+    } else {
+        Result::Ok(truncated_float_to_int64(math::trunc(value)))
+    }
+}
+
+fn date_nan() -> float64 {
+    num::parse_float64("NaN").unwrap_or(0.0)
+}
+
+fn int64_float(value: int64) -> float64 {
+    num::parse_float64(value.to_string()).unwrap_or(date_nan())
+}
+
+pub fn make_date_from_float_components(values: Vec[float64]) -> float64 {
+    if values.len() < 7 {
+        return date_nan()
+    } else {};
+    let fields: Vec[float64] = Vec::with_capacity(7);
+    let mut index = 0;
+    while index < 7 {
+        if !math::is_finite(values[index]) {
+            return date_nan()
+        } else {};
+        fields.push(math::trunc(values[index]));
+        index += 1;
+    }
+    if fields[0] >= 0.0 && fields[0] < 100.0 {
+        fields[0] += 1900.0;
+    } else {};
+    let normalized_year = fields[0] + math::floor(fields[1] / 12.0);
+    let normalized_month = fields[1] - math::floor(fields[1] / 12.0) * 12.0;
+    if normalized_year < -271821.0 || normalized_year > 275760.0 {
+        return date_nan()
+    } else {};
+    let year = truncated_float_to_int64(normalized_year);
+    let month = truncated_float_to_int64(normalized_month) + 1;
+    let first_day = days_from_civil_unchecked(year, month, 1);
+    let day = int64_float(first_day) + fields[2] - 1.0;
+    let mut time = fields[3] * 3600000.0;
+    let minute_part = fields[4] * 60000.0;
+    time += minute_part;
+    let second_part = fields[5] * 1000.0;
+    time += second_part;
+    time += fields[6];
+    let day_part = day * 86400000.0;
+    let timestamp = day_part + time;
+    match time_clip(timestamp) {
+        Ok(value) => int64_float(value),
+        Err(_) => date_nan(),
+    }
+}
+
+fn clip_integer(value: int64) -> Result[int64, DateError] {
+    if value < -MAX_TIME_MILLISECONDS || value > MAX_TIME_MILLISECONDS {
+        Result::Err(date_error(DateErrorKind::TimeOutOfRange))
+    } else {
+        Result::Ok(value)
+    }
+}
+
+pub fn make_time(hour: int64, minute: int64, second: int64, millisecond: int64) -> Result[
+    int64,
+    DateError,
+] {
+    let hour_part = match checked_multiply_positive(hour, MILLISECONDS_PER_HOUR) {
+        Some(value) => value,
+        None => return Result::Err(date_error(DateErrorKind::ArithmeticOverflow)),
+    };
+    let minute_part = match checked_multiply_positive(minute, MILLISECONDS_PER_MINUTE) {
+        Some(value) => value,
+        None => return Result::Err(date_error(DateErrorKind::ArithmeticOverflow)),
+    };
+    let second_part = match checked_multiply_positive(second, MILLISECONDS_PER_SECOND) {
+        Some(value) => value,
+        None => return Result::Err(date_error(DateErrorKind::ArithmeticOverflow)),
+    };
+    let hour_and_minute = match checked_add(hour_part, minute_part) {
+        Some(value) => value,
+        None => return Result::Err(date_error(DateErrorKind::ArithmeticOverflow)),
+    };
+    let with_seconds = match checked_add(hour_and_minute, second_part) {
+        Some(value) => value,
+        None => return Result::Err(date_error(DateErrorKind::ArithmeticOverflow)),
+    };
+    match checked_add(with_seconds, millisecond) {
+        Some(value) => Result::Ok(value),
+        None => Result::Err(date_error(DateErrorKind::ArithmeticOverflow)),
+    }
+}
+
+pub fn make_day(year: int64, month: int64, date: int64) -> Result[int64, DateError] {
+    let year_offset = floor_div(month, 12);
+    let normalized_year = match checked_add(year, year_offset) {
+        Some(value) => value,
+        None => return Result::Err(date_error(DateErrorKind::ArithmeticOverflow)),
+    };
+    require_calendar_year(normalized_year)?;
+    let normalized_month = floor_mod(month, 12) + 1;
+    let first_day = days_from_civil_unchecked(normalized_year, normalized_month, 1);
+    let date_offset = match checked_subtract(date, 1) {
+        Some(value) => value,
+        None => return Result::Err(date_error(DateErrorKind::ArithmeticOverflow)),
+    };
+    match checked_add(first_day, date_offset) {
+        Some(value) => Result::Ok(value),
+        None => Result::Err(date_error(DateErrorKind::ArithmeticOverflow)),
+    }
+}
+
+pub fn make_date(day: int64, time: int64) -> Result[int64, DateError] {
+    let day_part = match checked_multiply_positive(day, MILLISECONDS_PER_DAY) {
+        Some(value) => value,
+        None => return Result::Err(date_error(DateErrorKind::ArithmeticOverflow)),
+    };
+    match checked_add(day_part, time) {
+        Some(value) => Result::Ok(value),
+        None => Result::Err(date_error(DateErrorKind::ArithmeticOverflow)),
+    }
+}
+
+fn valid_components(value: DateComponents) -> Result[unit, DateError] {
+    let month_length = days_in_month(value.year, value.month)?;
+    if value.day < 1 || value.day > month_length || value.hour < 0 || value.hour > 23
+        || value.minute < 0
+        || value.minute > 59
+        || value.second < 0
+        || value.second > 59
+        || value.millisecond < 0
+        || value.millisecond > 999 {
+        Result::Err(date_error(DateErrorKind::InvalidDate))
+    } else {
+        Result::Ok(())
+    }
+}
+
+pub fn utc_from_components(value: DateComponents) -> Result[int64, DateError] {
+    valid_components(value)?;
+    let day = days_from_civil(value.year, value.month, value.day)?;
+    let time = make_time(
+        value.hour.to_int64(),
+        value.minute.to_int64(),
+        value.second.to_int64(),
+        value.millisecond.to_int64(),
+    )?;
+    clip_integer(make_date(day, time)?)
+}
+
+pub fn civil_from_utc(value: int64) -> Result[CivilFields, DateError] {
+    let clipped = clip_integer(value)?;
+    let days = floor_div(clipped, MILLISECONDS_PER_DAY);
+    let within_day = clipped - days * MILLISECONDS_PER_DAY;
+    let date = civil_from_days(days)?;
+    let hour = within_day / MILLISECONDS_PER_HOUR;
+    let after_hour = within_day % MILLISECONDS_PER_HOUR;
+    let minute = after_hour / MILLISECONDS_PER_MINUTE;
+    let after_minute = after_hour % MILLISECONDS_PER_MINUTE;
+    let second = after_minute / MILLISECONDS_PER_SECOND;
+    let millisecond = after_minute % MILLISECONDS_PER_SECOND;
+    let weekday = floor_mod(days + 4, 7);
+    let year_start = days_from_civil_unchecked(date.year, 1, 1);
+    Result::Ok(
+        CivilFields {
+            year: date.year,
+            month: date.month,
+            day: date.day,
+            hour: hour.to_int(),
+            minute: minute.to_int(),
+            second: second.to_int(),
+            millisecond: millisecond.to_int(),
+            weekday: weekday.to_int(),
+            yearday: (days - year_start).to_int(),
+        },
+    )
+}
+
+fn at_end(parser: IsoParser) -> bool {
+    parser.index.get() >= parser.value.byte_len()
+}
+
+fn current(parser: IsoParser) -> Option[byte] {
+    if at_end(parser) {
+        Option::None
+    } else {
+        Option::Some(parser.value.byte_get(parser.index.get()))
+    }
+}
+
+fn consume(parser: IsoParser, expected: byte) -> bool {
+    match current(parser) {
+        Some(value) => if value == expected {
+            parser.index.set(parser.index.get() + 1);
+            true
+        } else {
+            false
+        },
+        None => false,
+    }
+}
+
+fn is_digit(value: byte) -> bool {
+    value >= b'0' && value <= b'9'
+}
+
+fn parse_digits(parser: IsoParser, count: int) -> Result[int64, DateError] {
+    let start = parser.index.get();
+    let mut value: int64 = 0;
+    let mut consumed = 0;
+    while consumed < count {
+        let digit = match current(parser) {
+            Some(value) => value,
+            None => return Result::Err(syntax_error(parser.index.get())),
+        };
+        if !is_digit(digit) {
+            return Result::Err(syntax_error(parser.index.get()))
+        } else {};
+        value = value * 10 + (digit - b'0').to_int64();
+        parser.index.set(parser.index.get() + 1);
+        consumed += 1;
+    }
+    if parser.index.get() != start + count {
+        Result::Err(syntax_error(start))
+    } else {
+        Result::Ok(value)
+    }
+}
+
+fn validate_ascii(value: string) -> Result[unit, DateError] {
+    let mut index = 0;
+    while index < value.byte_len() {
+        if value.byte_get(index) > 127 {
+            return Result::Err(DateError { kind: DateErrorKind::NonAsciiInput, offset: index })
+        } else {};
+        index += 1;
+    }
+    Result::Ok(())
+}
+
+fn parse_fraction(parser: IsoParser) -> Result[int, DateError] {
+    let start = parser.index.get();
+    let mut digits = 0;
+    let mut milliseconds = 0;
+    while digits < 9 {
+        let digit = match current(parser) {
+            Some(value) => value,
+            None => break,
+        };
+        if !is_digit(digit) {
+            break
+        } else {};
+        if digits < 3 {
+            let multiplier = if digits == 0 {
+                100
+            } else if digits == 1 {
+                10
+            } else {
+                1
+            };
+            milliseconds += (digit - b'0').to_int() * multiplier;
+        } else {};
+        parser.index.set(parser.index.get() + 1);
+        digits += 1;
+    }
+    if digits == 0 {
+        Result::Err(syntax_error(start))
+    } else if match current(parser) {
+        Some(value) => is_digit(value),
+        None => false,
+    } {
+        Result::Err(syntax_error(parser.index.get()))
+    } else {
+        Result::Ok(milliseconds)
+    }
+}
+
+fn parse_time_zone(parser: IsoParser) -> Result[IsoTimeZone, DateError] {
+    if consume(parser, b'Z') {
+        return Result::Ok(IsoTimeZone::Utc)
+    } else {};
+    let sign = match current(parser) {
+        Some(value) => if value == b'+' {
+            1
+        } else if value == b'-' {
+            -1
+        } else {
+            return Result::Err(syntax_error(parser.index.get()))
+        },
+        None => return Result::Err(syntax_error(parser.index.get())),
+    };
+    parser.index.set(parser.index.get() + 1);
+    let hour = parse_digits(parser, 2)?.to_int();
+    let minute = if consume(parser, b':') {
+        parse_digits(parser, 2)?.to_int()
+    } else {
+        parse_digits(parser, 2)?.to_int()
+    };
+    if hour > 23 || minute > 59 {
+        Result::Err(syntax_error(parser.index.get()))
+    } else {
+        Result::Ok(IsoTimeZone::Offset(sign * (hour * 60 + minute)))
+    }
+}
+
+pub fn parse_iso(value: string) -> Result[ParsedIsoDate, DateError] {
+    validate_ascii(value)?;
+    let parser = IsoParser { value, index: Ref::new(0) };
+    if at_end(parser) {
+        return Result::Err(syntax_error(0))
+    } else {};
+    let mut negative_year = false;
+    let year_digits = match current(parser) {
+        Some(value) => if value == b'+' || value == b'-' {
+            negative_year = value == b'-';
+            parser.index.set(parser.index.get() + 1);
+            6
+        } else {
+            4
+        },
+        None => return Result::Err(syntax_error(0)),
+    };
+    let year_magnitude = parse_digits(parser, year_digits)?;
+    if negative_year && year_magnitude == 0 {
+        return Result::Err(syntax_error(0))
+    } else {};
+    let year = if negative_year {
+        -year_magnitude
+    } else {
+        year_magnitude
+    };
+    let mut month = 1;
+    let mut day = 1;
+    if consume(parser, b'-') {
+        month = parse_digits(parser, 2)?.to_int();
+        if month < 1 || month > 12 {
+            return Result::Err(syntax_error(parser.index.get() - 2))
+        } else {};
+        if consume(parser, b'-') {
+            day = parse_digits(parser, 2)?.to_int();
+            if day < 1 || day > 31 {
+                return Result::Err(syntax_error(parser.index.get() - 2))
+            } else {};
+        } else {};
+    } else {};
+    let has_time = consume(parser, b'T');
+    let mut hour = 0;
+    let mut minute = 0;
+    let mut second = 0;
+    let mut millisecond = 0;
+    if has_time {
+        hour = parse_digits(parser, 2)?.to_int();
+        if !consume(parser, b':') {
+            return Result::Err(syntax_error(parser.index.get()))
+        } else {};
+        minute = parse_digits(parser, 2)?.to_int();
+        if consume(parser, b':') {
+            second = parse_digits(parser, 2)?.to_int();
+            if consume(parser, b'.') || consume(parser, b',') {
+                millisecond = parse_fraction(parser)?;
+            } else {};
+        } else {};
+        if hour > 24 || minute > 59 || second > 59
+            || hour == 24 && (minute != 0 || second != 0 || millisecond != 0) {
+            return Result::Err(syntax_error(parser.index.get()))
+        } else {};
+    } else {};
+    let time_zone = if at_end(parser) {
+        if has_time {
+            IsoTimeZone::Local
+        } else {
+            IsoTimeZone::Utc
+        }
+    } else if has_time {
+        parse_time_zone(parser)?
+    } else {
+        return Result::Err(syntax_error(parser.index.get()))
+    };
+    if !at_end(parser) {
+        return Result::Err(syntax_error(parser.index.get()))
+    } else {};
+    Result::Ok(
+        ParsedIsoDate {
+            components: DateComponents { year, month, day, hour, minute, second, millisecond },
+            time_zone,
+            date_only: !has_time,
+        },
+    )
+}
+
+pub fn parsed_iso_to_utc(value: ParsedIsoDate) -> Result[int64, DateError] {
+    let components = value.components;
+    let day = make_day(
+        components.year,
+        (components.month - 1).to_int64(),
+        components.day.to_int64(),
+    )?;
+    let time = make_time(
+        components.hour.to_int64(),
+        components.minute.to_int64(),
+        components.second.to_int64(),
+        components.millisecond.to_int64(),
+    )?;
+    let unadjusted = make_date(day, time)?;
+    let adjusted = match value.time_zone {
+        IsoTimeZone::Utc => unadjusted,
+        IsoTimeZone::Offset(minutes) => {
+            let offset = match checked_multiply_positive(
+                minutes.to_int64(),
+                MILLISECONDS_PER_MINUTE,
+            ) {
+                Some(value) => value,
+                None => return Result::Err(date_error(DateErrorKind::ArithmeticOverflow)),
+            };
+            match checked_subtract(unadjusted, offset) {
+                Some(value) => value,
+                None => return Result::Err(date_error(DateErrorKind::ArithmeticOverflow)),
+            }
+        },
+        IsoTimeZone::Local => {
+            return Result::Err(date_error(DateErrorKind::LocalTimeRequiresOffset))
+        },
+    };
+    clip_integer(adjusted)
+}
+
+pub fn parse_iso_timestamp(value: string) -> Result[int64, DateError] {
+    parsed_iso_to_utc(parse_iso(value)?)
+}
+
+fn legacy_skip_space(value: string, index: Ref[int]) -> bool {
+    if index.get() < value.byte_len() && value.byte_get(index.get()) == b' ' {
+        index.set(index.get() + 1);
+        true
+    } else {
+        false
+    }
+}
+
+fn legacy_month(value: string, index: Ref[int]) -> Option[int] {
+    if index.get() + 3 > value.byte_len() {
+        return Option::None
+    } else {};
+    let start = index.get();
+    let month = match (value.byte_get(start), value.byte_get(start + 1), value.byte_get(start + 2)) {
+        (b'J', b'a', b'n') => 1,
+        (b'F', b'e', b'b') => 2,
+        (b'M', b'a', b'r') => 3,
+        (b'A', b'p', b'r') => 4,
+        (b'M', b'a', b'y') => 5,
+        (b'J', b'u', b'n') => 6,
+        (b'J', b'u', b'l') => 7,
+        (b'A', b'u', b'g') => 8,
+        (b'S', b'e', b'p') => 9,
+        (b'O', b'c', b't') => 10,
+        (b'N', b'o', b'v') => 11,
+        (b'D', b'e', b'c') => 12,
+        _ => return Option::None,
+    };
+    index.set(start + 3);
+    Option::Some(month)
+}
+
+fn legacy_number(value: string, index: Ref[int], minimum: int, maximum: int) -> Option[int] {
+    let start = index.get();
+    let mut result = 0;
+    let mut count = 0;
+    while index.get() < value.byte_len() && count < maximum {
+        let current = value.byte_get(index.get());
+        if !is_digit(current) {
+            break
+        } else {};
+        result = result * 10 + (current - b'0').to_int();
+        index.set(index.get() + 1);
+        count += 1;
+    }
+    if count < minimum {
+        index.set(start);
+        Option::None
+    } else {
+        Option::Some(result)
+    }
+}
+
+fn legacy_consume_byte(value: string, index: Ref[int], expected: byte) -> bool {
+    if index.get() < value.byte_len() && value.byte_get(index.get()) == expected {
+        index.set(index.get() + 1);
+        true
+    } else {
+        false
+    }
+}
+
+fn parse_legacy_timestamp(value: string) -> Result[int64, DateError] {
+    validate_ascii(value)?;
+    let index = Ref::new(0);
+    let first_month = legacy_month(value, index);
+    let month = match first_month {
+        Some(value) => value,
+        None => {
+            index.set(0);
+            if value.byte_len() < 4 || value.byte_get(3) != b' ' {
+                return Result::Err(syntax_error(0))
+            } else {};
+            index.set(4);
+            match legacy_month(value, index) {
+                Some(value) => value,
+                None => return Result::Err(syntax_error(index.get())),
+            }
+        },
+    };
+    if !legacy_skip_space(value, index) {
+        return Result::Err(syntax_error(index.get()))
+    } else {};
+    let day = match legacy_number(value, index, 1, 2) {
+        Some(value) => value,
+        None => return Result::Err(syntax_error(index.get())),
+    };
+    if !legacy_skip_space(value, index) {
+        return Result::Err(syntax_error(index.get()))
+    } else {};
+    let year = match legacy_number(value, index, 4, 6) {
+        Some(value) => value,
+        None => return Result::Err(syntax_error(index.get())),
+    };
+    let mut hour = 0;
+    let mut minute = 0;
+    let mut second = 0;
+    let mut offset_minutes = 0;
+    if index.get() < value.byte_len() {
+        if !legacy_skip_space(value, index) {
+            return Result::Err(syntax_error(index.get()))
+        } else {};
+        hour = match legacy_number(value, index, 2, 2) {
+            Some(value) => value,
+            None => return Result::Err(syntax_error(index.get())),
+        };
+        if !legacy_consume_byte(value, index, b':') {
+            return Result::Err(syntax_error(index.get()))
+        } else {};
+        minute = match legacy_number(value, index, 2, 2) {
+            Some(value) => value,
+            None => return Result::Err(syntax_error(index.get())),
+        };
+        if legacy_consume_byte(value, index, b':') {
+            second = match legacy_number(value, index, 2, 2) {
+                Some(value) => value,
+                None => return Result::Err(syntax_error(index.get())),
+            };
+        } else {};
+        if index.get() < value.byte_len() {
+            if !legacy_skip_space(value, index) || index.get() + 8 != value.byte_len()
+                || value.byte_get(index.get()) != b'G'
+                || value.byte_get(index.get() + 1) != b'M'
+                || value.byte_get(index.get() + 2) != b'T' {
+                return Result::Err(syntax_error(index.get()))
+            } else {};
+            index.set(index.get() + 3);
+            let sign = if legacy_consume_byte(value, index, b'+') {
+                1
+            } else if legacy_consume_byte(value, index, b'-') {
+                -1
+            } else {
+                return Result::Err(syntax_error(index.get()))
+            };
+            let offset_hour = match legacy_number(value, index, 2, 2) {
+                Some(value) => value,
+                None => return Result::Err(syntax_error(index.get())),
+            };
+            let offset_minute = match legacy_number(value, index, 2, 2) {
+                Some(value) => value,
+                None => return Result::Err(syntax_error(index.get())),
+            };
+            if offset_hour > 23 || offset_minute > 59 {
+                return Result::Err(syntax_error(index.get()))
+            } else {};
+            offset_minutes = sign * (offset_hour * 60 + offset_minute);
+        } else {}
+    } else {};
+    if index.get() != value.byte_len() || day < 1 || day > 31 || hour > 23 || minute > 59
+        || second > 59 {
+        return Result::Err(syntax_error(index.get()))
+    } else {};
+    let timestamp = utc_from_components(
+        DateComponents { year: year.to_int64(), month, day, hour, minute, second, millisecond: 0 },
+    )?;
+    let offset = offset_minutes.to_int64() * MILLISECONDS_PER_MINUTE;
+    clip_integer(
+        match checked_subtract(timestamp, offset) {
+            Some(value) => value,
+            None => return Result::Err(date_error(DateErrorKind::ArithmeticOverflow)),
+        },
+    )
+}
+
+pub fn parse_timestamp(value: string) -> Result[int64, DateError] {
+    match parse_iso(value) {
+        Ok(parsed) => {
+            let normalized = match parsed.time_zone {
+                IsoTimeZone::Local => ParsedIsoDate {
+                    components: parsed.components,
+                    time_zone: IsoTimeZone::Utc,
+                    date_only: parsed.date_only,
+                },
+                _ => parsed,
+            };
+            parsed_iso_to_utc(normalized)
+        },
+        Err(_) => parse_legacy_timestamp(value),
+    }
+}
+
+fn pad_unsigned(value: int64, width: int) -> string {
+    let digits = value.to_string();
+    let mut result = "";
+    let mut remaining = width - digits.byte_len();
+    while remaining > 0 {
+        result += "0";
+        remaining -= 1;
+    }
+    result + digits
+}
+
+fn format_year(year: int64) -> string {
+    if year >= 0 && year <= 9999 {
+        pad_unsigned(year, 4)
+    } else if year < 0 {
+        "-" + pad_unsigned(-year, 6)
+    } else {
+        "+" + pad_unsigned(year, 6)
+    }
+}
+
+pub fn to_iso_string(value: int64) -> Result[string, DateError] {
+    let fields = civil_from_utc(value)?;
+    Result::Ok(
+        format_year(fields.year) + "-" + pad_unsigned(fields.month.to_int64(), 2) + "-"
+            + pad_unsigned(fields.day.to_int64(), 2)
+            + "T"
+            + pad_unsigned(fields.hour.to_int64(), 2)
+            + ":"
+            + pad_unsigned(fields.minute.to_int64(), 2)
+            + ":"
+            + pad_unsigned(fields.second.to_int64(), 2)
+            + "."
+            + pad_unsigned(fields.millisecond.to_int64(), 3)
+            + "Z",
+    )
+}

@@ -1,0 +1,114 @@
+package main;
+
+use gomlang::quickjs::test262;
+use std::env;
+use std::io;
+use std::process;
+
+const HELP: string = "Usage: run-test262 [--harness DIR] FILE...";
+
+#[derive(PartialEq, Eq)]
+struct Command {
+    harness_directory: string,
+    files: Vec[string],
+    help: bool,
+}
+
+fn parse_command(arguments: Vec[string]) -> Result[Command, string] {
+    let mut harness_directory = "test262/harness";
+    let files: Vec[string] = Vec::[];
+    let mut help = false;
+    let mut index = 1;
+    while index < arguments.len() {
+        let argument = arguments[index];
+        if argument == "-h" || argument == "--help" {
+            help = true;
+            index += 1;
+        } else if argument == "--harness" {
+            if index + 1 >= arguments.len() {
+                return Result::Err("--harness requires a directory")
+            } else {};
+            harness_directory = arguments[index + 1];
+            index += 2;
+        } else if argument.starts_with("-") {
+            return Result::Err("unknown option: " + argument)
+        } else {
+            files.push(argument);
+            index += 1;
+        }
+    }
+    if help {
+        if files.is_empty() {
+            Result::Ok(Command { harness_directory, files, help })
+        } else {
+            Result::Err("help does not accept test files")
+        }
+    } else if files.is_empty() {
+        Result::Err("at least one test file is required")
+    } else {
+        Result::Ok(Command { harness_directory, files, help })
+    }
+}
+
+fn variant_name(value: test262::SourceVariant) -> string {
+    match value {
+        test262::SourceVariant::Sloppy => "sloppy",
+        test262::SourceVariant::Strict => "strict",
+        test262::SourceVariant::Module => "module",
+        test262::SourceVariant::Raw => "raw",
+    }
+}
+
+fn display_result(file: string, value: test262::RunResult) -> int {
+    let prefix = file + " [" + variant_name(value.variant) + "] ";
+    match value.status {
+        test262::RunStatus::Passed => {
+            io::println(prefix + "PASS");
+            0
+        },
+        test262::RunStatus::Skipped => {
+            io::println(prefix + "SKIP " + value.message);
+            0
+        },
+        test262::RunStatus::Failed => {
+            io::eprintln(prefix + "FAIL " + value.message);
+            1
+        },
+    }
+}
+
+fn execute(command: Command) -> int {
+    if command.help {
+        io::println(HELP);
+        return 0
+    } else {};
+    let mut failed = 0;
+    for file in command.files {
+        match test262::run_file(file, command.harness_directory) {
+            Ok(results) => for result in results {
+                failed += display_result(file, result);
+            },
+            Err(message) => {
+                io::eprintln(file + " FAIL " + message);
+                failed += 1;
+            },
+        }
+    }
+    failed
+}
+
+fn main() -> unit {
+    match parse_command(env::args()) {
+        Ok(command) => process::exit(
+            if execute(command) == 0 {
+                0
+            } else {
+                1
+            },
+        ),
+        Err(message) => {
+            io::eprintln("run-test262: " + message);
+            process::exit(2)
+        },
+    }
+}

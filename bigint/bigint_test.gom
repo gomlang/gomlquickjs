@@ -1,0 +1,286 @@
+package bigint;
+
+use std::testing;
+
+fn expect_parse(value: string) -> BigInteger {
+    match parse(value) {
+        Ok(value) => value,
+        Err(value) => {
+            testing::fail(value.to_string());
+            BigInteger::zero()
+        },
+    }
+}
+
+fn expect_parse_radix(value: string, radix: int) -> BigInteger {
+    match parse_radix(value, radix) {
+        Ok(value) => value,
+        Err(value) => {
+            testing::fail(value.to_string());
+            BigInteger::zero()
+        },
+    }
+}
+
+fn expect_radix(value: BigInteger, radix: int) -> string {
+    match value.to_string_radix(radix) {
+        Ok(value) => value,
+        Err(value) => {
+            testing::fail(value.to_string());
+            ""
+        },
+    }
+}
+
+fn expect_div_rem(left: BigInteger, right: BigInteger) -> (BigInteger, BigInteger) {
+    match left.div_rem(right) {
+        Ok(value) => value,
+        Err(value) => {
+            testing::fail(value.to_string());
+            (BigInteger::zero(), BigInteger::zero())
+        },
+    }
+}
+
+fn expect_pow(value: BigInteger, exponent: int) -> BigInteger {
+    match value.pow(exponent) {
+        Ok(value) => value,
+        Err(value) => {
+            testing::fail(value.to_string());
+            BigInteger::zero()
+        },
+    }
+}
+
+fn expect_left(value: BigInteger, count: int) -> BigInteger {
+    match value.shift_left(count) {
+        Ok(value) => value,
+        Err(value) => {
+            testing::fail(value.to_string());
+            BigInteger::zero()
+        },
+    }
+}
+
+fn expect_right(value: BigInteger, count: int) -> BigInteger {
+    match value.shift_right(count) {
+        Ok(value) => value,
+        Err(value) => {
+            testing::fail(value.to_string());
+            BigInteger::zero()
+        },
+    }
+}
+
+fn assert_text(value: BigInteger, expected: string) -> unit {
+    testing::assert_eq(value.to_string(), expected)
+}
+
+#[test]
+fn normalizes_parts_and_eliminates_negative_zero() -> unit {
+    let empty = BigInteger::from_parts(true, Vec::[]);
+    testing::assert(empty.is_zero());
+    testing::assert(!empty.is_negative());
+    testing::assert(empty.limbs() == Vec::[0]);
+    let padded_zero = BigInteger::from_parts(true, Vec::[0, 0, 0]);
+    testing::assert(padded_zero == empty);
+    testing::assert_eq(padded_zero.limb_count(), 1);
+    let normalized = BigInteger::from_parts(false, Vec::[0xffffffff, 0, 0]);
+    testing::assert(normalized.limbs() == Vec::[0xffffffff]);
+    testing::assert_eq(normalized.bit_length(), 32);
+    testing::assert_eq(BigInteger::zero().negate().signum(), 0);
+    assert_text(BigInteger::from_int64(-9223372036854775807 - 1), "-9223372036854775808");
+    assert_text(BigInteger::from_uint64(18446744073709551615), "18446744073709551615")
+}
+
+#[test]
+fn parses_and_formats_every_supported_radix() -> unit {
+    let decimal = "1234567890123456789012345678901234567890";
+    let value = expect_parse(decimal);
+    let representations = [
+        (
+            2,
+            "1110100000110010010010000001110101110000001101101111110011101110001010110010111100010111111001011011001110001111110000101011010010",
+        ),
+        (3, "2210011122111220012120110020120111120221212221200121202121212000000012210200101200"),
+        (7, "14352166440243125300325633660135465425653514463"),
+        (10, decimal),
+        (16, "3a0c92075c0dbf3b8acbc5f96ce3f0ad2"),
+        (36, "1izibjf4zvdbmvq66d6wm8g1ci"),
+    ];
+    for entry in representations {
+        testing::assert_eq(expect_radix(value, entry.0), entry.1);
+        testing::assert(expect_parse_radix(entry.1, entry.0) == value);
+        testing::assert(expect_parse_radix("-" + entry.1, entry.0) == value.negate())
+    }
+    testing::assert(expect_parse("-000000") == BigInteger::zero());
+    testing::assert(expect_parse_radix("+Z", 36) == BigInteger::from_int64(35))
+}
+
+#[test]
+fn reports_structured_parse_and_operation_errors() -> unit {
+    match parse_radix("1", 1) {
+        Err(BigIntError::InvalidRadix(value)) => testing::assert_eq(value, 1),
+        _ => testing::fail("expected invalid radix"),
+    };
+    match parse_radix("1", 37) {
+        Err(BigIntError::InvalidRadix(value)) => testing::assert_eq(value, 37),
+        _ => testing::fail("expected invalid radix"),
+    };
+    match parse("-") {
+        Err(BigIntError::EmptyInput) => (),
+        _ => testing::fail("expected empty input"),
+    };
+    match parse_radix("10z", 10) {
+        Err(BigIntError::InvalidDigit { offset, value, radix }) => {
+            testing::assert_eq(offset, 2);
+            testing::assert_eq(value, b'z');
+            testing::assert_eq(radix, 10)
+        },
+        _ => testing::fail("expected invalid digit"),
+    };
+    testing::assert(expect_parse("1").div_rem(BigInteger::zero()).is_err());
+    match expect_parse("2").pow(-1) {
+        Err(BigIntError::NegativeExponent(value)) => testing::assert_eq(value, -1),
+        _ => testing::fail("expected negative exponent"),
+    };
+    testing::assert(expect_parse("1").shift_left(100000001).is_err());
+    testing::assert(expect_parse("1").shift_right(-100000001).is_err());
+    testing::assert(expect_parse("1").to_string_radix(0).is_err())
+}
+
+#[test]
+fn matches_native_small_integer_arithmetic_oracle() -> unit {
+    let mut left = -32;
+    while left <= 32 {
+        let left_big = BigInteger::from_int64(left.to_int64());
+        let mut right = -32;
+        while right <= 32 {
+            let right_big = BigInteger::from_int64(right.to_int64());
+            assert_text(left_big.add(right_big), (left + right).to_string());
+            assert_text(left_big.subtract(right_big), (left - right).to_string());
+            assert_text(left_big.multiply(right_big), (left * right).to_string());
+            let expected_compare = if left < right {
+                -1
+            } else if left > right {
+                1
+            } else {
+                0
+            };
+            testing::assert_eq(left_big.compare(right_big), expected_compare);
+            if right != 0 {
+                let (quotient, remainder) = expect_div_rem(left_big, right_big);
+                assert_text(quotient, (left / right).to_string());
+                assert_text(remainder, (left % right).to_string());
+                testing::assert(quotient.multiply(right_big).add(remainder) == left_big)
+            } else {};
+            right += 1;
+        }
+        left += 1;
+    }
+}
+
+#[test]
+fn matches_native_small_integer_bitwise_oracle() -> unit {
+    let mut left = -32;
+    while left <= 32 {
+        let left_big = BigInteger::from_int64(left.to_int64());
+        assert_text(left_big.bit_not(), (~left).to_string());
+        let mut right = -32;
+        while right <= 32 {
+            let right_big = BigInteger::from_int64(right.to_int64());
+            assert_text(left_big.bit_and(right_big), (left & right).to_string());
+            assert_text(left_big.bit_or(right_big), (left | right).to_string());
+            assert_text(left_big.bit_xor(right_big), (left ^ right).to_string());
+            right += 1;
+        }
+        let mut shift = 0;
+        while shift <= 8 {
+            assert_text(expect_left(left_big, shift), (left << shift).to_string());
+            assert_text(expect_right(left_big, shift), (left >> shift).to_string());
+            shift += 1;
+        }
+        left += 1;
+    }
+}
+
+#[test]
+fn performs_large_arithmetic_with_division_identities() -> unit {
+    let left = expect_parse("1234567890123456789012345678901234567890");
+    let right = expect_parse("98765432109876543210987654321");
+    assert_text(left.add(right), "1234567890222222221122222222112222222211");
+    assert_text(left.subtract(right), "1234567890024691356902469135690246913569");
+    let product = left.multiply(right);
+    assert_text(product, "121932631137021795226185032733744855963362292333223746380111126352690");
+    let (quotient, remainder) = expect_div_rem(left, right);
+    assert_text(quotient, "12499999886");
+    assert_text(remainder, "9259259400925925941327160484");
+    testing::assert(quotient.multiply(right).add(remainder) == left);
+    let (recovered, zero) = expect_div_rem(product, right);
+    testing::assert(recovered == left);
+    testing::assert(zero.is_zero());
+    let negative = left.negate();
+    let (negative_quotient, negative_remainder) = expect_div_rem(negative, right);
+    testing::assert(negative_quotient == quotient.negate());
+    testing::assert(negative_remainder == remainder.negate());
+    let maximum_limb_product = BigInteger::from_uint64(18446744073709551615).multiply(
+        BigInteger::from_uint64(18446744073709551615),
+    );
+    assert_text(maximum_limb_product, "340282366920938463426481119284349108225");
+    testing::assert_eq(expect_radix(maximum_limb_product, 16), "fffffffffffffffe0000000000000001");
+    let all_96_bits = BigInteger::from_parts(false, Vec::[0xffffffff, 0xffffffff, 0xffffffff]);
+    testing::assert_eq(
+        expect_radix(all_96_bits.multiply(all_96_bits), 16),
+        "fffffffffffffffffffffffe000000000000000000000001",
+    )
+}
+
+#[test]
+fn raises_large_powers_by_squaring() -> unit {
+    testing::assert(expect_pow(BigInteger::zero(), 0) == BigInteger::one());
+    assert_text(expect_pow(BigInteger::from_int64(-2), 11), "-2048");
+    testing::assert_eq(
+        expect_radix(expect_pow(BigInteger::from_int64(2), 256), 16),
+        "10000000000000000000000000000000000000000000000000000000000000000",
+    );
+    let base = expect_parse("12345678901234567890");
+    let square = expect_pow(base, 2);
+    testing::assert(square == base.multiply(base));
+    testing::assert(expect_pow(base, 5) == expect_pow(base, 2).multiply(expect_pow(base, 3)))
+}
+
+#[test]
+fn implements_infinite_twos_complement_for_large_values() -> unit {
+    let left = expect_parse("1234567890123456789012345678901234567890");
+    let negative_right = expect_parse("-98765432109876543210987654321");
+    assert_text(left.bit_and(negative_right), "1234567890044227637149857450589001613890");
+    assert_text(left.bit_or(negative_right), "-19536280247388314898754700321");
+    assert_text(left.bit_xor(negative_right), "-1234567890063763917397245765487756314211");
+    assert_text(left.bit_not(), "-1234567890123456789012345678901234567891");
+    testing::assert(left.bit_and(BigInteger::from_int64(-1)) == left);
+    testing::assert(left.bit_or(BigInteger::zero()) == left);
+    testing::assert(left.bit_xor(left).is_zero());
+    testing::assert(left.bit_not() == left.negate().subtract(BigInteger::one()));
+    testing::assert(
+        left.bit_and(negative_right).bit_not() == left.bit_not().bit_or(negative_right.bit_not()),
+    )
+}
+
+#[test]
+fn implements_quickjs_arithmetic_shift_semantics() -> unit {
+    let left = expect_parse("1234567890123456789012345678901234567890");
+    assert_text(
+        expect_left(left, 97),
+        "195625090867187345416937199318854342011865871692101824685577160622080",
+    );
+    assert_text(expect_right(left.negate(), 73), "-130714959819599354");
+    assert_text(expect_right(BigInteger::from_int64(-5), 1), "-3");
+    assert_text(expect_right(BigInteger::from_int64(-1), 1000), "-1");
+    assert_text(expect_right(BigInteger::from_int64(5), 1000), "0");
+    assert_text(expect_left(BigInteger::from_int64(5), -3), "0");
+    assert_text(expect_right(BigInteger::from_int64(5), -3), "40");
+    assert_text(expect_left(BigInteger::from_int64(-5), -1), "-3");
+    assert_text(expect_right(BigInteger::from_int64(-5), -1), "-10");
+    testing::assert(expect_right(expect_left(left, 129), 129) == left);
+    testing::assert(expect_right(expect_left(left.negate(), 129), 129) == left.negate())
+}

@@ -1,0 +1,297 @@
+package builtins;
+
+use gomlang::quickjs::runtime;
+use gomlang::quickjs::bytecode;
+use gomlang::quickjs::vm;
+use std::math;
+use std::num;
+use std::testing;
+
+fn collection_property(heap: runtime::Heap, object: runtime::ObjectId, name: string) -> runtime::Value {
+    match runtime::get_property(heap, object, runtime::string_property_key(name)) {
+        Ok(Some(value)) => value,
+        _ => {
+            testing::fail("missing collection property " + name);
+            runtime::Value::Undefined
+        },
+    }
+}
+
+fn collection_invoke(
+    context: vm::Context,
+    callable: runtime::Value,
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+) -> runtime::Value {
+    let code = Vec::[bytecode::Instruction::GetLoc(0), bytecode::Instruction::GetLoc(1)];
+    let mut index = 0;
+    while index < arguments.len() {
+        code.push(bytecode::Instruction::GetLoc(index + 2));
+        index += 1;
+    }
+    code.push(bytecode::Instruction::CallMethod(arguments.len()));
+    code.push(bytecode::Instruction::Return);
+    let locals = Vec::[this_value, callable];
+    for argument in arguments {
+        locals.push(argument)
+    }
+    match context.execute_with_locals(bytecode::Function::new(Vec::[], code, locals.len()), locals) {
+        Ok(value) => value,
+        Err(value) => {
+            testing::fail(value.kind.debug());
+            runtime::Value::Undefined
+        },
+    }
+}
+
+fn collection_read(context: vm::Context, receiver: runtime::Value, name: string) -> runtime::Value {
+    match context.read_property_at_depth(receiver, runtime::Value::String(js_string(name)), 0) {
+        Ok(value) => value,
+        Err(value) => {
+            testing::fail(value.kind.debug());
+            runtime::Value::Undefined
+        },
+    }
+}
+
+fn construct_collection(context: vm::Context, constructor: runtime::Value) -> runtime::ObjectId {
+    match context.execute_with_locals(
+        bytecode::Function::new(
+            Vec::[],
+            Vec::[
+                bytecode::Instruction::GetLoc(0),
+                bytecode::Instruction::Construct(0),
+                bytecode::Instruction::Return,
+            ],
+            1,
+        ),
+        Vec::[constructor],
+    ) {
+        Ok(runtime::Value::Object(value)) => value,
+        _ => {
+            testing::fail("expected collection object");
+            match runtime::new_ordinary_object(context.heap(), Option::None) {
+                Ok(value) => value,
+                Err(value) => {
+                    testing::fail(value.message);
+                    construct_collection(context, constructor)
+                },
+            }
+        },
+    }
+}
+
+fn expect_collections(value: Result[CollectionInstall, BuiltinError]) -> CollectionInstall {
+    match value {
+        Ok(value) => value,
+        Err(value) => {
+            testing::fail(value.message);
+            expect_collections(install_collections(vm::Context::new(runtime::Heap::new())))
+        },
+    }
+}
+
+fn function_id(value: runtime::Value) -> runtime::ObjectId {
+    match value {
+        runtime::Value::Object(value) => value,
+        _ => {
+            testing::fail("expected function object");
+            function_id(value)
+        },
+    }
+}
+
+#[test]
+fn map_and_set_builtins_preserve_same_value_zero_and_order() -> unit {
+    let context = vm::Context::new(runtime::Heap::new());
+    let installed = expect_collections(install_collections(context));
+    let map = construct_collection(context, installed.map);
+    let map_prototype = match collection_property(
+        context.heap(),
+        function_id(installed.map),
+        "prototype",
+    ) {
+        runtime::Value::Object(value) => value,
+        _ => map,
+    };
+    let set = collection_property(context.heap(), map_prototype, "set");
+    let get = collection_property(context.heap(), map_prototype, "get");
+    let entries = collection_property(context.heap(), map_prototype, "entries");
+    let nan = num::parse_float64("NaN").unwrap_or(0.0);
+    let _ = collection_invoke(
+        context,
+        set,
+        runtime::Value::Object(map),
+        Vec::[runtime::Value::Float(nan), runtime::Value::Int(1)],
+    );
+    let _ = collection_invoke(
+        context,
+        set,
+        runtime::Value::Object(map),
+        Vec::[runtime::Value::Float(nan), runtime::Value::Int(2)],
+    );
+    testing::assert_eq(
+        expect_number(collection_read(context, runtime::Value::Object(map), "size")),
+        1.0,
+    );
+    testing::assert_eq(
+        expect_number(
+            collection_invoke(
+                context,
+                get,
+                runtime::Value::Object(map),
+                Vec::[runtime::Value::Float(nan)],
+            ),
+        ),
+        2.0,
+    );
+    let iterator = match collection_invoke(context, entries, runtime::Value::Object(map), Vec::[]) {
+        runtime::Value::Object(value) => value,
+        _ => map,
+    };
+    let next = collection_property(context.heap(), iterator, "next");
+    let result = match collection_invoke(context, next, runtime::Value::Object(iterator), Vec::[]) {
+        runtime::Value::Object(value) => value,
+        _ => map,
+    };
+    let pair = match collection_property(context.heap(), result, "value") {
+        runtime::Value::Object(value) => value,
+        _ => map,
+    };
+    testing::assert_eq(expect_number(collection_property(context.heap(), pair, "length")), 2.0);
+    let set_object = construct_collection(context, installed.set);
+    let set_prototype = match collection_property(
+        context.heap(),
+        function_id(installed.set),
+        "prototype",
+    ) {
+        runtime::Value::Object(value) => value,
+        _ => set_object,
+    };
+    let add = collection_property(context.heap(), set_prototype, "add");
+    let has = collection_property(context.heap(), set_prototype, "has");
+    let negative_zero = num::parse_float64("-0").unwrap_or(0.0);
+    let _ = collection_invoke(
+        context,
+        add,
+        runtime::Value::Object(set_object),
+        Vec::[runtime::Value::Float(negative_zero)],
+    );
+    match collection_invoke(
+        context,
+        has,
+        runtime::Value::Object(set_object),
+        Vec::[runtime::Value::Float(0.0)],
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected Set.has result"),
+    };
+    testing::assert(!math::is_nan(0.0))
+}
+
+#[test]
+fn weak_collections_accept_weak_keys_and_discard_stale_objects() -> unit {
+    let context = vm::Context::new(runtime::Heap::new());
+    let installed = expect_collections(install_collections(context));
+    let weak_map = construct_collection(context, installed.weak_map);
+    let weak_map_prototype = match collection_property(
+        context.heap(),
+        function_id(installed.weak_map),
+        "prototype",
+    ) {
+        runtime::Value::Object(value) => value,
+        _ => weak_map,
+    };
+    let set = collection_property(context.heap(), weak_map_prototype, "set");
+    let get = collection_property(context.heap(), weak_map_prototype, "get");
+    let has = collection_property(context.heap(), weak_map_prototype, "has");
+    let key = match runtime::new_ordinary_object(context.heap(), Option::None) {
+        Ok(value) => value,
+        Err(value) => {
+            testing::fail(value.message);
+            weak_map
+        },
+    };
+    let _ = collection_invoke(
+        context,
+        set,
+        runtime::Value::Object(weak_map),
+        Vec::[runtime::Value::Object(key), runtime::Value::Int(42)],
+    );
+    testing::assert_eq(
+        expect_number(
+            collection_invoke(
+                context,
+                get,
+                runtime::Value::Object(weak_map),
+                Vec::[runtime::Value::Object(key)],
+            ),
+        ),
+        42.0,
+    );
+    testing::assert(context.heap().free(key));
+    match collection_invoke(
+        context,
+        has,
+        runtime::Value::Object(weak_map),
+        Vec::[runtime::Value::Object(key)],
+    ) {
+        runtime::Value::Bool(value) => testing::assert(!value),
+        _ => testing::fail("expected WeakMap.has result"),
+    };
+    let weak_set = construct_collection(context, installed.weak_set);
+    let weak_set_prototype = match collection_property(
+        context.heap(),
+        function_id(installed.weak_set),
+        "prototype",
+    ) {
+        runtime::Value::Object(value) => value,
+        _ => weak_set,
+    };
+    let add = collection_property(context.heap(), weak_set_prototype, "add");
+    let has = collection_property(context.heap(), weak_set_prototype, "has");
+    let symbol = runtime::Value::Symbol(runtime::Symbol::new(301, Option::Some("weak")));
+    let _ = collection_invoke(context, add, runtime::Value::Object(weak_set), Vec::[symbol]);
+    match collection_invoke(context, has, runtime::Value::Object(weak_set), Vec::[symbol]) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected WeakSet.has result"),
+    };
+    let target = match runtime::new_ordinary_object(context.heap(), Option::None) {
+        Ok(value) => value,
+        Err(value) => {
+            testing::fail(value.message);
+            weak_set
+        },
+    };
+    let reference = match context.execute_with_locals(
+        bytecode::Function::new(
+            Vec::[],
+            Vec::[
+                bytecode::Instruction::GetLoc(0),
+                bytecode::Instruction::GetLoc(1),
+                bytecode::Instruction::Construct(1),
+                bytecode::Instruction::Return,
+            ],
+            2,
+        ),
+        Vec::[installed.weak_ref, runtime::Value::Object(target)],
+    ) {
+        Ok(runtime::Value::Object(value)) => value,
+        _ => weak_set,
+    };
+    let deref = collection_read(context, runtime::Value::Object(reference), "deref");
+    match collection_invoke(
+        context,
+        deref,
+        runtime::Value::Object(reference),
+        Vec::[runtime::Value::Object(target)],
+    ) {
+        runtime::Value::Object(value) => testing::assert(value == target),
+        _ => testing::fail("expected WeakRef target"),
+    };
+    testing::assert(context.heap().free(target));
+    match collection_invoke(context, deref, runtime::Value::Object(reference), Vec::[]) {
+        runtime::Value::Undefined => (),
+        _ => testing::fail("expected collected WeakRef target"),
+    }
+}

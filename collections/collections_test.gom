@@ -1,0 +1,202 @@
+package collections;
+
+use gomlang::quickjs::runtime;
+use std::num;
+use std::testing;
+
+fn collection_string(value: string) -> runtime::JsString {
+    let bytes = value.to_bytes();
+    runtime::JsString::from_utf8(bytes.slice(0, bytes.len()))
+}
+
+fn collection_assert_same(actual: runtime::Value, expected: runtime::Value) -> unit {
+    testing::assert(runtime::same_value(actual, expected))
+}
+
+fn collection_expect(value: Option[runtime::Value]) -> runtime::Value {
+    match value {
+        Some(value) => value,
+        None => {
+            testing::fail("expected collection value");
+            runtime::Value::Undefined
+        },
+    }
+}
+
+fn collection_object(heap: runtime::Heap) -> runtime::ObjectId {
+    match runtime::new_ordinary_object(heap, Option::None) {
+        Ok(value) => value,
+        Err(value) => {
+            testing::fail(value.message);
+            collection_object(runtime::Heap::new())
+        },
+    }
+}
+
+#[test]
+fn map_stores_primitive_keys_and_distinguishes_absence_from_undefined() -> unit {
+    let map = JsMap::new();
+    map.set(runtime::Value::Undefined, runtime::Value::String(collection_string("undefined")));
+    map.set(runtime::Value::Null, runtime::Value::String(collection_string("null")));
+    map.set(runtime::Value::Bool(true), runtime::Value::Int(1));
+    map.set(runtime::Value::Int(42), runtime::Value::Undefined);
+    testing::assert_eq(map.size(), 4);
+    collection_assert_same(
+        collection_expect(map.get(runtime::Value::Undefined)),
+        runtime::Value::String(collection_string("undefined")),
+    );
+    testing::assert(map.has(runtime::Value::Int(42)));
+    match map.get(runtime::Value::Int(42)) {
+        Some(runtime::Value::Undefined) => (),
+        _ => testing::fail("expected stored undefined"),
+    };
+    testing::assert(!map.has(runtime::Value::Int(7)));
+    testing::assert(map.get(runtime::Value::Int(7)).is_none())
+}
+
+#[test]
+fn map_uses_same_value_zero_for_nan_and_signed_zero() -> unit {
+    let map = JsMap::new();
+    let first_nan = num::parse_float64("NaN").unwrap_or(0.0);
+    let second_nan = runtime::primitive_to_number(runtime::Value::Undefined).unwrap_or(0.0);
+    let negative_zero = num::parse_float64("-0").unwrap_or(0.0);
+    map.set(runtime::Value::Float(first_nan), runtime::Value::Int(1));
+    map.set(runtime::Value::Float(second_nan), runtime::Value::Int(2));
+    testing::assert_eq(map.size(), 1);
+    collection_assert_same(
+        collection_expect(map.get(runtime::Value::Float(first_nan))),
+        runtime::Value::Int(2),
+    );
+    map.set(runtime::Value::Float(negative_zero), runtime::Value::Int(3));
+    testing::assert(runtime::same_value(map.keys()[1], runtime::Value::Float(0.0)));
+    testing::assert(!runtime::same_value(map.keys()[1], runtime::Value::Float(negative_zero)));
+    map.set(runtime::Value::Int(0), runtime::Value::Int(4));
+    testing::assert_eq(map.size(), 2);
+    collection_assert_same(
+        collection_expect(map.get(runtime::Value::Float(0.0))),
+        runtime::Value::Int(4),
+    )
+}
+
+#[test]
+fn map_supports_utf16_bigint_symbol_and_object_identity_keys() -> unit {
+    let map = JsMap::new();
+    let first_string = runtime::JsString::from_code_units(Vec::[0xd800, 65]);
+    let equal_string = runtime::JsString::from_code_units(Vec::[0xd800, 65]);
+    let other_string = runtime::JsString::from_code_units(Vec::[0xd800, 66]);
+    map.set(runtime::Value::String(first_string), runtime::Value::Int(1));
+    collection_assert_same(
+        collection_expect(map.get(runtime::Value::String(equal_string))),
+        runtime::Value::Int(1),
+    );
+    testing::assert(!map.has(runtime::Value::String(other_string)));
+    map.set(runtime::Value::BigInt(runtime::BigInt::new(false, "00123")), runtime::Value::Int(2));
+    collection_assert_same(
+        collection_expect(map.get(runtime::Value::BigInt(runtime::BigInt::new(false, "123")))),
+        runtime::Value::Int(2),
+    );
+    let first_symbol = runtime::Symbol::new(10, Option::Some("first"));
+    let equal_symbol = runtime::Symbol::new(10, Option::Some("other"));
+    let other_symbol = runtime::Symbol::new(11, Option::Some("first"));
+    map.set(runtime::Value::Symbol(first_symbol), runtime::Value::Int(3));
+    testing::assert(map.has(runtime::Value::Symbol(equal_symbol)));
+    testing::assert(!map.has(runtime::Value::Symbol(other_symbol)));
+    let heap = runtime::Heap::new();
+    let first_object = collection_object(heap);
+    let second_object = collection_object(heap);
+    map.set(runtime::Value::Object(first_object), runtime::Value::Int(4));
+    testing::assert(map.has(runtime::Value::Object(first_object)));
+    testing::assert(!map.has(runtime::Value::Object(second_object)))
+}
+
+#[test]
+fn map_preserves_order_across_updates_deletes_and_reinsertion() -> unit {
+    let map = JsMap::new();
+    map.set(runtime::Value::String(collection_string("a")), runtime::Value::Int(1));
+    map.set(runtime::Value::String(collection_string("b")), runtime::Value::Int(2));
+    map.set(runtime::Value::String(collection_string("c")), runtime::Value::Int(3));
+    map.set(runtime::Value::String(collection_string("b")), runtime::Value::Int(20));
+    let updated = map.entries();
+    testing::assert_eq(updated.len(), 3);
+    collection_assert_same(updated[0].key, runtime::Value::String(collection_string("a")));
+    collection_assert_same(updated[1].key, runtime::Value::String(collection_string("b")));
+    collection_assert_same(updated[1].value, runtime::Value::Int(20));
+    collection_assert_same(updated[2].key, runtime::Value::String(collection_string("c")));
+    testing::assert(map.delete(runtime::Value::String(collection_string("b"))));
+    testing::assert(!map.delete(runtime::Value::String(collection_string("b"))));
+    map.set(runtime::Value::String(collection_string("b")), runtime::Value::Int(200));
+    let keys = map.keys();
+    let values = map.values();
+    collection_assert_same(keys[0], runtime::Value::String(collection_string("a")));
+    collection_assert_same(keys[1], runtime::Value::String(collection_string("c")));
+    collection_assert_same(keys[2], runtime::Value::String(collection_string("b")));
+    collection_assert_same(values[0], runtime::Value::Int(1));
+    collection_assert_same(values[1], runtime::Value::Int(3));
+    collection_assert_same(values[2], runtime::Value::Int(200))
+}
+
+#[test]
+fn map_snapshots_are_independent_and_clear_resets_size() -> unit {
+    let map = JsMap::new();
+    map.set(runtime::Value::Int(1), runtime::Value::String(collection_string("one")));
+    let entries = map.entries();
+    let keys = map.keys();
+    let values = map.values();
+    map.set(runtime::Value::Int(2), runtime::Value::String(collection_string("two")));
+    map.set(runtime::Value::Int(1), runtime::Value::String(collection_string("updated")));
+    testing::assert_eq(entries.len(), 1);
+    testing::assert_eq(keys.len(), 1);
+    testing::assert_eq(values.len(), 1);
+    collection_assert_same(entries[0].value, runtime::Value::String(collection_string("one")));
+    collection_assert_same(values[0], runtime::Value::String(collection_string("one")));
+    map.clear();
+    testing::assert_eq(map.size(), 0);
+    testing::assert(map.entries().is_empty())
+}
+
+#[test]
+fn set_uses_same_value_zero_and_preserves_reinsertion_order() -> unit {
+    let set = JsSet::new();
+    let nan = num::parse_float64("NaN").unwrap_or(0.0);
+    let other_nan = runtime::primitive_to_number(runtime::Value::Undefined).unwrap_or(0.0);
+    let negative_zero = num::parse_float64("-0").unwrap_or(0.0);
+    set.add(runtime::Value::Float(nan));
+    set.add(runtime::Value::Float(other_nan));
+    set.add(runtime::Value::Float(negative_zero));
+    testing::assert(runtime::same_value(set.values()[1], runtime::Value::Float(0.0)));
+    testing::assert(!runtime::same_value(set.values()[1], runtime::Value::Float(negative_zero)));
+    set.add(runtime::Value::Int(0));
+    set.add(runtime::Value::String(collection_string("tail")));
+    testing::assert_eq(set.size(), 3);
+    testing::assert(set.has(runtime::Value::Float(nan)));
+    testing::assert(set.has(runtime::Value::Float(0.0)));
+    testing::assert(set.delete(runtime::Value::Int(0)));
+    set.add(runtime::Value::Int(0));
+    let values = set.values();
+    collection_assert_same(values[0], runtime::Value::Float(nan));
+    collection_assert_same(values[1], runtime::Value::String(collection_string("tail")));
+    collection_assert_same(values[2], runtime::Value::Int(0));
+    testing::assert(!set.delete(runtime::Value::Bool(false)))
+}
+
+#[test]
+fn set_supports_identity_keys_snapshots_and_clear() -> unit {
+    let set = JsSet::new();
+    let heap = runtime::Heap::new();
+    let first = collection_object(heap);
+    let second = collection_object(heap);
+    set.add(runtime::Value::Object(first));
+    set.add(runtime::Value::Object(first));
+    set.add(runtime::Value::Object(second));
+    set.add(runtime::Value::BigInt(runtime::BigInt::new(true, "7")));
+    set.add(runtime::Value::Symbol(runtime::Symbol::new(90, Option::None)));
+    testing::assert_eq(set.size(), 4);
+    let snapshot = set.values();
+    set.delete(runtime::Value::Object(first));
+    testing::assert_eq(snapshot.len(), 4);
+    collection_assert_same(snapshot[0], runtime::Value::Object(first));
+    collection_assert_same(snapshot[1], runtime::Value::Object(second));
+    set.clear();
+    testing::assert_eq(set.size(), 0);
+    testing::assert(set.values().is_empty())
+}

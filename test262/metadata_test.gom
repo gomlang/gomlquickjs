@@ -1,0 +1,83 @@
+package test262;
+
+use std::testing;
+
+fn expect_case(value: Result[TestCase, MetadataError]) -> TestCase {
+    match value {
+        Ok(value) => value,
+        Err(value) => {
+            testing::fail(value.to_string());
+            expect_case(parse("/*---\nflags: [raw]\n---*/"))
+        },
+    }
+}
+
+fn expect_error(value: Result[TestCase, MetadataError]) -> MetadataError {
+    match value {
+        Err(value) => value,
+        Ok(_) => {
+            testing::fail("expected metadata error");
+            expect_error(parse(""))
+        },
+    }
+}
+
+#[test]
+fn parses_inline_test262_metadata_and_negative_expectations() -> unit {
+    let source = "// Copyright\n/*---\ndescription: sample\nincludes: [assert.js, compareArray.js]\nflags: [onlyStrict, async]\nfeatures: [BigInt, regexp-lookbehind]\nnegative:\n  phase: runtime\n  type: TypeError\n---*/\nthrow new TypeError();\n";
+    let value = expect_case(parse(source));
+    testing::assert_eq(value.source, source);
+    testing::assert(value.metadata.includes == Vec::["assert.js", "compareArray.js"]);
+    testing::assert(value.metadata.flags == Vec::["onlyStrict", "async"]);
+    testing::assert(value.metadata.features == Vec::["BigInt", "regexp-lookbehind"]);
+    testing::assert(value.metadata.asynchronous);
+    testing::assert(
+        value.metadata.negative
+            == Option::Some(
+                NegativeExpectation { phase: NegativePhase::Runtime, type_name: "TypeError" },
+            ),
+    );
+    testing::assert(source_variants(value.metadata) == Vec::[SourceVariant::Strict])
+}
+
+#[test]
+fn parses_block_lists_and_deduplicates_values() -> unit {
+    let value = expect_case(
+        parse(
+            "/*---\nincludes:\n  - assert.js\n  - 'assert.js'\nflags:\n  - noStrict\nfeatures:\n  - Symbol\n  - \"Map\"\n---*/\n0;",
+        ),
+    );
+    testing::assert(value.metadata.includes == Vec::["assert.js"]);
+    testing::assert(value.metadata.features == Vec::["Symbol", "Map"]);
+    testing::assert(source_variants(value.metadata) == Vec::[SourceVariant::Sloppy])
+}
+
+#[test]
+fn selects_module_raw_and_default_variants() -> unit {
+    let module = expect_case(parse("/*---\nflags: [module]\n---*/"));
+    testing::assert(source_variants(module.metadata) == Vec::[SourceVariant::Module]);
+    let raw = expect_case(parse("/*---\nflags: [raw, onlyStrict]\n---*/"));
+    testing::assert(source_variants(raw.metadata) == Vec::[SourceVariant::Raw]);
+    let plain = expect_case(parse("/*---\nfeatures: []\n---*/"));
+    testing::assert(
+        source_variants(plain.metadata) == Vec::[SourceVariant::Sloppy, SourceVariant::Strict],
+    )
+}
+
+#[test]
+fn rejects_missing_unterminated_and_malformed_metadata() -> unit {
+    testing::assert(expect_error(parse("let value = 1;")).message.contains("missing"));
+    testing::assert(expect_error(parse("/*---\nflags: []")).message.contains("unterminated"));
+    testing::assert(
+        expect_error(parse("/*---\nflags: async\n---*/")).message.contains("inline list"),
+    );
+    testing::assert(
+        expect_error(parse("/*---\nnegative:\n  phase: parse\n---*/")).message.contains(
+            "missing type",
+        ),
+    );
+    let phase = expect_error(
+        parse("/*---\nnegative:\n  phase: compile\n  type: SyntaxError\n---*/"),
+    );
+    testing::assert_eq(phase.line, 3)
+}
