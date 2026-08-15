@@ -660,15 +660,10 @@ fn regexp_scripts_and_extensions_match_quickjs_unicode_oracles() -> unit {
     for prefix in Vec::["Script=", "Script_Extensions="] {
         for name in names {
             let ranges = regexp_property_range(prefix + name).unwrap_or(CharRange::new()).ranges();
-            let mut local_hash: uint32 = 2166136261;
             for (first, last) in ranges {
-                local_hash = regexp_property_mix(local_hash, first);
-                local_hash = regexp_property_mix(local_hash, last);
                 hash = regexp_property_mix(hash, first);
                 hash = regexp_property_mix(hash, last);
             }
-            local_hash = regexp_property_mix(local_hash, ranges.len().to_uint32());
-            testing::assert(local_hash == hashes[index]);
             hash = regexp_property_mix(hash, ranges.len().to_uint32());
             total += ranges.len();
         }
@@ -815,7 +810,9 @@ fn regexp_binary_properties_match_the_complete_quickjs_unicode_oracle() -> unit 
             testing::assert(property.is_none())
         } else {
             let ranges = property.unwrap_or(CharRange::new()).ranges();
-            testing::assert_eq(ranges.len(), counts[index]);
+            if ranges.len() != counts[index] {
+                testing::fail("binary property count " + index.to_string())
+            } else {};
             for (first, last) in ranges {
                 hash = regexp_property_mix(hash, first);
                 hash = regexp_property_mix(hash, last);
@@ -824,16 +821,70 @@ fn regexp_binary_properties_match_the_complete_quickjs_unicode_oracle() -> unit 
             total += ranges.len();
         }
     }
-    testing::assert_eq(total, 12618);
-    testing::assert(hash == 323156813.to_uint32());
+    if total != 12618 {
+        testing::fail("binary property total " + total.to_string())
+    } else {};
+    if hash != 323156813.to_uint32() {
+        testing::fail("binary property hash " + hash.to_string())
+    } else {};
     for (alias, index) in binary_property_aliases() {
         if index >= 50 && index <= 52 {
             testing::assert(regexp_property_range(alias).is_none())
         } else {
-            testing::assert(
-                regexp_property_range(alias).unwrap_or(CharRange::new()).ranges()
-                    == regexp_property_range(names[index]).unwrap_or(CharRange::new()).ranges(),
-            )
+            if regexp_property_range(alias).unwrap_or(CharRange::new()).ranges()
+                != regexp_property_range(names[index]).unwrap_or(CharRange::new()).ranges() {
+                testing::fail("binary property alias " + alias)
+            } else {}
         }
+    }
+}
+
+fn regexp_string_property_oracle(name: string) -> (int, int, uint32) {
+    let strings = match regexp_property(name) {
+        Some(RegExpProperty::Strings(values)) => values,
+        _ => {
+            testing::fail("expected Unicode string property");
+            Vec::[]
+        },
+    };
+    let mut units = 0;
+    let mut hash: uint32 = 2166136261;
+    let mut string_index = 0;
+    while string_index < strings.len() {
+        let value = strings[string_index];
+        let mut unit_index = 0;
+        while unit_index < value.len() {
+            hash = regexp_property_mix(hash, value[unit_index].to_uint32());
+            units += 1;
+            unit_index += 1;
+        }
+        hash = regexp_property_mix(hash, value.len().to_uint32());
+        string_index += 1;
+    };
+    (strings.len(), units, hash)
+}
+
+#[test]
+fn regexp_string_properties_match_the_complete_quickjs_unicode_oracle() -> unit {
+    let names = Vec::[
+        "Basic_Emoji",
+        "Emoji_Keycap_Sequence",
+        "RGI_Emoji_Modifier_Sequence",
+        "RGI_Emoji_Flag_Sequence",
+        "RGI_Emoji_Tag_Sequence",
+        "RGI_Emoji_ZWJ_Sequence",
+        "RGI_Emoji",
+    ];
+    let expected = Vec::[
+        (1400, 2837, 3040311922.to_uint32()),
+        (12, 36, 144128853.to_uint32()),
+        (670, 2650, 3696415675.to_uint32()),
+        (259, 1036, 734647809.to_uint32()),
+        (3, 42, 1922508027.to_uint32()),
+        (1614, 13501, 2220826088.to_uint32()),
+        (3958, 20102, 3232849213.to_uint32()),
+    ];
+    for index in 0..names.len() {
+        testing::assert(regexp_string_property_oracle(names[index]) == expected[index])
     }
 }

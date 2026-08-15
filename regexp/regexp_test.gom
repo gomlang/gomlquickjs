@@ -214,6 +214,72 @@ fn unicode_sets_support_nested_algebra_and_string_members() -> unit {
 }
 
 #[test]
+fn unicode_string_properties_match_sequences_and_set_operations() -> unit {
+    testing::assert(
+        expect_regex(compile_utf8_with_flags("^\\p{Basic_Emoji}$", "v")).is_match(js_string("😀")),
+    );
+    testing::assert(
+        expect_regex(compile_utf8_with_flags("^\\p{Emoji_Keycap_Sequence}$", "v")).is_match(
+            js_string("#️⃣"),
+        ),
+    );
+    testing::assert(
+        expect_regex(compile_utf8_with_flags("^\\p{RGI_Emoji_Modifier_Sequence}$", "v")).is_match(
+            js_string("👍🏻"),
+        ),
+    );
+    let flag = expect_regex(compile_utf8_with_flags("\\p{RGI_Emoji_Flag_Sequence}", "v"));
+    assert_match_range(flag.search(js_string("x🇨🇳y")), 1, 5);
+    let england = runtime::JsString::from_code_units(
+        Vec::[
+            0xd83c,
+            0xdff4,
+            0xdb40,
+            0xdc67,
+            0xdb40,
+            0xdc62,
+            0xdb40,
+            0xdc65,
+            0xdb40,
+            0xdc6e,
+            0xdb40,
+            0xdc67,
+            0xdb40,
+            0xdc7f,
+        ],
+    );
+    testing::assert(
+        expect_regex(compile_utf8_with_flags("^\\p{RGI_Emoji_Tag_Sequence}$", "v")).is_match(
+            england,
+        ),
+    );
+    testing::assert(
+        expect_regex(compile_utf8_with_flags("^\\p{RGI_Emoji_ZWJ_Sequence}$", "v")).is_match(
+            js_string("👩‍💻"),
+        ),
+    );
+    testing::assert(
+        expect_regex(compile_utf8_with_flags("^\\p{RGI_Emoji}$", "v")).is_match(js_string("🇨🇳")),
+    );
+    let nested = expect_regex(compile_utf8_with_flags("^[\\p{RGI_Emoji}&&\\q{🇨🇳|A}]$", "v"));
+    testing::assert(nested.is_match(js_string("🇨🇳")));
+    testing::assert(!nested.is_match(js_string("A")));
+    let removed = expect_regex(compile_utf8_with_flags("^[\\p{RGI_Emoji}--\\q{🇨🇳}]$", "v"));
+    testing::assert(!removed.is_match(js_string("🇨🇳")));
+    testing::assert(removed.is_match(js_string("😀")))
+}
+
+#[test]
+fn unicode_string_properties_are_longest_first_and_v_only() -> unit {
+    let longest = expect_regex(compile_utf8_with_flags("\\p{Basic_Emoji}", "v"));
+    assert_match_range(longest.search(js_string("©️")), 0, 2);
+    testing::assert(compile_utf8_with_flags("\\p{Basic_Emoji}", "u").is_err());
+    testing::assert(compile_utf8_with_flags("[\\p{Basic_Emoji}]", "u").is_err());
+    testing::assert(compile_utf8_with_flags("\\P{Basic_Emoji}", "v").is_err());
+    testing::assert(compile_utf8_with_flags("[\\P{Basic_Emoji}]", "v").is_err())
+}
+
+#[test]
 fn nested_and_alternating_captures_keep_path_local_state() -> unit {
     let regex = expect_regex(compile_utf8("^((a)|(b))+$"));
     let found = assert_match_range(regex.search(js_string("aba")), 0, 3);

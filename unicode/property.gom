@@ -4106,3 +4106,235 @@ pub fn regexp_property_range(name: string) -> Option[CharRange] {
         None => Option::None,
     }
 }
+
+pub enum RegExpProperty {
+    Scalar(CharRange),
+    Strings(Vec[Vec[uint16]]),
+}
+
+fn regexp_property_append_code_point(output: Vec[uint16], value: uint32) -> unit {
+    if value <= 0xffff {
+        output.push(value.to_uint16())
+    } else {
+        let adjusted = value - 0x10000;
+        output.push((0xd800 + (adjusted >> 10)).to_uint16());
+        output.push((0xdc00 + (adjusted & 0x3ff)).to_uint16())
+    }
+}
+
+fn regexp_property_sequence(code_points: Vec[uint32]) -> Vec[uint16] {
+    let output: Vec[uint16] = Vec::[];
+    for value in code_points {
+        regexp_property_append_code_point(output, value)
+    }
+    output
+}
+
+fn regexp_property_copy_sequence(input: Vec[uint32]) -> Vec[uint32] {
+    let output: Vec[uint32] = Vec::with_capacity(input.len());
+    for value in input {
+        output.push(value)
+    }
+    output
+}
+
+fn regexp_property_contains_sequence(values: Vec[Vec[uint16]], value: Vec[uint16]) -> bool {
+    for current in values {
+        if current == value {
+            return true
+        } else {}
+    }
+    false
+}
+
+fn regexp_property_add_sequence(values: Vec[Vec[uint16]], code_points: Vec[uint32]) -> unit {
+    values.push(regexp_property_sequence(code_points))
+}
+
+fn regexp_property_add_sequences(values: Vec[Vec[uint16]], additions: Vec[Vec[uint16]]) -> unit {
+    for value in additions {
+        values.push(value)
+    }
+}
+
+fn regexp_property_add_range_sequences(
+    values: Vec[Vec[uint16]],
+    range: CharRange,
+    suffix: Vec[uint32],
+) -> unit {
+    for (first, last) in range.ranges() {
+        let mut value = first;
+        while value <= last {
+            let sequence: Vec[uint32] = Vec::[value];
+            for code_point in suffix {
+                sequence.push(code_point)
+            }
+            regexp_property_add_sequence(values, sequence);
+            value += 1;
+        }
+    }
+}
+
+fn basic_emoji_sequences() -> Vec[Vec[uint16]] {
+    let values: Vec[Vec[uint16]] = Vec::[];
+    regexp_property_add_range_sequences(values, binary_property_direct(16), Vec::[]);
+    regexp_property_add_range_sequences(values, binary_property_direct(17), Vec::[0xfe0f]);
+    values
+}
+
+fn emoji_keycap_sequences() -> Vec[Vec[uint16]] {
+    let values: Vec[Vec[uint16]] = Vec::[];
+    regexp_property_add_range_sequences(values, binary_property_direct(20), Vec::[0xfe0f, 0x20e3]);
+    values
+}
+
+fn rgi_emoji_modifier_sequences() -> Vec[Vec[uint16]] {
+    let values: Vec[Vec[uint16]] = Vec::[];
+    for (first, last) in binary_property_direct(51).ranges() {
+        let mut base = first;
+        while base <= last {
+            for modifier in 0..5 {
+                regexp_property_add_sequence(values, Vec::[base, 0x1f3fb + modifier.to_uint32()])
+            }
+            base += 1;
+        }
+    }
+    values
+}
+
+fn rgi_emoji_flag_sequences() -> Vec[Vec[uint16]] {
+    let values: Vec[Vec[uint16]] = Vec::[];
+    for (first, last) in binary_property_direct(19).ranges() {
+        let mut value = first;
+        while value <= last {
+            regexp_property_add_sequence(values, Vec::[0x1f1e6 + value / 26, 0x1f1e6 + value % 26]);
+            value += 1;
+        }
+    }
+    values
+}
+
+fn rgi_emoji_tag_sequences() -> Vec[Vec[uint16]] {
+    let values: Vec[Vec[uint16]] = Vec::[];
+    let data = rgi_emoji_tag_sequence_data();
+    let mut index = 0;
+    while index < data.len() {
+        let sequence: Vec[uint32] = Vec::[0x1f3f4];
+        while data[index] != 0 {
+            sequence.push(0xe0000 + data[index].to_uint32());
+            index += 1;
+        }
+        index += 1;
+        sequence.push(0xe007f);
+        regexp_property_add_sequence(values, sequence);
+    }
+    values
+}
+
+fn rgi_emoji_zwj_sequences() -> Vec[Vec[uint16]] {
+    let values: Vec[Vec[uint16]] = Vec::[];
+    let data = rgi_emoji_zwj_sequence_data();
+    let mut index = 0;
+    while index < data.len() {
+        let length = data[index].to_int();
+        index += 1;
+        let sequence: Vec[uint32] = Vec::[];
+        let modifier_positions: Vec[int] = Vec::[];
+        let mut modifier_kind = 0;
+        let mut hair_position = 0 - 1;
+        for item_index in 0..length {
+            let encoded = data[index].to_uint32() | (data[index + 1].to_uint32() << 8);
+            index += 2;
+            let presentation = encoded >> 15;
+            let current_modifier_kind = ((encoded >> 13) & 3).to_int();
+            let compact = encoded & 0x1fff;
+            let code_point = if compact < 0x1000 {
+                compact + 0x2000
+            } else {
+                compact - 0x1000 + 0x1f000
+            };
+            if code_point == 0x1f9b0 {
+                hair_position = sequence.len();
+            } else {};
+            sequence.push(code_point);
+            if current_modifier_kind != 0 {
+                modifier_kind = current_modifier_kind;
+                modifier_positions.push(sequence.len());
+                sequence.push(0)
+            } else {};
+            if presentation != 0 {
+                sequence.push(0xfe0f)
+            } else {};
+            if item_index < length - 1 {
+                sequence.push(0x200d)
+            } else {}
+        }
+        let modifier_count = if modifier_kind == 1 {
+            5
+        } else if modifier_kind == 2 {
+            25
+        } else if modifier_kind == 3 {
+            20
+        } else {
+            1
+        };
+        let hair_count = if hair_position >= 0 {
+            4
+        } else {
+            1
+        };
+        for hair_index in 0..hair_count {
+            for modifier_index in 0..modifier_count {
+                let candidate = regexp_property_copy_sequence(sequence);
+                if hair_position >= 0 {
+                    candidate.set(hair_position, 0x1f9b0 + hair_index.to_uint32())
+                } else {};
+                if modifier_kind == 1 {
+                    candidate.set(modifier_positions[0], 0x1f3fb + modifier_index.to_uint32())
+                } else if modifier_kind == 2 || modifier_kind == 3 {
+                    let mut first = modifier_index / 5;
+                    let second = modifier_index % 5;
+                    if modifier_kind == 3 && first >= second {
+                        first += 1;
+                    } else {};
+                    candidate.set(modifier_positions[0], 0x1f3fb + first.to_uint32());
+                    candidate.set(modifier_positions[1], 0x1f3fb + second.to_uint32())
+                } else {};
+                regexp_property_add_sequence(values, candidate)
+            }
+        }
+    }
+    values
+}
+
+fn regexp_string_property(name: string) -> Option[Vec[Vec[uint16]]] {
+    let values: Vec[Vec[uint16]] = match name {
+        "Basic_Emoji" => basic_emoji_sequences(),
+        "Emoji_Keycap_Sequence" => emoji_keycap_sequences(),
+        "RGI_Emoji_Modifier_Sequence" => rgi_emoji_modifier_sequences(),
+        "RGI_Emoji_Flag_Sequence" => rgi_emoji_flag_sequences(),
+        "RGI_Emoji_Tag_Sequence" => rgi_emoji_tag_sequences(),
+        "RGI_Emoji_ZWJ_Sequence" => rgi_emoji_zwj_sequences(),
+        "RGI_Emoji" => {
+            let output = basic_emoji_sequences();
+            regexp_property_add_sequences(output, emoji_keycap_sequences());
+            regexp_property_add_sequences(output, rgi_emoji_modifier_sequences());
+            regexp_property_add_sequences(output, rgi_emoji_flag_sequences());
+            regexp_property_add_sequences(output, rgi_emoji_tag_sequences());
+            regexp_property_add_sequences(output, rgi_emoji_zwj_sequences());
+            output
+        },
+        _ => return Option::None,
+    };
+    Option::Some(values)
+}
+
+pub fn regexp_property(name: string) -> Option[RegExpProperty] {
+    match regexp_property_range(name) {
+        Some(range) => Option::Some(RegExpProperty::Scalar(range)),
+        None => match regexp_string_property(name) {
+            Some(strings) => Option::Some(RegExpProperty::Strings(strings)),
+            None => Option::None,
+        },
+    }
+}
