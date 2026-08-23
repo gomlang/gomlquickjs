@@ -7,18 +7,18 @@ use std::text;
 
 #[test]
 fn parses_eval_file_help_and_stdin_commands() -> unit {
-    match parse_command(Vec::["qjs"]) {
+    match parse_command(Vec::from_array(["qjs"])) {
         Ok(Command::Stdin(_)) => (),
         _ => testing::fail("expected stdin command"),
     };
-    match parse_command(Vec::["qjs", "-e", "return 1;"]) {
+    match parse_command(Vec::from_array(["qjs", "-e", "return 1;"])) {
         Ok(Command::Evaluate(source, arguments, _)) => {
             testing::assert_eq(source, "return 1;");
             testing::assert(arguments.is_empty())
         },
         _ => testing::fail("expected eval command"),
     };
-    match parse_command(Vec::["qjs", "input.js"]) {
+    match parse_command(Vec::from_array(["qjs", "input.js"])) {
         Ok(Command::File(path, arguments, _)) => {
             testing::assert_eq(path, "input.js");
             testing::assert_eq(arguments.len(), 1);
@@ -26,7 +26,7 @@ fn parses_eval_file_help_and_stdin_commands() -> unit {
         },
         _ => testing::fail("expected file command"),
     };
-    match parse_command(Vec::["qjs", "--help"]) {
+    match parse_command(Vec::from_array(["qjs", "--help"])) {
         Ok(Command::Help) => (),
         _ => testing::fail("expected help command"),
     }
@@ -34,10 +34,10 @@ fn parses_eval_file_help_and_stdin_commands() -> unit {
 
 #[test]
 fn rejects_invalid_command_lines() -> unit {
-    testing::assert(parse_command(Vec::["qjs", "--missing"]).is_err());
-    testing::assert(parse_command(Vec::["qjs", "-e"]).is_err());
-    testing::assert(parse_command(Vec::["qjs", "-I"]).is_err());
-    match parse_command(Vec::["qjs", "one.js", "two.js"]) {
+    testing::assert(parse_command(Vec::from_array(["qjs", "--missing"])).is_err());
+    testing::assert(parse_command(Vec::from_array(["qjs", "-e"])).is_err());
+    testing::assert(parse_command(Vec::from_array(["qjs", "-I"])).is_err());
+    match parse_command(Vec::from_array(["qjs", "one.js", "two.js"])) {
         Ok(Command::File(_, arguments, _)) => {
             testing::assert_eq(arguments.len(), 2);
             testing::assert_eq(arguments[1], "two.js")
@@ -49,7 +49,9 @@ fn rejects_invalid_command_lines() -> unit {
 #[test]
 fn parses_module_script_strict_include_std_and_quit_options() -> unit {
     match parse_command(
-        Vec::["qjs", "--strict", "-I", "setup.js", "--std", "-m", "input.js", "argument"],
+        Vec::from_array(
+            ["qjs", "--strict", "-I", "setup.js", "--std", "-m", "input.js", "argument"],
+        ),
     ) {
         Ok(Command::File(path, arguments, options)) => {
             testing::assert_eq(path, "input.js");
@@ -59,17 +61,18 @@ fn parses_module_script_strict_include_std_and_quit_options() -> unit {
             testing::assert(options.mode == SourceMode::Module);
             testing::assert(options.strict);
             testing::assert_eq(options.includes.len(), 1);
-            testing::assert_eq(options.includes[0], "setup.js")
+            testing::assert_eq(options.includes[0], "setup.js");
+            testing::assert(options.report_unhandled_rejections)
         },
         _ => testing::fail("expected configured file command"),
     };
-    match parse_command(Vec::["qjs", "-m", "--script", "-e", "return 1;"]) {
+    match parse_command(Vec::from_array(["qjs", "-m", "--script", "-e", "return 1;"])) {
         Ok(Command::Evaluate(_, _, options)) => {
             testing::assert(options.mode == SourceMode::Script)
         },
         _ => testing::fail("expected forced script command"),
     };
-    match parse_command(Vec::["qjs", "--", "-input.js", "argument"]) {
+    match parse_command(Vec::from_array(["qjs", "--", "-input.js", "argument"])) {
         Ok(Command::File(path, arguments, _)) => {
             testing::assert_eq(path, "-input.js");
             testing::assert_eq(arguments.len(), 2);
@@ -78,9 +81,17 @@ fn parses_module_script_strict_include_std_and_quit_options() -> unit {
         },
         _ => testing::fail("expected option-terminated file command"),
     };
-    match parse_command(Vec::["qjs", "-q"]) {
+    match parse_command(Vec::from_array(["qjs", "-q"])) {
         Ok(Command::Quit) => (),
         _ => testing::fail("expected quit command"),
+    };
+    match parse_command(
+        Vec::from_array(["qjs", "--no-unhandled-rejection", "-e", "Promise.reject(1)"]),
+    ) {
+        Ok(Command::Evaluate(_, _, options)) => {
+            testing::assert(!options.report_unhandled_rejections)
+        },
+        _ => testing::fail("expected unhandled rejection option"),
     }
 }
 
@@ -94,11 +105,16 @@ fn executes_includes_before_strict_main_and_defers_jobs_until_main() -> unit {
         Ok(()) => (),
         Err(message) => testing::fail(message),
     };
-    let options = ExecutionOptions { mode: SourceMode::Script, strict: true, includes: Vec::[path] };
+    let options = ExecutionOptions {
+        mode: SourceMode::Script,
+        strict: true,
+        includes: Vec::from_array([path]),
+        report_unhandled_rejections: true,
+    };
     let result = run(
         Command::Evaluate(
             "if (includeValue !== 40) throw 'include jobs ran early'; if ((function() { return this; })() !== undefined) throw 'script is not strict'; Promise.resolve().then(function() { if (includeValue !== 41) throw 'include job did not run'; });",
-            Vec::[],
+            Vec::new(),
             options,
         ),
     );
@@ -114,8 +130,13 @@ fn forced_module_eval_supports_await_and_forced_script_rejects_it() -> unit {
     match run(
         Command::Evaluate(
             "let value = await Promise.resolve(42); if (value !== 42) throw value;",
-            Vec::[],
-            ExecutionOptions { mode: SourceMode::Module, strict: false, includes: Vec::[] },
+            Vec::new(),
+            ExecutionOptions {
+                mode: SourceMode::Module,
+                strict: false,
+                includes: Vec::new(),
+                report_unhandled_rejections: true,
+            },
         ),
     ) {
         Ok(()) => (),
@@ -124,7 +145,7 @@ fn forced_module_eval_supports_await_and_forced_script_rejects_it() -> unit {
     match run(
         Command::Evaluate(
             "export let value = await Promise.resolve(42);",
-            Vec::[],
+            Vec::new(),
             default_execution_options(),
         ),
     ) {
@@ -135,8 +156,13 @@ fn forced_module_eval_supports_await_and_forced_script_rejects_it() -> unit {
         run(
             Command::Evaluate(
                 "await Promise.resolve(42);",
-                Vec::[],
-                ExecutionOptions { mode: SourceMode::Script, strict: false, includes: Vec::[] },
+                Vec::new(),
+                ExecutionOptions {
+                    mode: SourceMode::Script,
+                    strict: false,
+                    includes: Vec::new(),
+                    report_unhandled_rejections: true,
+                },
             ),
         ).is_err(),
     );
@@ -165,7 +191,7 @@ fn eval_source_functions_expose_cmdline_metadata() -> unit {
     };
     match execute_source_with_arguments_at_path(
         "function f(){} return f.fileName;",
-        Vec::[],
+        Vec::new(),
         Option::Some("named.js"),
     ) {
         Ok(value) => expect_host_string(value, "named.js"),
@@ -205,11 +231,14 @@ fn executes_math_builtins_from_source() -> unit {
 
 #[test]
 fn exposes_eval_and_file_script_arguments() -> unit {
-    match execute_source_with_arguments("return scriptArgs.join('|');", Vec::["alpha", "beta"]) {
+    match execute_source_with_arguments(
+        "return scriptArgs.join('|');",
+        Vec::from_array(["alpha", "beta"]),
+    ) {
         Ok(value) => expect_host_string(value, "alpha|beta"),
         Err(value) => testing::fail(value),
     };
-    match parse_command(Vec::["qjs", "-e", "return 1;", "left", "right"]) {
+    match parse_command(Vec::from_array(["qjs", "-e", "return 1;", "left", "right"])) {
         Ok(Command::Evaluate(_, arguments, _)) => {
             testing::assert_eq(arguments.len(), 2);
             testing::assert_eq(arguments[0], "left");
@@ -322,13 +351,221 @@ fn drains_promise_jobs_before_timer_jobs() -> unit {
 }
 
 #[test]
+fn reports_unhandled_promise_rejections_after_draining_jobs() -> unit {
+    match run(Command::Evaluate("Promise.reject(7);", Vec::new(), default_execution_options())) {
+        Err(message) => testing::assert_eq(message, "Possibly unhandled promise rejection: 7"),
+        Ok(()) => testing::fail("expected unhandled rejection"),
+    };
+    match run(
+        Command::Evaluate(
+            "let error = new Error('broken'); Promise.reject(error); error = null; std.gc();",
+            Vec::new(),
+            default_execution_options(),
+        ),
+    ) {
+        Err(message) => {
+            testing::assert(message.contains("Possibly unhandled promise rejection: Error: broken"));
+            testing::assert(message.contains("at <cmdline>"))
+        },
+        Ok(()) => testing::fail("expected error rejection"),
+    };
+    for (source, expected) in Vec::from_array(
+        [
+            ("Promise.reject('bad');", "Possibly unhandled promise rejection: \"bad\""),
+            ("Promise.reject(12n);", "Possibly unhandled promise rejection: 12n"),
+            (
+                "Promise.reject(Symbol('token'));",
+                "Possibly unhandled promise rejection: Symbol(token)",
+            ),
+        ],
+    ) {
+        match run(Command::Evaluate(source, Vec::new(), default_execution_options())) {
+            Err(message) => testing::assert_eq(message, expected),
+            Ok(()) => testing::fail("expected primitive rejection"),
+        }
+    }
+}
+
+#[test]
+fn rejection_reporting_is_side_effect_free_and_stops_before_host_jobs() -> unit {
+    match run(
+        Command::Evaluate(
+            "Promise.reject({ a: 1, toString() { throw new Error('called'); } });",
+            Vec::new(),
+            default_execution_options(),
+        ),
+    ) {
+        Err(message) => testing::assert_eq(
+            message,
+            "Possibly unhandled promise rejection: { a: 1, toString: [Function toString] }",
+        ),
+        Ok(()) => testing::fail("expected object rejection"),
+    };
+    match run(
+        Command::Evaluate(
+            "let pending = Promise.reject(13); os.setTimeout(function() { pending.catch(function() {}); }, 0);",
+            Vec::new(),
+            default_execution_options(),
+        ),
+    ) {
+        Err(message) => testing::assert_eq(message, "Possibly unhandled promise rejection: 13"),
+        Ok(()) => testing::fail("expected rejection before timer job"),
+    }
+}
+
+#[test]
+fn rejection_tracking_roots_only_reportable_promises() -> unit {
+    match run(
+        Command::Evaluate(
+            "let weak = (() => { let promise = Promise.reject(14); let result = new WeakRef(promise); promise = null; return result; })(); std.gc(); if (weak.deref() === undefined) throw new Error('unhandled promise was collected');",
+            Vec::new(),
+            default_execution_options(),
+        ),
+    ) {
+        Err(message) => testing::assert_eq(message, "Possibly unhandled promise rejection: 14"),
+        Ok(()) => testing::fail("expected rooted rejection"),
+    };
+    match run(
+        Command::Evaluate(
+            "let refs = (() => { let reason = { value: 15 }; let promise = Promise.reject(reason); let result = [new WeakRef(promise), new WeakRef(reason)]; promise.catch(function() {}); promise = null; reason = null; return result; })(); Promise.drainJobs(); std.gc(); if (refs[0].deref() !== undefined || refs[1].deref() !== undefined) throw new Error('handled rejection remained rooted');",
+            Vec::new(),
+            default_execution_options(),
+        ),
+    ) {
+        Ok(()) => (),
+        Err(message) => testing::fail(message),
+    }
+}
+
+#[test]
+fn pending_promises_root_reaction_handlers() -> unit {
+    match execute_source(
+        "let resolve; let source = new Promise(function(callback) { resolve = callback; }); let result = 0; let handler = function(value) { result = value; }; let weak = new WeakRef(handler); source.then(handler); handler = null; std.gc(); if (weak.deref() === undefined) throw new Error('reaction handler was collected'); resolve(42); Promise.drainJobs(); if (result !== 42) throw new Error('reaction handler did not run');",
+    ) {
+        Ok(_) => (),
+        Err(message) => testing::fail(message),
+    }
+}
+
+#[test]
+fn handled_and_suppressed_promise_rejections_do_not_fail() -> unit {
+    for source in Vec::from_array(
+        [
+            "Promise.reject(7).catch(function() {});",
+            "let pending = Promise.reject(8); Promise.resolve().then(function() { pending.catch(function() {}); });",
+        ],
+    ) {
+        match run(Command::Evaluate(source, Vec::new(), default_execution_options())) {
+            Ok(()) => (),
+            Err(message) => testing::fail(message),
+        }
+    }
+    let options = ExecutionOptions {
+        mode: SourceMode::Auto,
+        strict: false,
+        includes: Vec::new(),
+        report_unhandled_rejections: false,
+    };
+    match run(
+        Command::Evaluate(
+            "let error = new Error('hidden'); let pending = Promise.reject(error); error = null; std.gc(); pending.catch(function(reason) { if (reason.message !== 'hidden') throw reason; });",
+            Vec::new(),
+            options,
+        ),
+    ) {
+        Ok(()) => (),
+        Err(message) => testing::fail(message),
+    };
+    match run(
+        Command::Evaluate(
+            "let refs = (() => { let reason = { value: 9 }; let pending = Promise.reject(reason); return [new WeakRef(pending), new WeakRef(reason)]; })(); std.gc(); if (refs[0].deref() !== undefined || refs[1].deref() !== undefined) throw new Error('suppressed rejection remained rooted');",
+            Vec::new(),
+            options,
+        ),
+    ) {
+        Ok(()) => (),
+        Err(message) => testing::fail(message),
+    }
+}
+
+#[test]
+fn rejection_propagation_and_modules_track_the_terminal_promise() -> unit {
+    match run(
+        Command::Evaluate("Promise.reject(10).then();", Vec::new(), default_execution_options()),
+    ) {
+        Err(message) => testing::assert_eq(message, "Possibly unhandled promise rejection: 10"),
+        Ok(()) => testing::fail("expected propagated rejection"),
+    };
+    let options = ExecutionOptions {
+        mode: SourceMode::Module,
+        strict: false,
+        includes: Vec::new(),
+        report_unhandled_rejections: true,
+    };
+    match run(Command::Evaluate("Promise.reject(11); export {};", Vec::new(), options)) {
+        Err(message) => testing::assert_eq(message, "Possibly unhandled promise rejection: 11"),
+        Ok(()) => testing::fail("expected module rejection"),
+    };
+    match run(
+        Command::Evaluate(
+            "Promise.reject(12); await new Promise(function(resolve) { os.setTimeout(resolve, 0); }); export {};",
+            Vec::new(),
+            options,
+        ),
+    ) {
+        Err(message) => testing::assert_eq(message, "Possibly unhandled promise rejection: 12"),
+        Ok(()) => testing::fail("expected module rejection before timer job"),
+    };
+    match run(
+        Command::Evaluate(
+            "Promise.reject('unhandled'); await Promise.reject('module'); export {};",
+            Vec::new(),
+            options,
+        ),
+    ) {
+        Err(message) => {
+            testing::assert(message.contains("module"));
+            testing::assert(!message.contains("Possibly unhandled promise rejection"))
+        },
+        Ok(()) => testing::fail("expected top-level await rejection"),
+    }
+}
+
+#[test]
+fn dynamic_import_jobs_run_before_rejection_checkpoints() -> unit {
+    let path = "__gomlquickjs_qjs_dynamic_checkpoint_7b32__.mjs";
+    match fs::write_file(path, "export const value = 1;") {
+        Ok(()) => (),
+        Err(message) => testing::fail(message),
+    };
+    let options = ExecutionOptions {
+        mode: SourceMode::Module,
+        strict: false,
+        includes: Vec::new(),
+        report_unhandled_rejections: true,
+    };
+    let result = run(
+        Command::Evaluate(
+            "let pending = Promise.reject(16); import('./__gomlquickjs_qjs_dynamic_checkpoint_7b32__.mjs').then(function() { pending.catch(function() {}); }); export {};",
+            Vec::new(),
+            options,
+        ),
+    );
+    let _ = fs::remove_file(path);
+    match result {
+        Ok(()) => (),
+        Err(message) => testing::fail(message),
+    }
+}
+
+#[test]
 fn mjs_files_execute_as_modules_with_top_level_await() -> unit {
     let path = "__gomlquickjs_qjs_tla_8c41__.mjs";
     match fs::write_file(path, "await Promise.resolve(42);") {
         Ok(()) => (),
         Err(message) => testing::fail(message),
     };
-    match run(Command::File(path, Vec::[path], default_execution_options())) {
+    match run(Command::File(path, Vec::from_array([path]), default_execution_options())) {
         Ok(()) => (),
         Err(message) => testing::fail(message),
     };

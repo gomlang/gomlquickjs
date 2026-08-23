@@ -30,7 +30,7 @@ fn promise_rejection(value: runtime::Value) -> PromiseFailure {
 #[test]
 fn job_queue_is_fifo_and_drains_nested_jobs() -> unit {
     let queue = JobQueue::new();
-    let order: Vec[int] = Vec::[];
+    let order: Vec[isize] = Vec::new();
     queue.enqueue(
         || {
             order.push(1);
@@ -113,7 +113,7 @@ fn catch_recovers_and_reactions_keep_registration_order() -> unit {
         },
     );
     testing::assert(recovered.is_pending());
-    let order: Vec[int] = Vec::[];
+    let order: Vec[isize] = Vec::new();
     let fulfilled = Promise::fulfilled(queue, runtime::Value::Int(0));
     let _ = fulfilled.then(
         Option::Some(
@@ -223,11 +223,13 @@ fn all_and_race_follow_input_order_and_first_settlement() -> unit {
     let second = Promise::pending(queue);
     let combined = all(
         queue,
-        Vec::[
-            PromiseResolution::Promise(first),
-            PromiseResolution::Promise(second),
-            value(runtime::Value::Int(3)),
-        ],
+        Vec::from_array(
+            [
+                PromiseResolution::Promise(first),
+                PromiseResolution::Promise(second),
+                value(runtime::Value::Int(3)),
+            ],
+        ),
     );
     testing::assert(second.resolve(value(runtime::Value::Int(2))));
     testing::assert(first.resolve(value(runtime::Value::Int(1))));
@@ -245,7 +247,9 @@ fn all_and_race_follow_input_order_and_first_settlement() -> unit {
     let race_second = Promise::pending(queue);
     let raced = race(
         queue,
-        Vec::[PromiseResolution::Promise(race_first), PromiseResolution::Promise(race_second)],
+        Vec::from_array(
+            [PromiseResolution::Promise(race_first), PromiseResolution::Promise(race_second)],
+        ),
     );
     testing::assert(race_second.reject(promise_rejection(runtime::Value::Int(42))));
     testing::assert(race_first.resolve(value(runtime::Value::Int(41))));
@@ -265,7 +269,7 @@ fn all_settled_and_any_collect_results_in_input_order() -> unit {
     let second = Promise::pending(queue);
     let settled = all_settled(
         queue,
-        Vec::[PromiseResolution::Promise(first), PromiseResolution::Promise(second)],
+        Vec::from_array([PromiseResolution::Promise(first), PromiseResolution::Promise(second)]),
     );
     testing::assert(second.reject(promise_rejection(runtime::Value::Int(52))));
     testing::assert(first.resolve(value(runtime::Value::Int(51))));
@@ -292,7 +296,9 @@ fn all_settled_and_any_collect_results_in_input_order() -> unit {
     let any_second = Promise::pending(queue);
     let selected = any(
         queue,
-        Vec::[PromiseResolution::Promise(any_first), PromiseResolution::Promise(any_second)],
+        Vec::from_array(
+            [PromiseResolution::Promise(any_first), PromiseResolution::Promise(any_second)],
+        ),
     );
     testing::assert(any_second.reject(promise_rejection(runtime::Value::Int(62))));
     testing::assert(any_first.reject(promise_rejection(runtime::Value::Int(61))));
@@ -320,10 +326,10 @@ fn all_settled_and_any_collect_results_in_input_order() -> unit {
 #[test]
 fn empty_combinators_have_ecmascript_terminal_states() -> unit {
     let queue = JobQueue::new();
-    let empty_all = all(queue, Vec::[]);
-    let empty_race = race(queue, Vec::[]);
-    let empty_settled = all_settled(queue, Vec::[]);
-    let empty_any = any(queue, Vec::[]);
+    let empty_all = all(queue, Vec::new());
+    let empty_race = race(queue, Vec::new());
+    let empty_settled = all_settled(queue, Vec::new());
+    let empty_any = any(queue, Vec::new());
     match empty_all.state() {
         PromiseState::Fulfilled(PromiseFulfillment::Values(values)) => {
             testing::assert(values.is_empty())
@@ -343,4 +349,52 @@ fn empty_combinators_have_ecmascript_terminal_states() -> unit {
         },
         _ => testing::fail("expected empty any rejection"),
     }
+}
+
+#[test]
+fn rejection_tracker_follows_handled_and_propagated_promises() -> unit {
+    let queue = JobQueue::new();
+    let rejected: Vec[Promise] = Vec::new();
+    let handled: Vec[Promise] = Vec::new();
+    queue.set_rejection_tracker(
+        Option::Some(
+            |promise, _, is_handled| if is_handled {
+                handled.push(promise)
+            } else {
+                rejected.push(promise)
+            },
+        ),
+    );
+    let source = Promise::rejected(queue, promise_rejection(runtime::Value::Int(7)));
+    testing::assert_eq(rejected.len(), 1);
+    testing::assert(rejected[0].same(source));
+    let child = source.then(Option::None, Option::None);
+    testing::assert_eq(handled.len(), 1);
+    testing::assert(handled[0].same(source));
+    testing::assert_eq(queue.run_all(), 1);
+    testing::assert_eq(rejected.len(), 2);
+    testing::assert(rejected[1].same(child));
+    let _ = child.catch(|_| undefined_resolution());
+    testing::assert_eq(handled.len(), 2);
+    testing::assert(handled[1].same(child))
+}
+
+#[test]
+fn rejection_tracker_ignores_promises_handled_before_settlement() -> unit {
+    let queue = JobQueue::new();
+    let rejected = Ref::new(0);
+    queue.set_rejection_tracker(
+        Option::Some(
+            |_, _, handled| if !handled {
+                rejected.set(rejected.get() + 1)
+            } else {},
+        ),
+    );
+    let source = Promise::pending(queue);
+    let child = source.then(Option::None, Option::Some(|_| undefined_resolution()));
+    testing::assert(source.reject(promise_rejection(runtime::Value::Int(8))));
+    testing::assert_eq(rejected.get(), 0);
+    testing::assert_eq(queue.run_all(), 1);
+    testing::assert_eq(rejected.get(), 0);
+    promise_assert_scalar(child, runtime::Value::Undefined)
 }
