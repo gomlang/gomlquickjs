@@ -136,7 +136,8 @@ Uncaught JavaScript errors retain source stack information in qjs diagnostics.
 The command accepts forced module, script, and strict execution modes, preloaded `-I` scripts,
 `--std`, `--no-unhandled-rejection`, and runtime-only `-q` initialization. File execution treats `.mjs` inputs as modules,
 otherwise detects module syntax, and uses a path-aware ES module loader with named,
-default, namespace, and side-effect imports, declaration, named, default, and star exports,
+default, namespace, combined, string-named, and side-effect imports, declaration, named,
+default, star, and namespace exports with source-order function declaration hoisting,
 live binding cells, immutable namespace accessors, relative resolution, star ambiguity checks,
 QuickJS-compatible working-directory resolution for bare specifiers, cycle-safe graph
 instantiation and evaluation, and Promise-based dynamic import with specifier
