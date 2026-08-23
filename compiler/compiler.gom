@@ -1576,45 +1576,239 @@ fn compile_bigint(compiler: Compiler, raw: string, span: ast::Span) -> unit {
     }
 }
 
-fn compile_optional_member(
+fn has_optional_chain(expression: ast::Expr) -> bool {
+    match expression {
+        ast::Expr::Member { object, optional, .. } => {
+            optional || has_optional_chain(object.get())
+        },
+        ast::Expr::Call { callee, optional, .. } => {
+            optional || has_optional_chain(callee.get())
+        },
+        _ => false,
+    }
+}
+
+fn parenthesized_has_optional_chain(expression: ast::Expr) -> bool {
+    match expression {
+        ast::Expr::Parenthesized { expression, .. } => {
+            parenthesized_has_optional_chain(expression.get())
+        },
+        _ => has_optional_chain(expression),
+    }
+}
+
+fn emit_optional_chain_test(
     compiler: Compiler,
-    object: ast::Expr,
+    drop_count: isize,
+    result_count: isize,
+    short_circuit_true: bool,
+    exits: Vec[isize],
+) -> unit {
+    let _ = emit(compiler, bytecode::Instruction::Dup);
+    let _ = emit(compiler, bytecode::Instruction::IsUndefinedOrNull);
+    let present = emit(compiler, bytecode::Instruction::IfFalse(-1));
+    let mut dropped = 0;
+    while dropped < drop_count {
+        let _ = emit(compiler, bytecode::Instruction::Drop);
+        dropped += 1;
+    }
+    if short_circuit_true {
+        let _ = emit(compiler, bytecode::Instruction::PushTrue);
+    } else {
+        let mut pushed = 0;
+        while pushed < result_count {
+            let _ = emit(compiler, bytecode::Instruction::Undefined);
+            pushed += 1;
+        }
+    };
+    exits.push(emit(compiler, bytecode::Instruction::Goto(-1)));
+    let _ = patch_jump(compiler, present, current_offset(compiler));
+}
+
+fn patch_optional_chain_exits(compiler: Compiler, exits: Vec[isize]) -> unit {
+    let end = current_offset(compiler);
+    for exit in exits {
+        let _ = patch_jump(compiler, exit, end);
+    }
+}
+
+fn compile_chain_property(
+    compiler: Compiler,
     property: ast::Expr,
     computed: bool,
     member_offset: isize,
+    span: ast::Span,
 ) -> unit {
-    compile_expression(compiler, object);
-    let _ = emit(compiler, bytecode::Instruction::Dup);
-    let _ = emit(compiler, bytecode::Instruction::Null);
-    let _ = emit(compiler, bytecode::Instruction::StrictEq);
-    let nullish = emit(compiler, bytecode::Instruction::IfTrue(-1));
-    let _ = emit(compiler, bytecode::Instruction::Dup);
-    let _ = emit(compiler, bytecode::Instruction::Undefined);
-    let _ = emit(compiler, bytecode::Instruction::StrictEq);
-    let undefined = emit(compiler, bytecode::Instruction::IfTrue(-1));
     if computed {
         compile_expression(compiler, property);
         let _ = emit_at(compiler, bytecode::Instruction::GetArrayEl, member_offset);
     } else {
         match property {
+            ast::Expr::PrivateIdentifier { name, span } => {
+                compile_private_name(compiler, name, span);
+                let _ = emit_at(compiler, bytecode::Instruction::GetPrivate, member_offset);
+            },
             ast::Expr::Identifier { name, .. } => {
                 let index = string_constant(compiler, name);
                 let _ = emit_at(compiler, bytecode::Instruction::GetField(index), member_offset);
             },
             _ => {
+                compile_error(compiler, "named member requires an identifier", span);
                 let _ = emit(compiler, bytecode::Instruction::Drop);
                 let _ = emit(compiler, bytecode::Instruction::Undefined);
             },
         }
+    }
+}
+
+fn compile_chain_member_access(
+    compiler: Compiler,
+    object: ast::Expr,
+    property: ast::Expr,
+    computed: bool,
+    optional: bool,
+    span: ast::Span,
+    keep_receiver: bool,
+    result_count: isize,
+    short_circuit_true: bool,
+    exits: Vec[isize],
+) -> unit {
+    let member_offset = first_source_byte_between(
+        compiler,
+        ast::expr_span(object).end,
+        ast::expr_span(property).start,
+    );
+    if match object {
+        ast::Expr::Super { .. } => true,
+        _ => false,
+    } {
+        if optional {
+            compile_error(compiler, "optional chain cannot start from `super`", span);
+            if keep_receiver {
+                let _ = emit(compiler, bytecode::Instruction::Undefined);
+            } else {};
+            let _ = emit(compiler, bytecode::Instruction::Undefined);
+        } else {
+            if keep_receiver {
+                compile_this_value(compiler)
+            } else {};
+            compile_member(
+                compiler,
+                ast::Expr::Member {
+                    object: Ref::new(object),
+                    property: Ref::new(property),
+                    computed,
+                    optional,
+                    span,
+                },
+            )
+        }
+    } else {
+        compile_chain_value(compiler, object, result_count, short_circuit_true, exits);
+        if optional {
+            emit_optional_chain_test(compiler, 1, result_count, short_circuit_true, exits)
+        } else {};
+        if keep_receiver {
+            let _ = emit(compiler, bytecode::Instruction::Dup);
+        } else {};
+        compile_chain_property(compiler, property, computed, member_offset, span);
+    }
+}
+
+fn compile_chain_value(
+    compiler: Compiler,
+    expression: ast::Expr,
+    result_count: isize,
+    short_circuit_true: bool,
+    exits: Vec[isize],
+) -> unit {
+    match expression {
+        ast::Expr::Member { object, property, computed, optional, span } => {
+            if optional || has_optional_chain(object.get()) {
+                compile_chain_member_access(
+                    compiler,
+                    object.get(),
+                    property.get(),
+                    computed,
+                    optional,
+                    span,
+                    false,
+                    result_count,
+                    short_circuit_true,
+                    exits,
+                )
+            } else {
+                compile_member(
+                    compiler,
+                    ast::Expr::Member { object, property, computed, optional, span },
+                )
+            }
+        },
+        ast::Expr::Call { callee, arguments, optional, span } => {
+            if optional || has_optional_chain(callee.get()) {
+                compile_chain_call(
+                    compiler,
+                    callee.get(),
+                    arguments,
+                    optional,
+                    span,
+                    result_count,
+                    short_circuit_true,
+                    exits,
+                )
+            } else {
+                compile_call(compiler, callee.get(), arguments, span)
+            }
+        },
+        _ => compile_expression(compiler, expression),
+    }
+}
+
+fn compile_optional_chain_expression(compiler: Compiler, expression: ast::Expr) -> unit {
+    let exits: Vec[isize] = Vec::new();
+    compile_chain_value(compiler, expression, 1, false, exits);
+    patch_optional_chain_exits(compiler, exits);
+}
+
+fn compile_optional_chain_reference(compiler: Compiler, expression: ast::Expr) -> unit {
+    let exits: Vec[isize] = Vec::new();
+    match expression {
+        ast::Expr::Member { object, property, computed, optional, span } => {
+            compile_chain_member_access(
+                compiler,
+                object.get(),
+                property.get(),
+                computed,
+                optional,
+                span,
+                true,
+                2,
+                false,
+                exits,
+            )
+        },
+        _ => {
+            let _ = emit(compiler, bytecode::Instruction::Undefined);
+            compile_expression(compiler, expression);
+        },
     };
-    let done = emit(compiler, bytecode::Instruction::Goto(-1));
-    let nullish_target = current_offset(compiler);
-    let _ = emit(compiler, bytecode::Instruction::Drop);
-    let _ = emit(compiler, bytecode::Instruction::Undefined);
-    let end = current_offset(compiler);
-    let _ = patch_jump(compiler, nullish, nullish_target);
-    let _ = patch_jump(compiler, undefined, nullish_target);
-    let _ = patch_jump(compiler, done, end);
+    patch_optional_chain_exits(compiler, exits);
+}
+
+fn compile_parenthesized_callee(compiler: Compiler, expression: ast::Expr) -> bool {
+    match expression {
+        ast::Expr::Parenthesized { expression, .. } => {
+            compile_parenthesized_callee(compiler, expression.get())
+        },
+        ast::Expr::Member { .. } => {
+            compile_optional_chain_reference(compiler, expression);
+            true
+        },
+        _ => {
+            compile_expression(compiler, expression);
+            false
+        },
+    }
 }
 
 fn compile_member(compiler: Compiler, expression: ast::Expr) -> unit {
@@ -1626,12 +1820,9 @@ fn compile_member(compiler: Compiler, expression: ast::Expr) -> unit {
                 ast::expr_span(property.get()).start,
             );
             if optional {
-                compile_optional_member(
+                compile_optional_chain_expression(
                     compiler,
-                    object.get(),
-                    property.get(),
-                    computed,
-                    member_offset,
+                    ast::Expr::Member { object, property, computed, optional, span },
                 )
             } else if match object.get() {
                 ast::Expr::Super { .. } => true,
@@ -1751,62 +1942,110 @@ fn compile_call_argument_array(compiler: Compiler, arguments: Vec[ast::Expr]) ->
     }
 }
 
-fn compile_optional_member_call(
+fn compile_call_from_stack(
     compiler: Compiler,
-    object: ast::Expr,
-    property: ast::Expr,
-    computed: bool,
     arguments: Vec[ast::Expr],
     spread: bool,
+    method: bool,
     call_offset: isize,
 ) -> unit {
-    compile_expression(compiler, object);
-    let _ = emit(compiler, bytecode::Instruction::Dup);
-    let _ = emit(compiler, bytecode::Instruction::Null);
-    let _ = emit(compiler, bytecode::Instruction::StrictEq);
-    let nullish = emit(compiler, bytecode::Instruction::IfTrue(-1));
-    let _ = emit(compiler, bytecode::Instruction::Dup);
-    let _ = emit(compiler, bytecode::Instruction::Undefined);
-    let _ = emit(compiler, bytecode::Instruction::StrictEq);
-    let undefined = emit(compiler, bytecode::Instruction::IfTrue(-1));
-    let _ = emit(compiler, bytecode::Instruction::Dup);
-    if computed {
-        compile_expression(compiler, property);
-        let _ = emit(compiler, bytecode::Instruction::GetArrayEl);
-    } else {
-        match property {
-            ast::Expr::Identifier { name, .. } => {
-                let index = string_constant(compiler, name);
-                let _ = emit(compiler, bytecode::Instruction::GetField(index));
-            },
-            _ => {
-                let _ = emit(compiler, bytecode::Instruction::Drop);
-                let _ = emit(compiler, bytecode::Instruction::Undefined);
-            },
-        }
-    };
     if spread {
         compile_call_argument_array(compiler, arguments);
-        let _ = emit_at(compiler, bytecode::Instruction::CallMethodArray, call_offset);
+        let _ = emit_at(
+            compiler,
+            if method {
+                bytecode::Instruction::CallMethodArray
+            } else {
+                bytecode::Instruction::CallArray
+            },
+            call_offset,
+        );
     } else {
         for argument in arguments {
             compile_expression(compiler, argument)
         }
-        let _ = emit_at(compiler, bytecode::Instruction::CallMethod(arguments.len()), call_offset);
-    };
-    let done = emit(compiler, bytecode::Instruction::Goto(-1));
-    let nullish_target = current_offset(compiler);
-    let _ = emit(compiler, bytecode::Instruction::Drop);
-    let _ = emit(compiler, bytecode::Instruction::Undefined);
-    let end = current_offset(compiler);
-    let _ = patch_jump(compiler, nullish, nullish_target);
-    let _ = patch_jump(compiler, undefined, nullish_target);
-    let _ = patch_jump(compiler, done, end);
+        let _ = emit_at(
+            compiler,
+            if method {
+                bytecode::Instruction::CallMethod(arguments.len())
+            } else {
+                bytecode::Instruction::Call(arguments.len())
+            },
+            call_offset,
+        );
+    }
 }
 
-fn compile_call(compiler: Compiler, callee: ast::Expr, arguments: Vec[ast::Expr], span: ast::Span) -> unit {
-    let spread = call_arguments_have_spread(arguments);
+fn compile_chain_callee(
+    compiler: Compiler,
+    callee: ast::Expr,
+    result_count: isize,
+    short_circuit_true: bool,
+    exits: Vec[isize],
+) -> bool {
+    match callee {
+        ast::Expr::Member { object, property, computed, optional, span } => {
+            compile_chain_member_access(
+                compiler,
+                object.get(),
+                property.get(),
+                computed,
+                optional,
+                span,
+                true,
+                result_count,
+                short_circuit_true,
+                exits,
+            );
+            true
+        },
+        ast::Expr::Parenthesized { expression, .. } => {
+            compile_parenthesized_callee(compiler, expression.get())
+        },
+        _ => {
+            compile_chain_value(compiler, callee, result_count, short_circuit_true, exits);
+            false
+        },
+    }
+}
+
+fn compile_chain_call(
+    compiler: Compiler,
+    callee: ast::Expr,
+    arguments: Vec[ast::Expr],
+    optional: bool,
+    span: ast::Span,
+    result_count: isize,
+    short_circuit_true: bool,
+    exits: Vec[isize],
+) -> unit {
     let call_offset = first_source_byte_between(compiler, ast::expr_span(callee).end, span.end);
+    let method = compile_chain_callee(compiler, callee, result_count, short_circuit_true, exits);
+    if optional {
+        emit_optional_chain_test(
+            compiler,
+            if method {
+                2
+            } else {
+                1
+            },
+            result_count,
+            short_circuit_true,
+            exits,
+        )
+    } else {};
+    let spread = call_arguments_have_spread(arguments);
+    compile_call_from_stack(compiler, arguments, spread, method, call_offset);
+}
+
+fn compile_call(
+    compiler: Compiler,
+    callee: ast::Expr,
+    arguments: Vec[ast::Expr],
+    call_span: ast::Span,
+) -> unit {
+    let spread = call_arguments_have_spread(arguments);
+    let call_offset = first_source_byte_between(compiler, ast::expr_span(callee).end, call_span.end);
     if !spread
         && match callee {
             ast::Expr::Identifier { name, .. } => name == "eval"
@@ -1825,7 +2064,12 @@ fn compile_call(compiler: Compiler, callee: ast::Expr, arguments: Vec[ast::Expr]
     } else {};
     match callee {
         ast::Expr::Parenthesized { expression, .. } => {
-            compile_call(compiler, expression.get(), arguments, span)
+            if parenthesized_has_optional_chain(expression.get()) {
+                let method = compile_parenthesized_callee(compiler, expression.get());
+                compile_call_from_stack(compiler, arguments, spread, method, call_offset)
+            } else {
+                compile_call(compiler, expression.get(), arguments, call_span)
+            }
         },
         ast::Expr::Super { span } => {
             if !compiler.super_call_allowed {
@@ -1848,14 +2092,16 @@ fn compile_call(compiler: Compiler, callee: ast::Expr, arguments: Vec[ast::Expr]
             }
         },
         ast::Expr::Member { object, property, computed, optional, span } => if optional {
-            compile_optional_member_call(
+            compile_optional_chain_expression(
                 compiler,
-                object.get(),
-                property.get(),
-                computed,
-                arguments,
-                spread,
-                call_offset,
+                ast::Expr::Call {
+                    callee: Ref::new(
+                        ast::Expr::Member { object, property, computed, optional, span },
+                    ),
+                    arguments,
+                    optional: false,
+                    span: call_span,
+                },
             )
         } else if match object.get() {
             ast::Expr::Super { .. } => true,
@@ -1992,6 +2238,18 @@ fn compile_tagged_template(
     let argument_count = substitutions.len() + 1;
     let template_index = template_constant(compiler, cooked, raw);
     match tag {
+        ast::Expr::Parenthesized { expression, .. } => {
+            let method = compile_parenthesized_callee(compiler, expression.get());
+            compile_tagged_arguments(compiler, template_index, substitutions);
+            let _ = emit(
+                compiler,
+                if method {
+                    bytecode::Instruction::CallMethod(argument_count)
+                } else {
+                    bytecode::Instruction::Call(argument_count)
+                },
+            );
+        },
         ast::Expr::Member { object, property, computed, optional, span } => if match object.get() {
             ast::Expr::Super { .. } => true,
             _ => false,
@@ -2064,16 +2322,6 @@ fn compile_construct(compiler: Compiler, callee: ast::Expr, arguments: Vec[ast::
     }
 }
 
-fn has_optional_member(expression: ast::Expr) -> bool {
-    match expression {
-        ast::Expr::Member { object, optional, .. } => {
-            optional || has_optional_member(object.get())
-        },
-        ast::Expr::Parenthesized { expression, .. } => has_optional_member(expression.get()),
-        _ => false,
-    }
-}
-
 fn compile_plain_identifier_delete(compiler: Compiler, name: string) -> unit {
     if lookup_binding(compiler, name).is_some() || lookup_outer_binding(compiler, name).is_some()
         || name == "arguments" && (compiler.arguments_available || compiler.lexical_arguments) {
@@ -2120,8 +2368,99 @@ fn compile_with_identifier_delete(compiler: Compiler, name: string, span: ast::S
     }
 }
 
+fn compile_optional_chain_member_delete(
+    compiler: Compiler,
+    object: ast::Expr,
+    property: ast::Expr,
+    computed: bool,
+    optional: bool,
+    span: ast::Span,
+) -> unit {
+    if match object {
+        ast::Expr::Super { .. } => true,
+        _ => false,
+    } {
+        if optional {
+            compile_error(compiler, "optional chain cannot start from `super`", span)
+        } else {};
+        set_source_offset(compiler, span.start);
+        let _ = emit(compiler, bytecode::Instruction::ThrowReferenceError);
+        return
+    } else {};
+    if !computed
+        && match property {
+            ast::Expr::PrivateIdentifier { .. } => true,
+            _ => false,
+        } {
+        compile_error(compiler, "private elements cannot be deleted", span);
+        compile_expression(compiler, object);
+        let _ = emit(compiler, bytecode::Instruction::Drop);
+        let _ = emit(compiler, bytecode::Instruction::PushFalse);
+        return
+    } else {};
+    let exits: Vec[isize] = Vec::new();
+    compile_chain_value(compiler, object, 1, true, exits);
+    if optional {
+        emit_optional_chain_test(compiler, 1, 1, true, exits)
+    } else {};
+    if computed {
+        compile_expression(compiler, property);
+        let _ = emit(compiler, bytecode::Instruction::Delete);
+    } else {
+        match property {
+            ast::Expr::Identifier { name, .. } => {
+                let index = string_constant(compiler, name);
+                let _ = emit(compiler, bytecode::Instruction::PushConst(index));
+                let _ = emit(compiler, bytecode::Instruction::Delete);
+            },
+            _ => {
+                compile_error(compiler, "named member requires an identifier", span);
+                let _ = emit(compiler, bytecode::Instruction::Drop);
+                let _ = emit(compiler, bytecode::Instruction::PushFalse);
+            },
+        }
+    };
+    patch_optional_chain_exits(compiler, exits);
+}
+
 fn compile_delete(compiler: Compiler, argument: ast::Expr) -> unit {
+    if has_optional_chain(argument) {
+        match argument {
+            ast::Expr::Member { object, property, computed, optional, span } => {
+                if !computed
+                    && match property.get() {
+                        ast::Expr::PrivateIdentifier { .. } => true,
+                        _ => false,
+                    } {
+                    compile_optional_chain_expression(
+                        compiler,
+                        ast::Expr::Member { object, property, computed, optional, span },
+                    );
+                    let _ = emit(compiler, bytecode::Instruction::Drop);
+                    let _ = emit(compiler, bytecode::Instruction::PushTrue);
+                } else {
+                    compile_optional_chain_member_delete(
+                        compiler,
+                        object.get(),
+                        property.get(),
+                        computed,
+                        optional,
+                        span,
+                    )
+                }
+            },
+            _ => {
+                compile_optional_chain_expression(compiler, argument);
+                let _ = emit(compiler, bytecode::Instruction::Drop);
+                let _ = emit(compiler, bytecode::Instruction::PushTrue);
+            },
+        };
+        return
+    } else {};
     match argument {
+        ast::Expr::Parenthesized { expression, .. } => {
+            compile_delete(compiler, expression.get())
+        },
         ast::Expr::Identifier { name, span } => if compiler.strict {
             compile_error(compiler, "identifier deletion is not allowed in strict mode", span);
             let _ = emit(compiler, bytecode::Instruction::PushFalse);
@@ -2146,32 +2485,16 @@ fn compile_delete(compiler: Compiler, argument: ast::Expr) -> unit {
             let _ = emit(compiler, bytecode::Instruction::Drop);
             let _ = emit(compiler, bytecode::Instruction::PushFalse);
         } else if computed {
-            let optional_chain = optional || has_optional_member(object.get());
             compile_expression(compiler, object.get());
             compile_expression(compiler, property.get());
-            let _ = emit(
-                compiler,
-                if optional_chain {
-                    bytecode::Instruction::DeleteOptional
-                } else {
-                    bytecode::Instruction::Delete
-                },
-            );
+            let _ = emit(compiler, bytecode::Instruction::Delete);
         } else {
             match property.get() {
                 ast::Expr::Identifier { name, .. } => {
-                    let optional_chain = optional || has_optional_member(object.get());
                     compile_expression(compiler, object.get());
                     let index = string_constant(compiler, name);
                     let _ = emit(compiler, bytecode::Instruction::PushConst(index));
-                    let _ = emit(
-                        compiler,
-                        if optional_chain {
-                            bytecode::Instruction::DeleteOptional
-                        } else {
-                            bytecode::Instruction::Delete
-                        },
-                    );
+                    let _ = emit(compiler, bytecode::Instruction::Delete);
                 },
                 _ => {
                     compile_error(compiler, "named member requires an identifier", span);
@@ -2450,8 +2773,11 @@ fn prepare_assignment_target(compiler: Compiler, expression: ast::Expr, fallback
         } else {
             with_identifier_assignment_target(compiler, name, span)
         },
+        ast::Expr::Parenthesized { expression, .. } => {
+            prepare_assignment_target(compiler, expression.get(), fallback_span)
+        },
         ast::Expr::Member { object, property, computed, optional, span } => {
-            if optional {
+            if optional || has_optional_chain(object.get()) {
                 compile_error(compiler, "optional chain is not an assignment target", span)
             } else {};
             let member_offset = first_source_byte_between(
@@ -3449,9 +3775,28 @@ fn compile_expression(compiler: Compiler, expression: ast::Expr) -> unit {
             compile_error(compiler, "spread expression is only valid in calls", span);
             compile_expression(compiler, argument.get());
         },
-        ast::Expr::Member { .. } => compile_member(compiler, expression),
-        ast::Expr::Call { callee, arguments, span } => {
-            compile_call(compiler, callee.get(), arguments, span)
+        ast::Expr::Member { object, property, computed, optional, span } => {
+            if optional || has_optional_chain(object.get()) {
+                compile_optional_chain_expression(
+                    compiler,
+                    ast::Expr::Member { object, property, computed, optional, span },
+                )
+            } else {
+                compile_member(
+                    compiler,
+                    ast::Expr::Member { object, property, computed, optional, span },
+                )
+            }
+        },
+        ast::Expr::Call { callee, arguments, optional, span } => {
+            if optional || has_optional_chain(callee.get()) {
+                compile_optional_chain_expression(
+                    compiler,
+                    ast::Expr::Call { callee, arguments, optional, span },
+                )
+            } else {
+                compile_call(compiler, callee.get(), arguments, span)
+            }
         },
         ast::Expr::DynamicImport { specifier, options, .. } => {
             compile_expression(compiler, specifier.get());

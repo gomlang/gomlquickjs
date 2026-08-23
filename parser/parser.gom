@@ -480,7 +480,30 @@ fn update_operator(kind: lexer::TokenKind) -> Option[ast::UpdateOperator] {
 fn assignment_target(value: ast::Expr) -> bool {
     match value {
         ast::Expr::Identifier { .. } => true,
-        ast::Expr::Member { optional, .. } => !optional,
+        ast::Expr::Member { object, optional, .. } => {
+            !optional && !has_optional_chain(object.get())
+        },
+        ast::Expr::Parenthesized { expression, .. } => assignment_target(expression.get()),
+        _ => false,
+    }
+}
+
+fn has_optional_chain(value: ast::Expr) -> bool {
+    match value {
+        ast::Expr::Member { object, optional, .. } => {
+            optional || has_optional_chain(object.get())
+        },
+        ast::Expr::Call { callee, optional, .. } => {
+            optional || has_optional_chain(callee.get())
+        },
+        _ => false,
+    }
+}
+
+fn parenthesized_super(value: ast::Expr) -> bool {
+    match value {
+        ast::Expr::Super { .. } => true,
+        ast::Expr::Parenthesized { expression, .. } => parenthesized_super(expression.get()),
         _ => false,
     }
 }
@@ -1806,7 +1829,7 @@ fn parse_primary(parser: Parser) -> ast::Expr {
     }
 }
 
-fn parse_call(parser: Parser, callee: ast::Expr) -> ast::Expr {
+fn parse_call(parser: Parser, callee: ast::Expr, optional: bool) -> ast::Expr {
     let start = ast::expr_span(callee).start;
     let open = bump(parser);
     let arguments: Vec[ast::Expr] = Vec::new();
@@ -1864,11 +1887,12 @@ fn parse_call(parser: Parser, callee: ast::Expr) -> ast::Expr {
             report(parser, "expected `)`", missing_span(parser))
         } else {}
     };
-    ast::Expr::Call { callee: Ref::new(callee), arguments, span: ast::span(start, end) }
+    ast::Expr::Call { callee: Ref::new(callee), arguments, optional, span: ast::span(start, end) }
 }
 
 fn parse_postfix(parser: Parser, initial: ast::Expr) -> ast::Expr {
     let mut expression = initial;
+    let mut optional_chain = false;
     let mut done = false;
     while !done {
         if at(parser, lexer::TokenKind::Dot) {
@@ -1916,7 +1940,15 @@ fn parse_postfix(parser: Parser, initial: ast::Expr) -> ast::Expr {
             };
         } else if at(parser, lexer::TokenKind::OptionalChain) {
             let start = ast::expr_span(expression).start;
-            bump(parser);
+            let token = bump(parser);
+            optional_chain = true;
+            if parenthesized_super(expression) {
+                report(parser, "optional chain cannot start from `super`", convert_span(token.span))
+            } else {};
+            if at(parser, lexer::TokenKind::LParen) {
+                expression = parse_call(parser, expression, true);
+                continue
+            } else {};
             let computed = at(parser, lexer::TokenKind::LBracket);
             if computed {
                 let _ = bump(parser);
@@ -1929,7 +1961,13 @@ fn parse_postfix(parser: Parser, initial: ast::Expr) -> ast::Expr {
                 }
             } else {
                 let property_token = current_token(parser);
-                if is_identifier_name(property_token.kind) {
+                if property_token.kind == lexer::TokenKind::PrivateIdentifier {
+                    bump(parser);
+                    ast::Expr::PrivateIdentifier {
+                        name: property_token.value,
+                        span: convert_span(property_token.span),
+                    }
+                } else if is_identifier_name(property_token.kind) {
                     bump(parser);
                     ast::Expr::Identifier {
                         name: property_token.value,
@@ -1955,10 +1993,17 @@ fn parse_postfix(parser: Parser, initial: ast::Expr) -> ast::Expr {
             if current_token(parser).line_break_before && block_arrow(expression) {
                 done = true;
             } else {
-                expression = parse_call(parser, expression);
+                expression = parse_call(parser, expression, false);
             }
         } else if at(parser, lexer::TokenKind::NoSubstitutionTemplate)
             || at(parser, lexer::TokenKind::TemplateHead) {
+            if optional_chain {
+                report(
+                    parser,
+                    "tagged template cannot appear in an optional chain",
+                    convert_span(current_token(parser).span),
+                )
+            } else {};
             expression = parse_tagged_template(parser, expression);
         } else {
             done = true;
@@ -2036,9 +2081,16 @@ fn parse_new_expression(parser: Parser) -> ast::Expr {
             done = true;
         }
     }
+    if at(parser, lexer::TokenKind::OptionalChain) {
+        report(
+            parser,
+            "new keyword cannot be used with an optional chain",
+            convert_span(current_token(parser).span),
+        )
+    } else {};
     let mut end = expr_end(callee);
     let arguments = if at(parser, lexer::TokenKind::LParen) {
-        match parse_call(parser, callee) {
+        match parse_call(parser, callee, false) {
             ast::Expr::Call { arguments, span, .. } => {
                 end = span.end;
                 arguments
@@ -2085,7 +2137,7 @@ fn parse_prefix(parser: Parser) -> ast::Expr {
             let start = bump(parser).span.start;
             bump(parser);
             let end = bump(parser).span.end;
-            ast::Expr::NewTarget { span: ast::span(start, end) }
+            parse_postfix(parser, ast::Expr::NewTarget { span: ast::span(start, end) })
         } else if at(parser, lexer::TokenKind::NewKeyword) {
             parse_new_expression(parser)
         } else {
