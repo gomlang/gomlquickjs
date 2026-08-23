@@ -30,7 +30,7 @@ fn promise_object_invoke(
     callable: runtime::Value,
     arguments: Vec[runtime::Value],
 ) -> Result[runtime::Value, vm::VmError] {
-    let code: Vec[bytecode::Instruction] = Vec::[bytecode::Instruction::GetLoc(0)];
+    let code: Vec[bytecode::Instruction] = Vec::from_array([bytecode::Instruction::GetLoc(0)]);
     let mut index = 0;
     while index < arguments.len() {
         code.push(bytecode::Instruction::GetLoc(index + 1));
@@ -43,7 +43,7 @@ fn promise_object_invoke(
     for value in arguments {
         locals.push(value)
     }
-    context.execute_with_locals(bytecode::Function::new(Vec::[], code, locals.len()), locals)
+    context.execute_with_locals(bytecode::Function::new(Vec::new(), code, locals.len()), locals)
 }
 
 fn promise_object_invoke_method(
@@ -52,10 +52,9 @@ fn promise_object_invoke_method(
     callable: runtime::Value,
     arguments: Vec[runtime::Value],
 ) -> Result[runtime::Value, vm::VmError] {
-    let code: Vec[bytecode::Instruction] = Vec::[
-        bytecode::Instruction::GetLoc(0),
-        bytecode::Instruction::GetLoc(1),
-    ];
+    let code: Vec[bytecode::Instruction] = Vec::from_array(
+        [bytecode::Instruction::GetLoc(0), bytecode::Instruction::GetLoc(1)],
+    );
     let mut index = 0;
     while index < arguments.len() {
         code.push(bytecode::Instruction::GetLoc(index + 2));
@@ -69,7 +68,7 @@ fn promise_object_invoke_method(
     for value in arguments {
         locals.push(value)
     }
-    context.execute_with_locals(bytecode::Function::new(Vec::[], code, locals.len()), locals)
+    context.execute_with_locals(bytecode::Function::new(Vec::new(), code, locals.len()), locals)
 }
 
 fn promise_object_vm_failure(error: vm::VmError) -> promise::PromiseFailure {
@@ -242,8 +241,28 @@ fn promise_object_wrap(
     value: promise::Promise,
 ) -> Result[runtime::Value, vm::NativeError] {
     let object = allocate_ordinary(heap, Option::Some(prototype))?;
+    value.bind_host_object(object);
     states[object] = value;
     Result::Ok(runtime::Value::Object(object))
+}
+
+fn promise_object_gc_edges(
+    heap: runtime::Heap,
+    states: HashMap[runtime::ObjectId, promise::Promise],
+) -> Vec[runtime::GcEdge] {
+    let edges: Vec[runtime::GcEdge] = Vec::new();
+    let stale: Vec[runtime::ObjectId] = Vec::new();
+    for (object, state) in states.entries() {
+        if heap.contains(object) {
+            edges.push(runtime::GcEdge { owner: object, values: state.gc_values() })
+        } else {
+            stale.push(object)
+        }
+    }
+    for object in stale {
+        let _ = states.remove(object);
+    }
+    edges
 }
 
 fn promise_object_new_native(
@@ -305,7 +324,12 @@ fn promise_object_thenable_execute(
         Ok(value) => value,
         Err(error) => return Result::Err(promise::PromiseFailure::TypeError(error.message)),
     };
-    match promise_object_invoke_method(context, receiver, then_function, Vec::[resolve, reject]) {
+    match promise_object_invoke_method(
+        context,
+        receiver,
+        then_function,
+        Vec::from_array([resolve, reject]),
+    ) {
         Ok(_) => Result::Ok(()),
         Err(error) => Result::Err(promise_object_vm_failure(error)),
     }
@@ -363,7 +387,7 @@ fn promise_object_async_resume(
     generator: runtime::Value,
     input: runtime::Value,
     throwing: bool,
-    depth: int,
+    depth: isize,
 ) -> unit {
     let result = if throwing {
         context.throw_generator_raw_at_depth(generator, input, depth)
@@ -451,7 +475,7 @@ fn promise_object_async_resume(
             Result::Ok(promise::value(runtime::Value::Undefined))
         },
     );
-    let _ = awaited.then(on_fulfilled, on_rejected);
+    let _ = awaited.then_with_roots(on_fulfilled, on_rejected, Vec::from_array([generator]));
 }
 
 fn promise_object_async_runner(
@@ -460,7 +484,7 @@ fn promise_object_async_runner(
     queue: promise::JobQueue,
     prototype: runtime::ObjectId,
     generator: runtime::Value,
-    depth: int,
+    depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     let capability = promise::PromiseCapability::new(queue);
     let result = match promise_object_wrap(context.heap(), states, prototype, capability.promise()) {
@@ -495,7 +519,7 @@ struct AsyncGeneratorRequest {
     value: runtime::Value,
     capability: promise::PromiseCapability,
     promise_value: runtime::Value,
-    depth: int,
+    depth: isize,
 }
 
 struct AsyncGeneratorState {
@@ -508,7 +532,7 @@ fn async_generator_update_roots(
     generator: runtime::Value,
     state: AsyncGeneratorState,
 ) -> unit {
-    let roots: Vec[runtime::Value] = Vec::[];
+    let roots: Vec[runtime::Value] = Vec::new();
     for request in state.requests {
         roots.push(request.value);
         roots.push(request.promise_value)
@@ -727,7 +751,11 @@ fn async_generator_await_resume(
             Result::Ok(promise::value(runtime::Value::Undefined))
         },
     );
-    let _ = promise.then(on_fulfilled, on_rejected);
+    let _ = promise.then_with_roots(
+        on_fulfilled,
+        on_rejected,
+        Vec::from_array([generator, request.value, request.promise_value]),
+    );
 }
 
 fn async_generator_await_yield(
@@ -810,7 +838,11 @@ fn async_generator_await_yield(
             Result::Ok(promise::value(runtime::Value::Undefined))
         },
     );
-    let _ = promise.then(on_fulfilled, on_rejected);
+    let _ = promise.then_with_roots(
+        on_fulfilled,
+        on_rejected,
+        Vec::from_array([generator, request.value, request.promise_value]),
+    );
 }
 
 fn async_generator_await_return(
@@ -880,7 +912,11 @@ fn async_generator_await_return(
             Result::Ok(promise::value(runtime::Value::Undefined))
         },
     );
-    let _ = promise.then(on_fulfilled, on_rejected);
+    let _ = promise.then_with_roots(
+        on_fulfilled,
+        on_rejected,
+        Vec::from_array([generator, request.value, request.promise_value]),
+    );
 }
 
 fn async_generator_resume(
@@ -958,7 +994,7 @@ fn async_generator_enqueue(
     generator: runtime::Value,
     value: runtime::Value,
     kind: AsyncGeneratorRequestKind,
-    depth: int,
+    depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     let capability = promise::PromiseCapability::new(queue);
     let promise_value = match promise_object_wrap(
@@ -1019,7 +1055,10 @@ fn async_generator_runner(
 ) -> Result[runtime::Value, vm::VmError] {
     match generator {
         runtime::Value::Object(value) => {
-            generators[value] = AsyncGeneratorState { requests: Vec::[], running: Ref::new(false) };
+            generators[value] = AsyncGeneratorState {
+                requests: Vec::new(),
+                running: Ref::new(false),
+            };
             Result::Ok(generator)
         },
         _ => Result::Err(
@@ -1103,7 +1142,7 @@ fn promise_object_construct(
     let capability = promise::PromiseCapability::new(queue);
     let object = promise_object_wrap(heap, states, prototype, capability.promise())?;
     let (resolve, reject) = promise_object_resolvers(context, states, prototype, capability)?;
-    match promise_object_invoke(context, executor, Vec::[resolve, reject]) {
+    match promise_object_invoke(context, executor, Vec::from_array([resolve, reject])) {
         Ok(_) => (),
         Err(error) => {
             let _ = capability.reject(promise_object_vm_failure(error));
@@ -1132,7 +1171,7 @@ fn promise_object_fulfill_handler(
                         return Result::Err(promise::PromiseFailure::TypeError(error.message))
                     },
                 };
-                match promise_object_invoke(context, value, Vec::[argument_value]) {
+                match promise_object_invoke(context, value, Vec::from_array([argument_value])) {
                     Ok(result) => {
                         promise_object_resolution(
                             context,
@@ -1168,7 +1207,7 @@ fn promise_object_reject_handler(
                         return Result::Err(promise::PromiseFailure::TypeError(error.message))
                     },
                 };
-                match promise_object_invoke(context, value, Vec::[argument_value]) {
+                match promise_object_invoke(context, value, Vec::from_array([argument_value])) {
                     Ok(result) => {
                         promise_object_resolution(
                             context,
@@ -1195,7 +1234,7 @@ fn promise_object_finally_handler(
 ) -> Option[() -> Result[promise::PromiseResolution, promise::PromiseFailure]] {
     if promise_object_callable(value) {
         Option::Some(
-            || match promise_object_invoke(context, value, Vec::[]) {
+            || match promise_object_invoke(context, value, Vec::new()) {
                 Ok(result) => {
                     promise_object_resolution(context, context.heap(), states, prototype, result)
                 },
@@ -1216,13 +1255,19 @@ fn promise_object_then(
     arguments: Vec[runtime::Value],
 ) -> Result[runtime::Value, vm::NativeError] {
     let source = promise_object_state(states, this_value)?;
+    let fulfill_value = argument(arguments, 0);
+    let reject_value = argument(arguments, 1);
     let on_fulfilled: Option[
         (promise::PromiseFulfillment) -> Result[promise::PromiseResolution, promise::PromiseFailure],
-    ] = promise_object_fulfill_handler(context, states, prototype, argument(arguments, 0));
+    ] = promise_object_fulfill_handler(context, states, prototype, fulfill_value);
     let on_rejected: Option[
         (promise::PromiseFailure) -> Result[promise::PromiseResolution, promise::PromiseFailure],
-    ] = promise_object_reject_handler(context, states, prototype, argument(arguments, 1));
-    let child = source.then(on_fulfilled, on_rejected);
+    ] = promise_object_reject_handler(context, states, prototype, reject_value);
+    let child = source.then_with_roots(
+        on_fulfilled,
+        on_rejected,
+        Vec::from_array([fulfill_value, reject_value]),
+    );
     promise_object_wrap(heap, states, prototype, child)
 }
 
@@ -1235,13 +1280,14 @@ fn promise_object_catch(
     arguments: Vec[runtime::Value],
 ) -> Result[runtime::Value, vm::NativeError] {
     let source = promise_object_state(states, this_value)?;
+    let reject_value = argument(arguments, 0);
     let on_fulfilled: Option[
         (promise::PromiseFulfillment) -> Result[promise::PromiseResolution, promise::PromiseFailure],
     ] = Option::None;
     let on_rejected: Option[
         (promise::PromiseFailure) -> Result[promise::PromiseResolution, promise::PromiseFailure],
-    ] = promise_object_reject_handler(context, states, prototype, argument(arguments, 0));
-    let child = source.then(on_fulfilled, on_rejected);
+    ] = promise_object_reject_handler(context, states, prototype, reject_value);
+    let child = source.then_with_roots(on_fulfilled, on_rejected, Vec::from_array([reject_value]));
     promise_object_wrap(heap, states, prototype, child)
 }
 
@@ -1254,14 +1300,15 @@ fn promise_object_finally(
     arguments: Vec[runtime::Value],
 ) -> Result[runtime::Value, vm::NativeError] {
     let source = promise_object_state(states, this_value)?;
+    let handler_value = argument(arguments, 0);
     let handler: Option[() -> Result[promise::PromiseResolution, promise::PromiseFailure]] = promise_object_finally_handler(
         context,
         states,
         prototype,
-        argument(arguments, 0),
+        handler_value,
     );
     let child = match handler {
-        Some(handler) => source.finally(handler),
+        Some(handler) => source.finally_with_roots(handler, Vec::from_array([handler_value])),
         None => {
             let on_fulfilled: Option[
                 (promise::PromiseFulfillment) -> Result[
@@ -1275,7 +1322,7 @@ fn promise_object_finally(
                     promise::PromiseFailure,
                 ],
             ] = Option::None;
-            source.then(on_fulfilled, on_rejected)
+            source.then_with_roots(on_fulfilled, on_rejected, Vec::from_array([handler_value]))
         },
     };
     promise_object_wrap(heap, states, prototype, child)
@@ -1357,7 +1404,7 @@ fn promise_object_array_values(heap: runtime::Heap, input: runtime::Value) -> Re
     };
     let length = match runtime::get_property(heap, object, runtime::string_property_key("length")) {
         Ok(Some(runtime::Value::Int(value))) => if value >= 0 {
-            value.to_int()
+            value.to_isize()
         } else {
             return Result::Err(
                 promise::PromiseFailure::TypeError(
@@ -1405,7 +1452,7 @@ fn promise_object_iterator_record(context: vm::Context, input: runtime::Value) -
     };
     let method = context.read_property_at_depth(input, runtime::Value::Symbol(symbol), 0)?;
     let callable = iterator_callable(method, "Promise combinator input is not iterable")?;
-    let arguments: Vec[runtime::Value] = Vec::[];
+    let arguments: Vec[runtime::Value] = Vec::new();
     let iterator = context.invoke_with_this_at_depth(callable, arguments, input, 0)?;
     match iterator {
         runtime::Value::Object(_) => iterator_record(context, iterator, 0),
@@ -1424,7 +1471,7 @@ fn promise_object_iterable_values(context: vm::Context, input: runtime::Value) -
         Ok(value) => value,
         Err(error) => return Result::Err(promise_object_iteration_failure(error)),
     };
-    let values: Vec[runtime::Value] = Vec::[];
+    let values: Vec[runtime::Value] = Vec::new();
     loop {
         match iterator_step(context, record, 0) {
             Ok(Some(value)) => values.push(value),
@@ -1564,7 +1611,7 @@ fn promise_object_static_try(
     let capability = promise::PromiseCapability::new(queue);
     let result = promise_object_wrap(heap, states, prototype, capability.promise())?;
     let callback = argument(arguments, 0);
-    let callback_arguments: Vec[runtime::Value] = Vec::[];
+    let callback_arguments: Vec[runtime::Value] = Vec::new();
     let mut index = 1;
     while index < arguments.len() {
         callback_arguments.push(arguments[index]);
@@ -1619,10 +1666,11 @@ fn promise_object_drain(
     Result::Ok(array_length_value(queue.run_all()))
 }
 
-fn async_generator_identity(this_value: runtime::Value, arguments: Vec[runtime::Value], depth: int) -> Result[
-    runtime::Value,
-    vm::VmError,
-] {
+fn async_generator_identity(
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+    depth: isize,
+) -> Result[runtime::Value, vm::VmError] {
     let _ = arguments;
     let _ = depth;
     Result::Ok(this_value)
@@ -1639,12 +1687,14 @@ fn install_async_generator(
         Ok(value) => value,
         Err(error) => return Result::Err(BuiltinError { message: error.message }),
     };
-    let generators: HashMap[runtime::ObjectId, AsyncGeneratorState] = HashMap::{};
-    for (name, kind) in Vec::[
-        ("next", AsyncGeneratorRequestKind::Next),
-        ("throw", AsyncGeneratorRequestKind::Throw),
-        ("return", AsyncGeneratorRequestKind::Return),
-    ] {
+    let generators: HashMap[runtime::ObjectId, AsyncGeneratorState] = HashMap::new();
+    for (name, kind) in Vec::from_array(
+        [
+            ("next", AsyncGeneratorRequestKind::Next),
+            ("throw", AsyncGeneratorRequestKind::Throw),
+            ("return", AsyncGeneratorRequestKind::Return),
+        ],
+    ) {
         define_value(
             heap,
             prototype,
@@ -1710,7 +1760,8 @@ pub fn install_promise_with_queue(context: vm::Context, queue: promise::JobQueue
         Ok(value) => value,
         Err(error) => return Result::Err(BuiltinError { message: error.message }),
     };
-    let states: HashMap[runtime::ObjectId, promise::Promise] = HashMap::{};
+    let states: HashMap[runtime::ObjectId, promise::Promise] = HashMap::new();
+    context.add_external_edge_provider(|| promise_object_gc_edges(context.heap(), states));
     install_async_generator(context, states, queue, prototype)?;
     define_to_string_tag(context, prototype, "Promise")?;
     define_value(
@@ -1800,7 +1851,7 @@ pub fn install_promise_with_queue(context: vm::Context, queue: promise::JobQueue
         true,
         true,
     )?;
-    for operation in Vec::["all", "allSettled", "any"] {
+    for operation in Vec::from_array(["all", "allSettled", "any"]) {
         let operation_name = operation;
         define_value(
             heap,

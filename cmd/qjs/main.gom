@@ -2,7 +2,10 @@ package main;
 
 use gomlang::quickjs::builtins;
 use gomlang::quickjs::compiler;
+use gomlang::quickjs::dtoa;
+use gomlang::quickjs::json;
 use gomlang::quickjs::modules;
+use gomlang::quickjs::promise;
 use gomlang::quickjs::runtime;
 use gomlang::quickjs::vm;
 use std::env;
@@ -11,7 +14,7 @@ use std::io;
 use std::process;
 use std::text;
 
-const HELP: string = "Usage: qjs [options] [file [args...]]\n  -e, --eval EXPR [args...]  evaluate source text\n  -m, --module               force module evaluation\n      --script               force script evaluation\n      --strict               force strict script evaluation\n  -I, --include FILE         evaluate a script before the main input\n      --std                  expose the std and os host objects\n  -q, --quit                 initialize the runtime and quit\n  -h, --help                 show this help\n  -v, --version              show the compatibility version";
+const HELP: string = "Usage: qjs [options] [file [args...]]\n  -e, --eval EXPR [args...]  evaluate source text\n  -m, --module               force module evaluation\n      --script               force script evaluation\n      --strict               force strict script evaluation\n  -I, --include FILE         evaluate a script before the main input\n      --std                  expose the std and os host objects\n      --no-unhandled-rejection\n                            ignore unhandled promise rejections\n  -q, --quit                 initialize the runtime and quit\n  -h, --help                 show this help\n  -v, --version              show the compatibility version";
 
 const VERSION: string = "gomlquickjs 2026-06-04";
 
@@ -26,6 +29,7 @@ struct ExecutionOptions {
     mode: SourceMode,
     strict: bool,
     includes: Vec[string],
+    report_unhandled_rejections: bool,
 }
 
 enum Command {
@@ -38,11 +42,16 @@ enum Command {
 }
 
 fn default_execution_options() -> ExecutionOptions {
-    ExecutionOptions { mode: SourceMode::Auto, strict: false, includes: Vec::[] }
+    ExecutionOptions {
+        mode: SourceMode::Auto,
+        strict: false,
+        includes: Vec::new(),
+        report_unhandled_rejections: true,
+    }
 }
 
-fn command_arguments(arguments: Vec[string], start: int) -> Vec[string] {
-    let values: Vec[string] = Vec::[];
+fn command_arguments(arguments: Vec[string], start: isize) -> Vec[string] {
+    let values: Vec[string] = Vec::new();
     let mut index = start;
     while index < arguments.len() {
         values.push(arguments[index]);
@@ -54,7 +63,8 @@ fn command_arguments(arguments: Vec[string], start: int) -> Vec[string] {
 fn parse_command(arguments: Vec[string]) -> Result[Command, string] {
     let mut mode = SourceMode::Auto;
     let mut strict = false;
-    let includes: Vec[string] = Vec::[];
+    let includes: Vec[string] = Vec::new();
+    let mut report_unhandled_rejections = true;
     let mut index = 1;
     while index < arguments.len() {
         let argument = arguments[index];
@@ -75,6 +85,9 @@ fn parse_command(arguments: Vec[string]) -> Result[Command, string] {
             index += 1;
         } else if argument == "--std" {
             index += 1;
+        } else if argument == "--no-unhandled-rejection" {
+            report_unhandled_rejections = false;
+            index += 1;
         } else if argument == "-I" || argument == "--include" {
             if index + 1 >= arguments.len() {
                 return Result::Err("include requires a file argument")
@@ -89,18 +102,22 @@ fn parse_command(arguments: Vec[string]) -> Result[Command, string] {
                 Command::Evaluate(
                     arguments[index + 1],
                     command_arguments(arguments, index + 2),
-                    ExecutionOptions { mode, strict, includes },
+                    ExecutionOptions { mode, strict, includes, report_unhandled_rejections },
                 ),
             )
         } else if argument == "--" {
             if index + 1 >= arguments.len() {
-                return Result::Ok(Command::Stdin(ExecutionOptions { mode, strict, includes }))
+                return Result::Ok(
+                    Command::Stdin(
+                        ExecutionOptions { mode, strict, includes, report_unhandled_rejections },
+                    ),
+                )
             };
             return Result::Ok(
                 Command::File(
                     arguments[index + 1],
                     command_arguments(arguments, index + 1),
-                    ExecutionOptions { mode, strict, includes },
+                    ExecutionOptions { mode, strict, includes, report_unhandled_rejections },
                 ),
             )
         } else if argument.byte_len() > 0 && argument.byte_get(0) == b'-' {
@@ -110,12 +127,14 @@ fn parse_command(arguments: Vec[string]) -> Result[Command, string] {
                 Command::File(
                     argument,
                     command_arguments(arguments, index),
-                    ExecutionOptions { mode, strict, includes },
+                    ExecutionOptions { mode, strict, includes, report_unhandled_rejections },
                 ),
             )
         }
     }
-    Result::Ok(Command::Stdin(ExecutionOptions { mode, strict, includes }))
+    Result::Ok(
+        Command::Stdin(ExecutionOptions { mode, strict, includes, report_unhandled_rejections }),
+    )
 }
 
 fn compile_diagnostics(errors: Vec[compiler::CompileError]) -> string {
@@ -136,14 +155,14 @@ fn compile_diagnostics(errors: Vec[compiler::CompileError]) -> string {
 }
 
 fn execute_source(source: string) -> Result[runtime::Value, string] {
-    execute_source_with_arguments(source, Vec::[])
+    execute_source_with_arguments(source, Vec::new())
 }
 
 fn thrown_text(heap: runtime::Heap, value: runtime::Value) -> string {
     match value {
         runtime::Value::String(value) => value.to_host_string().unwrap_or("<invalid string>"),
         runtime::Value::Object(object) => {
-            for name in Vec::["stack", "message", "name"] {
+            for name in Vec::from_array(["stack", "message", "name"]) {
                 match runtime::get_property(heap, object, runtime::string_property_key(name)) {
                     Ok(Some(runtime::Value::String(value))) => match value.to_host_string() {
                         Ok(value) => if value.byte_len() > 0 {
@@ -171,22 +190,413 @@ fn runtime_error_text(context: vm::Context, error: vm::VmError) -> string {
 struct RuntimeSession {
     context: vm::Context,
     realm: builtins::Realm,
+    unhandled_rejections: Vec[PendingRejection],
+    report_unhandled_rejections: bool,
+    checkpoint_reached: Ref[bool],
 }
 
-fn initialize_runtime(script_arguments: Vec[string]) -> Result[RuntimeSession, string] {
+struct PendingRejection {
+    promise: promise::Promise,
+    failure: promise::PromiseFailure,
+    roots: Vec[Ref[runtime::Value]],
+}
+
+fn pending_rejection_index(rejections: Vec[PendingRejection], expected: promise::Promise) -> Option[
+    isize,
+] {
+    let mut index = 0;
+    while index < rejections.len() {
+        if rejections[index].promise.same(expected) {
+            return Option::Some(index)
+        } else {};
+        index += 1;
+    }
+    Option::None
+}
+
+fn track_promise_rejection(
+    context: vm::Context,
+    rejections: Vec[PendingRejection],
+    current: promise::Promise,
+    failure: promise::PromiseFailure,
+    handled: bool,
+) -> unit {
+    match pending_rejection_index(rejections, current) {
+        Some(index) => if handled {
+            for root in rejections[index].roots {
+                let _ = context.remove_external_root(root);
+            }
+            let _ = rejections.remove(index);
+        } else {},
+        None => if !handled {
+            let roots: Vec[Ref[runtime::Value]] = Vec::new();
+            let promise_root = current.host_object_root();
+            context.add_external_root(promise_root);
+            roots.push(promise_root);
+            root_promise_failure(context, failure, roots);
+            rejections.push(PendingRejection { promise: current, failure, roots })
+        } else {},
+    }
+}
+
+fn root_promise_failure(
+    context: vm::Context,
+    failure: promise::PromiseFailure,
+    roots: Vec[Ref[runtime::Value]],
+) -> unit {
+    match failure {
+        promise::PromiseFailure::Rejection(value) => {
+            let root = Ref::new(value);
+            context.add_external_root(root);
+            roots.push(root)
+        },
+        promise::PromiseFailure::Aggregate(aggregate) => for error in aggregate.errors {
+            root_promise_failure(context, error, roots)
+        },
+        promise::PromiseFailure::TypeError(_) => (),
+    }
+}
+
+fn initialize_runtime_with_tracking(
+    script_arguments: Vec[string],
+    report_unhandled_rejections: bool,
+) -> Result[RuntimeSession, string] {
     let context = vm::Context::new(runtime::Heap::new());
     compiler::install_dynamic_function_compiler(context);
     match builtins::install(context) {
         Err(error) => Result::Err("cannot initialize runtime: " + error.message),
         Ok(realm) => {
+            let unhandled_rejections: Vec[PendingRejection] = Vec::new();
+            let checkpoint_reached = Ref::new(false);
+            if report_unhandled_rejections {
+                realm.promise_queue().set_rejection_tracker(
+                    Option::Some(
+                        |current, failure, handled| track_promise_rejection(
+                            context,
+                            unhandled_rejections,
+                            current,
+                            failure,
+                            handled,
+                        ),
+                    ),
+                );
+                context.set_job_checkpoint(
+                    Option::Some(
+                        || if unhandled_rejections.is_empty() {
+                            false
+                        } else {
+                            checkpoint_reached.set(true);
+                            true
+                        },
+                    ),
+                )
+            } else {};
             modules::install_worker_module_loader(context);
             modules::install_dynamic_import_loader(context, realm.global_object());
             match builtins::set_script_args(context, realm, script_arguments) {
                 Err(error) => {
                     Result::Err("cannot initialize script arguments: " + error.message)
                 },
-                Ok(()) => Result::Ok(RuntimeSession { context, realm }),
+                Ok(()) => Result::Ok(
+                    RuntimeSession {
+                        context,
+                        realm,
+                        unhandled_rejections,
+                        report_unhandled_rejections,
+                        checkpoint_reached,
+                    },
+                ),
             }
+        },
+    }
+}
+
+fn initialize_runtime(script_arguments: Vec[string]) -> Result[RuntimeSession, string] {
+    initialize_runtime_with_tracking(script_arguments, true)
+}
+
+fn rejection_quoted_string(context: vm::Context, value: runtime::JsString) -> string {
+    match json::stringify(context.heap(), runtime::Value::String(value)) {
+        Ok(string_value) => string_value.to_host_string().unwrap_or("<invalid string>"),
+        Err(_) => "<invalid string>",
+    }
+}
+
+fn rejection_string_property(context: vm::Context, object: runtime::ObjectId, name: string) -> Option[
+    string,
+] {
+    match runtime::get_property(context.heap(), object, runtime::string_property_key(name)) {
+        Ok(Some(runtime::Value::String(value))) => match value.to_host_string() {
+            Ok(value) => Option::Some(value),
+            Err(_) => Option::None,
+        },
+        _ => Option::None,
+    }
+}
+
+fn rejection_error_text(context: vm::Context, object: runtime::ObjectId) -> string {
+    let name = rejection_string_property(context, object, "name").unwrap_or("Error");
+    let message = rejection_string_property(context, object, "message").unwrap_or("");
+    let header = if message.byte_len() == 0 {
+        name
+    } else {
+        name + ": " + message
+    };
+    match rejection_string_property(context, object, "stack") {
+        Some(stack) => if stack.byte_len() == 0 {
+            header
+        } else if stack.contains(header) {
+            stack
+        } else {
+            header + "\n" + stack
+        },
+        None => header,
+    }
+}
+
+fn rejection_simple_property_name(value: string) -> bool {
+    if value.byte_len() == 0 {
+        return false
+    } else {};
+    let first = value.byte_get(0);
+    if !((first >= b'a' && first <= b'z') || (first >= b'A' && first <= b'Z') || first == b'_'
+        || first == b'$') {
+        return false
+    } else {};
+    let mut index = 1;
+    while index < value.byte_len() {
+        let current = value.byte_get(index);
+        if !((current >= b'a' && current <= b'z') || (current >= b'A' && current <= b'Z')
+            || (current >= b'0' && current <= b'9')
+            || current == b'_'
+            || current == b'$') {
+            return false
+        } else {};
+        index += 1;
+    }
+    true
+}
+
+fn rejection_property_key_text(context: vm::Context, key: runtime::PropertyKey) -> string {
+    match key {
+        runtime::PropertyKey::String(value) => match value.to_host_string() {
+            Ok(host_value) => if rejection_simple_property_name(host_value) {
+                host_value
+            } else {
+                rejection_quoted_string(context, value)
+            },
+            Err(_) => "<invalid string>",
+        },
+        runtime::PropertyKey::Symbol(value) => {
+            "["
+                + rejection_value_text_at_depth(
+                    context,
+                    runtime::Value::Symbol(value),
+                    Vec::new(),
+                    0,
+                )
+                + "]"
+        },
+    }
+}
+
+fn rejection_seen_object(seen: Vec[runtime::ObjectId], expected: runtime::ObjectId) -> bool {
+    for object in seen {
+        if object == expected {
+            return true
+        } else {}
+    }
+    false
+}
+
+fn rejection_function_text(context: vm::Context, object: runtime::ObjectId) -> string {
+    match rejection_string_property(context, object, "name") {
+        Some(name) => if name.byte_len() == 0 {
+            "[Function]"
+        } else {
+            "[Function " + name + "]"
+        },
+        None => "[Function]",
+    }
+}
+
+fn rejection_descriptor_text(
+    context: vm::Context,
+    descriptor: runtime::PropertyDescriptor,
+    seen: Vec[runtime::ObjectId],
+    depth: isize,
+) -> string {
+    match runtime::descriptor_value(descriptor) {
+        Some(value) => rejection_value_text_at_depth(context, value, seen, depth),
+        None => {
+            let getter = runtime::descriptor_get(descriptor).is_some();
+            let setter = runtime::descriptor_set(descriptor).is_some();
+            if getter && setter {
+                "[Getter/Setter]"
+            } else if getter {
+                "[Getter]"
+            } else if setter {
+                "[Setter]"
+            } else {
+                "undefined"
+            }
+        },
+    }
+}
+
+fn rejection_object_text(
+    context: vm::Context,
+    object: runtime::ObjectId,
+    seen: Vec[runtime::ObjectId],
+    depth: isize,
+) -> string {
+    if rejection_seen_object(seen, object) {
+        return "[Circular]"
+    } else if depth >= 2 {
+        return "[Object]"
+    } else if object.is_callable() {
+        return rejection_function_text(context, object)
+    } else {};
+    let target = match context.heap().get(object) {
+        Some(value) => value,
+        None => return "<object>",
+    };
+    let array = match target.kind() {
+        runtime::ObjectKind::Array => true,
+        _ => false,
+    };
+    seen.push(object);
+    let builder = text::StringBuilder::new();
+    builder.write_string(
+        if array {
+            "[ "
+        } else {
+            "{ "
+        },
+    );
+    let mut first = true;
+    let mut count = 0;
+    for key in runtime::own_property_keys(context.heap(), object) {
+        match target.own_property(key) {
+            Some(descriptor) => if runtime::descriptor_enumerable(descriptor) {
+                if count >= 100 {
+                    if !first {
+                        builder.write_string(", ")
+                    } else {};
+                    builder.write_string("...");
+                    first = false;
+                    break
+                } else {};
+                if !first {
+                    builder.write_string(", ")
+                } else {};
+                if !array {
+                    builder.write_string(rejection_property_key_text(context, key));
+                    builder.write_string(": ")
+                } else {};
+                builder.write_string(
+                    rejection_descriptor_text(context, descriptor, seen, depth + 1),
+                );
+                first = false;
+                count += 1;
+            } else {},
+            None => (),
+        }
+    }
+    let _ = seen.pop();
+    builder.write_string(
+        if array {
+            " ]"
+        } else {
+            " }"
+        },
+    );
+    builder.finish()
+}
+
+fn rejection_value_text_at_depth(
+    context: vm::Context,
+    value: runtime::Value,
+    seen: Vec[runtime::ObjectId],
+    depth: isize,
+) -> string {
+    match value {
+        runtime::Value::Undefined => "undefined",
+        runtime::Value::Null => "null",
+        runtime::Value::Bool(value) => value.to_string(),
+        runtime::Value::Int(value) => value.to_string(),
+        runtime::Value::Float(value) => dtoa::number_to_string(value),
+        runtime::Value::String(value) => rejection_quoted_string(context, value),
+        runtime::Value::BigInt(value) => value.to_string() + "n",
+        runtime::Value::Symbol(value) => match value.description() {
+            Some(description) => match description.to_host_string() {
+                Ok(host_value) => if rejection_simple_property_name(host_value) {
+                    "Symbol(" + host_value + ")"
+                } else {
+                    "Symbol(" + rejection_quoted_string(context, description) + ")"
+                },
+                Err(_) => "Symbol(<invalid string>)",
+            },
+            None => "Symbol(\"\")",
+        },
+        runtime::Value::Object(object) => {
+            let error = match context.object_builtin_tag(object) {
+                Some(tag) => tag.to_host_string().unwrap_or("") == "Error",
+                None => false,
+            };
+            if error {
+                rejection_error_text(context, object)
+            } else {
+                rejection_object_text(context, object, seen, depth)
+            }
+        },
+    }
+}
+
+fn rejection_value_text(context: vm::Context, value: runtime::Value) -> string {
+    rejection_value_text_at_depth(context, value, Vec::new(), 0)
+}
+
+fn rejection_failure_text(context: vm::Context, failure: promise::PromiseFailure) -> string {
+    match failure {
+        promise::PromiseFailure::Rejection(value) => rejection_value_text(context, value),
+        promise::PromiseFailure::TypeError(message) => "TypeError: " + message,
+        promise::PromiseFailure::Aggregate(_) => "AggregateError",
+    }
+}
+
+fn check_unhandled_rejections(session: RuntimeSession) -> Result[unit, string] {
+    if !session.report_unhandled_rejections || session.unhandled_rejections.is_empty() {
+        return Result::Ok(())
+    } else {};
+    let builder = text::StringBuilder::new();
+    let mut first = true;
+    for rejection in session.unhandled_rejections {
+        if !first {
+            builder.write_char('\n')
+        } else {};
+        builder.write_string("Possibly unhandled promise rejection: ");
+        builder.write_string(rejection_failure_text(session.context, rejection.failure));
+        first = false;
+    }
+    Result::Err(builder.finish())
+}
+
+fn finish_runtime_execution(session: RuntimeSession, execution: Result[runtime::Value, string]) -> Result[
+    runtime::Value,
+    string,
+] {
+    match execution {
+        Ok(value) => {
+            check_unhandled_rejections(session)?;
+            Result::Ok(value)
+        },
+        Err(error) => if session.checkpoint_reached.get()
+            && error.contains("top-level await remained pending without host jobs") {
+            check_unhandled_rejections(session)?;
+            Result::Err(error)
+        } else {
+            Result::Err(error)
         },
     }
 }
@@ -265,7 +675,7 @@ fn execute_source_with_arguments_at_path(
     module_path: Option[string],
 ) -> Result[runtime::Value, string] {
     let session = initialize_runtime(script_arguments)?;
-    execute_script_in_runtime(session, source, module_path, true)
+    finish_runtime_execution(session, execute_script_in_runtime(session, source, module_path, true))
 }
 
 fn execute_module_file_in_runtime(session: RuntimeSession, path: string) -> Result[
@@ -315,6 +725,15 @@ fn fail(message: string) -> unit {
     process::exit(1)
 }
 
+fn report_error(message: string) -> unit {
+    if message.starts_with("Possibly unhandled promise rejection: ") {
+        io::eprintln(message);
+        process::exit(1)
+    } else {
+        fail(message)
+    }
+}
+
 fn source_uses_module_mode(mode: SourceMode, path: Option[string], source: string) -> bool {
     match mode {
         SourceMode::Module => true,
@@ -337,64 +756,66 @@ fn run(command: Command) -> Result[unit, string] {
             Result::Ok(())
         },
         Command::Quit => {
-            let _ = initialize_runtime(Vec::[])?;
+            let _ = initialize_runtime(Vec::new())?;
             Result::Ok(())
         },
         Command::Evaluate(source, arguments, options) => {
-            let session = initialize_runtime(arguments)?;
+            let session = initialize_runtime_with_tracking(
+                arguments,
+                options.report_unhandled_rejections,
+            )?;
             execute_include_files(session, options)?;
-            if source_uses_module_mode(options.mode, Option::None, source) {
-                let _ = execute_module_source_in_runtime(
-                    session,
-                    "qjs-eval.mjs",
-                    source,
-                    "<cmdline>",
-                )?;
+            let execution = if source_uses_module_mode(options.mode, Option::None, source) {
+                execute_module_source_in_runtime(session, "qjs-eval.mjs", source, "<cmdline>")
             } else {
-                let _ = execute_script_in_runtime(
+                execute_script_in_runtime(
                     session,
                     strict_source(source, options.strict),
                     Option::None,
                     true,
-                )?;
+                )
             };
+            let _ = finish_runtime_execution(session, execution)?;
             Result::Ok(())
         },
         Command::File(path, arguments, options) => {
             let source = read_file(path)?;
-            let session = initialize_runtime(arguments)?;
+            let session = initialize_runtime_with_tracking(
+                arguments,
+                options.report_unhandled_rejections,
+            )?;
             execute_include_files(session, options)?;
-            if source_uses_module_mode(options.mode, Option::Some(path), source) {
-                let _ = execute_module_file_in_runtime(session, path)?;
+            let execution = if source_uses_module_mode(options.mode, Option::Some(path), source) {
+                execute_module_file_in_runtime(session, path)
             } else {
-                let _ = execute_script_in_runtime(
+                execute_script_in_runtime(
                     session,
                     strict_source(source, options.strict),
                     Option::Some(path),
                     true,
-                )?;
+                )
             };
+            let _ = finish_runtime_execution(session, execution)?;
             Result::Ok(())
         },
         Command::Stdin(options) => {
             let source = read_stdin()?;
-            let session = initialize_runtime(Vec::[])?;
+            let session = initialize_runtime_with_tracking(
+                Vec::new(),
+                options.report_unhandled_rejections,
+            )?;
             execute_include_files(session, options)?;
-            if source_uses_module_mode(options.mode, Option::None, source) {
-                let _ = execute_module_source_in_runtime(
-                    session,
-                    "qjs-stdin.mjs",
-                    source,
-                    "<stdin>",
-                )?;
+            let execution = if source_uses_module_mode(options.mode, Option::None, source) {
+                execute_module_source_in_runtime(session, "qjs-stdin.mjs", source, "<stdin>")
             } else {
-                let _ = execute_script_in_runtime(
+                execute_script_in_runtime(
                     session,
                     strict_source(source, options.strict),
                     Option::None,
                     true,
-                )?;
+                )
             };
+            let _ = finish_runtime_execution(session, execution)?;
             Result::Ok(())
         },
     }
@@ -405,7 +826,7 @@ fn main() -> unit {
         Err(error) => fail(error),
         Ok(command) => match run(command) {
             Ok(()) => (),
-            Err(error) => fail(error),
+            Err(error) => report_error(error),
         },
     }
 }

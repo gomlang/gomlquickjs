@@ -9,15 +9,15 @@ use std::math;
 use std::num;
 use std::text;
 
-const MAX_CALL_DEPTH: int = 256;
+const MAX_CALL_DEPTH: isize = 256;
 
 pub enum VmErrorKind {
     VerificationFailed(Vec[bytecode::VerifyError]),
     StackUnderflow,
-    InvalidConstant(int),
-    InvalidLocal(int),
-    InvalidUpvalue(int),
-    InvalidJump(int),
+    InvalidConstant(isize),
+    InvalidLocal(isize),
+    InvalidUpvalue(isize),
+    InvalidJump(isize),
     ExpectedObject,
     InvalidPropertyKey,
     TypeError(string),
@@ -63,7 +63,7 @@ impl Debug for VmErrorKind {
 
 #[derive(Debug)]
 pub struct VmError {
-    pub offset: int,
+    pub offset: isize,
     pub kind: VmErrorKind,
 }
 
@@ -82,22 +82,22 @@ type NativeConstructorCallable = (runtime::Heap, runtime::ObjectId, Vec[runtime:
     NativeError,
 ];
 
-type VmCallable = (runtime::Value, Vec[runtime::Value], int) -> Result[runtime::Value, VmError];
+type VmCallable = (runtime::Value, Vec[runtime::Value], isize) -> Result[runtime::Value, VmError];
 
 type VmConstructorCallable = (
     runtime::ObjectId,
     Vec[runtime::Value],
     Option[runtime::ObjectId],
     runtime::Value,
-    int,
+    isize,
 ) -> Result[runtime::Value, VmError];
 
-type VmConstructorPrepareCallable = (Vec[runtime::Value], int) -> Result[
+type VmConstructorPrepareCallable = (Vec[runtime::Value], isize) -> Result[
     Vec[runtime::Value],
     VmError,
 ];
 
-type VmSelfAllocatingConstructorCallable = (Vec[runtime::Value], int) -> Result[
+type VmSelfAllocatingConstructorCallable = (Vec[runtime::Value], isize) -> Result[
     runtime::Value,
     VmError,
 ];
@@ -115,14 +115,14 @@ type DynamicEvalCompiler = (string, Vec[bytecode::EvalBinding]) -> Result[
     bytecode::SourceError,
 ];
 
-pub type DynamicModuleLoader = (runtime::Value, runtime::Value, runtime::Value, int) -> Result[
+pub type DynamicModuleLoader = (runtime::Value, runtime::Value, runtime::Value, isize) -> Result[
     runtime::Value,
     VmError,
 ];
 
-pub type AsyncFunctionRunner = (runtime::Value, int) -> Result[runtime::Value, VmError];
+pub type AsyncFunctionRunner = (runtime::Value, isize) -> Result[runtime::Value, VmError];
 
-pub type AsyncGeneratorRunner = (runtime::Value, int) -> Result[runtime::Value, VmError];
+pub type AsyncGeneratorRunner = (runtime::Value, isize) -> Result[runtime::Value, VmError];
 
 pub struct HostPromiseCapability {
     promise_value: runtime::Value,
@@ -156,9 +156,13 @@ pub type HostPromiseCapabilityFactory = () -> Result[HostPromiseCapability, VmEr
 
 pub type WorkerModuleLoader = (Context, runtime::ObjectId, string) -> Result[runtime::Value, string];
 
-pub type MicrotaskDrainer = () -> int;
+pub type MicrotaskDrainer = () -> isize;
 
 pub type MicrotaskPending = () -> bool;
+
+pub type ExternalEdgeProvider = () -> Vec[runtime::GcEdge];
+
+pub type JobCheckpoint = () -> bool;
 
 pub enum PrimitiveKind {
     Boolean,
@@ -337,7 +341,7 @@ enum UpvalueCell {
 
 struct ActiveFrame {
     function: bytecode::Function,
-    offset: Ref[int],
+    offset: Ref[isize],
     stack: Vec[runtime::Value],
     locals: Vec[Ref[runtime::Value]],
     upvalues: Vec[UpvalueCell],
@@ -378,9 +382,9 @@ struct GeneratorFrame {
     instance_initializer: Ref[Option[runtime::ObjectId]],
     arguments_object: Ref[Option[runtime::ObjectId]],
     request_roots: Ref[Vec[runtime::Value]],
-    offset: Ref[int],
+    offset: Ref[isize],
     status: Ref[GeneratorStatus],
-    depth: int,
+    depth: isize,
     eval_environment: Ref[Option[Ref[EvalEnvironment]]],
 }
 
@@ -397,18 +401,18 @@ struct GeneratorRuntime {
 impl GeneratorRuntime {
     fn new() -> GeneratorRuntime {
         GeneratorRuntime {
-            states: HashMap::{},
+            states: HashMap::new(),
             prototype: Ref::new(Option::None),
             async_generator_prototype: Ref::new(Option::None),
             async_iterator_symbol: Ref::new(Option::None),
             async_function_runner: Ref::new(Option::None),
             async_generator_runner: Ref::new(Option::None),
-            async_roots: HashMap::{},
+            async_roots: HashMap::new(),
         }
     }
 }
 
-pub type HostTask = (int) -> Result[unit, VmError];
+pub type HostTask = (isize) -> Result[unit, VmError];
 
 enum HostJob {
     Callback {
@@ -422,15 +426,15 @@ enum HostJob {
 }
 
 enum StepResult {
-    Continue(int),
-    Yield(runtime::Value, int),
-    Await(runtime::Value, int),
+    Continue(isize),
+    Yield(runtime::Value, isize),
+    Await(runtime::Value, isize),
     Return(runtime::Value),
 }
 
 enum ExecutionResult {
-    Yield(runtime::Value, int),
-    Await(runtime::Value, int),
+    Yield(runtime::Value, isize),
+    Await(runtime::Value, isize),
     Return(runtime::Value),
 }
 
@@ -445,8 +449,8 @@ struct Machine {
     heap: runtime::Heap,
     functions: HashMap[runtime::ObjectId, Closure],
     bound_functions: HashMap[runtime::ObjectId, BoundFunction],
-    function_objects: HashMap[uint64, runtime::ObjectId],
-    template_objects: HashMap[uint64, runtime::ObjectId],
+    function_objects: HashMap[u64, runtime::ObjectId],
+    template_objects: HashMap[u64, runtime::ObjectId],
     native_functions: HashMap[runtime::ObjectId, NativeCallable],
     native_constructor_functions: HashMap[runtime::ObjectId, NativeConstructorCallable],
     vm_functions: HashMap[runtime::ObjectId, VmCallable],
@@ -474,7 +478,7 @@ struct Machine {
     generators: GeneratorRuntime,
     dynamic_eval_compiler: Ref[Option[DynamicEvalCompiler]],
     dynamic_module_loader: Ref[Option[DynamicModuleLoader]],
-    depth: int,
+    depth: isize,
     eval_environment: Ref[Option[Ref[EvalEnvironment]]],
 }
 
@@ -482,8 +486,8 @@ pub struct Context {
     heap_value: runtime::Heap,
     functions_value: HashMap[runtime::ObjectId, Closure],
     bound_functions_value: HashMap[runtime::ObjectId, BoundFunction],
-    function_objects_value: HashMap[uint64, runtime::ObjectId],
-    template_objects_value: HashMap[uint64, runtime::ObjectId],
+    function_objects_value: HashMap[u64, runtime::ObjectId],
+    template_objects_value: HashMap[u64, runtime::ObjectId],
     native_functions_value: HashMap[runtime::ObjectId, NativeCallable],
     native_constructor_functions_value: HashMap[runtime::ObjectId, NativeConstructorCallable],
     vm_functions_value: HashMap[runtime::ObjectId, VmCallable],
@@ -506,6 +510,8 @@ pub struct Context {
     microtask_pending_value: Ref[Option[MicrotaskPending]],
     generators_value: GeneratorRuntime,
     external_roots_value: Vec[Ref[runtime::Value]],
+    external_edge_providers_value: Vec[ExternalEdgeProvider],
+    job_checkpoint_value: Ref[Option[JobCheckpoint]],
     virtual_modules_value: HashMap[string, runtime::Value],
     worker_module_loader_value: Ref[Option[WorkerModuleLoader]],
     current_module_path_value: Ref[Option[string]],
@@ -656,14 +662,14 @@ impl Context {
     pub fn new(heap: runtime::Heap) -> Context {
         Context {
             heap_value: heap,
-            functions_value: HashMap::{},
-            bound_functions_value: HashMap::{},
-            function_objects_value: HashMap::{},
-            template_objects_value: HashMap::{},
-            native_functions_value: HashMap::{},
-            native_constructor_functions_value: HashMap::{},
-            vm_functions_value: HashMap::{},
-            vm_constructor_functions_value: HashMap::{},
+            functions_value: HashMap::new(),
+            bound_functions_value: HashMap::new(),
+            function_objects_value: HashMap::new(),
+            template_objects_value: HashMap::new(),
+            native_functions_value: HashMap::new(),
+            native_constructor_functions_value: HashMap::new(),
+            vm_functions_value: HashMap::new(),
+            vm_constructor_functions_value: HashMap::new(),
             native_constructors_value: collections::HashSet::new(),
             global_object_value: Ref::new(Option::None),
             primitive_prototypes_value: PrimitivePrototypes::new(),
@@ -671,18 +677,20 @@ impl Context {
             regexp_constructor_value: Ref::new(Option::None),
             well_known_symbols_value: WellKnownSymbols::new(),
             iterator_symbol_value: Ref::new(Option::None),
-            object_builtin_tags_value: HashMap::{},
+            object_builtin_tags_value: HashMap::new(),
             dynamic_function_compiler_value: Ref::new(Option::None),
             dynamic_eval_compiler_value: Ref::new(Option::None),
             dynamic_module_loader_value: Ref::new(Option::None),
             promise_capability_factory_value: Ref::new(Option::None),
-            active_frames_value: Vec::[],
-            host_jobs_value: Vec::[],
+            active_frames_value: Vec::new(),
+            host_jobs_value: Vec::new(),
             microtask_drainer_value: Ref::new(Option::None),
             microtask_pending_value: Ref::new(Option::None),
             generators_value: GeneratorRuntime::new(),
-            external_roots_value: Vec::[],
-            virtual_modules_value: HashMap::{},
+            external_roots_value: Vec::new(),
+            external_edge_providers_value: Vec::new(),
+            job_checkpoint_value: Ref::new(Option::None),
+            virtual_modules_value: HashMap::new(),
             worker_module_loader_value: Ref::new(Option::None),
             current_module_path_value: Ref::new(Option::None),
         }
@@ -694,6 +702,26 @@ impl Context {
 
     pub fn add_external_root(self: Context, value: Ref[runtime::Value]) -> unit {
         self.external_roots_value.push(value)
+    }
+
+    pub fn add_external_edge_provider(self: Context, provider: ExternalEdgeProvider) -> unit {
+        self.external_edge_providers_value.push(provider)
+    }
+
+    pub fn remove_external_root(self: Context, expected: Ref[runtime::Value]) -> bool {
+        let mut index = 0;
+        while index < self.external_roots_value.len() {
+            if self.external_roots_value[index] == expected {
+                let _ = self.external_roots_value.remove(index);
+                return true
+            } else {};
+            index += 1;
+        }
+        false
+    }
+
+    pub fn set_job_checkpoint(self: Context, checkpoint: Option[JobCheckpoint]) -> unit {
+        self.job_checkpoint_value.set(checkpoint)
     }
 
     pub fn register_virtual_module(self: Context, specifier: string, value: runtime::Value) -> unit {
@@ -741,14 +769,19 @@ impl Context {
             } else {},
             None => (),
         };
-        let roots: Vec[runtime::Value] = Vec::[];
-        let edges: Vec[runtime::GcEdge] = Vec::[];
+        let roots: Vec[runtime::Value] = Vec::new();
+        let edges: Vec[runtime::GcEdge] = Vec::new();
         push_optional_object_root(roots, self.global_object_value.get());
         push_optional_root(roots, self.regexp_constructor_value.get());
         push_optional_object_root(roots, self.generators_value.prototype.get());
         push_optional_object_root(roots, self.generators_value.async_generator_prototype.get());
         for value in self.external_roots_value {
             roots.push(value.get())
+        }
+        for provider in self.external_edge_providers_value {
+            for edge in provider() {
+                edges.push(edge)
+            }
         }
         for (_, value) in self.virtual_modules_value.entries() {
             roots.push(value)
@@ -770,7 +803,7 @@ impl Context {
             }
         }
         for (owner, frame) in self.generators_value.states.entries() {
-            let values: Vec[runtime::Value] = Vec::[];
+            let values: Vec[runtime::Value] = Vec::new();
             push_generator_frame_roots(values, frame);
             edges.push(runtime::GcEdge { owner, values })
         }
@@ -778,7 +811,7 @@ impl Context {
             roots.push(runtime::Value::Object(generator))
         }
         for (owner, closure) in self.functions_value.entries() {
-            let values: Vec[runtime::Value] = Vec::[];
+            let values: Vec[runtime::Value] = Vec::new();
             push_upvalue_roots(values, closure.upvalues);
             push_optional_object_root(values, closure.home_object.get());
             push_optional_root(values, closure.new_target);
@@ -787,7 +820,7 @@ impl Context {
             edges.push(runtime::GcEdge { owner, values })
         }
         for (owner, bound) in self.bound_functions_value.entries() {
-            let values: Vec[runtime::Value] = Vec::[bound.target, bound.this_value];
+            let values: Vec[runtime::Value] = Vec::from_array([bound.target, bound.this_value]);
             for value in bound.arguments {
                 values.push(value)
             }
@@ -796,42 +829,46 @@ impl Context {
         for (_, object) in self.template_objects_value.entries() {
             roots.push(runtime::Value::Object(object))
         }
-        for kind in Vec::[
-            ErrorPrototypeKind::Error,
-            ErrorPrototypeKind::InternalError,
-            ErrorPrototypeKind::TypeError,
-            ErrorPrototypeKind::RangeError,
-            ErrorPrototypeKind::ReferenceError,
-            ErrorPrototypeKind::SyntaxError,
-            ErrorPrototypeKind::UriError,
-        ] {
+        for kind in Vec::from_array(
+            [
+                ErrorPrototypeKind::Error,
+                ErrorPrototypeKind::InternalError,
+                ErrorPrototypeKind::TypeError,
+                ErrorPrototypeKind::RangeError,
+                ErrorPrototypeKind::ReferenceError,
+                ErrorPrototypeKind::SyntaxError,
+                ErrorPrototypeKind::UriError,
+            ],
+        ) {
             push_optional_object_root(roots, self.error_prototypes_value.slot(kind).get())
         }
         match self.iterator_symbol_value.get() {
             Some(value) => roots.push(runtime::Value::Symbol(value)),
             None => (),
         };
-        for kind in Vec::[
-            WellKnownSymbolKind::AsyncIterator,
-            WellKnownSymbolKind::HasInstance,
-            WellKnownSymbolKind::IsConcatSpreadable,
-            WellKnownSymbolKind::Match,
-            WellKnownSymbolKind::MatchAll,
-            WellKnownSymbolKind::Replace,
-            WellKnownSymbolKind::Search,
-            WellKnownSymbolKind::Species,
-            WellKnownSymbolKind::Split,
-            WellKnownSymbolKind::ToPrimitive,
-            WellKnownSymbolKind::ToStringTag,
-            WellKnownSymbolKind::Unscopables,
-        ] {
+        for kind in Vec::from_array(
+            [
+                WellKnownSymbolKind::AsyncIterator,
+                WellKnownSymbolKind::HasInstance,
+                WellKnownSymbolKind::IsConcatSpreadable,
+                WellKnownSymbolKind::Match,
+                WellKnownSymbolKind::MatchAll,
+                WellKnownSymbolKind::Replace,
+                WellKnownSymbolKind::Search,
+                WellKnownSymbolKind::Species,
+                WellKnownSymbolKind::Split,
+                WellKnownSymbolKind::ToPrimitive,
+                WellKnownSymbolKind::ToStringTag,
+                WellKnownSymbolKind::Unscopables,
+            ],
+        ) {
             match self.well_known_symbols_value.slot(kind).get() {
                 Some(value) => roots.push(runtime::Value::Symbol(value)),
                 None => (),
             }
         }
         let result = self.heap_value.collect_with_edges(roots, edges);
-        let stale: Vec[runtime::ObjectId] = Vec::[];
+        let stale: Vec[runtime::ObjectId] = Vec::new();
         for (object, _) in self.generators_value.states.entries() {
             if !self.heap_value.contains(object) {
                 stale.push(object)
@@ -843,7 +880,7 @@ impl Context {
         result
     }
 
-    pub fn run_finalization_jobs_at_depth(self: Context, depth: int) -> int {
+    pub fn run_finalization_jobs_at_depth(self: Context, depth: isize) -> isize {
         let mut count = 0;
         while count < 16777216 {
             let job = match runtime::pop_finalization_job(self.heap_value) {
@@ -852,7 +889,7 @@ impl Context {
             };
             let _ = self.invoke_with_this_at_depth(
                 job.callback,
-                Vec::[job.held],
+                Vec::from_array([job.held]),
                 runtime::Value::Undefined,
                 depth,
             );
@@ -886,16 +923,57 @@ impl Context {
         self.microtask_pending_value.set(Option::Some(pending))
     }
 
-    fn run_microtasks(self: Context) -> int {
+    fn run_microtasks(self: Context) -> isize {
         match self.microtask_drainer_value.get() {
             Some(drain) => drain(),
             None => 0,
         }
     }
 
-    pub fn run_pending_jobs_at_depth(self: Context, depth: int) -> Result[int, VmError] {
+    fn job_checkpoint_requested(self: Context) -> bool {
+        match self.job_checkpoint_value.get() {
+            Some(checkpoint) => checkpoint(),
+            None => false,
+        }
+    }
+
+    fn pending_host_task_index(self: Context) -> Option[isize] {
+        let mut index = 0;
+        while index < self.host_jobs_value.len() {
+            match self.host_jobs_value[index] {
+                HostJob::Task { .. } => return Option::Some(index),
+                HostJob::Callback { .. } => (),
+            };
+            index += 1;
+        }
+        Option::None
+    }
+
+    fn run_host_tasks_at_depth(self: Context, depth: isize, limit: isize) -> Result[isize, VmError] {
+        let mut count = 0;
+        while count < limit {
+            let index = match self.pending_host_task_index() {
+                Some(index) => index,
+                None => break,
+            };
+            match self.host_jobs_value.remove(index) {
+                HostJob::Task { callback, .. } => callback(depth)?,
+                HostJob::Callback { .. } => (),
+            };
+            count += 1;
+            count += self.run_finalization_jobs_at_depth(depth);
+            count += self.run_microtasks();
+        }
+        Result::Ok(count)
+    }
+
+    pub fn run_pending_jobs_at_depth(self: Context, depth: isize) -> Result[isize, VmError] {
         let mut count = self.run_finalization_jobs_at_depth(depth);
         count += self.run_microtasks();
+        count += self.run_host_tasks_at_depth(depth, 16777216 - count)?;
+        if self.job_checkpoint_requested() {
+            return Result::Ok(count)
+        } else {};
         while !self.host_jobs_value.is_empty() && count < 16777216 {
             let job = self.host_jobs_value.remove(0);
             match job {
@@ -912,11 +990,15 @@ impl Context {
             count += 1;
             count += self.run_finalization_jobs_at_depth(depth);
             count += self.run_microtasks();
+            count += self.run_host_tasks_at_depth(depth, 16777216 - count)?;
+            if self.job_checkpoint_requested() {
+                return Result::Ok(count)
+            } else {}
         }
         Result::Ok(count)
     }
 
-    pub fn run_pending_jobs(self: Context) -> Result[int, VmError] {
+    pub fn run_pending_jobs(self: Context) -> Result[isize, VmError] {
         self.run_pending_jobs_at_depth(0)
     }
 
@@ -948,7 +1030,7 @@ impl Context {
         self: Context,
         generator: runtime::Value,
         input: runtime::Value,
-        depth: int,
+        depth: isize,
     ) -> Result[runtime::Value, VmError] {
         generator_completion_result(
             self.heap_value,
@@ -965,7 +1047,7 @@ impl Context {
         self: Context,
         generator: runtime::Value,
         input: runtime::Value,
-        depth: int,
+        depth: isize,
     ) -> Result[GeneratorCompletion, VmError] {
         self.resume_generator_completion_at_depth(
             generator,
@@ -979,7 +1061,7 @@ impl Context {
         self: Context,
         generator: runtime::Value,
         input: runtime::Value,
-        depth: int,
+        depth: isize,
     ) -> Result[runtime::Value, VmError] {
         generator_completion_result(
             self.heap_value,
@@ -996,7 +1078,7 @@ impl Context {
         self: Context,
         generator: runtime::Value,
         input: runtime::Value,
-        depth: int,
+        depth: isize,
     ) -> Result[GeneratorCompletion, VmError] {
         self.resume_generator_completion_at_depth(
             generator,
@@ -1010,7 +1092,7 @@ impl Context {
         self: Context,
         generator: runtime::Value,
         input: runtime::Value,
-        depth: int,
+        depth: isize,
     ) -> Result[runtime::Value, VmError] {
         generator_completion_result(
             self.heap_value,
@@ -1027,7 +1109,7 @@ impl Context {
         self: Context,
         generator: runtime::Value,
         input: runtime::Value,
-        depth: int,
+        depth: isize,
     ) -> Result[GeneratorCompletion, VmError] {
         self.resume_generator_completion_at_depth(
             generator,
@@ -1042,7 +1124,7 @@ impl Context {
         generator: runtime::Value,
         input: runtime::Value,
         kind: GeneratorResumeKind,
-        depth: int,
+        depth: isize,
     ) -> Result[GeneratorCompletion, VmError] {
         let object = match generator {
             runtime::Value::Object(value) => value,
@@ -1309,7 +1391,7 @@ impl Context {
         }
     }
 
-    pub fn value_to_string_at_depth(self: Context, value: runtime::Value, depth: int) -> Result[
+    pub fn value_to_string_at_depth(self: Context, value: runtime::Value, depth: isize) -> Result[
         runtime::JsString,
         VmError,
     ] {
@@ -1524,7 +1606,7 @@ impl Context {
 
     pub fn new_vm_function(
         self: Context,
-        callback: (runtime::Value, Vec[runtime::Value], int) -> Result[runtime::Value, VmError],
+        callback: (runtime::Value, Vec[runtime::Value], isize) -> Result[runtime::Value, VmError],
     ) -> Result[runtime::Value, VmError] {
         match runtime::new_object(
             self.heap_value,
@@ -1619,7 +1701,7 @@ impl Context {
             Vec[runtime::Value],
             Option[runtime::ObjectId],
             runtime::Value,
-            int,
+            isize,
         ) -> Result[runtime::Value, VmError],
     ) -> Result[unit, VmError] {
         match value {
@@ -1641,7 +1723,7 @@ impl Context {
     pub fn set_vm_constructor_prepare_callback(
         self: Context,
         value: runtime::Value,
-        prepare: (Vec[runtime::Value], int) -> Result[Vec[runtime::Value], VmError],
+        prepare: (Vec[runtime::Value], isize) -> Result[Vec[runtime::Value], VmError],
     ) -> Result[unit, VmError] {
         match value {
             runtime::Value::Object(object) => match self.vm_constructor_functions_value.get(object) {
@@ -1664,7 +1746,7 @@ impl Context {
     pub fn set_vm_self_allocating_constructor_callback(
         self: Context,
         value: runtime::Value,
-        callback: (Vec[runtime::Value], int) -> Result[runtime::Value, VmError],
+        callback: (Vec[runtime::Value], isize) -> Result[runtime::Value, VmError],
     ) -> Result[unit, VmError] {
         match value {
             runtime::Value::Object(object) => if self.vm_functions_value.get(object).is_some() {
@@ -1683,11 +1765,11 @@ impl Context {
     }
 }
 
-pub fn max_call_depth() -> int {
+pub fn max_call_depth() -> isize {
     MAX_CALL_DEPTH
 }
 
-fn error(offset: int, kind: VmErrorKind) -> VmError {
+fn error(offset: isize, kind: VmErrorKind) -> VmError {
     VmError { offset, kind }
 }
 
@@ -1756,7 +1838,7 @@ fn materialize_error_value(
     )
 }
 
-fn stack_line(function: bytecode::Function, offset: int) -> string {
+fn stack_line(function: bytecode::Function, offset: isize) -> string {
     let source_name = match function.source_name() {
         Some(value) => value.to_host_string().unwrap_or("<input>"),
         None => "<input>",
@@ -1770,7 +1852,7 @@ fn stack_line(function: bytecode::Function, offset: int) -> string {
     }
 }
 
-fn error_stack(machine: Machine, offset: int) -> runtime::JsString {
+fn error_stack(machine: Machine, offset: isize) -> runtime::JsString {
     let mut result = "";
     let mut index = machine.active_frames.len();
     while index > 0 {
@@ -1789,7 +1871,7 @@ fn error_stack(machine: Machine, offset: int) -> runtime::JsString {
     js_string(result)
 }
 
-fn ensure_error_stack(machine: Machine, value: runtime::Value, offset: int) -> runtime::Value {
+fn ensure_error_stack(machine: Machine, value: runtime::Value, offset: isize) -> runtime::Value {
     let object = match value {
         runtime::Value::Object(value) => value,
         _ => return value,
@@ -1899,7 +1981,7 @@ fn error_value(machine: Machine, kind: VmErrorKind) -> runtime::Value {
     }
 }
 
-fn error_value_at(machine: Machine, kind: VmErrorKind, offset: int) -> runtime::Value {
+fn error_value_at(machine: Machine, kind: VmErrorKind, offset: isize) -> runtime::Value {
     ensure_error_stack(machine, error_value(machine, kind), offset)
 }
 
@@ -1926,7 +2008,7 @@ fn native_error_kind(message: string) -> VmErrorKind {
     }
 }
 
-fn handler_target(function: bytecode::Function, offset: int) -> Option[int] {
+fn handler_target(function: bytecode::Function, offset: isize) -> Option[isize] {
     let handlers = function.exception_handlers();
     let mut selected: Option[bytecode::ExceptionHandler] = Option::None;
     for handler in handlers {
@@ -1948,7 +2030,7 @@ fn handler_target(function: bytecode::Function, offset: int) -> Option[int] {
     }
 }
 
-fn pop(machine: Machine, offset: int) -> Result[runtime::Value, VmError] {
+fn pop(machine: Machine, offset: isize) -> Result[runtime::Value, VmError] {
     match machine.stack.pop() {
         Some(value) => Result::Ok(value),
         None => Result::Err(error(offset, VmErrorKind::StackUnderflow)),
@@ -1982,20 +2064,20 @@ fn primitive_result(value: runtime::Value) -> Option[runtime::Value] {
 
 fn ordinary_to_primitive(
     machine: Machine,
-    offset: int,
+    offset: isize,
     object: runtime::ObjectId,
     hint: PrimitiveHint,
 ) -> Result[runtime::Value, VmError] {
     let receiver = runtime::Value::Object(object);
     let names = match hint {
-        PrimitiveHint::String => Vec::["toString", "valueOf"],
-        PrimitiveHint::Default | PrimitiveHint::Number => Vec::["valueOf", "toString"],
+        PrimitiveHint::String => Vec::from_array(["toString", "valueOf"]),
+        PrimitiveHint::Default | PrimitiveHint::Number => Vec::from_array(["valueOf", "toString"]),
     };
     for name in names {
         let method = read_property(machine, offset, receiver, runtime::string_property_key(name))?;
         match method {
             runtime::Value::Object(callable) => if callable.is_callable() {
-                let result = call_value(machine, offset, method, Vec::[], receiver)?;
+                let result = call_value(machine, offset, method, Vec::new(), receiver)?;
                 match primitive_result(result) {
                     Some(value) => return Result::Ok(value),
                     None => (),
@@ -2007,7 +2089,7 @@ fn ordinary_to_primitive(
     Result::Err(error(offset, VmErrorKind::TypeError("cannot convert object to primitive value")))
 }
 
-fn to_primitive(machine: Machine, offset: int, value: runtime::Value, hint: PrimitiveHint) -> Result[
+fn to_primitive(machine: Machine, offset: isize, value: runtime::Value, hint: PrimitiveHint) -> Result[
     runtime::Value,
     VmError,
 ] {
@@ -2025,7 +2107,7 @@ fn to_primitive(machine: Machine, offset: int, value: runtime::Value, hint: Prim
                         machine,
                         offset,
                         method,
-                        Vec::[primitive_hint_name(hint)],
+                        Vec::from_array([primitive_hint_name(hint)]),
                         value,
                     )?;
                     return match primitive_result(result) {
@@ -2054,14 +2136,14 @@ fn to_primitive(machine: Machine, offset: int, value: runtime::Value, hint: Prim
     ordinary_to_primitive(machine, offset, object, hint)
 }
 
-fn number(machine: Machine, offset: int, value: runtime::Value) -> Result[float64, VmError] {
+fn number(machine: Machine, offset: isize, value: runtime::Value) -> Result[f64, VmError] {
     match runtime::primitive_to_number(to_primitive(machine, offset, value, PrimitiveHint::Number)?) {
         Ok(value) => Result::Ok(value),
         Err(value) => Result::Err(error(offset, VmErrorKind::TypeError(value.message))),
     }
 }
 
-fn bigint_value(machine: Machine, offset: int, value: runtime::Value) -> Result[
+fn bigint_value(machine: Machine, offset: isize, value: runtime::Value) -> Result[
     runtime::BigInt,
     VmError,
 ] {
@@ -2099,7 +2181,7 @@ fn is_string(value: runtime::Value) -> bool {
     }
 }
 
-fn primitive_to_string(machine: Machine, offset: int, value: runtime::Value) -> Result[
+fn primitive_to_string(machine: Machine, offset: isize, value: runtime::Value) -> Result[
     runtime::JsString,
     VmError,
 ] {
@@ -2120,7 +2202,7 @@ fn primitive_to_string(machine: Machine, offset: int, value: runtime::Value) -> 
     }
 }
 
-fn template_array(machine: Machine, offset: int, values: Vec[Option[runtime::JsString]]) -> Result[
+fn template_array(machine: Machine, offset: isize, values: Vec[Option[runtime::JsString]]) -> Result[
     runtime::ObjectId,
     VmError,
 ] {
@@ -2153,7 +2235,7 @@ fn template_array(machine: Machine, offset: int, values: Vec[Option[runtime::JsS
     Result::Ok(object)
 }
 
-fn materialize_template(machine: Machine, offset: int, template: Ref[bytecode::TemplateConstant]) -> Result[
+fn materialize_template(machine: Machine, offset: isize, template: Ref[bytecode::TemplateConstant]) -> Result[
     runtime::Value,
     VmError,
 ] {
@@ -2166,7 +2248,7 @@ fn materialize_template(machine: Machine, offset: int, template: Ref[bytecode::T
         },
         None => (),
     };
-    let raw_values: Vec[Option[runtime::JsString]] = Vec::[];
+    let raw_values: Vec[Option[runtime::JsString]] = Vec::new();
     for value in template.get().raw() {
         raw_values.push(Option::Some(value))
     }
@@ -2188,7 +2270,7 @@ fn materialize_template(machine: Machine, offset: int, template: Ref[bytecode::T
     Result::Ok(runtime::Value::Object(cooked))
 }
 
-fn constant_value(machine: Machine, offset: int, index: int) -> Result[runtime::Value, VmError] {
+fn constant_value(machine: Machine, offset: isize, index: isize) -> Result[runtime::Value, VmError] {
     match machine.function.constant(index) {
         Some(bytecode::Constant::Float(value)) => Result::Ok(runtime::Value::Float(value)),
         Some(bytecode::Constant::String(value)) => Result::Ok(runtime::Value::String(value)),
@@ -2217,9 +2299,9 @@ fn constant_value(machine: Machine, offset: int, index: int) -> Result[runtime::
     }
 }
 
-fn arguments_length_value(length: int) -> runtime::Value {
+fn arguments_length_value(length: isize) -> runtime::Value {
     if length <= 2147483647 {
-        runtime::Value::Int(length.to_int32())
+        runtime::Value::Int(length.to_i32())
     } else {
         runtime::Value::Float(num::parse_float64(length.to_string()).unwrap_or(0.0))
     }
@@ -2236,7 +2318,7 @@ fn throw_restricted_arguments_property(
     Result::Err(NativeError { message: "TypeError: restricted arguments property" })
 }
 
-fn arguments_thrower(machine: Machine, offset: int) -> Result[runtime::Value, VmError] {
+fn arguments_thrower(machine: Machine, offset: isize) -> Result[runtime::Value, VmError] {
     let object = match runtime::new_object(
         machine.heap,
         runtime::ObjectKind::Function,
@@ -2267,7 +2349,7 @@ fn arguments_thrower(machine: Machine, offset: int) -> Result[runtime::Value, Vm
     Result::Ok(runtime::Value::Object(object))
 }
 
-fn materialize_arguments(machine: Machine, offset: int) -> Result[runtime::Value, VmError] {
+fn materialize_arguments(machine: Machine, offset: isize) -> Result[runtime::Value, VmError] {
     match machine.arguments_object.get() {
         Some(value) => if machine.heap.contains(value) {
             return Result::Ok(runtime::Value::Object(value))
@@ -2304,7 +2386,7 @@ fn materialize_arguments(machine: Machine, offset: int) -> Result[runtime::Value
                 if !runtime::map_argument_index(
                     machine.heap,
                     object,
-                    index.to_uint32(),
+                    index.to_u32(),
                     machine.locals[local],
                 ) {
                     return Result::Err(error(offset, VmErrorKind::TypeError("cannot map argument")))
@@ -2422,7 +2504,7 @@ pub fn function_definition_location(self: Context, value: runtime::Value) -> Opt
     }
 }
 
-fn materialize_rest_arguments(machine: Machine, offset: int, start: int) -> Result[
+fn materialize_rest_arguments(machine: Machine, offset: isize, start: isize) -> Result[
     runtime::Value,
     VmError,
 ] {
@@ -2452,8 +2534,8 @@ fn materialize_rest_arguments(machine: Machine, offset: int, start: int) -> Resu
 
 fn materialize_function(
     machine: Machine,
-    offset: int,
-    identity: Option[uint64],
+    offset: isize,
+    identity: Option[u64],
     function: Ref[bytecode::Function],
 ) -> Result[runtime::Value, VmError] {
     match runtime::new_object(
@@ -2465,7 +2547,7 @@ fn materialize_function(
         },
     ) {
         Ok(object) => {
-            let upvalues: Vec[UpvalueCell] = Vec::[];
+            let upvalues: Vec[UpvalueCell] = Vec::new();
             let mut index = 0;
             while index < function.get().upvalue_count() {
                 let cell = match function.get().upvalue_source(index) {
@@ -2518,7 +2600,7 @@ fn materialize_function(
                 object,
                 runtime::string_property_key("length"),
                 runtime::data_descriptor(
-                    runtime::Value::Int(function.get().function_length().to_int32()),
+                    runtime::Value::Int(function.get().function_length().to_i32()),
                     false,
                     false,
                     true,
@@ -2549,7 +2631,7 @@ fn materialize_function(
                     object,
                     runtime::string_property_key("lineNumber"),
                     runtime::data_descriptor(
-                        runtime::Value::Int(location.line.to_int32()),
+                        runtime::Value::Int(location.line.to_i32()),
                         false,
                         false,
                         true,
@@ -2560,7 +2642,7 @@ fn materialize_function(
                         object,
                         runtime::string_property_key("columnNumber"),
                         runtime::data_descriptor(
-                            runtime::Value::Int(location.column.to_int32()),
+                            runtime::Value::Int(location.column.to_i32()),
                             false,
                             false,
                             true,
@@ -2614,7 +2696,7 @@ fn materialize_function(
     }
 }
 
-fn field_key(machine: Machine, offset: int, index: int) -> Result[runtime::PropertyKey, VmError] {
+fn field_key(machine: Machine, offset: isize, index: isize) -> Result[runtime::PropertyKey, VmError] {
     match machine.function.constant(index) {
         Some(bytecode::Constant::String(value)) => {
             Result::Ok(runtime::js_string_property_key(value))
@@ -2624,7 +2706,7 @@ fn field_key(machine: Machine, offset: int, index: int) -> Result[runtime::Prope
     }
 }
 
-fn global_object(machine: Machine, offset: int) -> Result[runtime::ObjectId, VmError] {
+fn global_object(machine: Machine, offset: isize) -> Result[runtime::ObjectId, VmError] {
     match machine.global_object {
         Some(object) => if machine.heap.contains(object) {
             Result::Ok(object)
@@ -2635,7 +2717,7 @@ fn global_object(machine: Machine, offset: int) -> Result[runtime::ObjectId, VmE
     }
 }
 
-fn eval_name(machine: Machine, offset: int, index: int) -> Result[string, VmError] {
+fn eval_name(machine: Machine, offset: isize, index: isize) -> Result[string, VmError] {
     match machine.function.constant(index) {
         Some(bytecode::Constant::String(value)) => match value.to_host_string() {
             Ok(value) => Result::Ok(value),
@@ -2663,7 +2745,7 @@ fn eval_environment_cell(environment: Option[Ref[EvalEnvironment]], name: string
     }
 }
 
-fn read_eval_binding(machine: Machine, offset: int, index: int, missing_is_undefined: bool) -> Result[
+fn read_eval_binding(machine: Machine, offset: isize, index: isize, missing_is_undefined: bool) -> Result[
     runtime::Value,
     VmError,
 ] {
@@ -2692,7 +2774,7 @@ fn read_eval_binding(machine: Machine, offset: int, index: int, missing_is_undef
     }
 }
 
-fn write_eval_binding(machine: Machine, offset: int, index: int, value: runtime::Value) -> Result[
+fn write_eval_binding(machine: Machine, offset: isize, index: isize, value: runtime::Value) -> Result[
     unit,
     VmError,
 ] {
@@ -2715,7 +2797,7 @@ fn write_eval_binding(machine: Machine, offset: int, index: int, value: runtime:
     }
 }
 
-fn initialize_eval_binding(machine: Machine, offset: int, index: int) -> Result[unit, VmError] {
+fn initialize_eval_binding(machine: Machine, offset: isize, index: isize) -> Result[unit, VmError] {
     let name = eval_name(machine, offset, index)?;
     match machine.eval_environment.get() {
         Some(environment) => {
@@ -2747,7 +2829,7 @@ fn initialize_eval_binding(machine: Machine, offset: int, index: int) -> Result[
     }
 }
 
-fn delete_eval_binding(machine: Machine, offset: int, index: int) -> Result[bool, VmError] {
+fn delete_eval_binding(machine: Machine, offset: isize, index: isize) -> Result[bool, VmError] {
     let name = eval_name(machine, offset, index)?;
     let mut current = machine.eval_environment.get();
     while true {
@@ -2777,12 +2859,12 @@ fn delete_eval_binding(machine: Machine, offset: int, index: int) -> Result[bool
 
 fn enter_eval_environment(machine: Machine) -> unit {
     let environment = Ref::new(
-        EvalEnvironment { values: HashMap::{}, parent: machine.eval_environment.get() },
+        EvalEnvironment { values: HashMap::new(), parent: machine.eval_environment.get() },
     );
     machine.eval_environment.set(Option::Some(environment))
 }
 
-fn property_key(machine: Machine, offset: int, value: runtime::Value) -> Result[
+fn property_key(machine: Machine, offset: isize, value: runtime::Value) -> Result[
     runtime::PropertyKey,
     VmError,
 ] {
@@ -2805,7 +2887,7 @@ fn property_key(machine: Machine, offset: int, value: runtime::Value) -> Result[
     }
 }
 
-fn property_key_value(machine: Machine, offset: int, value: runtime::Value) -> Result[
+fn property_key_value(machine: Machine, offset: isize, value: runtime::Value) -> Result[
     runtime::Value,
     VmError,
 ] {
@@ -2822,7 +2904,7 @@ fn property_name(key: runtime::PropertyKey, name: string) -> bool {
     }
 }
 
-fn string_property_index(key: runtime::PropertyKey) -> Option[int] {
+fn string_property_index(key: runtime::PropertyKey) -> Option[isize] {
     let value = match key {
         runtime::PropertyKey::String(value) => value,
         runtime::PropertyKey::Symbol(_) => return Option::None,
@@ -2839,7 +2921,7 @@ fn string_property_index(key: runtime::PropertyKey) -> Option[int] {
         if code_unit < 48 || code_unit > 57 || result > 429496729 {
             return Option::None
         } else {};
-        result = result * 10 + (code_unit - 48).to_int();
+        result = result * 10 + (code_unit - 48).to_isize();
         if result > 4294967294 {
             return Option::None
         } else {};
@@ -2850,7 +2932,7 @@ fn string_property_index(key: runtime::PropertyKey) -> Option[int] {
 
 fn read_prototype_property(
     machine: Machine,
-    offset: int,
+    offset: isize,
     prototype: Ref[Option[runtime::ObjectId]],
     receiver: runtime::Value,
     key: runtime::PropertyKey,
@@ -2861,7 +2943,7 @@ fn read_prototype_property(
     }
 }
 
-fn proxy_parts(machine: Machine, offset: int, object: runtime::ObjectId) -> Result[
+fn proxy_parts(machine: Machine, offset: isize, object: runtime::ObjectId) -> Result[
     Option[(runtime::ObjectId, runtime::ObjectId)],
     VmError,
 ] {
@@ -2878,7 +2960,7 @@ fn proxy_parts(machine: Machine, offset: int, object: runtime::ObjectId) -> Resu
     }
 }
 
-fn proxy_trap(machine: Machine, offset: int, handler: runtime::ObjectId, name: string) -> Result[
+fn proxy_trap(machine: Machine, offset: isize, handler: runtime::ObjectId, name: string) -> Result[
     Option[runtime::Value],
     VmError,
 ] {
@@ -2904,7 +2986,7 @@ fn property_key_runtime_value(key: runtime::PropertyKey) -> runtime::Value {
 
 fn proxy_target_descriptor(
     machine: Machine,
-    offset: int,
+    offset: isize,
     target: runtime::ObjectId,
     key: runtime::PropertyKey,
 ) -> Result[Option[runtime::PropertyDescriptor], VmError] {
@@ -2916,7 +2998,7 @@ fn proxy_target_descriptor(
 
 fn validate_proxy_get(
     machine: Machine,
-    offset: int,
+    offset: isize,
     target: runtime::ObjectId,
     key: runtime::PropertyKey,
     result: runtime::Value,
@@ -2955,7 +3037,7 @@ fn validate_proxy_get(
 
 fn validate_proxy_set(
     machine: Machine,
-    offset: int,
+    offset: isize,
     target: runtime::ObjectId,
     key: runtime::PropertyKey,
     value: runtime::Value,
@@ -2993,7 +3075,7 @@ fn validate_proxy_set(
 
 fn read_object_property(
     machine: Machine,
-    offset: int,
+    offset: isize,
     object: runtime::ObjectId,
     receiver: runtime::Value,
     key: runtime::PropertyKey,
@@ -3009,7 +3091,9 @@ fn read_object_property(
                     machine,
                     offset,
                     trap,
-                    Vec::[runtime::Value::Object(target), property_key_runtime_value(key), receiver],
+                    Vec::from_array(
+                        [runtime::Value::Object(target), property_key_runtime_value(key), receiver],
+                    ),
                     runtime::Value::Object(handler),
                 )?,
             ),
@@ -3020,7 +3104,7 @@ fn read_object_property(
     match runtime::get_property_descriptor(machine.heap, object, key) {
         Ok(Some(runtime::PropertyDescriptor::Data { value, .. })) => Result::Ok(value),
         Ok(Some(runtime::PropertyDescriptor::Accessor { get: Some(value), .. })) => {
-            call_value(machine, offset, value, Vec::[], receiver)
+            call_value(machine, offset, value, Vec::new(), receiver)
         },
         Ok(Some(runtime::PropertyDescriptor::Accessor { get: None, .. })) | Ok(None) => {
             Result::Ok(runtime::Value::Undefined)
@@ -3029,22 +3113,24 @@ fn read_object_property(
     }
 }
 
-fn read_property(machine: Machine, offset: int, receiver: runtime::Value, key: runtime::PropertyKey) -> Result[
-    runtime::Value,
-    VmError,
-] {
+fn read_property(
+    machine: Machine,
+    offset: isize,
+    receiver: runtime::Value,
+    key: runtime::PropertyKey,
+) -> Result[runtime::Value, VmError] {
     match receiver {
         runtime::Value::Object(object) => {
             read_object_property(machine, offset, object, receiver, key)
         },
         runtime::Value::String(value) => if property_name(key, "length") {
-            Result::Ok(runtime::Value::Int(value.len().to_int32()))
+            Result::Ok(runtime::Value::Int(value.len().to_i32()))
         } else {
             match string_property_index(key) {
                 Some(index) => if index < value.len() {
                     Result::Ok(
                         runtime::Value::String(
-                            runtime::JsString::from_code_units(Vec::[value.get(index)]),
+                            runtime::JsString::from_code_units(Vec::from_array([value.get(index)])),
                         ),
                     )
                 } else {
@@ -3115,7 +3201,7 @@ fn global_reference_name(key: runtime::PropertyKey) -> string {
 
 fn read_global_property(
     machine: Machine,
-    offset: int,
+    offset: isize,
     object: runtime::ObjectId,
     key: runtime::PropertyKey,
 ) -> Result[runtime::Value, VmError] {
@@ -3135,7 +3221,7 @@ fn read_global_property(
 
 fn write_object_property(
     machine: Machine,
-    offset: int,
+    offset: isize,
     object: runtime::ObjectId,
     receiver: runtime::Value,
     key: runtime::PropertyKey,
@@ -3148,12 +3234,14 @@ fn write_object_property(
                     machine,
                     offset,
                     trap,
-                    Vec::[
-                        runtime::Value::Object(target),
-                        property_key_runtime_value(key),
-                        value,
-                        receiver,
-                    ],
+                    Vec::from_array(
+                        [
+                            runtime::Value::Object(target),
+                            property_key_runtime_value(key),
+                            value,
+                            receiver,
+                        ],
+                    ),
                     runtime::Value::Object(handler),
                 )?;
                 if runtime::to_boolean(result) {
@@ -3197,7 +3285,7 @@ fn write_object_property(
     } else {};
     match runtime::get_property_descriptor(machine.heap, object, key) {
         Ok(Some(runtime::PropertyDescriptor::Accessor { set: Some(setter), .. })) => {
-            let _ = call_value(machine, offset, setter, Vec::[value], receiver)?;
+            let _ = call_value(machine, offset, setter, Vec::from_array([value]), receiver)?;
             Result::Ok(())
         },
         Ok(_) => match runtime::set_property(machine.heap, object, key, value) {
@@ -3214,7 +3302,7 @@ fn write_object_property(
 
 fn define_copied_property(
     machine: Machine,
-    offset: int,
+    offset: isize,
     target: runtime::ObjectId,
     key: runtime::PropertyKey,
     value: runtime::Value,
@@ -3231,7 +3319,7 @@ fn define_copied_property(
     }
 }
 
-fn array_literal_target(machine: Machine, offset: int, value: runtime::Value) -> Result[
+fn array_literal_target(machine: Machine, offset: isize, value: runtime::Value) -> Result[
     runtime::ObjectId,
     VmError,
 ] {
@@ -3253,17 +3341,17 @@ fn array_literal_target(machine: Machine, offset: int, value: runtime::Value) ->
 
 fn append_array_literal_value(
     machine: Machine,
-    offset: int,
+    offset: isize,
     array: runtime::ObjectId,
     value: runtime::Value,
 ) -> Result[unit, VmError] {
-    match arrayx::push(machine.heap, array, Vec::[value]) {
+    match arrayx::push(machine.heap, array, Vec::from_array([value])) {
         Ok(_) => Result::Ok(()),
         Err(value) => Result::Err(error(offset, VmErrorKind::TypeError(value.to_string()))),
     }
 }
 
-fn append_array_literal(machine: Machine, offset: int) -> Result[unit, VmError] {
+fn append_array_literal(machine: Machine, offset: isize) -> Result[unit, VmError] {
     let value = pop(machine, offset)?;
     let target = pop(machine, offset)?;
     let array = array_literal_target(machine, offset, target)?;
@@ -3272,7 +3360,7 @@ fn append_array_literal(machine: Machine, offset: int) -> Result[unit, VmError] 
     Result::Ok(())
 }
 
-fn append_array_literal_hole(machine: Machine, offset: int) -> Result[unit, VmError] {
+fn append_array_literal_hole(machine: Machine, offset: isize) -> Result[unit, VmError] {
     let target = pop(machine, offset)?;
     let array = array_literal_target(machine, offset, target)?;
     let length = match arrayx::length(machine.heap, array) {
@@ -3285,7 +3373,7 @@ fn append_array_literal_hole(machine: Machine, offset: int) -> Result[unit, VmEr
         runtime::string_property_key("length"),
         runtime::data_descriptor(
             if length + 1 <= 2147483647 {
-                runtime::Value::Int((length + 1).to_int32())
+                runtime::Value::Int((length + 1).to_i32())
             } else {
                 runtime::Value::Float(num::parse_float64((length + 1).to_string()).unwrap_or(0.0))
             },
@@ -3302,7 +3390,7 @@ fn append_array_literal_hole(machine: Machine, offset: int) -> Result[unit, VmEr
 
 fn append_iterator_values(
     machine: Machine,
-    offset: int,
+    offset: isize,
     array: runtime::ObjectId,
     iterator: runtime::Value,
 ) -> Result[unit, VmError] {
@@ -3316,7 +3404,7 @@ fn append_iterator_values(
     };
     let next = read_property(machine, offset, iterator, runtime::string_property_key("next"))?;
     loop {
-        let result = call_value(machine, offset, next, Vec::[], iterator)?;
+        let result = call_value(machine, offset, next, Vec::new(), iterator)?;
         match result {
             runtime::Value::Object(_) => {},
             _ => {
@@ -3336,7 +3424,7 @@ fn append_iterator_values(
 
 fn append_custom_iterable(
     machine: Machine,
-    offset: int,
+    offset: isize,
     array: runtime::ObjectId,
     source: runtime::Value,
 ) -> Result[bool, VmError] {
@@ -3351,7 +3439,7 @@ fn append_custom_iterable(
             error(offset, VmErrorKind::TypeError("array spread value is not iterable")),
         ),
         runtime::Value::Object(value) => if value.is_callable() {
-            let iterator = call_value(machine, offset, method, Vec::[], source)?;
+            let iterator = call_value(machine, offset, method, Vec::new(), source)?;
             append_iterator_values(machine, offset, array, iterator)?;
             Result::Ok(true)
         } else {
@@ -3361,7 +3449,7 @@ fn append_custom_iterable(
     }
 }
 
-fn enumeration_array(machine: Machine, offset: int, keys: Vec[runtime::JsString]) -> Result[
+fn enumeration_array(machine: Machine, offset: isize, keys: Vec[runtime::JsString]) -> Result[
     runtime::Value,
     VmError,
 ] {
@@ -3384,7 +3472,7 @@ fn enumeration_array(machine: Machine, offset: int, keys: Vec[runtime::JsString]
     Result::Ok(runtime::Value::Object(array))
 }
 
-fn proxy_own_keys(machine: Machine, offset: int, object: runtime::ObjectId) -> Result[
+fn proxy_own_keys(machine: Machine, offset: isize, object: runtime::ObjectId) -> Result[
     Vec[runtime::PropertyKey],
     VmError,
 ] {
@@ -3395,11 +3483,11 @@ fn proxy_own_keys(machine: Machine, offset: int, object: runtime::ObjectId) -> R
                     machine,
                     offset,
                     trap,
-                    Vec::[runtime::Value::Object(target)],
+                    Vec::from_array([runtime::Value::Object(target)]),
                     runtime::Value::Object(handler),
                 )?;
                 let values = argument_array_values(machine, offset, value)?;
-                let keys: Vec[runtime::PropertyKey] = Vec::[];
+                let keys: Vec[runtime::PropertyKey] = Vec::new();
                 for value in values {
                     let key = match value {
                         runtime::Value::String(value) => runtime::PropertyKey::String(value),
@@ -3476,7 +3564,7 @@ fn proxy_own_keys(machine: Machine, offset: int, object: runtime::ObjectId) -> R
     }
 }
 
-fn push_own_keys(machine: Machine, offset: int) -> Result[unit, VmError] {
+fn push_own_keys(machine: Machine, offset: isize) -> Result[unit, VmError] {
     let value = pop(machine, offset)?;
     let object = match value {
         runtime::Value::Object(value) => value,
@@ -3503,7 +3591,7 @@ fn push_own_keys(machine: Machine, offset: int) -> Result[unit, VmError] {
     Result::Ok(())
 }
 
-fn proxy_get_prototype_of(machine: Machine, offset: int, object: runtime::ObjectId) -> Result[
+fn proxy_get_prototype_of(machine: Machine, offset: isize, object: runtime::ObjectId) -> Result[
     Option[runtime::ObjectId],
     VmError,
 ] {
@@ -3514,7 +3602,7 @@ fn proxy_get_prototype_of(machine: Machine, offset: int, object: runtime::Object
                     machine,
                     offset,
                     trap,
-                    Vec::[runtime::Value::Object(target)],
+                    Vec::from_array([runtime::Value::Object(target)]),
                     runtime::Value::Object(handler),
                 )?;
                 let prototype = match result {
@@ -3550,7 +3638,7 @@ fn proxy_get_prototype_of(machine: Machine, offset: int, object: runtime::Object
     }
 }
 
-fn proxy_is_extensible(machine: Machine, offset: int, object: runtime::ObjectId) -> Result[
+fn proxy_is_extensible(machine: Machine, offset: isize, object: runtime::ObjectId) -> Result[
     bool,
     VmError,
 ] {
@@ -3562,7 +3650,7 @@ fn proxy_is_extensible(machine: Machine, offset: int, object: runtime::ObjectId)
                         machine,
                         offset,
                         trap,
-                        Vec::[runtime::Value::Object(target)],
+                        Vec::from_array([runtime::Value::Object(target)]),
                         runtime::Value::Object(handler),
                     )?,
                 );
@@ -3588,7 +3676,7 @@ fn proxy_is_extensible(machine: Machine, offset: int, object: runtime::ObjectId)
 
 fn proxy_set_prototype_of(
     machine: Machine,
-    offset: int,
+    offset: isize,
     object: runtime::ObjectId,
     prototype: Option[runtime::ObjectId],
 ) -> Result[bool, VmError] {
@@ -3604,7 +3692,7 @@ fn proxy_set_prototype_of(
                         machine,
                         offset,
                         trap,
-                        Vec::[runtime::Value::Object(target), prototype_value],
+                        Vec::from_array([runtime::Value::Object(target), prototype_value]),
                         runtime::Value::Object(handler),
                     )?,
                 );
@@ -3627,7 +3715,7 @@ fn proxy_set_prototype_of(
     }
 }
 
-fn proxy_prevent_extensions(machine: Machine, offset: int, object: runtime::ObjectId) -> Result[
+fn proxy_prevent_extensions(machine: Machine, offset: isize, object: runtime::ObjectId) -> Result[
     bool,
     VmError,
 ] {
@@ -3639,7 +3727,7 @@ fn proxy_prevent_extensions(machine: Machine, offset: int, object: runtime::Obje
                         machine,
                         offset,
                         trap,
-                        Vec::[runtime::Value::Object(target)],
+                        Vec::from_array([runtime::Value::Object(target)]),
                         runtime::Value::Object(handler),
                     )?,
                 );
@@ -3662,7 +3750,7 @@ fn proxy_prevent_extensions(machine: Machine, offset: int, object: runtime::Obje
     }
 }
 
-fn push_get_prototype_of(machine: Machine, offset: int) -> Result[unit, VmError] {
+fn push_get_prototype_of(machine: Machine, offset: isize) -> Result[unit, VmError] {
     let target = reflect_target(offset, pop(machine, offset)?)?;
     machine.stack.push(
         match proxy_get_prototype_of(machine, offset, target)? {
@@ -3673,7 +3761,7 @@ fn push_get_prototype_of(machine: Machine, offset: int) -> Result[unit, VmError]
     Result::Ok(())
 }
 
-fn push_set_prototype_of(machine: Machine, offset: int) -> Result[unit, VmError] {
+fn push_set_prototype_of(machine: Machine, offset: isize) -> Result[unit, VmError] {
     let prototype = match pop(machine, offset)? {
         runtime::Value::Null => Option::None,
         runtime::Value::Object(value) => Option::Some(value),
@@ -3688,13 +3776,13 @@ fn push_set_prototype_of(machine: Machine, offset: int) -> Result[unit, VmError]
     Result::Ok(())
 }
 
-fn push_is_extensible(machine: Machine, offset: int) -> Result[unit, VmError] {
+fn push_is_extensible(machine: Machine, offset: isize) -> Result[unit, VmError] {
     let target = reflect_target(offset, pop(machine, offset)?)?;
     machine.stack.push(runtime::Value::Bool(proxy_is_extensible(machine, offset, target)?));
     Result::Ok(())
 }
 
-fn push_prevent_extensions(machine: Machine, offset: int) -> Result[unit, VmError] {
+fn push_prevent_extensions(machine: Machine, offset: isize) -> Result[unit, VmError] {
     let target = reflect_target(offset, pop(machine, offset)?)?;
     machine.stack.push(runtime::Value::Bool(proxy_prevent_extensions(machine, offset, target)?));
     Result::Ok(())
@@ -3702,7 +3790,7 @@ fn push_prevent_extensions(machine: Machine, offset: int) -> Result[unit, VmErro
 
 fn own_property_enumerable(
     machine: Machine,
-    offset: int,
+    offset: isize,
     object: runtime::ObjectId,
     key: runtime::PropertyKey,
 ) -> Result[Option[bool], VmError] {
@@ -3718,7 +3806,9 @@ fn own_property_enumerable(
                     machine,
                     offset,
                     trap,
-                    Vec::[runtime::Value::Object(target), property_key_runtime_value(key)],
+                    Vec::from_array(
+                        [runtime::Value::Object(target), property_key_runtime_value(key)],
+                    ),
                     runtime::Value::Object(handler),
                 )?;
                 match result {
@@ -3769,7 +3859,7 @@ fn own_property_enumerable(
 
 fn enumerable_property(
     machine: Machine,
-    offset: int,
+    offset: isize,
     object: runtime::ObjectId,
     key: runtime::PropertyKey,
 ) -> Result[bool, VmError] {
@@ -3788,7 +3878,7 @@ fn enumerable_property(
     Result::Ok(false)
 }
 
-fn push_enumerable_property(machine: Machine, offset: int) -> Result[unit, VmError] {
+fn push_enumerable_property(machine: Machine, offset: isize) -> Result[unit, VmError] {
     let source = pop(machine, offset)?;
     let key = property_key(machine, offset, pop(machine, offset)?)?;
     let object = match source {
@@ -3813,9 +3903,9 @@ fn push_enumerable_property(machine: Machine, offset: int) -> Result[unit, VmErr
     Result::Ok(())
 }
 
-fn enumerate_value(machine: Machine, offset: int) -> Result[unit, VmError] {
+fn enumerate_value(machine: Machine, offset: isize) -> Result[unit, VmError] {
     let source = pop(machine, offset)?;
-    let keys: Vec[runtime::JsString] = Vec::[];
+    let keys: Vec[runtime::JsString] = Vec::new();
     match source {
         runtime::Value::Object(object) => {
             let visited: collections::HashSet[runtime::JsString] = collections::HashSet::new();
@@ -3874,7 +3964,7 @@ fn enumerate_value(machine: Machine, offset: int) -> Result[unit, VmError] {
     Result::Ok(())
 }
 
-fn start_iterator(machine: Machine, offset: int) -> Result[unit, VmError] {
+fn start_iterator(machine: Machine, offset: isize) -> Result[unit, VmError] {
     let source = pop(machine, offset)?;
     let symbol = match machine.iterator_symbol {
         Some(value) => value,
@@ -3889,7 +3979,7 @@ fn start_iterator(machine: Machine, offset: int) -> Result[unit, VmError] {
         } else {},
         _ => return Result::Err(error(offset, VmErrorKind::TypeError("value is not iterable"))),
     };
-    let iterator = call_value(machine, offset, method, Vec::[], source)?;
+    let iterator = call_value(machine, offset, method, Vec::new(), source)?;
     match iterator {
         runtime::Value::Object(_) => {},
         _ => {
@@ -3914,7 +4004,7 @@ fn start_iterator(machine: Machine, offset: int) -> Result[unit, VmError] {
     Result::Ok(())
 }
 
-fn start_async_iterator(machine: Machine, offset: int) -> Result[unit, VmError] {
+fn start_async_iterator(machine: Machine, offset: isize) -> Result[unit, VmError] {
     let source = pop(machine, offset)?;
     let method = match machine.generators.async_iterator_symbol.get() {
         Some(symbol) => match read_property(
@@ -3950,7 +4040,7 @@ fn start_async_iterator(machine: Machine, offset: int) -> Result[unit, VmError] 
             error(offset, VmErrorKind::TypeError("value is not async iterable")),
         ),
     };
-    let iterator = call_value(machine, offset, selected, Vec::[], source)?;
+    let iterator = call_value(machine, offset, selected, Vec::new(), source)?;
     match iterator {
         runtime::Value::Object(_) => (),
         _ => return Result::Err(
@@ -3973,14 +4063,14 @@ fn start_async_iterator(machine: Machine, offset: int) -> Result[unit, VmError] 
     Result::Ok(())
 }
 
-fn advance_iterator(machine: Machine, offset: int) -> Result[unit, VmError] {
+fn advance_iterator(machine: Machine, offset: isize) -> Result[unit, VmError] {
     let next = pop(machine, offset)?;
     let iterator = pop(machine, offset)?;
-    let result = call_value(machine, offset, next, Vec::[], iterator)?;
+    let result = call_value(machine, offset, next, Vec::new(), iterator)?;
     push_iterator_result(machine, offset, result, "iterator next result is not an object")
 }
 
-fn push_iterator_result(machine: Machine, offset: int, result: runtime::Value, message: string) -> Result[
+fn push_iterator_result(machine: Machine, offset: isize, result: runtime::Value, message: string) -> Result[
     unit,
     VmError,
 ] {
@@ -3996,15 +4086,15 @@ fn push_iterator_result(machine: Machine, offset: int, result: runtime::Value, m
     Result::Ok(())
 }
 
-fn advance_iterator_with_value(machine: Machine, offset: int) -> Result[unit, VmError] {
+fn advance_iterator_with_value(machine: Machine, offset: isize) -> Result[unit, VmError] {
     let input = pop(machine, offset)?;
     let next = pop(machine, offset)?;
     let iterator = pop(machine, offset)?;
-    let result = call_value(machine, offset, next, Vec::[input], iterator)?;
+    let result = call_value(machine, offset, next, Vec::from_array([input]), iterator)?;
     push_iterator_result(machine, offset, result, "iterator next result is not an object")
 }
 
-fn call_iterator_next(machine: Machine, offset: int, with_value: bool) -> Result[unit, VmError] {
+fn call_iterator_next(machine: Machine, offset: isize, with_value: bool) -> Result[unit, VmError] {
     let input = if with_value {
         Option::Some(pop(machine, offset)?)
     } else {
@@ -4013,14 +4103,14 @@ fn call_iterator_next(machine: Machine, offset: int, with_value: bool) -> Result
     let next = pop(machine, offset)?;
     let iterator = pop(machine, offset)?;
     let arguments = match input {
-        Some(value) => Vec::[value],
-        None => Vec::[],
+        Some(value) => Vec::from_array([value]),
+        None => Vec::new(),
     };
     machine.stack.push(call_value(machine, offset, next, arguments, iterator)?);
     Result::Ok(())
 }
 
-fn call_iterator_resume(machine: Machine, offset: int, returning: bool) -> Result[unit, VmError] {
+fn call_iterator_resume(machine: Machine, offset: isize, returning: bool) -> Result[unit, VmError] {
     let input = pop(machine, offset)?;
     let iterator = pop(machine, offset)?;
     let name = if returning {
@@ -4048,7 +4138,7 @@ fn call_iterator_resume(machine: Machine, offset: int, returning: bool) -> Resul
                     ),
                 ),
                 _ => {
-                    let result = call_value(machine, offset, return_method, Vec::[], iterator)?;
+                    let result = call_value(machine, offset, return_method, Vec::new(), iterator)?;
                     machine.stack.push(runtime::Value::Bool(false));
                     machine.stack.push(result);
                     Result::Ok(())
@@ -4056,7 +4146,7 @@ fn call_iterator_resume(machine: Machine, offset: int, returning: bool) -> Resul
             }
         },
         _ => {
-            let result = call_value(machine, offset, method, Vec::[input], iterator)?;
+            let result = call_value(machine, offset, method, Vec::from_array([input]), iterator)?;
             if !returning {
                 machine.stack.push(runtime::Value::Bool(true))
             } else {};
@@ -4066,12 +4156,12 @@ fn call_iterator_resume(machine: Machine, offset: int, returning: bool) -> Resul
     }
 }
 
-fn decode_iterator_result(machine: Machine, offset: int) -> Result[unit, VmError] {
+fn decode_iterator_result(machine: Machine, offset: isize) -> Result[unit, VmError] {
     let result = pop(machine, offset)?;
     push_iterator_result(machine, offset, result, "iterator result is not an object")
 }
 
-fn decode_iterator_throw_result(machine: Machine, offset: int) -> Result[unit, VmError] {
+fn decode_iterator_throw_result(machine: Machine, offset: isize) -> Result[unit, VmError] {
     let result = pop(machine, offset)?;
     let has_throw = pop(machine, offset)?;
     match has_throw {
@@ -4092,7 +4182,7 @@ fn decode_iterator_throw_result(machine: Machine, offset: int) -> Result[unit, V
     }
 }
 
-fn resume_iterator_method(machine: Machine, offset: int, returning: bool) -> Result[unit, VmError] {
+fn resume_iterator_method(machine: Machine, offset: isize, returning: bool) -> Result[unit, VmError] {
     let input = pop(machine, offset)?;
     let iterator = pop(machine, offset)?;
     let name = if returning {
@@ -4113,7 +4203,7 @@ fn resume_iterator_method(machine: Machine, offset: int, returning: bool) -> Res
             )
         },
         _ => {
-            let result = call_value(machine, offset, method, Vec::[input], iterator)?;
+            let result = call_value(machine, offset, method, Vec::from_array([input]), iterator)?;
             push_iterator_result(
                 machine,
                 offset,
@@ -4128,7 +4218,7 @@ fn resume_iterator_method(machine: Machine, offset: int, returning: bool) -> Res
     }
 }
 
-fn close_iterator_value(machine: Machine, offset: int, iterator: runtime::Value) -> Result[
+fn close_iterator_value(machine: Machine, offset: isize, iterator: runtime::Value) -> Result[
     unit,
     VmError,
 ] {
@@ -4136,7 +4226,7 @@ fn close_iterator_value(machine: Machine, offset: int, iterator: runtime::Value)
     match method {
         runtime::Value::Undefined | runtime::Value::Null => Result::Ok(()),
         runtime::Value::Object(object) => if object.is_callable() {
-            let result = call_value(machine, offset, method, Vec::[], iterator)?;
+            let result = call_value(machine, offset, method, Vec::new(), iterator)?;
             match result {
                 runtime::Value::Object(_) => Result::Ok(()),
                 _ => Result::Err(
@@ -4150,12 +4240,12 @@ fn close_iterator_value(machine: Machine, offset: int, iterator: runtime::Value)
     }
 }
 
-fn close_iterator(machine: Machine, offset: int) -> Result[unit, VmError] {
+fn close_iterator(machine: Machine, offset: isize) -> Result[unit, VmError] {
     let iterator = pop(machine, offset)?;
     close_iterator_value(machine, offset, iterator)
 }
 
-fn close_iterator_throw(machine: Machine, offset: int) -> Result[unit, VmError] {
+fn close_iterator_throw(machine: Machine, offset: isize) -> Result[unit, VmError] {
     let exception = pop(machine, offset)?;
     let iterator = pop(machine, offset)?;
     let _ = close_iterator_value(machine, offset, iterator);
@@ -4163,7 +4253,7 @@ fn close_iterator_throw(machine: Machine, offset: int) -> Result[unit, VmError] 
     Result::Ok(())
 }
 
-fn append_array_spread(machine: Machine, offset: int) -> Result[unit, VmError] {
+fn append_array_spread(machine: Machine, offset: isize) -> Result[unit, VmError] {
     let source = pop(machine, offset)?;
     let target = pop(machine, offset)?;
     let array = array_literal_target(machine, offset, target)?;
@@ -4225,7 +4315,7 @@ fn append_array_spread(machine: Machine, offset: int) -> Result[unit, VmError] {
 
 fn define_accessor_property_with_key(
     machine: Machine,
-    offset: int,
+    offset: isize,
     key: runtime::PropertyKey,
     getter: bool,
     enumerable: bool,
@@ -4278,7 +4368,7 @@ fn define_accessor_property_with_key(
     }
 }
 
-fn define_accessor_property(machine: Machine, offset: int, index: int, getter: bool) -> Result[
+fn define_accessor_property(machine: Machine, offset: isize, index: isize, getter: bool) -> Result[
     unit,
     VmError,
 ] {
@@ -4286,7 +4376,7 @@ fn define_accessor_property(machine: Machine, offset: int, index: int, getter: b
     define_accessor_property_with_key(machine, offset, key, getter, true)
 }
 
-fn define_computed_accessor_property(machine: Machine, offset: int, getter: bool) -> Result[
+fn define_computed_accessor_property(machine: Machine, offset: isize, getter: bool) -> Result[
     unit,
     VmError,
 ] {
@@ -4298,9 +4388,9 @@ fn define_computed_accessor_property(machine: Machine, offset: int, getter: bool
 
 fn define_class_element_with_key(
     machine: Machine,
-    offset: int,
+    offset: isize,
     key: runtime::PropertyKey,
-    kind: int,
+    kind: isize,
 ) -> Result[unit, VmError] {
     if kind == 1 {
         define_accessor_property_with_key(machine, offset, key, true, false)
@@ -4344,7 +4434,7 @@ fn define_class_element_with_key(
     }
 }
 
-fn define_class_element(machine: Machine, offset: int, index: int, kind: int) -> Result[
+fn define_class_element(machine: Machine, offset: isize, index: isize, kind: isize) -> Result[
     unit,
     VmError,
 ] {
@@ -4352,7 +4442,10 @@ fn define_class_element(machine: Machine, offset: int, index: int, kind: int) ->
     define_class_element_with_key(machine, offset, key, kind)
 }
 
-fn define_computed_class_element(machine: Machine, offset: int, kind: int) -> Result[unit, VmError] {
+fn define_computed_class_element(machine: Machine, offset: isize, kind: isize) -> Result[
+    unit,
+    VmError,
+] {
     let method = pop(machine, offset)?;
     let key = property_key(machine, offset, pop(machine, offset)?)?;
     machine.stack.push(method);
@@ -4391,7 +4484,7 @@ fn bound_arguments(bound: BoundFunction, arguments: Vec[runtime::Value]) -> Vec[
     combined
 }
 
-fn set_class_heritage(machine: Machine, offset: int, derived: bool) -> Result[unit, VmError] {
+fn set_class_heritage(machine: Machine, offset: isize, derived: bool) -> Result[unit, VmError] {
     let heritage = pop(machine, offset)?;
     let class = match pop(machine, offset)? {
         runtime::Value::Object(value) => value,
@@ -4477,7 +4570,7 @@ fn set_class_heritage(machine: Machine, offset: int, derived: bool) -> Result[un
     }
 }
 
-fn source_function_closure(machine: Machine, offset: int, value: runtime::Value) -> Result[
+fn source_function_closure(machine: Machine, offset: isize, value: runtime::Value) -> Result[
     Closure,
     VmError,
 ] {
@@ -4492,7 +4585,7 @@ fn source_function_closure(machine: Machine, offset: int, value: runtime::Value)
     }
 }
 
-fn set_function_home_object(machine: Machine, offset: int) -> Result[unit, VmError] {
+fn set_function_home_object(machine: Machine, offset: isize) -> Result[unit, VmError] {
     let function = pop(machine, offset)?;
     let home = match pop(machine, offset)? {
         runtime::Value::Object(value) => value,
@@ -4506,7 +4599,7 @@ fn set_function_home_object(machine: Machine, offset: int) -> Result[unit, VmErr
     Result::Ok(())
 }
 
-fn set_class_instance_initializer(machine: Machine, offset: int) -> Result[unit, VmError] {
+fn set_class_instance_initializer(machine: Machine, offset: isize) -> Result[unit, VmError] {
     let initializer = pop(machine, offset)?;
     let home = match pop(machine, offset)? {
         runtime::Value::Object(value) => value,
@@ -4539,7 +4632,7 @@ fn set_class_instance_initializer(machine: Machine, offset: int) -> Result[unit,
     }
 }
 
-fn private_object(offset: int, value: runtime::Value, message: string) -> Result[
+fn private_object(offset: isize, value: runtime::Value, message: string) -> Result[
     runtime::ObjectId,
     VmError,
 ] {
@@ -4549,7 +4642,7 @@ fn private_object(offset: int, value: runtime::Value, message: string) -> Result
     }
 }
 
-fn private_callable(machine: Machine, offset: int, value: runtime::Value) -> Result[unit, VmError] {
+fn private_callable(machine: Machine, offset: isize, value: runtime::Value) -> Result[unit, VmError] {
     match value {
         runtime::Value::Object(object) => if object.is_callable() {
             Result::Ok(())
@@ -4560,7 +4653,10 @@ fn private_callable(machine: Machine, offset: int, value: runtime::Value) -> Res
     }
 }
 
-fn define_this_private_element(machine: Machine, offset: int, kind: int) -> Result[unit, VmError] {
+fn define_this_private_element(machine: Machine, offset: isize, kind: isize) -> Result[
+    unit,
+    VmError,
+] {
     let value = pop(machine, offset)?;
     let name = private_object(offset, pop(machine, offset)?, "invalid private name")?;
     let receiver = private_object(
@@ -4589,7 +4685,7 @@ fn define_this_private_element(machine: Machine, offset: int, kind: int) -> Resu
 
 fn read_private_element(
     machine: Machine,
-    offset: int,
+    offset: isize,
     receiver_value: runtime::Value,
     name_value: runtime::Value,
 ) -> Result[runtime::Value, VmError] {
@@ -4604,7 +4700,7 @@ fn read_private_element(
             value,
         ),
         Some(runtime::PrivateElement::Accessor { get: Some(getter), .. }) => {
-            call_value(machine, offset, getter, Vec::[], receiver_value)
+            call_value(machine, offset, getter, Vec::new(), receiver_value)
         },
         Some(runtime::PrivateElement::Accessor { get: None, .. }) => {
             Result::Ok(runtime::Value::Undefined)
@@ -4617,7 +4713,7 @@ fn read_private_element(
 
 fn write_private_element(
     machine: Machine,
-    offset: int,
+    offset: isize,
     receiver_value: runtime::Value,
     name_value: runtime::Value,
     value: runtime::Value,
@@ -4640,7 +4736,7 @@ fn write_private_element(
             Result::Err(error(offset, VmErrorKind::TypeError("cannot set private field")))
         },
         Some(runtime::PrivateElement::Accessor { set: Some(setter), .. }) => {
-            let _ = call_value(machine, offset, setter, Vec::[value], receiver_value)?;
+            let _ = call_value(machine, offset, setter, Vec::from_array([value]), receiver_value)?;
             Result::Ok(())
         },
         Some(runtime::PrivateElement::Accessor { set: None, .. }) | Some(runtime::PrivateElement::Method(_)) => Result::Err(
@@ -4652,7 +4748,7 @@ fn write_private_element(
     }
 }
 
-fn define_this_field_with_key(machine: Machine, offset: int, key: runtime::PropertyKey) -> Result[
+fn define_this_field_with_key(machine: Machine, offset: isize, key: runtime::PropertyKey) -> Result[
     unit,
     VmError,
 ] {
@@ -4675,19 +4771,19 @@ fn define_this_field_with_key(machine: Machine, offset: int, key: runtime::Prope
     }
 }
 
-fn define_this_field(machine: Machine, offset: int, index: int) -> Result[unit, VmError] {
+fn define_this_field(machine: Machine, offset: isize, index: isize) -> Result[unit, VmError] {
     let key = field_key(machine, offset, index)?;
     define_this_field_with_key(machine, offset, key)
 }
 
-fn define_computed_this_field(machine: Machine, offset: int) -> Result[unit, VmError] {
+fn define_computed_this_field(machine: Machine, offset: isize) -> Result[unit, VmError] {
     let value = pop(machine, offset)?;
     let key = property_key(machine, offset, pop(machine, offset)?)?;
     machine.stack.push(value);
     define_this_field_with_key(machine, offset, key)
 }
 
-fn initialize_instance_fields(machine: Machine, offset: int) -> Result[unit, VmError] {
+fn initialize_instance_fields(machine: Machine, offset: isize) -> Result[unit, VmError] {
     match machine.instance_initializer.get() {
         Some(initializer) => {
             let receiver = current_this(machine, offset)?;
@@ -4695,7 +4791,7 @@ fn initialize_instance_fields(machine: Machine, offset: int) -> Result[unit, VmE
                 machine,
                 offset,
                 runtime::Value::Object(initializer),
-                Vec::[],
+                Vec::new(),
                 receiver,
             )?;
             Result::Ok(())
@@ -4715,7 +4811,7 @@ fn excluded_property(key: runtime::PropertyKey, excluded: Vec[runtime::PropertyK
 
 fn copy_data_properties_value(
     machine: Machine,
-    offset: int,
+    offset: isize,
     target_value: runtime::Value,
     source: runtime::Value,
     excluded: Vec[runtime::PropertyKey],
@@ -4760,7 +4856,7 @@ fn copy_data_properties_value(
                         target,
                         key,
                         runtime::Value::String(
-                            runtime::JsString::from_code_units(Vec::[value.get(index)]),
+                            runtime::JsString::from_code_units(Vec::from_array([value.get(index)])),
                         ),
                     )?;
                 };
@@ -4778,13 +4874,16 @@ fn copy_data_properties_value(
     Result::Ok(())
 }
 
-fn copy_data_properties(machine: Machine, offset: int) -> Result[unit, VmError] {
+fn copy_data_properties(machine: Machine, offset: isize) -> Result[unit, VmError] {
     let source = pop(machine, offset)?;
     let target = pop(machine, offset)?;
-    copy_data_properties_value(machine, offset, target, source, Vec::[], false)
+    copy_data_properties_value(machine, offset, target, source, Vec::new(), false)
 }
 
-fn copy_data_properties_excluded(machine: Machine, offset: int, count: int) -> Result[unit, VmError] {
+fn copy_data_properties_excluded(machine: Machine, offset: isize, count: isize) -> Result[
+    unit,
+    VmError,
+] {
     if count < 0 {
         return Result::Err(error(offset, VmErrorKind::UnsupportedInstruction))
     } else {};
@@ -4799,7 +4898,7 @@ fn copy_data_properties_excluded(machine: Machine, offset: int, count: int) -> R
 
 fn write_property(
     machine: Machine,
-    offset: int,
+    offset: isize,
     receiver: runtime::Value,
     key: runtime::PropertyKey,
     value: runtime::Value,
@@ -4821,14 +4920,14 @@ fn write_property(
     }
 }
 
-fn reflect_target(offset: int, value: runtime::Value) -> Result[runtime::ObjectId, VmError] {
+fn reflect_target(offset: isize, value: runtime::Value) -> Result[runtime::ObjectId, VmError] {
     match value {
         runtime::Value::Object(value) => Result::Ok(value),
         _ => Result::Err(error(offset, VmErrorKind::TypeError("Reflect target is not an object"))),
     }
 }
 
-fn vm_descriptor_object(machine: Machine, offset: int, descriptor: runtime::PropertyDescriptor) -> Result[
+fn vm_descriptor_object(machine: Machine, offset: isize, descriptor: runtime::PropertyDescriptor) -> Result[
     runtime::Value,
     VmError,
 ] {
@@ -4836,7 +4935,7 @@ fn vm_descriptor_object(machine: Machine, offset: int, descriptor: runtime::Prop
         Ok(value) => value,
         Err(value) => return Result::Err(error(offset, VmErrorKind::TypeError(value.message))),
     };
-    let values: Vec[(string, runtime::Value)] = Vec::[];
+    let values: Vec[(string, runtime::Value)] = Vec::new();
     match runtime::descriptor_value(descriptor) {
         Some(value) => {
             values.push(("value", value));
@@ -4886,7 +4985,7 @@ fn vm_descriptor_object(machine: Machine, offset: int, descriptor: runtime::Prop
 
 fn define_receiver_property(
     machine: Machine,
-    offset: int,
+    offset: isize,
     object: runtime::ObjectId,
     key: runtime::PropertyKey,
     descriptor: runtime::PropertyDescriptor,
@@ -4899,11 +4998,13 @@ fn define_receiver_property(
                         machine,
                         offset,
                         trap,
-                        Vec::[
-                            runtime::Value::Object(target),
-                            property_key_runtime_value(key),
-                            vm_descriptor_object(machine, offset, descriptor)?,
-                        ],
+                        Vec::from_array(
+                            [
+                                runtime::Value::Object(target),
+                                property_key_runtime_value(key),
+                                vm_descriptor_object(machine, offset, descriptor)?,
+                            ],
+                        ),
                         runtime::Value::Object(handler),
                     )?,
                 );
@@ -4963,7 +5064,7 @@ fn define_receiver_property(
 
 fn reflect_set_property(
     machine: Machine,
-    offset: int,
+    offset: isize,
     target: runtime::ObjectId,
     receiver: runtime::Value,
     key: runtime::PropertyKey,
@@ -4977,12 +5078,14 @@ fn reflect_set_property(
                         machine,
                         offset,
                         trap,
-                        Vec::[
-                            runtime::Value::Object(proxy_target),
-                            property_key_runtime_value(key),
-                            value,
-                            receiver,
-                        ],
+                        Vec::from_array(
+                            [
+                                runtime::Value::Object(proxy_target),
+                                property_key_runtime_value(key),
+                                value,
+                                receiver,
+                            ],
+                        ),
                         runtime::Value::Object(handler),
                     )?,
                 );
@@ -5024,7 +5127,7 @@ fn reflect_set_property(
     match descriptor {
         Some(runtime::PropertyDescriptor::Accessor { set, .. }) => match set {
             Some(setter) => {
-                let _ = call_value(machine, offset, setter, Vec::[value], receiver)?;
+                let _ = call_value(machine, offset, setter, Vec::from_array([value]), receiver)?;
                 return Result::Ok(true)
             },
             None => return Result::Ok(false),
@@ -5059,7 +5162,7 @@ fn reflect_set_property(
     define_receiver_property(machine, offset, receiver, key, next)
 }
 
-fn push_reflect_get(machine: Machine, offset: int) -> Result[unit, VmError] {
+fn push_reflect_get(machine: Machine, offset: isize) -> Result[unit, VmError] {
     let receiver = pop(machine, offset)?;
     let key = property_key(machine, offset, pop(machine, offset)?)?;
     let target_value = pop(machine, offset)?;
@@ -5068,7 +5171,7 @@ fn push_reflect_get(machine: Machine, offset: int) -> Result[unit, VmError] {
     Result::Ok(())
 }
 
-fn push_reflect_set(machine: Machine, offset: int) -> Result[unit, VmError] {
+fn push_reflect_set(machine: Machine, offset: isize) -> Result[unit, VmError] {
     let receiver = pop(machine, offset)?;
     let value = pop(machine, offset)?;
     let key = property_key(machine, offset, pop(machine, offset)?)?;
@@ -5081,7 +5184,7 @@ fn push_reflect_set(machine: Machine, offset: int) -> Result[unit, VmError] {
 
 fn delete_property(
     machine: Machine,
-    offset: int,
+    offset: isize,
     receiver: runtime::Value,
     key: runtime::PropertyKey,
 ) -> Result[runtime::Value, VmError] {
@@ -5099,7 +5202,9 @@ fn delete_property(
                             machine,
                             offset,
                             trap,
-                            Vec::[runtime::Value::Object(target), property_key_runtime_value(key)],
+                            Vec::from_array(
+                                [runtime::Value::Object(target), property_key_runtime_value(key)],
+                            ),
                             runtime::Value::Object(handler),
                         )?;
                         let deleted = runtime::to_boolean(result);
@@ -5191,10 +5296,12 @@ fn delete_property(
     }
 }
 
-fn has_property(machine: Machine, offset: int, object: runtime::ObjectId, key: runtime::PropertyKey) -> Result[
-    bool,
-    VmError,
-] {
+fn has_property(
+    machine: Machine,
+    offset: isize,
+    object: runtime::ObjectId,
+    key: runtime::PropertyKey,
+) -> Result[bool, VmError] {
     match proxy_parts(machine, offset, object)? {
         Some((target, handler)) => match proxy_trap(machine, offset, handler, "has")? {
             Some(trap) => {
@@ -5203,7 +5310,9 @@ fn has_property(machine: Machine, offset: int, object: runtime::ObjectId, key: r
                         machine,
                         offset,
                         trap,
-                        Vec::[runtime::Value::Object(target), property_key_runtime_value(key)],
+                        Vec::from_array(
+                            [runtime::Value::Object(target), property_key_runtime_value(key)],
+                        ),
                         runtime::Value::Object(handler),
                     )?,
                 );
@@ -5240,15 +5349,15 @@ fn has_property(machine: Machine, offset: int, object: runtime::ObjectId, key: r
     }
 }
 
-fn to_uint32(value: float64) -> uint32 {
+fn to_u32(value: f64) -> u32 {
     if !math::is_finite(value) || value == 0.0 {
         0
     } else {
         let integer = math::trunc(value);
         let mut remaining = integer - math::floor(integer / 4294967296.0) * 4294967296.0;
         let mut place = 2147483648.0;
-        let mut mask: uint32 = 0x80000000;
-        let mut result: uint32 = 0;
+        let mut mask: u32 = 0x80000000;
+        let mut result: u32 = 0;
         while mask != 0 {
             if remaining >= place {
                 result = result | mask;
@@ -5261,15 +5370,15 @@ fn to_uint32(value: float64) -> uint32 {
     }
 }
 
-fn to_int32(value: float64) -> int32 {
-    to_uint32(value).to_int32()
+fn to_i32(value: f64) -> i32 {
+    to_u32(value).to_i32()
 }
 
-fn uint32_number(value: uint32) -> float64 {
+fn uint32_number(value: u32) -> f64 {
     num::parse_float64(value.to_string()).unwrap_or(0.0)
 }
 
-fn remainder(left: float64, right: float64) -> float64 {
+fn remainder(left: f64, right: f64) -> f64 {
     if math::is_nan(left) || math::is_nan(right) || math::is_infinite(left) || right == 0.0 {
         runtime::primitive_to_number(runtime::Value::Undefined).unwrap_or(0.0)
     } else if math::is_infinite(right) {
@@ -5279,7 +5388,7 @@ fn remainder(left: float64, right: float64) -> float64 {
     }
 }
 
-fn compare_strings(left: runtime::JsString, right: runtime::JsString) -> int {
+fn compare_strings(left: runtime::JsString, right: runtime::JsString) -> isize {
     let mut index = 0;
     let common = if left.len() < right.len() {
         left.len()
@@ -5303,7 +5412,7 @@ fn compare_strings(left: runtime::JsString, right: runtime::JsString) -> int {
     }
 }
 
-fn compare_bigint_number(value: runtime::BigInt, number: float64) -> Option[int] {
+fn compare_bigint_number(value: runtime::BigInt, number: f64) -> Option[isize] {
     if math::is_nan(number) {
         Option::None
     } else if math::is_infinite(number) {
@@ -5331,7 +5440,7 @@ fn compare_bigint_number(value: runtime::BigInt, number: float64) -> Option[int]
     }
 }
 
-fn equal_bigint_number(value: runtime::BigInt, number: float64) -> bool {
+fn equal_bigint_number(value: runtime::BigInt, number: f64) -> bool {
     if !math::is_finite(number) || math::trunc(number) != number {
         false
     } else {
@@ -5342,8 +5451,8 @@ fn equal_bigint_number(value: runtime::BigInt, number: float64) -> bool {
     }
 }
 
-fn bigint_count(offset: int, value: runtime::BigInt, limit: int, operation: string) -> Result[
-    int,
+fn bigint_count(offset: isize, value: runtime::BigInt, limit: isize, operation: string) -> Result[
+    isize,
     VmError,
 ] {
     if value.limb_count() != 1 {
@@ -5351,7 +5460,7 @@ fn bigint_count(offset: int, value: runtime::BigInt, limit: int, operation: stri
             error(offset, VmErrorKind::RangeError(operation + " exceeds implementation limit")),
         )
     } else {};
-    let magnitude = value.limbs()[0].to_int();
+    let magnitude = value.limbs()[0].to_isize();
     if magnitude > limit {
         Result::Err(
             error(offset, VmErrorKind::RangeError(operation + " exceeds implementation limit")),
@@ -5363,7 +5472,7 @@ fn bigint_count(offset: int, value: runtime::BigInt, limit: int, operation: stri
     }
 }
 
-fn less_than(machine: Machine, offset: int, left: runtime::Value, right: runtime::Value) -> Result[
+fn less_than(machine: Machine, offset: isize, left: runtime::Value, right: runtime::Value) -> Result[
     bool,
     VmError,
 ] {
@@ -5421,7 +5530,7 @@ fn less_than(machine: Machine, offset: int, left: runtime::Value, right: runtime
     }
 }
 
-fn less_than_or_equal(machine: Machine, offset: int, left: runtime::Value, right: runtime::Value) -> Result[
+fn less_than_or_equal(machine: Machine, offset: isize, left: runtime::Value, right: runtime::Value) -> Result[
     bool,
     VmError,
 ] {
@@ -5479,7 +5588,7 @@ fn less_than_or_equal(machine: Machine, offset: int, left: runtime::Value, right
     }
 }
 
-fn abstract_equal(machine: Machine, offset: int, left: runtime::Value, right: runtime::Value) -> Result[
+fn abstract_equal(machine: Machine, offset: isize, left: runtime::Value, right: runtime::Value) -> Result[
     bool,
     VmError,
 ] {
@@ -5533,10 +5642,10 @@ fn abstract_equal(machine: Machine, offset: int, left: runtime::Value, right: ru
             )
         },
         (runtime::Value::BigInt(left), runtime::Value::Int(right)) => {
-            Result::Ok(left == runtime::BigInt::from_int64(right.to_int64()))
+            Result::Ok(left == runtime::BigInt::from_int64(right.to_i64()))
         },
         (runtime::Value::Int(left), runtime::Value::BigInt(right)) => {
-            Result::Ok(runtime::BigInt::from_int64(left.to_int64()) == right)
+            Result::Ok(runtime::BigInt::from_int64(left.to_i64()) == right)
         },
         (runtime::Value::BigInt(left), runtime::Value::Float(right)) => {
             Result::Ok(equal_bigint_number(left, right))
@@ -5582,7 +5691,7 @@ fn abstract_equal(machine: Machine, offset: int, left: runtime::Value, right: ru
     }
 }
 
-fn push_numeric_binary(machine: Machine, offset: int, instruction: bytecode::Instruction) -> Result[
+fn push_numeric_binary(machine: Machine, offset: isize, instruction: bytecode::Instruction) -> Result[
     unit,
     VmError,
 ] {
@@ -5648,7 +5757,7 @@ fn push_numeric_binary(machine: Machine, offset: int, instruction: bytecode::Ins
     Result::Ok(())
 }
 
-fn push_add(machine: Machine, offset: int) -> Result[unit, VmError] {
+fn push_add(machine: Machine, offset: isize) -> Result[unit, VmError] {
     let right_source = pop(machine, offset)?;
     let left_source = pop(machine, offset)?;
     let left = to_primitive(machine, offset, left_source, PrimitiveHint::Default)?;
@@ -5679,7 +5788,7 @@ fn push_add(machine: Machine, offset: int) -> Result[unit, VmError] {
     }
 }
 
-fn push_bitwise_binary(machine: Machine, offset: int, instruction: bytecode::Instruction) -> Result[
+fn push_bitwise_binary(machine: Machine, offset: isize, instruction: bytecode::Instruction) -> Result[
     unit,
     VmError,
 ] {
@@ -5705,8 +5814,8 @@ fn push_bitwise_binary(machine: Machine, offset: int, instruction: bytecode::Ins
         },
         _ => (),
     };
-    let left = to_int32(number(machine, offset, left_value)?);
-    let right = to_int32(number(machine, offset, right_value)?);
+    let left = to_i32(number(machine, offset, left_value)?);
+    let right = to_i32(number(machine, offset, right_value)?);
     let result = match instruction {
         bytecode::Instruction::BitAnd => left & right,
         bytecode::Instruction::BitXor => left ^ right,
@@ -5717,7 +5826,7 @@ fn push_bitwise_binary(machine: Machine, offset: int, instruction: bytecode::Ins
     Result::Ok(())
 }
 
-fn push_shift(machine: Machine, offset: int, instruction: bytecode::Instruction) -> Result[
+fn push_shift(machine: Machine, offset: isize, instruction: bytecode::Instruction) -> Result[
     unit,
     VmError,
 ] {
@@ -5760,18 +5869,18 @@ fn push_shift(machine: Machine, offset: int, instruction: bytecode::Instruction)
         },
         _ => (),
     };
-    let right = to_uint32(number(machine, offset, right_value)?) & 31;
+    let right = to_u32(number(machine, offset, right_value)?) & 31;
     match instruction {
         bytecode::Instruction::Shl => {
-            let left = to_int32(number(machine, offset, left_value)?);
+            let left = to_i32(number(machine, offset, left_value)?);
             machine.stack.push(runtime::Value::Int(left << right));
         },
         bytecode::Instruction::Sar => {
-            let left = to_int32(number(machine, offset, left_value)?);
+            let left = to_i32(number(machine, offset, left_value)?);
             machine.stack.push(runtime::Value::Int(left >> right));
         },
         bytecode::Instruction::Shr => {
-            let left = to_uint32(number(machine, offset, left_value)?);
+            let left = to_u32(number(machine, offset, left_value)?);
             machine.stack.push(runtime::Value::Float(uint32_number(left >> right)));
         },
         _ => return Result::Err(error(offset, VmErrorKind::UnsupportedInstruction)),
@@ -5779,7 +5888,7 @@ fn push_shift(machine: Machine, offset: int, instruction: bytecode::Instruction)
     Result::Ok(())
 }
 
-fn push_comparison(machine: Machine, offset: int, instruction: bytecode::Instruction) -> Result[
+fn push_comparison(machine: Machine, offset: isize, instruction: bytecode::Instruction) -> Result[
     unit,
     VmError,
 ] {
@@ -5808,7 +5917,7 @@ fn push_comparison(machine: Machine, offset: int, instruction: bytecode::Instruc
     Result::Ok(())
 }
 
-fn push_in(machine: Machine, offset: int) -> Result[unit, VmError] {
+fn push_in(machine: Machine, offset: isize) -> Result[unit, VmError] {
     let right = pop(machine, offset)?;
     let left = pop(machine, offset)?;
     let object = match right {
@@ -5825,7 +5934,7 @@ fn push_in(machine: Machine, offset: int) -> Result[unit, VmError] {
     Result::Ok(())
 }
 
-fn push_with_has_binding(machine: Machine, offset: int) -> Result[unit, VmError] {
+fn push_with_has_binding(machine: Machine, offset: isize) -> Result[unit, VmError] {
     let right = pop(machine, offset)?;
     let left = pop(machine, offset)?;
     let object = match right {
@@ -5888,10 +5997,12 @@ fn push_with_has_binding(machine: Machine, offset: int) -> Result[unit, VmError]
     Result::Ok(())
 }
 
-fn ordinary_has_instance(machine: Machine, offset: int, right: runtime::Value, left: runtime::Value) -> Result[
-    bool,
-    VmError,
-] {
+fn ordinary_has_instance(
+    machine: Machine,
+    offset: isize,
+    right: runtime::Value,
+    left: runtime::Value,
+) -> Result[bool, VmError] {
     let constructor = match right {
         runtime::Value::Object(value) => if value.is_callable() && machine.heap.contains(value) {
             value
@@ -5936,7 +6047,7 @@ fn ordinary_has_instance(machine: Machine, offset: int, right: runtime::Value, l
     Result::Ok(false)
 }
 
-fn instance_of_value(machine: Machine, offset: int, left: runtime::Value, right: runtime::Value) -> Result[
+fn instance_of_value(machine: Machine, offset: isize, left: runtime::Value, right: runtime::Value) -> Result[
     bool,
     VmError,
 ] {
@@ -5966,7 +6077,9 @@ fn instance_of_value(machine: Machine, offset: int, left: runtime::Value, right:
             runtime::Value::Undefined | runtime::Value::Null => (),
             method => {
                 return Result::Ok(
-                    runtime::to_boolean(call_value(machine, offset, method, Vec::[left], right)?),
+                    runtime::to_boolean(
+                        call_value(machine, offset, method, Vec::from_array([left]), right)?,
+                    ),
                 )
             },
         },
@@ -5981,14 +6094,14 @@ fn instance_of_value(machine: Machine, offset: int, left: runtime::Value, right:
     }
 }
 
-fn push_instance_of(machine: Machine, offset: int) -> Result[unit, VmError] {
+fn push_instance_of(machine: Machine, offset: isize) -> Result[unit, VmError] {
     let right = pop(machine, offset)?;
     let left = pop(machine, offset)?;
     machine.stack.push(runtime::Value::Bool(instance_of_value(machine, offset, left, right)?));
     Result::Ok(())
 }
 
-fn push_is_prototype_of(machine: Machine, offset: int) -> Result[unit, VmError] {
+fn push_is_prototype_of(machine: Machine, offset: isize) -> Result[unit, VmError] {
     let candidate = pop(machine, offset)?;
     let prototype = match pop(machine, offset)? {
         runtime::Value::Object(value) => value,
@@ -6017,7 +6130,7 @@ fn push_is_prototype_of(machine: Machine, offset: int) -> Result[unit, VmError] 
     Result::Ok(())
 }
 
-fn local_get(machine: Machine, offset: int, index: int) -> Result[runtime::Value, VmError] {
+fn local_get(machine: Machine, offset: isize, index: isize) -> Result[runtime::Value, VmError] {
     if index < 0 || index >= machine.locals.len() {
         Result::Err(error(offset, VmErrorKind::InvalidLocal(index)))
     } else {
@@ -6025,7 +6138,7 @@ fn local_get(machine: Machine, offset: int, index: int) -> Result[runtime::Value
     }
 }
 
-fn local_put(machine: Machine, offset: int, index: int, value: runtime::Value) -> Result[
+fn local_put(machine: Machine, offset: isize, index: isize, value: runtime::Value) -> Result[
     unit,
     VmError,
 ] {
@@ -6037,7 +6150,7 @@ fn local_put(machine: Machine, offset: int, index: int, value: runtime::Value) -
     }
 }
 
-fn local_clone(machine: Machine, offset: int, index: int) -> Result[unit, VmError] {
+fn local_clone(machine: Machine, offset: isize, index: isize) -> Result[unit, VmError] {
     if index < 0 || index >= machine.locals.len() {
         Result::Err(error(offset, VmErrorKind::InvalidLocal(index)))
     } else {
@@ -6046,7 +6159,7 @@ fn local_clone(machine: Machine, offset: int, index: int) -> Result[unit, VmErro
     }
 }
 
-fn upvalue_get(machine: Machine, offset: int, index: int) -> Result[runtime::Value, VmError] {
+fn upvalue_get(machine: Machine, offset: isize, index: isize) -> Result[runtime::Value, VmError] {
     if index < 0 || index >= machine.upvalues.len() {
         Result::Err(error(offset, VmErrorKind::InvalidUpvalue(index)))
     } else {
@@ -6065,7 +6178,7 @@ fn upvalue_get(machine: Machine, offset: int, index: int) -> Result[runtime::Val
     }
 }
 
-fn upvalue_put(machine: Machine, offset: int, index: int, value: runtime::Value) -> Result[
+fn upvalue_put(machine: Machine, offset: isize, index: isize, value: runtime::Value) -> Result[
     unit,
     VmError,
 ] {
@@ -6084,7 +6197,7 @@ fn upvalue_put(machine: Machine, offset: int, index: int, value: runtime::Value)
     }
 }
 
-fn current_this(machine: Machine, offset: int) -> Result[runtime::Value, VmError] {
+fn current_this(machine: Machine, offset: isize) -> Result[runtime::Value, VmError] {
     match machine.this_value.get() {
         Some(value) => Result::Ok(value),
         None => Result::Err(
@@ -6093,7 +6206,7 @@ fn current_this(machine: Machine, offset: int) -> Result[runtime::Value, VmError
     }
 }
 
-fn super_base(machine: Machine, offset: int) -> Result[Option[runtime::ObjectId], VmError] {
+fn super_base(machine: Machine, offset: isize) -> Result[Option[runtime::ObjectId], VmError] {
     let home = match machine.home_object {
         Some(value) => value,
         None => return Result::Err(
@@ -6106,7 +6219,7 @@ fn super_base(machine: Machine, offset: int) -> Result[Option[runtime::ObjectId]
     }
 }
 
-fn read_super_property(machine: Machine, offset: int, key: runtime::PropertyKey) -> Result[
+fn read_super_property(machine: Machine, offset: isize, key: runtime::PropertyKey) -> Result[
     runtime::Value,
     VmError,
 ] {
@@ -6119,7 +6232,7 @@ fn read_super_property(machine: Machine, offset: int, key: runtime::PropertyKey)
 
 fn write_super_property(
     machine: Machine,
-    offset: int,
+    offset: isize,
     key: runtime::PropertyKey,
     value: runtime::Value,
 ) -> Result[unit, VmError] {
@@ -6127,7 +6240,7 @@ fn write_super_property(
     match super_base(machine, offset)? {
         Some(base) => match runtime::get_property_descriptor(machine.heap, base, key) {
             Ok(Some(runtime::PropertyDescriptor::Accessor { set: Some(setter), .. })) => {
-                let _ = call_value(machine, offset, setter, Vec::[value], receiver)?;
+                let _ = call_value(machine, offset, setter, Vec::from_array([value]), receiver)?;
                 Result::Ok(())
             },
             Ok(Some(runtime::PropertyDescriptor::Accessor { set: None, .. })) => Result::Err(
@@ -6159,7 +6272,10 @@ fn write_super_property(
     }
 }
 
-fn pop_arguments(machine: Machine, offset: int, count: int) -> Result[Vec[runtime::Value], VmError] {
+fn pop_arguments(machine: Machine, offset: isize, count: isize) -> Result[
+    Vec[runtime::Value],
+    VmError,
+] {
     let arguments: Vec[runtime::Value] = Vec::with_capacity(count);
     for _ in 0..count {
         arguments.push(runtime::Value::Undefined)
@@ -6172,10 +6288,11 @@ fn pop_arguments(machine: Machine, offset: int, count: int) -> Result[Vec[runtim
     Result::Ok(arguments)
 }
 
-fn initialize_call_locals(function: bytecode::Function, arguments: Vec[runtime::Value], offset: int) -> Result[
-    Vec[Ref[runtime::Value]],
-    VmError,
-] {
+fn initialize_call_locals(
+    function: bytecode::Function,
+    arguments: Vec[runtime::Value],
+    offset: isize,
+) -> Result[Vec[Ref[runtime::Value]], VmError] {
     let verification = bytecode::verify(function);
     if !verification.errors.is_empty() {
         Result::Err(error(offset, VmErrorKind::VerificationFailed(verification.errors)))
@@ -6208,11 +6325,11 @@ fn closure_this_cell(upvalues: Vec[UpvalueCell]) -> Option[Ref[Option[runtime::V
     Option::None
 }
 
-fn capture_eval_upvalues(machine: Machine, offset: int, function: bytecode::Function) -> Result[
+fn capture_eval_upvalues(machine: Machine, offset: isize, function: bytecode::Function) -> Result[
     Vec[UpvalueCell],
     VmError,
 ] {
-    let upvalues: Vec[UpvalueCell] = Vec::[];
+    let upvalues: Vec[UpvalueCell] = Vec::new();
     let mut index = 0;
     while index < function.upvalue_count() {
         let cell = match function.upvalue_source(index) {
@@ -6248,8 +6365,8 @@ fn capture_eval_upvalues(machine: Machine, offset: int, function: bytecode::Func
 
 fn evaluate_source(
     machine: Machine,
-    offset: int,
-    arguments: int,
+    offset: isize,
+    arguments: isize,
     bindings: Vec[bytecode::EvalBinding],
 ) -> Result[runtime::Value, VmError] {
     let values = pop_arguments(machine, offset, arguments)?;
@@ -6276,7 +6393,7 @@ fn evaluate_source(
             error(offset, VmErrorKind::TypeError("dynamic eval compiler is not installed")),
         ),
     };
-    let locals = initialize_call_locals(function, Vec::[], offset)?;
+    let locals = initialize_call_locals(function, Vec::new(), offset)?;
     let upvalues = capture_eval_upvalues(machine, offset, function)?;
     execute_initialized(
         function,
@@ -6299,7 +6416,7 @@ fn evaluate_source(
         machine.to_primitive_symbol,
         machine.has_instance_symbol,
         Option::None,
-        Vec::[],
+        Vec::new(),
         locals,
         upvalues,
         machine.this_value,
@@ -6315,7 +6432,7 @@ fn evaluate_source(
     )
 }
 
-fn push_dynamic_import(machine: Machine, offset: int) -> Result[unit, VmError] {
+fn push_dynamic_import(machine: Machine, offset: isize) -> Result[unit, VmError] {
     let referrer = pop(machine, offset)?;
     let options = pop(machine, offset)?;
     let specifier = pop(machine, offset)?;
@@ -6330,7 +6447,7 @@ fn push_dynamic_import(machine: Machine, offset: int) -> Result[unit, VmError] {
     Result::Ok(())
 }
 
-fn sloppy_this_value(machine: Machine, offset: int, value: runtime::Value) -> Result[
+fn sloppy_this_value(machine: Machine, offset: isize, value: runtime::Value) -> Result[
     runtime::Value,
     VmError,
 ] {
@@ -6381,7 +6498,7 @@ fn sloppy_this_value(machine: Machine, offset: int, value: runtime::Value) -> Re
 
 fn create_generator(
     machine: Machine,
-    offset: int,
+    offset: isize,
     object: runtime::ObjectId,
     function: bytecode::Function,
     arguments: Vec[runtime::Value],
@@ -6420,7 +6537,7 @@ fn create_generator(
         new_target,
         instance_initializer: closure.instance_initializer,
         arguments_object: Ref::new(Option::None),
-        request_roots: Ref::new(Vec::[]),
+        request_roots: Ref::new(Vec::new()),
         offset: Ref::new(0),
         status: Ref::new(GeneratorStatus::SuspendedStart),
         depth: machine.depth + 1,
@@ -6429,7 +6546,7 @@ fn create_generator(
     Result::Ok(runtime::Value::Object(generator))
 }
 
-fn proxy_argument_array(machine: Machine, offset: int, arguments: Vec[runtime::Value]) -> Result[
+fn proxy_argument_array(machine: Machine, offset: isize, arguments: Vec[runtime::Value]) -> Result[
     runtime::Value,
     VmError,
 ] {
@@ -6456,7 +6573,7 @@ fn proxy_argument_array(machine: Machine, offset: int, arguments: Vec[runtime::V
 
 fn call_value_with_mode(
     machine: Machine,
-    offset: int,
+    offset: isize,
     callee: runtime::Value,
     arguments: Vec[runtime::Value],
     this_value: runtime::Value,
@@ -6488,11 +6605,13 @@ fn call_value_with_mode(
                         machine,
                         offset,
                         trap,
-                        Vec::[
-                            runtime::Value::Object(target),
-                            this_value,
-                            proxy_argument_array(machine, offset, arguments)?,
-                        ],
+                        Vec::from_array(
+                            [
+                                runtime::Value::Object(target),
+                                this_value,
+                                proxy_argument_array(machine, offset, arguments)?,
+                            ],
+                        ),
                         runtime::Value::Object(handler),
                     ),
                     None => return call_value_with_mode(
@@ -6541,7 +6660,7 @@ fn call_value_with_mode(
                         Option::Some(
                             Ref::new(
                                 EvalEnvironment {
-                                    values: HashMap::{},
+                                    values: HashMap::new(),
                                     parent: closure.eval_environment,
                                 },
                             ),
@@ -6697,7 +6816,7 @@ fn call_value_with_mode(
 
 fn call_value(
     machine: Machine,
-    offset: int,
+    offset: isize,
     callee: runtime::Value,
     arguments: Vec[runtime::Value],
     this_value: runtime::Value,
@@ -6707,7 +6826,7 @@ fn call_value(
 
 fn construct_value_with_new_target(
     machine: Machine,
-    offset: int,
+    offset: isize,
     callee: runtime::Value,
     arguments: Vec[runtime::Value],
     new_target: runtime::Value,
@@ -6741,11 +6860,13 @@ fn construct_value_with_new_target(
                     machine,
                     offset,
                     trap,
-                    Vec::[
-                        runtime::Value::Object(target),
-                        proxy_argument_array(machine, offset, arguments)?,
-                        new_target,
-                    ],
+                    Vec::from_array(
+                        [
+                            runtime::Value::Object(target),
+                            proxy_argument_array(machine, offset, arguments)?,
+                            new_target,
+                        ],
+                    ),
                     runtime::Value::Object(handler),
                 )?;
                 return match result {
@@ -6873,14 +6994,14 @@ fn construct_value_with_new_target(
 
 fn construct_value(
     machine: Machine,
-    offset: int,
+    offset: isize,
     callee: runtime::Value,
     arguments: Vec[runtime::Value],
 ) -> Result[runtime::Value, VmError] {
     construct_value_with_new_target(machine, offset, callee, arguments, callee)
 }
 
-fn call_super_constructor(machine: Machine, offset: int, arguments: Vec[runtime::Value]) -> Result[
+fn call_super_constructor(machine: Machine, offset: isize, arguments: Vec[runtime::Value]) -> Result[
     runtime::Value,
     VmError,
 ] {
@@ -6907,14 +7028,14 @@ fn call_super_constructor(machine: Machine, offset: int, arguments: Vec[runtime:
     Result::Ok(result)
 }
 
-fn push_super_call(machine: Machine, offset: int, argument_count: int) -> Result[unit, VmError] {
+fn push_super_call(machine: Machine, offset: isize, argument_count: isize) -> Result[unit, VmError] {
     let arguments = pop_arguments(machine, offset, argument_count)?;
     let result = call_super_constructor(machine, offset, arguments)?;
     machine.stack.push(result);
     Result::Ok(())
 }
 
-fn push_super_array_call(machine: Machine, offset: int) -> Result[unit, VmError] {
+fn push_super_array_call(machine: Machine, offset: isize) -> Result[unit, VmError] {
     let array = pop(machine, offset)?;
     let arguments = argument_array_values(machine, offset, array)?;
     let result = call_super_constructor(machine, offset, arguments)?;
@@ -6922,7 +7043,7 @@ fn push_super_array_call(machine: Machine, offset: int) -> Result[unit, VmError]
     Result::Ok(())
 }
 
-fn push_call(machine: Machine, offset: int, argument_count: int, method: bool) -> Result[
+fn push_call(machine: Machine, offset: isize, argument_count: isize, method: bool) -> Result[
     unit,
     VmError,
 ] {
@@ -6938,7 +7059,7 @@ fn push_call(machine: Machine, offset: int, argument_count: int, method: bool) -
     Result::Ok(())
 }
 
-fn push_construct(machine: Machine, offset: int, argument_count: int) -> Result[unit, VmError] {
+fn push_construct(machine: Machine, offset: isize, argument_count: isize) -> Result[unit, VmError] {
     let arguments = pop_arguments(machine, offset, argument_count)?;
     let callee = pop(machine, offset)?;
     let result = construct_value(machine, offset, callee, arguments)?;
@@ -6946,7 +7067,7 @@ fn push_construct(machine: Machine, offset: int, argument_count: int) -> Result[
     Result::Ok(())
 }
 
-fn push_construct_with_new_target(machine: Machine, offset: int, argument_count: int) -> Result[
+fn push_construct_with_new_target(machine: Machine, offset: isize, argument_count: isize) -> Result[
     unit,
     VmError,
 ] {
@@ -6958,7 +7079,7 @@ fn push_construct_with_new_target(machine: Machine, offset: int, argument_count:
     Result::Ok(())
 }
 
-fn argument_array_values(machine: Machine, offset: int, value: runtime::Value) -> Result[
+fn argument_array_values(machine: Machine, offset: isize, value: runtime::Value) -> Result[
     Vec[runtime::Value],
     VmError,
 ] {
@@ -6983,7 +7104,7 @@ fn argument_array_values(machine: Machine, offset: int, value: runtime::Value) -
     Result::Ok(arguments)
 }
 
-fn push_array_call(machine: Machine, offset: int, method: bool) -> Result[unit, VmError] {
+fn push_array_call(machine: Machine, offset: isize, method: bool) -> Result[unit, VmError] {
     let array = pop(machine, offset)?;
     let arguments = argument_array_values(machine, offset, array)?;
     let callee = pop(machine, offset)?;
@@ -6997,7 +7118,7 @@ fn push_array_call(machine: Machine, offset: int, method: bool) -> Result[unit, 
     Result::Ok(())
 }
 
-fn push_array_construct(machine: Machine, offset: int) -> Result[unit, VmError] {
+fn push_array_construct(machine: Machine, offset: isize) -> Result[unit, VmError] {
     let array = pop(machine, offset)?;
     let arguments = argument_array_values(machine, offset, array)?;
     let callee = pop(machine, offset)?;
@@ -7006,7 +7127,7 @@ fn push_array_construct(machine: Machine, offset: int) -> Result[unit, VmError] 
     Result::Ok(())
 }
 
-fn jump(machine: Machine, offset: int, target: int) -> Result[StepResult, VmError] {
+fn jump(machine: Machine, offset: isize, target: isize) -> Result[StepResult, VmError] {
     if target < 0 || target >= machine.function.code_len() {
         Result::Err(error(offset, VmErrorKind::InvalidJump(target)))
     } else {
@@ -7014,7 +7135,7 @@ fn jump(machine: Machine, offset: int, target: int) -> Result[StepResult, VmErro
     }
 }
 
-fn step(machine: Machine, offset: int, instruction: bytecode::Instruction) -> Result[
+fn step(machine: Machine, offset: isize, instruction: bytecode::Instruction) -> Result[
     StepResult,
     VmError,
 ] {
@@ -7076,7 +7197,12 @@ fn step(machine: Machine, offset: int, instruction: bytecode::Instruction) -> Re
             };
             let pattern = constant_value(machine, offset, pattern)?;
             let flags = constant_value(machine, offset, flags)?;
-            let value = construct_value(machine, offset, constructor, Vec::[pattern, flags])?;
+            let value = construct_value(
+                machine,
+                offset,
+                constructor,
+                Vec::from_array([pattern, flags]),
+            )?;
             machine.stack.push(value);
         },
         bytecode::Instruction::ArrayAppend => append_array_literal(machine, offset)?,
@@ -7405,7 +7531,7 @@ fn step(machine: Machine, offset: int, instruction: bytecode::Instruction) -> Re
                     machine.stack.push(runtime::Value::BigInt(value.bit_not()))
                 },
                 _ => machine.stack.push(
-                    runtime::Value::Int(~to_int32(number(machine, offset, value)?)),
+                    runtime::Value::Int(~to_i32(number(machine, offset, value)?)),
                 ),
             }
         },
@@ -7498,8 +7624,8 @@ fn execute_initialized(
     heap: runtime::Heap,
     functions: HashMap[runtime::ObjectId, Closure],
     bound_functions: HashMap[runtime::ObjectId, BoundFunction],
-    function_objects: HashMap[uint64, runtime::ObjectId],
-    template_objects: HashMap[uint64, runtime::ObjectId],
+    function_objects: HashMap[u64, runtime::ObjectId],
+    template_objects: HashMap[u64, runtime::ObjectId],
     native_functions: HashMap[runtime::ObjectId, NativeCallable],
     native_constructor_functions: HashMap[runtime::ObjectId, NativeConstructorCallable],
     vm_functions: HashMap[runtime::ObjectId, VmCallable],
@@ -7526,7 +7652,7 @@ fn execute_initialized(
     generators: GeneratorRuntime,
     dynamic_eval_compiler: Ref[Option[DynamicEvalCompiler]],
     dynamic_module_loader: Ref[Option[DynamicModuleLoader]],
-    depth: int,
+    depth: isize,
 ) -> Result[runtime::Value, VmError] {
     let verification = bytecode::verify(function);
     if !verification.errors.is_empty() {
@@ -7606,7 +7732,7 @@ fn execute_machine(machine: Machine) -> Result[runtime::Value, VmError] {
     }
 }
 
-fn execute_machine_from(machine: Machine, start: int) -> Result[ExecutionResult, VmError] {
+fn execute_machine_from(machine: Machine, start: isize) -> Result[ExecutionResult, VmError] {
     let mut offset = start;
     while offset >= 0 && offset < machine.function.code_len() {
         if !machine.active_frames.is_empty() {
@@ -7692,9 +7818,9 @@ impl Context {
                 self.well_known_symbols_value.slot(WellKnownSymbolKind::ToPrimitive).get(),
                 self.well_known_symbols_value.slot(WellKnownSymbolKind::HasInstance).get(),
                 Option::None,
-                Vec::[],
-                Vec::[],
-                Vec::[],
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
                 Ref::new(Option::Some(global_this)),
                 Option::None,
                 Option::None,
@@ -7732,9 +7858,9 @@ impl Context {
             self.well_known_symbols_value.slot(WellKnownSymbolKind::ToPrimitive).get(),
             self.well_known_symbols_value.slot(WellKnownSymbolKind::HasInstance).get(),
             Option::None,
-            Vec::[],
+            Vec::new(),
             locals,
-            Vec::[],
+            Vec::new(),
             Ref::new(Option::Some(global_this)),
             Option::None,
             Option::None,
@@ -7787,9 +7913,9 @@ impl Context {
                 self.well_known_symbols_value.slot(WellKnownSymbolKind::ToPrimitive).get(),
                 self.well_known_symbols_value.slot(WellKnownSymbolKind::HasInstance).get(),
                 Option::None,
-                Vec::[],
-                Vec::[],
-                Vec::[],
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
                 Ref::new(Option::Some(runtime::Value::Undefined)),
                 Option::None,
                 Option::None,
@@ -7833,9 +7959,9 @@ impl Context {
             self.well_known_symbols_value.slot(WellKnownSymbolKind::ToPrimitive).get(),
             self.well_known_symbols_value.slot(WellKnownSymbolKind::HasInstance).get(),
             Option::None,
-            Vec::[],
+            Vec::new(),
             locals,
-            Vec::[],
+            Vec::new(),
             Ref::new(Option::Some(runtime::Value::Undefined)),
             Option::None,
             Option::None,
@@ -7886,15 +8012,15 @@ impl Context {
             function,
             stack: Vec::with_capacity(verification.max_stack),
             locals,
-            upvalues: Vec::[],
-            arguments: Vec::[],
+            upvalues: Vec::new(),
+            arguments: Vec::new(),
             this_value: Ref::new(Option::Some(runtime::Value::Undefined)),
             callee: Option::None,
             home_object: Option::None,
             new_target: Option::None,
             instance_initializer: Ref::new(Option::None),
             arguments_object: Ref::new(Option::None),
-            request_roots: Ref::new(Vec::[]),
+            request_roots: Ref::new(Vec::new()),
             offset: Ref::new(0),
             status: Ref::new(GeneratorStatus::SuspendedStart),
             depth: 1,
@@ -7914,12 +8040,11 @@ impl Context {
         callable: runtime::Value,
         arguments: Vec[runtime::Value],
         this_value: runtime::Value,
-        depth: int,
+        depth: isize,
     ) -> Result[runtime::Value, VmError] {
-        let code: Vec[bytecode::Instruction] = Vec::[
-            bytecode::Instruction::GetLoc(0),
-            bytecode::Instruction::GetLoc(1),
-        ];
+        let code: Vec[bytecode::Instruction] = Vec::from_array(
+            [bytecode::Instruction::GetLoc(0), bytecode::Instruction::GetLoc(1)],
+        );
         let mut index = 0;
         while index < arguments.len() {
             code.push(bytecode::Instruction::GetLoc(index + 2));
@@ -7934,7 +8059,7 @@ impl Context {
             locals.push(Ref::new(value))
         }
         execute_initialized(
-            bytecode::Function::new(Vec::[], code, locals.len()),
+            bytecode::Function::new(Vec::new(), code, locals.len()),
             self.heap_value,
             self.functions_value,
             self.bound_functions_value,
@@ -7954,9 +8079,9 @@ impl Context {
             self.well_known_symbols_value.slot(WellKnownSymbolKind::ToPrimitive).get(),
             self.well_known_symbols_value.slot(WellKnownSymbolKind::HasInstance).get(),
             Option::None,
-            Vec::[],
+            Vec::new(),
             locals,
-            Vec::[],
+            Vec::new(),
             Ref::new(Option::Some(runtime::Value::Undefined)),
             Option::None,
             Option::None,
@@ -7974,7 +8099,7 @@ impl Context {
         self: Context,
         values: Vec[runtime::Value],
         instruction: bytecode::Instruction,
-        depth: int,
+        depth: isize,
     ) -> Result[runtime::Value, VmError] {
         let code: Vec[bytecode::Instruction] = Vec::with_capacity(values.len() + 2);
         let locals: Vec[Ref[runtime::Value]] = Vec::with_capacity(values.len());
@@ -7987,7 +8112,7 @@ impl Context {
         code.push(instruction);
         code.push(bytecode::Instruction::Return);
         execute_initialized(
-            bytecode::Function::new(Vec::[], code, locals.len()),
+            bytecode::Function::new(Vec::new(), code, locals.len()),
             self.heap_value,
             self.functions_value,
             self.bound_functions_value,
@@ -8007,9 +8132,9 @@ impl Context {
             self.well_known_symbols_value.slot(WellKnownSymbolKind::ToPrimitive).get(),
             self.well_known_symbols_value.slot(WellKnownSymbolKind::HasInstance).get(),
             Option::None,
-            Vec::[],
+            Vec::new(),
             locals,
-            Vec::[],
+            Vec::new(),
             Ref::new(Option::Some(runtime::Value::Undefined)),
             Option::None,
             Option::None,
@@ -8028,10 +8153,10 @@ impl Context {
         target: runtime::Value,
         key: runtime::Value,
         receiver: runtime::Value,
-        depth: int,
+        depth: isize,
     ) -> Result[runtime::Value, VmError] {
         self.instruction_at_depth(
-            Vec::[target, key, receiver],
+            Vec::from_array([target, key, receiver]),
             bytecode::Instruction::ReflectGet,
             depth,
         )
@@ -8043,10 +8168,10 @@ impl Context {
         key: runtime::Value,
         value: runtime::Value,
         receiver: runtime::Value,
-        depth: int,
+        depth: isize,
     ) -> Result[bool, VmError] {
         match self.instruction_at_depth(
-            Vec::[target, key, value, receiver],
+            Vec::from_array([target, key, value, receiver]),
             bytecode::Instruction::ReflectSet,
             depth,
         )? {
@@ -8060,7 +8185,7 @@ impl Context {
         constructor: runtime::Value,
         arguments: Vec[runtime::Value],
         new_target: runtime::Value,
-        depth: int,
+        depth: isize,
     ) -> Result[runtime::Value, VmError] {
         let argument_count = arguments.len();
         let values: Vec[runtime::Value] = Vec::with_capacity(arguments.len() + 2);
@@ -8080,18 +8205,20 @@ impl Context {
         self: Context,
         receiver: runtime::Value,
         key: runtime::Value,
-        depth: int,
+        depth: isize,
     ) -> Result[runtime::Value, VmError] {
-        let locals: Vec[Ref[runtime::Value]] = Vec::[Ref::new(receiver), Ref::new(key)];
+        let locals: Vec[Ref[runtime::Value]] = Vec::from_array([Ref::new(receiver), Ref::new(key)]);
         execute_initialized(
             bytecode::Function::new(
-                Vec::[],
-                Vec::[
-                    bytecode::Instruction::GetLoc(0),
-                    bytecode::Instruction::GetLoc(1),
-                    bytecode::Instruction::GetArrayEl,
-                    bytecode::Instruction::Return,
-                ],
+                Vec::new(),
+                Vec::from_array(
+                    [
+                        bytecode::Instruction::GetLoc(0),
+                        bytecode::Instruction::GetLoc(1),
+                        bytecode::Instruction::GetArrayEl,
+                        bytecode::Instruction::Return,
+                    ],
+                ),
                 locals.len(),
             ),
             self.heap_value,
@@ -8113,9 +8240,9 @@ impl Context {
             self.well_known_symbols_value.slot(WellKnownSymbolKind::ToPrimitive).get(),
             self.well_known_symbols_value.slot(WellKnownSymbolKind::HasInstance).get(),
             Option::None,
-            Vec::[],
+            Vec::new(),
             locals,
-            Vec::[],
+            Vec::new(),
             Ref::new(Option::Some(runtime::Value::Undefined)),
             Option::None,
             Option::None,
@@ -8133,9 +8260,13 @@ impl Context {
         self: Context,
         target: runtime::Value,
         key: runtime::Value,
-        depth: int,
+        depth: isize,
     ) -> Result[bool, VmError] {
-        match self.instruction_at_depth(Vec::[key, target], bytecode::Instruction::In, depth)? {
+        match self.instruction_at_depth(
+            Vec::from_array([key, target]),
+            bytecode::Instruction::In,
+            depth,
+        )? {
             runtime::Value::Bool(value) => Result::Ok(value),
             _ => Result::Err(error(-1, VmErrorKind::TypeError("property test returned no status"))),
         }
@@ -8145,9 +8276,13 @@ impl Context {
         self: Context,
         target: runtime::Value,
         key: runtime::Value,
-        depth: int,
+        depth: isize,
     ) -> Result[bool, VmError] {
-        match self.instruction_at_depth(Vec::[target, key], bytecode::Instruction::Delete, depth)? {
+        match self.instruction_at_depth(
+            Vec::from_array([target, key]),
+            bytecode::Instruction::Delete,
+            depth,
+        )? {
             runtime::Value::Bool(value) => Result::Ok(value),
             _ => Result::Err(
                 error(-1, VmErrorKind::TypeError("property deletion returned no status")),
@@ -8155,28 +8290,32 @@ impl Context {
         }
     }
 
-    pub fn own_keys_at_depth(self: Context, target: runtime::Value, depth: int) -> Result[
+    pub fn own_keys_at_depth(self: Context, target: runtime::Value, depth: isize) -> Result[
         runtime::Value,
         VmError,
     ] {
-        self.instruction_at_depth(Vec::[target], bytecode::Instruction::OwnKeys, depth)
+        self.instruction_at_depth(Vec::from_array([target]), bytecode::Instruction::OwnKeys, depth)
     }
 
-    pub fn get_prototype_of_at_depth(self: Context, target: runtime::Value, depth: int) -> Result[
+    pub fn get_prototype_of_at_depth(self: Context, target: runtime::Value, depth: isize) -> Result[
         runtime::Value,
         VmError,
     ] {
-        self.instruction_at_depth(Vec::[target], bytecode::Instruction::GetPrototypeOf, depth)
+        self.instruction_at_depth(
+            Vec::from_array([target]),
+            bytecode::Instruction::GetPrototypeOf,
+            depth,
+        )
     }
 
     pub fn instance_of_at_depth(
         self: Context,
         candidate: runtime::Value,
         constructor: runtime::Value,
-        depth: int,
+        depth: isize,
     ) -> Result[bool, VmError] {
         match self.instruction_at_depth(
-            Vec::[candidate, constructor],
+            Vec::from_array([candidate, constructor]),
             bytecode::Instruction::InstanceOf,
             depth,
         )? {
@@ -8189,7 +8328,7 @@ impl Context {
         self: Context,
         constructor: runtime::Value,
         candidate: runtime::Value,
-        depth: int,
+        depth: isize,
     ) -> Result[bool, VmError] {
         let object = match constructor {
             runtime::Value::Object(value) => if value.is_callable()
@@ -8225,10 +8364,10 @@ impl Context {
         self: Context,
         prototype: runtime::Value,
         candidate: runtime::Value,
-        depth: int,
+        depth: isize,
     ) -> Result[bool, VmError] {
         match self.instruction_at_depth(
-            Vec::[prototype, candidate],
+            Vec::from_array([prototype, candidate]),
             bytecode::Instruction::IsPrototypeOf,
             depth,
         )? {
@@ -8241,10 +8380,10 @@ impl Context {
         self: Context,
         target: runtime::Value,
         prototype: runtime::Value,
-        depth: int,
+        depth: isize,
     ) -> Result[bool, VmError] {
         match self.instruction_at_depth(
-            Vec::[target, prototype],
+            Vec::from_array([target, prototype]),
             bytecode::Instruction::SetPrototypeOf,
             depth,
         )? {
@@ -8255,11 +8394,15 @@ impl Context {
         }
     }
 
-    pub fn is_extensible_at_depth(self: Context, target: runtime::Value, depth: int) -> Result[
+    pub fn is_extensible_at_depth(self: Context, target: runtime::Value, depth: isize) -> Result[
         bool,
         VmError,
     ] {
-        match self.instruction_at_depth(Vec::[target], bytecode::Instruction::IsExtensible, depth)? {
+        match self.instruction_at_depth(
+            Vec::from_array([target]),
+            bytecode::Instruction::IsExtensible,
+            depth,
+        )? {
             runtime::Value::Bool(value) => Result::Ok(value),
             _ => Result::Err(
                 error(-1, VmErrorKind::TypeError("extensibility test returned no status")),
@@ -8267,12 +8410,12 @@ impl Context {
         }
     }
 
-    pub fn prevent_extensions_at_depth(self: Context, target: runtime::Value, depth: int) -> Result[
+    pub fn prevent_extensions_at_depth(self: Context, target: runtime::Value, depth: isize) -> Result[
         bool,
         VmError,
     ] {
         match self.instruction_at_depth(
-            Vec::[target],
+            Vec::from_array([target]),
             bytecode::Instruction::PreventExtensions,
             depth,
         )? {
@@ -8288,18 +8431,20 @@ impl Context {
         receiver: runtime::Value,
         key: runtime::Value,
         value: runtime::Value,
-        depth: int,
+        depth: isize,
     ) -> Result[unit, VmError] {
-        let locals: Vec[Ref[runtime::Value]] = Vec::[Ref::new(key), Ref::new(value)];
+        let locals: Vec[Ref[runtime::Value]] = Vec::from_array([Ref::new(key), Ref::new(value)]);
         match execute_initialized(
             bytecode::Function::new(
-                Vec::[],
-                Vec::[
-                    bytecode::Instruction::GetLoc(0),
-                    bytecode::Instruction::GetLoc(1),
-                    bytecode::Instruction::DefineThisFieldComputed,
-                    bytecode::Instruction::ReturnUndef,
-                ],
+                Vec::new(),
+                Vec::from_array(
+                    [
+                        bytecode::Instruction::GetLoc(0),
+                        bytecode::Instruction::GetLoc(1),
+                        bytecode::Instruction::DefineThisFieldComputed,
+                        bytecode::Instruction::ReturnUndef,
+                    ],
+                ),
                 locals.len(),
             ),
             self.heap_value,
@@ -8321,9 +8466,9 @@ impl Context {
             self.well_known_symbols_value.slot(WellKnownSymbolKind::ToPrimitive).get(),
             self.well_known_symbols_value.slot(WellKnownSymbolKind::HasInstance).get(),
             Option::None,
-            Vec::[],
+            Vec::new(),
             locals,
-            Vec::[],
+            Vec::new(),
             Ref::new(Option::Some(receiver)),
             Option::None,
             Option::None,
@@ -8344,13 +8489,15 @@ impl Context {
         self: Context,
         value: runtime::Value,
         instruction: bytecode::Instruction,
-        depth: int,
+        depth: isize,
     ) -> Result[runtime::Value, VmError] {
-        let locals: Vec[Ref[runtime::Value]] = Vec::[Ref::new(value)];
+        let locals: Vec[Ref[runtime::Value]] = Vec::from_array([Ref::new(value)]);
         execute_initialized(
             bytecode::Function::new(
-                Vec::[],
-                Vec::[bytecode::Instruction::GetLoc(0), instruction, bytecode::Instruction::Return],
+                Vec::new(),
+                Vec::from_array(
+                    [bytecode::Instruction::GetLoc(0), instruction, bytecode::Instruction::Return],
+                ),
                 1,
             ),
             self.heap_value,
@@ -8372,9 +8519,9 @@ impl Context {
             self.well_known_symbols_value.slot(WellKnownSymbolKind::ToPrimitive).get(),
             self.well_known_symbols_value.slot(WellKnownSymbolKind::HasInstance).get(),
             Option::None,
-            Vec::[],
+            Vec::new(),
             locals,
-            Vec::[],
+            Vec::new(),
             Ref::new(Option::Some(runtime::Value::Undefined)),
             Option::None,
             Option::None,
@@ -8388,21 +8535,21 @@ impl Context {
         )
     }
 
-    pub fn to_primitive_default_at_depth(self: Context, value: runtime::Value, depth: int) -> Result[
+    pub fn to_primitive_default_at_depth(self: Context, value: runtime::Value, depth: isize) -> Result[
         runtime::Value,
         VmError,
     ] {
         self.primitive_at_depth(value, bytecode::Instruction::ToPrimitiveDefault, depth)
     }
 
-    pub fn to_primitive_number_at_depth(self: Context, value: runtime::Value, depth: int) -> Result[
+    pub fn to_primitive_number_at_depth(self: Context, value: runtime::Value, depth: isize) -> Result[
         runtime::Value,
         VmError,
     ] {
         self.primitive_at_depth(value, bytecode::Instruction::ToPrimitiveNumber, depth)
     }
 
-    pub fn to_primitive_string_at_depth(self: Context, value: runtime::Value, depth: int) -> Result[
+    pub fn to_primitive_string_at_depth(self: Context, value: runtime::Value, depth: isize) -> Result[
         runtime::Value,
         VmError,
     ] {

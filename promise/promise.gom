@@ -6,14 +6,15 @@ pub type PromiseJob = () -> unit;
 
 pub struct JobQueue {
     jobs_value: Vec[PromiseJob],
+    rejection_tracker_value: Ref[Option[PromiseRejectionTracker]],
 }
 
 impl JobQueue {
     pub fn new() -> JobQueue {
-        JobQueue { jobs_value: Vec::[] }
+        JobQueue { jobs_value: Vec::new(), rejection_tracker_value: Ref::new(Option::None) }
     }
 
-    pub fn len(self: JobQueue) -> int {
+    pub fn len(self: JobQueue) -> isize {
         self.jobs_value.len()
     }
 
@@ -23,6 +24,10 @@ impl JobQueue {
 
     pub fn enqueue(self: JobQueue, job: PromiseJob) -> unit {
         self.jobs_value.push(job)
+    }
+
+    pub fn set_rejection_tracker(self: JobQueue, tracker: Option[PromiseRejectionTracker]) -> unit {
+        self.rejection_tracker_value.set(tracker)
     }
 
     pub fn run_one(self: JobQueue) -> bool {
@@ -35,7 +40,7 @@ impl JobQueue {
         }
     }
 
-    pub fn run_all(self: JobQueue) -> int {
+    pub fn run_all(self: JobQueue) -> isize {
         let mut count = 0;
         while self.run_one() {
             count += 1;
@@ -87,6 +92,35 @@ pub enum PromiseState {
     Rejected(PromiseFailure),
 }
 
+fn push_failure_gc_values(failure: PromiseFailure, values: Vec[runtime::Value]) -> unit {
+    match failure {
+        PromiseFailure::Rejection(value) => values.push(value),
+        PromiseFailure::Aggregate(aggregate) => for error in aggregate.errors {
+            push_failure_gc_values(error, values)
+        },
+        PromiseFailure::TypeError(_) => (),
+    }
+}
+
+fn push_settlement_gc_values(settlement: PromiseSettlement, values: Vec[runtime::Value]) -> unit {
+    match settlement {
+        PromiseSettlement::Fulfilled(value) => values.push(value),
+        PromiseSettlement::Rejected(failure) => push_failure_gc_values(failure, values),
+    }
+}
+
+fn push_fulfillment_gc_values(fulfillment: PromiseFulfillment, values: Vec[runtime::Value]) -> unit {
+    match fulfillment {
+        PromiseFulfillment::Value(value) => values.push(value),
+        PromiseFulfillment::Values(items) => for value in items {
+            values.push(value)
+        },
+        PromiseFulfillment::Settlements(settlements) => for settlement in settlements {
+            push_settlement_gc_values(settlement, values)
+        },
+    }
+}
+
 enum ReactionInput {
     Fulfilled(PromiseFulfillment),
     Rejected(PromiseFailure),
@@ -96,15 +130,20 @@ struct PromiseReaction {
     on_fulfilled: Option[FulfillHandler],
     on_rejected: Option[RejectHandler],
     capability: PromiseCapability,
+    roots: Vec[runtime::Value],
 }
 
 pub struct Promise {
     identity_value: Ref[bool],
+    host_object_root_value: Ref[runtime::Value],
     state_value: Ref[PromiseState],
     reactions_value: Vec[PromiseReaction],
     queue_value: JobQueue,
     resolution_locked_value: Ref[bool],
+    handled_value: Ref[bool],
 }
+
+pub type PromiseRejectionTracker = (Promise, PromiseFailure, bool) -> unit;
 
 pub struct PromiseCapability {
     promise_value: Promise,
@@ -115,10 +154,12 @@ pub struct PromiseCapability {
 fn promise_pending(queue: JobQueue) -> Promise {
     Promise {
         identity_value: Ref::new(false),
+        host_object_root_value: Ref::new(runtime::Value::Undefined),
         state_value: Ref::new(PromiseState::Pending),
-        reactions_value: Vec::[],
+        reactions_value: Vec::new(),
         queue_value: queue,
         resolution_locked_value: Ref::new(false),
+        handled_value: Ref::new(false),
     }
 }
 
@@ -202,17 +243,39 @@ fn reject_internal(promise: Promise, error: PromiseFailure) -> bool {
         false
     } else {
         promise.state_value.set(PromiseState::Rejected(error));
+        if !promise.handled_value.get() {
+            match promise.queue_value.rejection_tracker_value.get() {
+                Some(tracker) => tracker(promise, error, false),
+                None => (),
+            }
+        } else {};
         drain_reactions(promise, ReactionInput::Rejected(error));
         true
     }
 }
 
+fn mark_handled(promise: Promise) -> unit {
+    if promise.handled_value.get() {
+        return
+    } else {};
+    promise.handled_value.set(true);
+    match promise.state_value.get() {
+        PromiseState::Rejected(error) => match promise.queue_value.rejection_tracker_value.get() {
+            Some(tracker) => tracker(promise, error, true),
+            None => (),
+        },
+        _ => (),
+    }
+}
+
 fn adopt_promise(target: Promise, source: Promise) -> unit {
+    mark_handled(source);
     let capability = continuation_capability(target);
     let reaction = PromiseReaction {
         on_fulfilled: Option::None,
         on_rejected: Option::None,
         capability,
+        roots: Vec::new(),
     };
     match source.state_value.get() {
         PromiseState::Pending => source.reactions_value.push(reaction),
@@ -270,6 +333,7 @@ fn begin_rejection(promise: Promise, error: PromiseFailure) -> bool {
 }
 
 fn register_reaction(promise: Promise, reaction: PromiseReaction) -> unit {
+    mark_handled(promise);
     match promise.state_value.get() {
         PromiseState::Pending => promise.reactions_value.push(reaction),
         PromiseState::Fulfilled(value) => {
@@ -371,6 +435,31 @@ impl Promise {
         self.identity_value == other.identity_value
     }
 
+    pub fn bind_host_object(self: Promise, object: runtime::ObjectId) -> unit {
+        self.host_object_root_value.set(runtime::Value::Object(object))
+    }
+
+    pub fn host_object_root(self: Promise) -> Ref[runtime::Value] {
+        self.host_object_root_value
+    }
+
+    pub fn gc_values(self: Promise) -> Vec[runtime::Value] {
+        let values: Vec[runtime::Value] = Vec::new();
+        match self.state_value.get() {
+            PromiseState::Pending => (),
+            PromiseState::Fulfilled(fulfillment) => {
+                push_fulfillment_gc_values(fulfillment, values)
+            },
+            PromiseState::Rejected(failure) => push_failure_gc_values(failure, values),
+        };
+        for reaction in self.reactions_value {
+            for value in reaction.roots {
+                values.push(value)
+            }
+        }
+        values
+    }
+
     pub fn resolve(self: Promise, resolution: PromiseResolution) -> bool {
         begin_resolution(self, resolution)
     }
@@ -384,9 +473,18 @@ impl Promise {
         on_fulfilled: Option[FulfillHandler],
         on_rejected: Option[RejectHandler],
     ) -> Promise {
+        self.then_with_roots(on_fulfilled, on_rejected, Vec::new())
+    }
+
+    pub fn then_with_roots(
+        self: Promise,
+        on_fulfilled: Option[FulfillHandler],
+        on_rejected: Option[RejectHandler],
+        roots: Vec[runtime::Value],
+    ) -> Promise {
         let capability = PromiseCapability::new(self.queue_value);
         let child = capability.promise();
-        register_reaction(self, PromiseReaction { on_fulfilled, on_rejected, capability });
+        register_reaction(self, PromiseReaction { on_fulfilled, on_rejected, capability, roots });
         child
     }
 
@@ -395,10 +493,15 @@ impl Promise {
     }
 
     pub fn finally(self: Promise, handler: FinallyHandler) -> Promise {
+        self.finally_with_roots(handler, Vec::new())
+    }
+
+    pub fn finally_with_roots(self: Promise, handler: FinallyHandler, roots: Vec[runtime::Value]) -> Promise {
         let queue = self.queue_value;
-        self.then(
+        self.then_with_roots(
             Option::Some(|value| finally_fulfilled(queue, handler, value)),
             Option::Some(|error| finally_rejected(queue, handler, error)),
+            roots,
         )
     }
 }
@@ -414,7 +517,7 @@ fn undefined_resolution() -> PromiseHandlerResult {
     Result::Ok(PromiseResolution::Fulfillment(PromiseFulfillment::Value(runtime::Value::Undefined)))
 }
 
-fn fill_optional_values(length: int) -> Vec[Option[runtime::Value]] {
+fn fill_optional_values(length: isize) -> Vec[Option[runtime::Value]] {
     let values: Vec[Option[runtime::Value]] = Vec::with_capacity(length);
     for _ in 0..length {
         values.push(Option::None)
@@ -440,7 +543,7 @@ pub fn all(queue: JobQueue, inputs: Vec[PromiseResolution]) -> Promise {
     let promise = capability.promise();
     if inputs.is_empty() {
         let _ = capability.resolve(
-            PromiseResolution::Fulfillment(PromiseFulfillment::Values(Vec::[])),
+            PromiseResolution::Fulfillment(PromiseFulfillment::Values(Vec::new())),
         );
         return promise
     } else {};
@@ -506,7 +609,7 @@ pub fn race(queue: JobQueue, inputs: Vec[PromiseResolution]) -> Promise {
     promise
 }
 
-fn fill_optional_settlements(length: int) -> Vec[Option[PromiseSettlement]] {
+fn fill_optional_settlements(length: isize) -> Vec[Option[PromiseSettlement]] {
     let values: Vec[Option[PromiseSettlement]] = Vec::with_capacity(length);
     for _ in 0..length {
         values.push(Option::None)
@@ -532,7 +635,7 @@ pub fn all_settled(queue: JobQueue, inputs: Vec[PromiseResolution]) -> Promise {
     let promise = capability.promise();
     if inputs.is_empty() {
         let _ = capability.resolve(
-            PromiseResolution::Fulfillment(PromiseFulfillment::Settlements(Vec::[])),
+            PromiseResolution::Fulfillment(PromiseFulfillment::Settlements(Vec::new())),
         );
         return promise
     } else {};
@@ -583,7 +686,7 @@ pub fn all_settled(queue: JobQueue, inputs: Vec[PromiseResolution]) -> Promise {
     promise
 }
 
-fn fill_optional_failures(length: int) -> Vec[Option[PromiseFailure]] {
+fn fill_optional_failures(length: isize) -> Vec[Option[PromiseFailure]] {
     let values: Vec[Option[PromiseFailure]] = Vec::with_capacity(length);
     for _ in 0..length {
         values.push(Option::None)
@@ -608,7 +711,9 @@ pub fn any(queue: JobQueue, inputs: Vec[PromiseResolution]) -> Promise {
     let capability = PromiseCapability::new(queue);
     let promise = capability.promise();
     if inputs.is_empty() {
-        let _ = capability.reject(PromiseFailure::Aggregate(AggregateFailure { errors: Vec::[] }));
+        let _ = capability.reject(
+            PromiseFailure::Aggregate(AggregateFailure { errors: Vec::new() }),
+        );
         return promise
     } else {};
     let errors = fill_optional_failures(inputs.len());

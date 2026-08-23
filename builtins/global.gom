@@ -27,23 +27,24 @@ type NativeBuiltin = (runtime::Heap, runtime::Value, Vec[runtime::Value]) -> Res
 ];
 
 struct TimerState {
-    next_id: Ref[int],
-    active: HashMap[int, bool],
+    next_id: Ref[isize],
+    active: HashMap[isize, bool],
 }
 
 fn new_timer_state() -> TimerState {
-    TimerState { next_id: Ref::new(1), active: HashMap::{} }
+    TimerState { next_id: Ref::new(1), active: HashMap::new() }
 }
 
-const MATH_RANDOM_MULTIPLIER: uint64 = 2685821657736338717;
+const MATH_RANDOM_MULTIPLIER: u64 = 2685821657736338717;
 
-const MATH_RANDOM_SEED: uint64 = 11400714819323198485;
+const MATH_RANDOM_SEED: u64 = 11400714819323198485;
 
 pub struct Realm {
     global_value: runtime::ObjectId,
     math_value: runtime::ObjectId,
     json_value: runtime::ObjectId,
     buffer_install_value: ArrayBufferInstall,
+    promise_queue_value: promise::JobQueue,
 }
 
 impl Realm {
@@ -61,6 +62,10 @@ impl Realm {
 
     pub fn arraybuffer_install(self: Realm) -> ArrayBufferInstall {
         self.buffer_install_value
+    }
+
+    pub fn promise_queue(self: Realm) -> promise::JobQueue {
+        self.promise_queue_value
     }
 }
 
@@ -120,11 +125,11 @@ fn function_native_error(value: vm::NativeError) -> vm::VmError {
     }
 }
 
-fn infinity() -> float64 {
+fn infinity() -> f64 {
     num::parse_float64("Infinity").unwrap_or(0.0)
 }
 
-fn nan() -> float64 {
+fn nan() -> f64 {
     num::parse_float64("NaN").unwrap_or(0.0)
 }
 
@@ -133,7 +138,7 @@ fn js_string(value: string) -> runtime::JsString {
     runtime::JsString::from_utf8(bytes.slice(0, bytes.len()))
 }
 
-fn argument(arguments: Vec[runtime::Value], index: int) -> runtime::Value {
+fn argument(arguments: Vec[runtime::Value], index: isize) -> runtime::Value {
     if index < 0 || index >= arguments.len() {
         runtime::Value::Undefined
     } else {
@@ -141,7 +146,7 @@ fn argument(arguments: Vec[runtime::Value], index: int) -> runtime::Value {
     }
 }
 
-fn number_argument(arguments: Vec[runtime::Value], index: int) -> Result[float64, vm::NativeError] {
+fn number_argument(arguments: Vec[runtime::Value], index: isize) -> Result[f64, vm::NativeError] {
     match runtime::primitive_to_number(argument(arguments, index)) {
         Ok(value) => Result::Ok(value),
         Err(value) => Result::Err(native_error(value.message)),
@@ -164,7 +169,7 @@ fn number_constructor_vm(
     context: vm::Context,
     this_value: runtime::Value,
     arguments: Vec[runtime::Value],
-    depth: int,
+    depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     let _ = this_value;
     if arguments.is_empty() {
@@ -188,14 +193,14 @@ fn bigint_constructor_vm(
     context: vm::Context,
     this_value: runtime::Value,
     arguments: Vec[runtime::Value],
-    depth: int,
+    depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     let _ = this_value;
     let value = context.to_primitive_number_at_depth(argument(arguments, 0), depth)?;
     match value {
         runtime::Value::BigInt(value) => Result::Ok(runtime::Value::BigInt(value)),
         runtime::Value::Int(value) => Result::Ok(
-            runtime::Value::BigInt(runtime::BigInt::from_int64(value.to_int64())),
+            runtime::Value::BigInt(runtime::BigInt::from_int64(value.to_i64())),
         ),
         runtime::Value::Float(value) => match runtime::integral_number_to_bigint(value) {
             Ok(value) => Result::Ok(runtime::Value::BigInt(value)),
@@ -225,7 +230,7 @@ fn bigint_constructor_vm(
     }
 }
 
-fn bigint_width(arguments: Vec[runtime::Value]) -> Result[int, vm::NativeError] {
+fn bigint_width(arguments: Vec[runtime::Value]) -> Result[isize, vm::NativeError] {
     let value = number_argument(arguments, 0)?;
     let integer = if math::is_nan(value) || value == 0.0 {
         0.0
@@ -353,7 +358,11 @@ fn string_constructor(
                 Some(runtime::Value::Symbol(_)) => {
                     Result::Err(native_error("cannot convert symbol to string"))
                 },
-                Some(value) => string_constructor(heap, runtime::Value::Undefined, Vec::[value]),
+                Some(value) => string_constructor(
+                    heap,
+                    runtime::Value::Undefined,
+                    Vec::from_array([value]),
+                ),
                 None => {
                     Result::Err(
                         native_error("ordinary object string conversion is not implemented"),
@@ -368,7 +377,7 @@ fn string_constructor_vm(
     context: vm::Context,
     this_value: runtime::Value,
     arguments: Vec[runtime::Value],
-    depth: int,
+    depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     let _ = this_value;
     if arguments.is_empty() {
@@ -379,7 +388,7 @@ fn string_constructor_vm(
         runtime::Value::Symbol(_) => match string_constructor(
             context.heap(),
             runtime::Value::Undefined,
-            Vec::[input],
+            Vec::from_array([input]),
         ) {
             Ok(value) => return Result::Ok(value),
             Err(value) => return Result::Err(function_vm_error(value.message)),
@@ -391,7 +400,11 @@ fn string_constructor_vm(
         runtime::Value::Symbol(_) => {
             Result::Err(function_vm_error("cannot convert symbol to string"))
         },
-        _ => match string_constructor(context.heap(), runtime::Value::Undefined, Vec::[primitive]) {
+        _ => match string_constructor(
+            context.heap(),
+            runtime::Value::Undefined,
+            Vec::from_array([primitive]),
+        ) {
             Ok(value) => Result::Ok(value),
             Err(value) => Result::Err(function_vm_error(value.message)),
         },
@@ -405,10 +418,10 @@ fn string_from_char_code(
 ) -> Result[runtime::Value, vm::NativeError] {
     let _ = heap;
     let _ = this_value;
-    let units: Vec[uint16] = Vec::with_capacity(arguments.len());
+    let units: Vec[u16] = Vec::with_capacity(arguments.len());
     let mut index = 0;
     while index < arguments.len() {
-        units.push((to_uint32(number_argument(arguments, index)?) & 0xffff).to_uint16());
+        units.push((to_u32(number_argument(arguments, index)?) & 0xffff).to_u16());
         index += 1;
     }
     Result::Ok(runtime::Value::String(runtime::JsString::from_code_units(units)))
@@ -421,7 +434,7 @@ fn string_from_code_point(
 ) -> Result[runtime::Value, vm::NativeError] {
     let _ = heap;
     let _ = this_value;
-    let units: Vec[uint16] = Vec::[];
+    let units: Vec[u16] = Vec::new();
     let mut index = 0;
     while index < arguments.len() {
         let value = number_argument(arguments, index)?;
@@ -433,18 +446,18 @@ fn string_from_code_point(
         if point < 0 {
             return Result::Err(native_error("RangeError: invalid Unicode code point"))
         } else if point <= 0xffff {
-            units.push(point.to_uint16())
+            units.push(point.to_u16())
         } else {
             let scalar = point - 0x10000;
-            units.push((0xd800 + scalar / 1024).to_uint16());
-            units.push((0xdc00 + scalar % 1024).to_uint16())
+            units.push((0xd800 + scalar / 1024).to_u16());
+            units.push((0xdc00 + scalar % 1024).to_u16())
         };
         index += 1;
     }
     Result::Ok(runtime::Value::String(runtime::JsString::from_code_units(units)))
 }
 
-fn string_raw_append(output: Vec[uint16], value: runtime::JsString) -> unit {
+fn string_raw_append(output: Vec[u16], value: runtime::JsString) -> unit {
     let mut index = 0;
     while index < value.len() {
         output.push(value.get(index));
@@ -452,8 +465,8 @@ fn string_raw_append(output: Vec[uint16], value: runtime::JsString) -> unit {
     }
 }
 
-fn string_raw_length(context: vm::Context, value: runtime::Value, depth: int) -> Result[
-    int,
+fn string_raw_length(context: vm::Context, value: runtime::Value, depth: isize) -> Result[
+    isize,
     vm::VmError,
 ] {
     let number = match number_value_at_depth(context, value, depth)? {
@@ -473,7 +486,7 @@ fn string_raw(
     context: vm::Context,
     this_value: runtime::Value,
     arguments: Vec[runtime::Value],
-    depth: int,
+    depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     let _ = this_value;
     let template = argument(arguments, 0);
@@ -502,7 +515,7 @@ fn string_raw(
     if length == 0 {
         return Result::Ok(runtime::Value::String(js_string("")))
     } else {};
-    let output: Vec[uint16] = Vec::[];
+    let output: Vec[u16] = Vec::new();
     let mut index = 0;
     while index < length {
         let segment = string_value_at_depth(
@@ -535,7 +548,11 @@ fn display_string(heap: runtime::Heap, value: runtime::Value) -> Result[string, 
         runtime::Value::BigInt(value) => return Result::Ok(value.to_string() + "n"),
         _ => (),
     };
-    let converted = match string_constructor(heap, runtime::Value::Undefined, Vec::[value])? {
+    let converted = match string_constructor(
+        heap,
+        runtime::Value::Undefined,
+        Vec::from_array([value]),
+    )? {
         runtime::Value::String(value) => value,
         _ => return Result::Err(native_error("string conversion did not produce a string")),
     };
@@ -549,7 +566,7 @@ fn value_string(heap: runtime::Heap, value: runtime::Value) -> Result[
     runtime::JsString,
     vm::NativeError,
 ] {
-    match string_constructor(heap, runtime::Value::Undefined, Vec::[value])? {
+    match string_constructor(heap, runtime::Value::Undefined, Vec::from_array([value]))? {
         runtime::Value::String(value) => Result::Ok(value),
         _ => Result::Err(native_error("string conversion did not produce a string")),
     }
@@ -601,7 +618,7 @@ fn global_decode_uri_component(
     uri_value(uri::decode_uri_component(value_string(heap, argument(arguments, 0))?))
 }
 
-fn legacy_escape_safe(value: uint16) -> bool {
+fn legacy_escape_safe(value: u16) -> bool {
     value >= 48 && value <= 57 || value >= 65 && value <= 90 || value >= 97 && value <= 122
         || value == 64
         || value == 42
@@ -612,21 +629,21 @@ fn legacy_escape_safe(value: uint16) -> bool {
         || value == 47
 }
 
-fn legacy_hex_digit(value: int) -> uint16 {
+fn legacy_hex_digit(value: isize) -> u16 {
     if value < 10 {
-        (48 + value).to_uint16()
+        (48 + value).to_u16()
     } else {
-        (55 + value).to_uint16()
+        (55 + value).to_u16()
     }
 }
 
-fn legacy_hex_value(value: uint16) -> Option[int] {
+fn legacy_hex_value(value: u16) -> Option[isize] {
     if value >= 48 && value <= 57 {
-        Option::Some((value - 48).to_int())
+        Option::Some((value - 48).to_isize())
     } else if value >= 65 && value <= 70 {
-        Option::Some((value - 55).to_int())
+        Option::Some((value - 55).to_isize())
     } else if value >= 97 && value <= 102 {
-        Option::Some((value - 87).to_int())
+        Option::Some((value - 87).to_isize())
     } else {
         Option::None
     }
@@ -638,7 +655,7 @@ fn global_escape(heap: runtime::Heap, this_value: runtime::Value, arguments: Vec
 ] {
     let _ = this_value;
     let input = value_string(heap, argument(arguments, 0))?;
-    let output: Vec[uint16] = Vec::with_capacity(input.len());
+    let output: Vec[u16] = Vec::with_capacity(input.len());
     let mut index = 0;
     while index < input.len() {
         let value = input.get(index);
@@ -646,22 +663,22 @@ fn global_escape(heap: runtime::Heap, this_value: runtime::Value, arguments: Vec
             output.push(value)
         } else if value < 256 {
             output.push(37);
-            output.push(legacy_hex_digit((value >> 4).to_int()));
-            output.push(legacy_hex_digit((value & 15).to_int()));
+            output.push(legacy_hex_digit((value >> 4).to_isize()));
+            output.push(legacy_hex_digit((value & 15).to_isize()));
         } else {
             output.push(37);
             output.push(117);
-            output.push(legacy_hex_digit(((value >> 12) & 15).to_int()));
-            output.push(legacy_hex_digit(((value >> 8) & 15).to_int()));
-            output.push(legacy_hex_digit(((value >> 4) & 15).to_int()));
-            output.push(legacy_hex_digit((value & 15).to_int()));
+            output.push(legacy_hex_digit(((value >> 12) & 15).to_isize()));
+            output.push(legacy_hex_digit(((value >> 8) & 15).to_isize()));
+            output.push(legacy_hex_digit(((value >> 4) & 15).to_isize()));
+            output.push(legacy_hex_digit((value & 15).to_isize()));
         };
         index += 1;
     }
     Result::Ok(runtime::Value::String(runtime::JsString::from_code_units(output)))
 }
 
-fn legacy_unescape_value(input: runtime::JsString, start: int, count: int) -> Option[uint16] {
+fn legacy_unescape_value(input: runtime::JsString, start: isize, count: isize) -> Option[u16] {
     if start + count > input.len() {
         return Option::None
     } else {};
@@ -676,7 +693,7 @@ fn legacy_unescape_value(input: runtime::JsString, start: int, count: int) -> Op
         };
         index += 1;
     }
-    Option::Some(value.to_uint16())
+    Option::Some(value.to_u16())
 }
 
 fn global_unescape(heap: runtime::Heap, this_value: runtime::Value, arguments: Vec[runtime::Value]) -> Result[
@@ -685,7 +702,7 @@ fn global_unescape(heap: runtime::Heap, this_value: runtime::Value, arguments: V
 ] {
     let _ = this_value;
     let input = value_string(heap, argument(arguments, 0))?;
-    let output: Vec[uint16] = Vec::with_capacity(input.len());
+    let output: Vec[u16] = Vec::with_capacity(input.len());
     let mut index = 0;
     while index < input.len() {
         if input.get(index) == 37 && index + 1 < input.len() && input.get(index + 1) == 117 {
@@ -718,7 +735,7 @@ fn global_unescape(heap: runtime::Heap, this_value: runtime::Value, arguments: V
     Result::Ok(runtime::Value::String(runtime::JsString::from_code_units(output)))
 }
 
-fn numeric_whitespace(value: uint16) -> bool {
+fn numeric_whitespace(value: u16) -> bool {
     value == 0x0009 || value == 0x000a || value == 0x000b || value == 0x000c || value == 0x000d
         || value == 0x0020
         || value == 0x00a0
@@ -732,7 +749,7 @@ fn numeric_whitespace(value: uint16) -> bool {
         || value == 0xfeff
 }
 
-fn skip_numeric_whitespace(value: runtime::JsString) -> int {
+fn skip_numeric_whitespace(value: runtime::JsString) -> isize {
     let mut index = 0;
     while index < value.len() && numeric_whitespace(value.get(index)) {
         index += 1;
@@ -740,31 +757,31 @@ fn skip_numeric_whitespace(value: runtime::JsString) -> int {
     index
 }
 
-fn ascii_digit(value: uint16) -> Option[int] {
+fn ascii_digit(value: u16) -> Option[isize] {
     if value >= 48 && value <= 57 {
-        Option::Some((value - 48).to_int())
+        Option::Some((value - 48).to_isize())
     } else if value >= 65 && value <= 90 {
-        Option::Some((value - 65).to_int() + 10)
+        Option::Some((value - 65).to_isize() + 10)
     } else if value >= 97 && value <= 122 {
-        Option::Some((value - 97).to_int() + 10)
+        Option::Some((value - 97).to_isize() + 10)
     } else {
         Option::None
     }
 }
 
-fn int_float(value: int) -> float64 {
+fn int_float(value: isize) -> f64 {
     num::parse_float64(value.to_string()).unwrap_or(0.0)
 }
 
-fn to_uint32(value: float64) -> uint32 {
+fn to_u32(value: f64) -> u32 {
     if !math::is_finite(value) || value == 0.0 {
         0
     } else {
         let integer = math::trunc(value);
         let mut remaining = integer - math::floor(integer / 4294967296.0) * 4294967296.0;
         let mut place = 2147483648.0;
-        let mut mask: uint32 = 0x80000000;
-        let mut result: uint32 = 0;
+        let mut mask: u32 = 0x80000000;
+        let mut result: u32 = 0;
         while mask != 0 {
             if remaining >= place {
                 result = result | mask;
@@ -777,7 +794,7 @@ fn to_uint32(value: float64) -> uint32 {
     }
 }
 
-fn radix_argument(arguments: Vec[runtime::Value]) -> Result[int, vm::NativeError] {
+fn radix_argument(arguments: Vec[runtime::Value]) -> Result[isize, vm::NativeError] {
     if arguments.len() < 2
         || match arguments[1] {
             runtime::Value::Undefined => true,
@@ -785,7 +802,7 @@ fn radix_argument(arguments: Vec[runtime::Value]) -> Result[int, vm::NativeError
         } {
         Result::Ok(0)
     } else {
-        Result::Ok(to_uint32(number_argument(arguments, 1)?).to_int32().to_int())
+        Result::Ok(to_u32(number_argument(arguments, 1)?).to_i32().to_isize())
     }
 }
 
@@ -836,14 +853,14 @@ fn global_parse_int(heap: runtime::Heap, this_value: runtime::Value, arguments: 
     }
 }
 
-fn decimal_digit(value: uint16) -> bool {
+fn decimal_digit(value: u16) -> bool {
     value >= 48 && value <= 57
 }
 
-fn append_ascii_range(output: Vec[byte], value: runtime::JsString, start: int, end: int) -> unit {
+fn append_ascii_range(output: Vec[byte], value: runtime::JsString, start: isize, end: isize) -> unit {
     let mut index = start;
     while index < end {
-        output.push(value.get(index).to_uint8());
+        output.push(value.get(index).to_u8());
         index += 1;
     }
 }
@@ -928,7 +945,7 @@ fn global_collect_garbage(
     context: vm::Context,
     this_value: runtime::Value,
     arguments: Vec[runtime::Value],
-    depth: int,
+    depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     let _ = this_value;
     let _ = arguments;
@@ -942,7 +959,7 @@ fn global_set_timeout(
     state: TimerState,
     this_value: runtime::Value,
     arguments: Vec[runtime::Value],
-    depth: int,
+    depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     let _ = this_value;
     let _ = depth;
@@ -957,7 +974,7 @@ fn global_set_timeout(
     let timer_id = state.next_id.get();
     state.next_id.set(timer_id + 1);
     state.active.set(timer_id, true);
-    let queued_arguments: Vec[runtime::Value] = Vec::[callback];
+    let queued_arguments: Vec[runtime::Value] = Vec::from_array([callback]);
     let mut index = 2;
     while index < arguments.len() {
         queued_arguments.push(arguments[index]);
@@ -974,7 +991,7 @@ fn global_set_timeout(
             } else {
                 let _ = state.active.remove(timer_id);
                 let callback = argument(arguments, 0);
-                let callback_arguments: Vec[runtime::Value] = Vec::[];
+                let callback_arguments: Vec[runtime::Value] = Vec::new();
                 let mut index = 1;
                 while index < arguments.len() {
                     callback_arguments.push(arguments[index]);
@@ -993,7 +1010,7 @@ fn global_set_timeout(
         Err(value) => return Result::Err(function_vm_error(value.message)),
     };
     context.enqueue_host_job(wrapper, queued_arguments)?;
-    Result::Ok(runtime::Value::Int(timer_id.to_int32()))
+    Result::Ok(runtime::Value::Int(timer_id.to_i32()))
 }
 
 fn global_clear_timeout(
@@ -1001,7 +1018,7 @@ fn global_clear_timeout(
     state: TimerState,
     this_value: runtime::Value,
     arguments: Vec[runtime::Value],
-    depth: int,
+    depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     let _ = this_value;
     let timer_id = std_file_index(context, argument(arguments, 0), depth)?;
@@ -1014,7 +1031,7 @@ fn global_sleep_async(
     timer_state: TimerState,
     promise: runtime::Value,
     arguments: Vec[runtime::Value],
-    depth: int,
+    depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     let delay = argument(arguments, 0);
     let executor = match allocate_vm_function_with_length(
@@ -1028,7 +1045,7 @@ fn global_sleep_async(
                 context,
                 timer_state,
                 runtime::Value::Undefined,
-                Vec::[resolve, delay],
+                Vec::from_array([resolve, delay]),
                 depth,
             )?;
             Result::Ok(runtime::Value::Undefined)
@@ -1037,14 +1054,14 @@ fn global_sleep_async(
         Ok(value) => value,
         Err(value) => return Result::Err(function_vm_error(value.message)),
     };
-    context.construct_with_new_target_at_depth(promise, Vec::[executor], promise, depth)
+    context.construct_with_new_target_at_depth(promise, Vec::from_array([executor]), promise, depth)
 }
 
 fn global_eval(
     context: vm::Context,
     this_value: runtime::Value,
     arguments: Vec[runtime::Value],
-    depth: int,
+    depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     let _ = this_value;
     let _ = depth;
@@ -1056,7 +1073,7 @@ fn global_eval(
         },
         _ => return Result::Ok(source),
     };
-    let bindings: Vec[bytecode::EvalBinding] = Vec::[];
+    let bindings: Vec[bytecode::EvalBinding] = Vec::new();
     let function = context.compile_dynamic_eval_source(text, bindings)?;
     context.execute(function)
 }
@@ -1065,7 +1082,7 @@ fn global_load_script(
     context: vm::Context,
     this_value: runtime::Value,
     arguments: Vec[runtime::Value],
-    depth: int,
+    depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     let _ = this_value;
     let _ = depth;
@@ -1080,7 +1097,7 @@ fn global_load_script(
         Ok(value) => value,
         Err(value) => return Result::Err(function_vm_error(value)),
     };
-    let bindings: Vec[bytecode::EvalBinding] = Vec::[];
+    let bindings: Vec[bytecode::EvalBinding] = Vec::new();
     let function = context.compile_dynamic_eval_source(source, bindings)?;
     context.execute(function)
 }
@@ -1089,7 +1106,7 @@ fn generator_next(
     context: vm::Context,
     this_value: runtime::Value,
     arguments: Vec[runtime::Value],
-    depth: int,
+    depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     context.resume_generator_at_depth(this_value, argument(arguments, 0), depth)
 }
@@ -1098,7 +1115,7 @@ fn generator_throw(
     context: vm::Context,
     this_value: runtime::Value,
     arguments: Vec[runtime::Value],
-    depth: int,
+    depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     context.throw_generator_at_depth(this_value, argument(arguments, 0), depth)
 }
@@ -1107,12 +1124,12 @@ fn generator_return(
     context: vm::Context,
     this_value: runtime::Value,
     arguments: Vec[runtime::Value],
-    depth: int,
+    depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     context.return_generator_at_depth(this_value, argument(arguments, 0), depth)
 }
 
-fn generator_iterator(this_value: runtime::Value, arguments: Vec[runtime::Value], depth: int) -> Result[
+fn generator_iterator(this_value: runtime::Value, arguments: Vec[runtime::Value], depth: isize) -> Result[
     runtime::Value,
     vm::VmError,
 ] {
@@ -1266,7 +1283,7 @@ fn number_is_finite(heap: runtime::Heap, this_value: runtime::Value, arguments: 
     Result::Ok(runtime::Value::Bool(result))
 }
 
-fn numeric_integer(value: runtime::Value) -> Option[float64] {
+fn numeric_integer(value: runtime::Value) -> Option[f64] {
     match value {
         runtime::Value::Int(value) => match runtime::primitive_to_number(runtime::Value::Int(value)) {
             Ok(value) => Option::Some(value),
@@ -1336,15 +1353,15 @@ fn define_data(
     }
 }
 
-fn array_length_value(length: int) -> runtime::Value {
+fn array_length_value(length: isize) -> runtime::Value {
     if length <= 2147483647 {
-        runtime::Value::Int(length.to_int32())
+        runtime::Value::Int(length.to_i32())
     } else {
         runtime::Value::Float(int_float(length))
     }
 }
 
-fn allocate_array(heap: runtime::Heap, values: Vec[runtime::Value], length: int) -> Result[
+fn allocate_array(heap: runtime::Heap, values: Vec[runtime::Value], length: isize) -> Result[
     runtime::ObjectId,
     vm::NativeError,
 ] {
@@ -1392,7 +1409,9 @@ fn array_constructor(
     if arguments.len() == 1 {
         match arguments[0] {
             runtime::Value::Int(value) => if value >= 0 {
-                Result::Ok(runtime::Value::Object(allocate_array(heap, Vec::[], value.to_int())?))
+                Result::Ok(
+                    runtime::Value::Object(allocate_array(heap, Vec::new(), value.to_isize())?),
+                )
             } else {
                 Result::Err(native_error("invalid array length"))
             },
@@ -1401,7 +1420,7 @@ fn array_constructor(
                 && math::trunc(value) == value {
                 let length = num::parse_int(dtoa::number_to_string(value)).unwrap_or(-1);
                 if length >= 0 {
-                    Result::Ok(runtime::Value::Object(allocate_array(heap, Vec::[], length)?))
+                    Result::Ok(runtime::Value::Object(allocate_array(heap, Vec::new(), length)?))
                 } else {
                     Result::Err(native_error("invalid array length"))
                 }
@@ -1415,7 +1434,7 @@ fn array_constructor(
     }
 }
 
-fn object_argument(arguments: Vec[runtime::Value], index: int) -> Result[
+fn object_argument(arguments: Vec[runtime::Value], index: isize) -> Result[
     runtime::ObjectId,
     vm::NativeError,
 ] {
@@ -1456,11 +1475,11 @@ fn function_call(
     context: vm::Context,
     this_value: runtime::Value,
     arguments: Vec[runtime::Value],
-    depth: int,
+    depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     let callable = function_callable(this_value)?;
     let receiver = argument(arguments, 0);
-    let call_arguments: Vec[runtime::Value] = Vec::[];
+    let call_arguments: Vec[runtime::Value] = Vec::new();
     let mut index = 1;
     while index < arguments.len() {
         call_arguments.push(arguments[index]);
@@ -1473,7 +1492,7 @@ fn function_to_string(
     context: vm::Context,
     this_value: runtime::Value,
     arguments: Vec[runtime::Value],
-    depth: int,
+    depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     let _ = arguments;
     let callable = function_callable(this_value)?;
@@ -1499,7 +1518,7 @@ fn function_file_name(
     context: vm::Context,
     this_value: runtime::Value,
     arguments: Vec[runtime::Value],
-    depth: int,
+    depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     let _ = arguments;
     let _ = depth;
@@ -1513,12 +1532,12 @@ fn function_line_number(
     context: vm::Context,
     this_value: runtime::Value,
     arguments: Vec[runtime::Value],
-    depth: int,
+    depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     let _ = arguments;
     let _ = depth;
     match vm::function_definition_location(context, this_value) {
-        Some(value) => Result::Ok(runtime::Value::Int(value.line.to_int32())),
+        Some(value) => Result::Ok(runtime::Value::Int(value.line.to_i32())),
         None => Result::Ok(runtime::Value::Undefined),
     }
 }
@@ -1527,12 +1546,12 @@ fn function_column_number(
     context: vm::Context,
     this_value: runtime::Value,
     arguments: Vec[runtime::Value],
-    depth: int,
+    depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     let _ = arguments;
     let _ = depth;
     match vm::function_definition_location(context, this_value) {
-        Some(value) => Result::Ok(runtime::Value::Int(value.column.to_int32())),
+        Some(value) => Result::Ok(runtime::Value::Int(value.column.to_i32())),
         None => Result::Ok(runtime::Value::Undefined),
     }
 }
@@ -1541,7 +1560,7 @@ fn function_has_instance(
     context: vm::Context,
     this_value: runtime::Value,
     arguments: Vec[runtime::Value],
-    depth: int,
+    depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     Result::Ok(
         runtime::Value::Bool(
@@ -1550,8 +1569,8 @@ fn function_has_instance(
     )
 }
 
-fn function_apply_length(context: vm::Context, value: runtime::Value, depth: int) -> Result[
-    int,
+fn function_apply_length(context: vm::Context, value: runtime::Value, depth: isize) -> Result[
+    isize,
     vm::VmError,
 ] {
     let number = match number_value_at_depth(context, value, depth)? {
@@ -1572,12 +1591,12 @@ fn function_apply_length(context: vm::Context, value: runtime::Value, depth: int
     }
 }
 
-fn function_apply_arguments(context: vm::Context, value: runtime::Value, depth: int) -> Result[
+fn function_apply_arguments(context: vm::Context, value: runtime::Value, depth: isize) -> Result[
     Vec[runtime::Value],
     vm::VmError,
 ] {
     match value {
-        runtime::Value::Undefined | runtime::Value::Null => Result::Ok(Vec::[]),
+        runtime::Value::Undefined | runtime::Value::Null => Result::Ok(Vec::new()),
         runtime::Value::Object(_) => {
             let length = function_apply_length(
                 context,
@@ -1610,7 +1629,7 @@ fn function_apply(
     context: vm::Context,
     this_value: runtime::Value,
     arguments: Vec[runtime::Value],
-    depth: int,
+    depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     let callable = function_callable(this_value)?;
     let receiver = argument(arguments, 0);
@@ -1622,11 +1641,11 @@ fn function_bind(
     context: vm::Context,
     this_value: runtime::Value,
     arguments: Vec[runtime::Value],
-    depth: int,
+    depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     let callable = function_callable(this_value)?;
     let receiver = argument(arguments, 0);
-    let bound_arguments: Vec[runtime::Value] = Vec::[];
+    let bound_arguments: Vec[runtime::Value] = Vec::new();
     let mut index = 1;
     while index < arguments.len() {
         bound_arguments.push(arguments[index]);
@@ -1637,7 +1656,7 @@ fn function_bind(
         runtime::Value::String(js_string("length")),
         depth,
     )? {
-        runtime::Value::Int(value) => int_float(value.to_int()),
+        runtime::Value::Int(value) => int_float(value.to_isize()),
         runtime::Value::Float(value) => value,
         _ => 0.0,
     };
@@ -1697,7 +1716,7 @@ fn dynamic_function_constructor_vm(
     context: vm::Context,
     this_value: runtime::Value,
     arguments: Vec[runtime::Value],
-    depth: int,
+    depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     let _ = this_value;
     let sources: Vec[string] = Vec::with_capacity(arguments.len());
@@ -1778,7 +1797,7 @@ fn object_prototype_is_prototype_of_at_depth(
     context: vm::Context,
     this_value: runtime::Value,
     arguments: Vec[runtime::Value],
-    depth: int,
+    depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     let prototype = match object_coercion(context.heap(), this_value) {
         Ok(value) => runtime::Value::Object(value),
@@ -1828,7 +1847,7 @@ fn object_prototype_to_string_at_depth(
     context: vm::Context,
     this_value: runtime::Value,
     arguments: Vec[runtime::Value],
-    depth: int,
+    depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     let base = match object_prototype_to_string(context.heap(), this_value, arguments) {
         Ok(runtime::Value::String(value)) => value,
@@ -1878,7 +1897,7 @@ fn object_prototype_to_locale_string_at_depth(
     context: vm::Context,
     this_value: runtime::Value,
     arguments: Vec[runtime::Value],
-    depth: int,
+    depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     let _ = arguments;
     let method = context.read_property_at_depth(
@@ -1886,7 +1905,7 @@ fn object_prototype_to_locale_string_at_depth(
         runtime::Value::String(js_string("toString")),
         depth,
     )?;
-    let call_arguments: Vec[runtime::Value] = Vec::[];
+    let call_arguments: Vec[runtime::Value] = Vec::new();
     context.invoke_with_this_at_depth(method, call_arguments, this_value, depth)
 }
 
@@ -1895,7 +1914,7 @@ fn object_prototype_define_accessor_at_depth(
     this_value: runtime::Value,
     arguments: Vec[runtime::Value],
     getter: bool,
-    depth: int,
+    depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     let object = match object_coercion(context.heap(), this_value) {
         Ok(value) => value,
@@ -1930,7 +1949,7 @@ fn object_prototype_define_accessor_at_depth(
         Ok(()) => (),
         Err(value) => return Result::Err(function_native_error(value)),
     };
-    for name in Vec::["enumerable", "configurable"] {
+    for name in Vec::from_array(["enumerable", "configurable"]) {
         match define_data(
             context.heap(),
             descriptor,
@@ -1947,7 +1966,7 @@ fn object_prototype_define_accessor_at_depth(
     let _ = object_define_property_at_depth(
         context,
         runtime::Value::Undefined,
-        Vec::[runtime::Value::Object(object), key, runtime::Value::Object(descriptor)],
+        Vec::from_array([runtime::Value::Object(object), key, runtime::Value::Object(descriptor)]),
         depth,
     )?;
     Result::Ok(runtime::Value::Undefined)
@@ -1958,7 +1977,7 @@ fn object_prototype_lookup_accessor_at_depth(
     this_value: runtime::Value,
     arguments: Vec[runtime::Value],
     getter: bool,
-    depth: int,
+    depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     let mut object = match object_coercion(context.heap(), this_value) {
         Ok(value) => value,
@@ -2139,7 +2158,7 @@ fn object_get_prototype_of_at_depth(
     context: vm::Context,
     this_value: runtime::Value,
     arguments: Vec[runtime::Value],
-    depth: int,
+    depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     let _ = this_value;
     let object = match object_coercion(context.heap(), argument(arguments, 0)) {
@@ -2153,7 +2172,7 @@ fn object_set_prototype_of_at_depth(
     context: vm::Context,
     this_value: runtime::Value,
     arguments: Vec[runtime::Value],
-    depth: int,
+    depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     let _ = this_value;
     let target = argument(arguments, 0);
@@ -2184,7 +2203,7 @@ fn object_prevent_extensions_at_depth(
     context: vm::Context,
     this_value: runtime::Value,
     arguments: Vec[runtime::Value],
-    depth: int,
+    depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     let _ = this_value;
     let target = argument(arguments, 0);
@@ -2202,7 +2221,7 @@ fn object_is_extensible_at_depth(
     context: vm::Context,
     this_value: runtime::Value,
     arguments: Vec[runtime::Value],
-    depth: int,
+    depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     let _ = this_value;
     match argument(arguments, 0) {
@@ -2508,7 +2527,7 @@ fn object_get_own_property_names(
     if !heap.contains(object) {
         return Result::Err(native_error("object does not belong to this heap"))
     } else {};
-    let values: Vec[runtime::Value] = Vec::[];
+    let values: Vec[runtime::Value] = Vec::new();
     for key in runtime::own_property_keys(heap, object) {
         match key {
             runtime::PropertyKey::String(value) => values.push(runtime::Value::String(value)),
@@ -2528,7 +2547,7 @@ fn object_get_own_property_symbols(
     if !heap.contains(object) {
         return Result::Err(native_error("object does not belong to this heap"))
     } else {};
-    let values: Vec[runtime::Value] = Vec::[];
+    let values: Vec[runtime::Value] = Vec::new();
     for key in runtime::own_property_keys(heap, object) {
         match key {
             runtime::PropertyKey::String(_) => (),
@@ -2557,7 +2576,7 @@ fn own_enumerable_string_keys(heap: runtime::Heap, object: runtime::ObjectId) ->
         Some(value) => value,
         None => return Result::Err(native_error("object does not belong to this heap")),
     };
-    let result: Vec[runtime::Value] = Vec::[];
+    let result: Vec[runtime::Value] = Vec::new();
     for key in runtime::own_property_keys(heap, object) {
         match key {
             runtime::PropertyKey::String(value) => match target.own_property(key) {
@@ -2588,7 +2607,7 @@ fn object_values(heap: runtime::Heap, this_value: runtime::Value, arguments: Vec
 ] {
     let _ = this_value;
     let object = object_coercion(heap, argument(arguments, 0))?;
-    let values: Vec[runtime::Value] = Vec::[];
+    let values: Vec[runtime::Value] = Vec::new();
     for key in own_enumerable_string_keys(heap, object)? {
         match key {
             runtime::Value::String(value) => match object_property(
@@ -2611,17 +2630,19 @@ fn object_entries(heap: runtime::Heap, this_value: runtime::Value, arguments: Ve
 ] {
     let _ = this_value;
     let object = object_coercion(heap, argument(arguments, 0))?;
-    let entries: Vec[runtime::Value] = Vec::[];
+    let entries: Vec[runtime::Value] = Vec::new();
     for key in own_enumerable_string_keys(heap, object)? {
         match key {
             runtime::Value::String(value) => {
-                let entry_values: Vec[runtime::Value] = Vec::[
-                    runtime::Value::String(value),
-                    match object_property(heap, object, runtime::js_string_property_key(value))? {
-                        Some(value) => value,
-                        None => runtime::Value::Undefined,
-                    },
-                ];
+                let entry_values: Vec[runtime::Value] = Vec::from_array(
+                    [
+                        runtime::Value::String(value),
+                        match object_property(heap, object, runtime::js_string_property_key(value))? {
+                            Some(value) => value,
+                            None => runtime::Value::Undefined,
+                        },
+                    ],
+                );
                 entries.push(
                     runtime::Value::Object(allocate_array(heap, entry_values, entry_values.len())?),
                 );
@@ -2636,7 +2657,7 @@ fn object_from_entries(
     context: vm::Context,
     this_value: runtime::Value,
     arguments: Vec[runtime::Value],
-    depth: int,
+    depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     let _ = this_value;
     let target = match runtime::new_ordinary_object(context.heap(), Option::None) {
@@ -2693,7 +2714,7 @@ fn object_group_by(
     context: vm::Context,
     this_value: runtime::Value,
     arguments: Vec[runtime::Value],
-    depth: int,
+    depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     let _ = this_value;
     let callback = argument(arguments, 1);
@@ -2719,7 +2740,7 @@ fn object_group_by(
         };
         let key_value = match context.invoke_with_this_at_depth(
             callback,
-            Vec::[item, array_length_value(count)],
+            Vec::from_array([item, array_length_value(count)]),
             runtime::Value::Undefined,
             depth,
         ) {
@@ -2753,7 +2774,7 @@ fn object_group_by(
                 )
             },
             Ok(None) => {
-                let value = match allocate_array(context.heap(), Vec::[], 0) {
+                let value = match allocate_array(context.heap(), Vec::new(), 0) {
                     Ok(value) => value,
                     Err(value) => {
                         return collection_close_with_error(
@@ -2785,7 +2806,7 @@ fn object_group_by(
                 )
             },
         };
-        match arrayx::push(context.heap(), group, Vec::[item]) {
+        match arrayx::push(context.heap(), group, Vec::from_array([item])) {
             Ok(_) => (),
             Err(value) => {
                 return collection_close_with_error(
@@ -2862,7 +2883,7 @@ fn object_define_properties(
         Some(value) => value,
         None => return Result::Err(native_error("object does not belong to this heap")),
     };
-    let pending: Vec[(runtime::PropertyKey, runtime::PropertyDescriptor)] = Vec::[];
+    let pending: Vec[(runtime::PropertyKey, runtime::PropertyDescriptor)] = Vec::new();
     for key in runtime::own_property_keys(heap, descriptors) {
         match descriptor_map.own_property(key) {
             Some(value) => if runtime::descriptor_enumerable(value) {
@@ -3035,7 +3056,7 @@ fn math_abs(heap: runtime::Heap, this_value: runtime::Value, arguments: Vec[runt
 }
 
 fn math_random(
-    state: Ref[uint64],
+    state: Ref[u64],
     heap: runtime::Heap,
     this_value: runtime::Value,
     arguments: Vec[runtime::Value],
@@ -3292,7 +3313,7 @@ fn math_clz32(heap: runtime::Heap, this_value: runtime::Value, arguments: Vec[ru
 ] {
     let _ = heap;
     let _ = this_value;
-    Result::Ok(runtime::Value::Int(mathx::clz32(number_argument(arguments, 0)?).to_int32()))
+    Result::Ok(runtime::Value::Int(mathx::clz32(number_argument(arguments, 0)?).to_i32()))
 }
 
 fn math_imul(heap: runtime::Heap, this_value: runtime::Value, arguments: Vec[runtime::Value]) -> Result[
@@ -3332,7 +3353,7 @@ fn math_hypot(heap: runtime::Heap, this_value: runtime::Value, arguments: Vec[ru
 ] {
     let _ = heap;
     let _ = this_value;
-    let values: Vec[float64] = Vec::with_capacity(arguments.len());
+    let values: Vec[f64] = Vec::with_capacity(arguments.len());
     let mut index = 0;
     while index < arguments.len() {
         values.push(number_argument(arguments, index)?);
@@ -3345,7 +3366,7 @@ fn math_sum_precise(
     context: vm::Context,
     this_value: runtime::Value,
     arguments: Vec[runtime::Value],
-    depth: int,
+    depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     let _ = this_value;
     let started = collection_iterator_start(context, argument(arguments, 0), depth)?;
@@ -3360,7 +3381,7 @@ fn math_sum_precise(
             Err(value) => return collection_close_with_error(context, iterator, depth, value),
         };
         match item {
-            runtime::Value::Int(value) => sum.add(int_float(value.to_int())),
+            runtime::Value::Int(value) => sum.add(int_float(value.to_isize())),
             runtime::Value::Float(value) => sum.add(value),
             _ => return collection_close_with_error(
                 context,
@@ -3553,7 +3574,7 @@ fn builtin_function_name(name: string) -> string {
     }
 }
 
-fn builtin_function_length(name: string) -> int {
+fn builtin_function_length(name: string) -> isize {
     match name {
         "AggregateError" => 2,
         "Error" | "EvalError" | "InternalError" | "RangeError" | "ReferenceError" | "SyntaxError" | "TypeError" | "URIError" => 1,
@@ -3649,14 +3670,14 @@ fn initialize_builtin_function(
     heap: runtime::Heap,
     value: runtime::Value,
     name: string,
-    length: int,
+    length: isize,
 ) -> bool {
     match value {
         runtime::Value::Object(object) => runtime::define_own_property(
             heap,
             object,
             runtime::string_property_key("length"),
-            runtime::data_descriptor(runtime::Value::Int(length.to_int32()), false, false, true),
+            runtime::data_descriptor(runtime::Value::Int(length.to_i32()), false, false, true),
         )
             && runtime::define_own_property(
                 heap,
@@ -3676,7 +3697,7 @@ fn initialize_builtin_function(
 fn allocate_function_with_length(
     context: vm::Context,
     name: string,
-    length: int,
+    length: isize,
     callback: (runtime::Heap, runtime::Value, Vec[runtime::Value]) -> Result[
         runtime::Value,
         vm::NativeError,
@@ -3697,7 +3718,7 @@ fn allocate_function_with_length(
 fn allocate_vm_function(
     context: vm::Context,
     name: string,
-    callback: (runtime::Value, Vec[runtime::Value], int) -> Result[runtime::Value, vm::VmError],
+    callback: (runtime::Value, Vec[runtime::Value], isize) -> Result[runtime::Value, vm::VmError],
 ) -> Result[runtime::Value, BuiltinError] {
     allocate_vm_function_with_length(context, name, builtin_function_length(name), callback)
 }
@@ -3705,8 +3726,8 @@ fn allocate_vm_function(
 fn allocate_vm_function_with_length(
     context: vm::Context,
     name: string,
-    length: int,
-    callback: (runtime::Value, Vec[runtime::Value], int) -> Result[runtime::Value, vm::VmError],
+    length: isize,
+    callback: (runtime::Value, Vec[runtime::Value], isize) -> Result[runtime::Value, vm::VmError],
 ) -> Result[runtime::Value, BuiltinError] {
     match context.new_vm_function(callback) {
         Ok(value) => if initialize_builtin_function(context.heap(), value, name, length) {
@@ -3718,7 +3739,7 @@ fn allocate_vm_function_with_length(
     }
 }
 
-fn number_value_at_depth(context: vm::Context, value: runtime::Value, depth: int) -> Result[
+fn number_value_at_depth(context: vm::Context, value: runtime::Value, depth: isize) -> Result[
     runtime::Value,
     vm::VmError,
 ] {
@@ -3729,7 +3750,7 @@ fn number_value_at_depth(context: vm::Context, value: runtime::Value, depth: int
     }
 }
 
-fn bigint_value_at_depth(context: vm::Context, value: runtime::Value, depth: int) -> Result[
+fn bigint_value_at_depth(context: vm::Context, value: runtime::Value, depth: isize) -> Result[
     runtime::Value,
     vm::VmError,
 ] {
@@ -3758,9 +3779,9 @@ fn bigint_value_at_depth(context: vm::Context, value: runtime::Value, depth: int
 fn number_arguments_at_depth(
     context: vm::Context,
     arguments: Vec[runtime::Value],
-    minimum: int,
+    minimum: isize,
     all: bool,
-    depth: int,
+    depth: isize,
 ) -> Result[Vec[runtime::Value], vm::VmError] {
     let total = if arguments.len() < minimum {
         minimum
@@ -3786,7 +3807,7 @@ fn define_number_function(
     object: runtime::ObjectId,
     name: string,
     callback: NativeBuiltin,
-    minimum: int,
+    minimum: isize,
     all: bool,
 ) -> Result[unit, BuiltinError] {
     define_value(
@@ -3809,7 +3830,7 @@ fn define_number_function(
     )
 }
 
-fn string_value_at_depth(context: vm::Context, value: runtime::Value, depth: int) -> Result[
+fn string_value_at_depth(context: vm::Context, value: runtime::Value, depth: isize) -> Result[
     runtime::Value,
     vm::VmError,
 ] {
@@ -3818,7 +3839,11 @@ fn string_value_at_depth(context: vm::Context, value: runtime::Value, depth: int
         runtime::Value::Symbol(_) => {
             Result::Err(function_vm_error("cannot convert symbol to string"))
         },
-        _ => match string_constructor(context.heap(), runtime::Value::Undefined, Vec::[primitive]) {
+        _ => match string_constructor(
+            context.heap(),
+            runtime::Value::Undefined,
+            Vec::from_array([primitive]),
+        ) {
             Ok(value) => Result::Ok(value),
             Err(value) => Result::Err(function_native_error(value)),
         },
@@ -3828,9 +3853,9 @@ fn string_value_at_depth(context: vm::Context, value: runtime::Value, depth: int
 fn string_arguments_at_depth(
     context: vm::Context,
     arguments: Vec[runtime::Value],
-    minimum: int,
+    minimum: isize,
     all: bool,
-    depth: int,
+    depth: isize,
 ) -> Result[Vec[runtime::Value], vm::VmError] {
     let total = if arguments.len() < minimum {
         minimum
@@ -3856,7 +3881,7 @@ fn define_string_function(
     object: runtime::ObjectId,
     name: string,
     callback: NativeBuiltin,
-    minimum: int,
+    minimum: isize,
     all: bool,
 ) -> Result[unit, BuiltinError] {
     define_value(
@@ -3891,10 +3916,12 @@ fn define_parse_int_function(context: vm::Context, object: runtime::ObjectId) ->
             context,
             "parseInt",
             |this_value, arguments, depth| {
-                let converted = Vec::[
-                    string_value_at_depth(context, argument(arguments, 0), depth)?,
-                    number_value_at_depth(context, argument(arguments, 1), depth)?,
-                ];
+                let converted = Vec::from_array(
+                    [
+                        string_value_at_depth(context, argument(arguments, 0), depth)?,
+                        number_value_at_depth(context, argument(arguments, 1), depth)?,
+                    ],
+                );
                 match global_parse_int(context.heap(), this_value, converted) {
                     Ok(value) => Result::Ok(value),
                     Err(value) => Result::Err(function_native_error(value)),
@@ -3920,10 +3947,12 @@ fn define_bigint_width_function(
             context,
             name,
             |this_value, arguments, depth| {
-                let converted = Vec::[
-                    number_value_at_depth(context, argument(arguments, 0), depth)?,
-                    bigint_value_at_depth(context, argument(arguments, 1), depth)?,
-                ];
+                let converted = Vec::from_array(
+                    [
+                        number_value_at_depth(context, argument(arguments, 0), depth)?,
+                        bigint_value_at_depth(context, argument(arguments, 1), depth)?,
+                    ],
+                );
                 match callback(context.heap(), this_value, converted) {
                     Ok(value) => Result::Ok(value),
                     Err(value) => Result::Err(function_native_error(value)),
@@ -3935,14 +3964,18 @@ fn define_bigint_width_function(
     )
 }
 
-fn property_key_value_at_depth(context: vm::Context, value: runtime::Value, depth: int) -> Result[
+fn property_key_value_at_depth(context: vm::Context, value: runtime::Value, depth: isize) -> Result[
     runtime::Value,
     vm::VmError,
 ] {
     let primitive = context.to_primitive_string_at_depth(value, depth)?;
     match primitive {
         runtime::Value::Symbol(value) => Result::Ok(runtime::Value::Symbol(value)),
-        _ => match string_constructor(context.heap(), runtime::Value::Undefined, Vec::[primitive]) {
+        _ => match string_constructor(
+            context.heap(),
+            runtime::Value::Undefined,
+            Vec::from_array([primitive]),
+        ) {
             Ok(value) => Result::Ok(value),
             Err(value) => Result::Err(function_native_error(value)),
         },
@@ -3952,8 +3985,8 @@ fn property_key_value_at_depth(context: vm::Context, value: runtime::Value, dept
 fn property_key_arguments_at_depth(
     context: vm::Context,
     arguments: Vec[runtime::Value],
-    key_index: int,
-    depth: int,
+    key_index: isize,
+    depth: isize,
 ) -> Result[Vec[runtime::Value], vm::VmError] {
     let total = if arguments.len() <= key_index {
         key_index + 1
@@ -4076,7 +4109,7 @@ fn reflect_object(value: runtime::Value) -> Result[runtime::ObjectId, vm::VmErro
     }
 }
 
-fn reflect_arguments(context: vm::Context, value: runtime::Value, depth: int) -> Result[
+fn reflect_arguments(context: vm::Context, value: runtime::Value, depth: isize) -> Result[
     Vec[runtime::Value],
     vm::VmError,
 ] {
@@ -4093,13 +4126,13 @@ fn parsed_descriptor_from_object_at_depth(
     context: vm::Context,
     object: runtime::ObjectId,
     current: Option[runtime::PropertyDescriptor],
-    depth: int,
+    depth: isize,
 ) -> Result[ParsedPropertyDescriptor, vm::VmError] {
     let snapshot = match runtime::new_null_prototype_object(context.heap()) {
         Ok(value) => value,
         Err(value) => return Result::Err(reflect_type_error(value.message)),
     };
-    for name in Vec::["enumerable", "configurable", "value", "writable", "get", "set"] {
+    for name in Vec::from_array(["enumerable", "configurable", "value", "writable", "get", "set"]) {
         let key = runtime::string_property_key(name);
         let key_value = runtime::Value::String(js_string(name));
         let present = context.has_property_at_depth(
@@ -4138,7 +4171,7 @@ fn descriptor_from_object_at_depth(
     context: vm::Context,
     object: runtime::ObjectId,
     current: Option[runtime::PropertyDescriptor],
-    depth: int,
+    depth: isize,
 ) -> Result[runtime::PropertyDescriptor, vm::VmError] {
     Result::Ok(parsed_descriptor_from_object_at_depth(context, object, current, depth)?.descriptor)
 }
@@ -4148,7 +4181,7 @@ fn typed_array_descriptor_at_depth(
     target: runtime::ObjectId,
     key: runtime::PropertyKey,
     descriptor: runtime::PropertyDescriptor,
-    depth: int,
+    depth: isize,
 ) -> Result[runtime::PropertyDescriptor, vm::VmError] {
     if !runtime::is_typed_array_valid_numeric_property(context.heap(), target, key) {
         Result::Ok(descriptor)
@@ -4201,7 +4234,7 @@ fn reflect_proxy_trap_at_depth(
     context: vm::Context,
     handler: runtime::ObjectId,
     name: string,
-    depth: int,
+    depth: isize,
 ) -> Result[Option[runtime::Value], vm::VmError] {
     let value = context.read_property_at_depth(
         runtime::Value::Object(handler),
@@ -4232,7 +4265,7 @@ fn proxy_get_own_property_descriptor_at_depth(
     context: vm::Context,
     object: runtime::ObjectId,
     key: runtime::PropertyKey,
-    depth: int,
+    depth: isize,
 ) -> Result[Option[runtime::PropertyDescriptor], vm::VmError] {
     match reflect_proxy_parts(context, object)? {
         Some((target, handler)) => match reflect_proxy_trap_at_depth(
@@ -4244,7 +4277,9 @@ fn proxy_get_own_property_descriptor_at_depth(
             Some(trap) => {
                 let result = context.invoke_with_this_at_depth(
                     trap,
-                    Vec::[runtime::Value::Object(target), property_key_runtime_value(key)],
+                    Vec::from_array(
+                        [runtime::Value::Object(target), property_key_runtime_value(key)],
+                    ),
                     runtime::Value::Object(handler),
                     depth,
                 )?;
@@ -4329,7 +4364,7 @@ fn proxy_define_property_at_depth(
     key: runtime::PropertyKey,
     descriptor: runtime::PropertyDescriptor,
     trap_descriptor: Option[runtime::Value],
-    depth: int,
+    depth: isize,
 ) -> Result[bool, vm::VmError] {
     match reflect_proxy_parts(context, object)? {
         Some((target, handler)) => match reflect_proxy_trap_at_depth(
@@ -4349,11 +4384,13 @@ fn proxy_define_property_at_depth(
                 let result = runtime::to_boolean(
                     context.invoke_with_this_at_depth(
                         trap,
-                        Vec::[
-                            runtime::Value::Object(target),
-                            property_key_runtime_value(key),
-                            descriptor_value,
-                        ],
+                        Vec::from_array(
+                            [
+                                runtime::Value::Object(target),
+                                property_key_runtime_value(key),
+                                descriptor_value,
+                            ],
+                        ),
                         runtime::Value::Object(handler),
                         depth,
                     )?,
@@ -4420,7 +4457,7 @@ fn proxy_define_property_at_depth(
     }
 }
 
-fn proxy_own_key_values_at_depth(context: vm::Context, object: runtime::ObjectId, depth: int) -> Result[
+fn proxy_own_key_values_at_depth(context: vm::Context, object: runtime::ObjectId, depth: isize) -> Result[
     Vec[runtime::Value],
     vm::VmError,
 ] {
@@ -4431,9 +4468,9 @@ fn proxy_own_key_values_at_depth(context: vm::Context, object: runtime::ObjectId
 fn proxy_own_enumerable_string_keys_at_depth(
     context: vm::Context,
     object: runtime::ObjectId,
-    depth: int,
+    depth: isize,
 ) -> Result[Vec[runtime::Value], vm::VmError] {
-    let result: Vec[runtime::Value] = Vec::[];
+    let result: Vec[runtime::Value] = Vec::new();
     for value in proxy_own_key_values_at_depth(context, object, depth)? {
         match value {
             runtime::Value::String(name) => match proxy_get_own_property_descriptor_at_depth(
@@ -4457,7 +4494,7 @@ fn object_define_property_at_depth(
     context: vm::Context,
     this_value: runtime::Value,
     arguments: Vec[runtime::Value],
-    depth: int,
+    depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     let _ = this_value;
     let target = reflect_object(argument(arguments, 0))?;
@@ -4492,7 +4529,7 @@ fn object_get_own_property_descriptor_at_depth(
     context: vm::Context,
     this_value: runtime::Value,
     arguments: Vec[runtime::Value],
-    depth: int,
+    depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     let _ = this_value;
     let object = match object_coercion(context.heap(), argument(arguments, 0)) {
@@ -4518,7 +4555,7 @@ fn object_own_property_test_at_depth(
     receiver: runtime::Value,
     key_value: runtime::Value,
     enumerable: bool,
-    depth: int,
+    depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     let object = match object_coercion(context.heap(), receiver) {
         Ok(value) => value,
@@ -4544,7 +4581,7 @@ fn object_has_own_at_depth(
     context: vm::Context,
     this_value: runtime::Value,
     arguments: Vec[runtime::Value],
-    depth: int,
+    depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     let _ = this_value;
     object_own_property_test_at_depth(
@@ -4560,7 +4597,7 @@ fn object_prototype_has_own_property_at_depth(
     context: vm::Context,
     this_value: runtime::Value,
     arguments: Vec[runtime::Value],
-    depth: int,
+    depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     object_own_property_test_at_depth(context, this_value, argument(arguments, 0), false, depth)
 }
@@ -4569,7 +4606,7 @@ fn object_prototype_property_is_enumerable_at_depth(
     context: vm::Context,
     this_value: runtime::Value,
     arguments: Vec[runtime::Value],
-    depth: int,
+    depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     object_own_property_test_at_depth(context, this_value, argument(arguments, 0), true, depth)
 }
@@ -4578,13 +4615,13 @@ fn object_own_keys_by_kind_at_depth(
     context: vm::Context,
     value: runtime::Value,
     symbols: bool,
-    depth: int,
+    depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     let object = match object_coercion(context.heap(), value) {
         Ok(value) => value,
         Err(value) => return Result::Err(function_native_error(value)),
     };
-    let values: Vec[runtime::Value] = Vec::[];
+    let values: Vec[runtime::Value] = Vec::new();
     for key in proxy_own_key_values_at_depth(context, object, depth)? {
         match key {
             runtime::Value::String(_) => if !symbols {
@@ -4606,7 +4643,7 @@ fn object_get_own_property_names_at_depth(
     context: vm::Context,
     this_value: runtime::Value,
     arguments: Vec[runtime::Value],
-    depth: int,
+    depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     let _ = this_value;
     object_own_keys_by_kind_at_depth(context, argument(arguments, 0), false, depth)
@@ -4616,7 +4653,7 @@ fn object_get_own_property_symbols_at_depth(
     context: vm::Context,
     this_value: runtime::Value,
     arguments: Vec[runtime::Value],
-    depth: int,
+    depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     let _ = this_value;
     object_own_keys_by_kind_at_depth(context, argument(arguments, 0), true, depth)
@@ -4626,7 +4663,7 @@ fn object_keys_at_depth(
     context: vm::Context,
     this_value: runtime::Value,
     arguments: Vec[runtime::Value],
-    depth: int,
+    depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     let _ = this_value;
     let object = match object_coercion(context.heap(), argument(arguments, 0)) {
@@ -4644,7 +4681,7 @@ fn object_define_properties_at_depth(
     context: vm::Context,
     this_value: runtime::Value,
     arguments: Vec[runtime::Value],
-    depth: int,
+    depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     let _ = this_value;
     let target = reflect_object(argument(arguments, 0))?;
@@ -4652,7 +4689,7 @@ fn object_define_properties_at_depth(
         Ok(value) => value,
         Err(value) => return Result::Err(function_native_error(value)),
     };
-    let pending: Vec[(runtime::PropertyKey, runtime::PropertyDescriptor, runtime::Value)] = Vec::[];
+    let pending: Vec[(runtime::PropertyKey, runtime::PropertyDescriptor, runtime::Value)] = Vec::new();
     for key_value in proxy_own_key_values_at_depth(context, descriptors, depth)? {
         let key = match key_value {
             runtime::Value::String(value) => runtime::js_string_property_key(value),
@@ -4710,7 +4747,7 @@ fn object_get_own_property_descriptors_at_depth(
     context: vm::Context,
     this_value: runtime::Value,
     arguments: Vec[runtime::Value],
-    depth: int,
+    depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     let _ = this_value;
     let source = match object_coercion(context.heap(), argument(arguments, 0)) {
@@ -4770,7 +4807,7 @@ fn object_set_integrity_level_at_depth(
     context: vm::Context,
     target: runtime::Value,
     frozen: bool,
-    depth: int,
+    depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     let object = match target {
         runtime::Value::Object(value) => value,
@@ -4806,7 +4843,7 @@ fn object_test_integrity_level_at_depth(
     context: vm::Context,
     target: runtime::Value,
     frozen: bool,
-    depth: int,
+    depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     let object = match target {
         runtime::Value::Object(value) => value,
@@ -4837,7 +4874,7 @@ fn object_seal_at_depth(
     context: vm::Context,
     this_value: runtime::Value,
     arguments: Vec[runtime::Value],
-    depth: int,
+    depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     let _ = this_value;
     object_set_integrity_level_at_depth(context, argument(arguments, 0), false, depth)
@@ -4847,7 +4884,7 @@ fn object_freeze_at_depth(
     context: vm::Context,
     this_value: runtime::Value,
     arguments: Vec[runtime::Value],
-    depth: int,
+    depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     let _ = this_value;
     object_set_integrity_level_at_depth(context, argument(arguments, 0), true, depth)
@@ -4857,7 +4894,7 @@ fn object_is_sealed_at_depth(
     context: vm::Context,
     this_value: runtime::Value,
     arguments: Vec[runtime::Value],
-    depth: int,
+    depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     let _ = this_value;
     object_test_integrity_level_at_depth(context, argument(arguments, 0), false, depth)
@@ -4867,7 +4904,7 @@ fn object_is_frozen_at_depth(
     context: vm::Context,
     this_value: runtime::Value,
     arguments: Vec[runtime::Value],
-    depth: int,
+    depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     let _ = this_value;
     object_test_integrity_level_at_depth(context, argument(arguments, 0), true, depth)
@@ -4877,7 +4914,7 @@ fn object_create_at_depth(
     context: vm::Context,
     this_value: runtime::Value,
     arguments: Vec[runtime::Value],
-    depth: int,
+    depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     let _ = this_value;
     let prototype = match argument(arguments, 0) {
@@ -4900,7 +4937,7 @@ fn object_create_at_depth(
         descriptors => object_define_properties_at_depth(
             context,
             runtime::Value::Undefined,
-            Vec::[runtime::Value::Object(object), descriptors],
+            Vec::from_array([runtime::Value::Object(object), descriptors]),
             depth,
         ),
     }
@@ -4910,7 +4947,7 @@ fn object_assign_at_depth(
     context: vm::Context,
     this_value: runtime::Value,
     arguments: Vec[runtime::Value],
-    depth: int,
+    depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     let _ = this_value;
     let target = match object_coercion(context.heap(), argument(arguments, 0)) {
@@ -4967,13 +5004,13 @@ fn object_enumerable_values_at_depth(
     context: vm::Context,
     value: runtime::Value,
     entries: bool,
-    depth: int,
+    depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     let source = match object_coercion(context.heap(), value) {
         Ok(value) => value,
         Err(value) => return Result::Err(function_native_error(value)),
     };
-    let values: Vec[runtime::Value] = Vec::[];
+    let values: Vec[runtime::Value] = Vec::new();
     for key in proxy_own_key_values_at_depth(context, source, depth)? {
         match key {
             runtime::Value::String(name) => match proxy_get_own_property_descriptor_at_depth(
@@ -4992,7 +5029,7 @@ fn object_enumerable_values_at_depth(
                     if entries {
                         let pair = match allocate_array(
                             context.heap(),
-                            Vec::[runtime::Value::String(name), value],
+                            Vec::from_array([runtime::Value::String(name), value]),
                             2,
                         ) {
                             Ok(value) => value,
@@ -5018,7 +5055,7 @@ fn object_values_at_depth(
     context: vm::Context,
     this_value: runtime::Value,
     arguments: Vec[runtime::Value],
-    depth: int,
+    depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     let _ = this_value;
     object_enumerable_values_at_depth(context, argument(arguments, 0), false, depth)
@@ -5028,7 +5065,7 @@ fn object_entries_at_depth(
     context: vm::Context,
     this_value: runtime::Value,
     arguments: Vec[runtime::Value],
-    depth: int,
+    depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     let _ = this_value;
     object_enumerable_values_at_depth(context, argument(arguments, 0), true, depth)
@@ -5038,7 +5075,7 @@ fn reflect_apply(
     context: vm::Context,
     this_value: runtime::Value,
     arguments: Vec[runtime::Value],
-    depth: int,
+    depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     let _ = this_value;
     let target = function_callable(argument(arguments, 0))?;
@@ -5050,7 +5087,7 @@ fn reflect_construct(
     context: vm::Context,
     this_value: runtime::Value,
     arguments: Vec[runtime::Value],
-    depth: int,
+    depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     let _ = this_value;
     let target = argument(arguments, 0);
@@ -5072,7 +5109,7 @@ fn reflect_define_property(
     context: vm::Context,
     this_value: runtime::Value,
     arguments: Vec[runtime::Value],
-    depth: int,
+    depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     let _ = this_value;
     let target = reflect_object(argument(arguments, 0))?;
@@ -5107,7 +5144,7 @@ fn reflect_delete_property(
     context: vm::Context,
     this_value: runtime::Value,
     arguments: Vec[runtime::Value],
-    depth: int,
+    depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     let _ = this_value;
     let target = argument(arguments, 0);
@@ -5123,7 +5160,7 @@ fn reflect_get(
     context: vm::Context,
     this_value: runtime::Value,
     arguments: Vec[runtime::Value],
-    depth: int,
+    depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     let _ = this_value;
     let target = argument(arguments, 0);
@@ -5139,7 +5176,7 @@ fn reflect_get_own_property_descriptor(
     context: vm::Context,
     this_value: runtime::Value,
     arguments: Vec[runtime::Value],
-    depth: int,
+    depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     let _ = this_value;
     let target = reflect_object(argument(arguments, 0))?;
@@ -5161,7 +5198,7 @@ fn reflect_get_prototype_of(
     context: vm::Context,
     this_value: runtime::Value,
     arguments: Vec[runtime::Value],
-    depth: int,
+    depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     let _ = this_value;
     let target = argument(arguments, 0);
@@ -5173,7 +5210,7 @@ fn reflect_has(
     context: vm::Context,
     this_value: runtime::Value,
     arguments: Vec[runtime::Value],
-    depth: int,
+    depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     let _ = this_value;
     let target = argument(arguments, 0);
@@ -5187,7 +5224,7 @@ fn reflect_is_extensible(
     context: vm::Context,
     this_value: runtime::Value,
     arguments: Vec[runtime::Value],
-    depth: int,
+    depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     let _ = this_value;
     let target = argument(arguments, 0);
@@ -5199,7 +5236,7 @@ fn reflect_own_keys(
     context: vm::Context,
     this_value: runtime::Value,
     arguments: Vec[runtime::Value],
-    depth: int,
+    depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     let _ = this_value;
     let target = argument(arguments, 0);
@@ -5211,7 +5248,7 @@ fn reflect_prevent_extensions(
     context: vm::Context,
     this_value: runtime::Value,
     arguments: Vec[runtime::Value],
-    depth: int,
+    depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     let _ = this_value;
     let target = argument(arguments, 0);
@@ -5223,7 +5260,7 @@ fn reflect_set(
     context: vm::Context,
     this_value: runtime::Value,
     arguments: Vec[runtime::Value],
-    depth: int,
+    depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     let _ = this_value;
     let target = argument(arguments, 0);
@@ -5249,7 +5286,7 @@ fn reflect_set_prototype_of(
     context: vm::Context,
     this_value: runtime::Value,
     arguments: Vec[runtime::Value],
-    depth: int,
+    depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     let _ = this_value;
     let target = argument(arguments, 0);
@@ -5267,21 +5304,23 @@ fn install_reflect(context: vm::Context) -> Result[runtime::ObjectId, BuiltinErr
         Ok(value) => value,
         Err(value) => return Result::Err(BuiltinError { message: value.message }),
     };
-    for (name, callback) in Vec::[
-        ("apply", reflect_apply),
-        ("construct", reflect_construct),
-        ("defineProperty", reflect_define_property),
-        ("deleteProperty", reflect_delete_property),
-        ("get", reflect_get),
-        ("getOwnPropertyDescriptor", reflect_get_own_property_descriptor),
-        ("getPrototypeOf", reflect_get_prototype_of),
-        ("has", reflect_has),
-        ("isExtensible", reflect_is_extensible),
-        ("ownKeys", reflect_own_keys),
-        ("preventExtensions", reflect_prevent_extensions),
-        ("set", reflect_set),
-        ("setPrototypeOf", reflect_set_prototype_of),
-    ] {
+    for (name, callback) in Vec::from_array(
+        [
+            ("apply", reflect_apply),
+            ("construct", reflect_construct),
+            ("defineProperty", reflect_define_property),
+            ("deleteProperty", reflect_delete_property),
+            ("get", reflect_get),
+            ("getOwnPropertyDescriptor", reflect_get_own_property_descriptor),
+            ("getPrototypeOf", reflect_get_prototype_of),
+            ("has", reflect_has),
+            ("isExtensible", reflect_is_extensible),
+            ("ownKeys", reflect_own_keys),
+            ("preventExtensions", reflect_prevent_extensions),
+            ("set", reflect_set),
+            ("setPrototypeOf", reflect_set_prototype_of),
+        ],
+    ) {
         define_value(
             context.heap(),
             object,
@@ -5414,7 +5453,7 @@ fn install_function(context: vm::Context, object_constructor: runtime::Value) ->
     if !runtime::prevent_extensions(context.heap(), thrower_object) {
         return Result::Err(BuiltinError { message: "cannot freeze restricted function property" })
     } else {};
-    for name in Vec::["caller", "arguments"] {
+    for name in Vec::from_array(["caller", "arguments"]) {
         if !runtime::define_own_property(
             context.heap(),
             prototype,
@@ -5479,11 +5518,9 @@ fn install_function(context: vm::Context, object_constructor: runtime::Value) ->
     define_value(context.heap(), prototype, "apply", apply, true, true)?;
     define_value(context.heap(), prototype, "bind", bind, true, true)?;
     define_value(context.heap(), prototype, "toString", to_string, true, true)?;
-    for (name, getter) in Vec::[
-        ("fileName", file_name),
-        ("lineNumber", line_number),
-        ("columnNumber", column_number),
-    ] {
+    for (name, getter) in Vec::from_array(
+        [("fileName", file_name), ("lineNumber", line_number), ("columnNumber", column_number)],
+    ) {
         if !runtime::define_own_property(
             context.heap(),
             prototype,
@@ -5629,10 +5666,12 @@ fn install_object(context: vm::Context) -> Result[runtime::Value, BuiltinError] 
         false,
     )?;
     define_value(context.heap(), prototype, "constructor", function, true, true)?;
-    for (name, callback) in Vec::[
-        ("hasOwnProperty", object_prototype_has_own_property_at_depth),
-        ("propertyIsEnumerable", object_prototype_property_is_enumerable_at_depth),
-    ] {
+    for (name, callback) in Vec::from_array(
+        [
+            ("hasOwnProperty", object_prototype_has_own_property_at_depth),
+            ("propertyIsEnumerable", object_prototype_property_is_enumerable_at_depth),
+        ],
+    ) {
         define_value(
             context.heap(),
             prototype,
@@ -5690,7 +5729,7 @@ fn install_object(context: vm::Context) -> Result[runtime::Value, BuiltinError] 
         true,
         true,
     )?;
-    for (name, getter) in Vec::[("__defineGetter__", true), ("__defineSetter__", false)] {
+    for (name, getter) in Vec::from_array([("__defineGetter__", true), ("__defineSetter__", false)]) {
         define_value(
             context.heap(),
             prototype,
@@ -5712,7 +5751,7 @@ fn install_object(context: vm::Context) -> Result[runtime::Value, BuiltinError] 
             true,
         )?
     }
-    for (name, getter) in Vec::[("__lookupGetter__", true), ("__lookupSetter__", false)] {
+    for (name, getter) in Vec::from_array([("__lookupGetter__", true), ("__lookupSetter__", false)]) {
         define_value(
             context.heap(),
             prototype,
@@ -5759,12 +5798,14 @@ fn install_object(context: vm::Context) -> Result[runtime::Value, BuiltinError] 
         true,
         true,
     )?;
-    for (name, callback) in Vec::[
-        ("getPrototypeOf", object_get_prototype_of_at_depth),
-        ("setPrototypeOf", object_set_prototype_of_at_depth),
-        ("preventExtensions", object_prevent_extensions_at_depth),
-        ("isExtensible", object_is_extensible_at_depth),
-    ] {
+    for (name, callback) in Vec::from_array(
+        [
+            ("getPrototypeOf", object_get_prototype_of_at_depth),
+            ("setPrototypeOf", object_set_prototype_of_at_depth),
+            ("preventExtensions", object_prevent_extensions_at_depth),
+            ("isExtensible", object_is_extensible_at_depth),
+        ],
+    ) {
         define_value(
             context.heap(),
             object,
@@ -5850,10 +5891,12 @@ fn install_object(context: vm::Context) -> Result[runtime::Value, BuiltinError] 
         true,
         true,
     )?;
-    for (name, callback) in Vec::[
-        ("getOwnPropertyNames", object_get_own_property_names_at_depth),
-        ("getOwnPropertySymbols", object_get_own_property_symbols_at_depth),
-    ] {
+    for (name, callback) in Vec::from_array(
+        [
+            ("getOwnPropertyNames", object_get_own_property_names_at_depth),
+            ("getOwnPropertySymbols", object_get_own_property_symbols_at_depth),
+        ],
+    ) {
         define_value(
             context.heap(),
             object,
@@ -5954,12 +5997,14 @@ fn install_object(context: vm::Context) -> Result[runtime::Value, BuiltinError] 
         true,
         true,
     )?;
-    for (name, callback) in Vec::[
-        ("seal", object_seal_at_depth),
-        ("freeze", object_freeze_at_depth),
-        ("isSealed", object_is_sealed_at_depth),
-        ("isFrozen", object_is_frozen_at_depth),
-    ] {
+    for (name, callback) in Vec::from_array(
+        [
+            ("seal", object_seal_at_depth),
+            ("freeze", object_freeze_at_depth),
+            ("isSealed", object_is_sealed_at_depth),
+            ("isFrozen", object_is_frozen_at_depth),
+        ],
+    ) {
         define_value(
             context.heap(),
             object,
@@ -6142,8 +6187,8 @@ fn install_math(context: vm::Context, object: runtime::ObjectId) -> Result[unit,
     define_number_function(context, object, "acosh", math_acosh, 1, false)?;
     define_number_function(context, object, "atanh", math_atanh, 1, false)?;
     define_number_function(context, object, "atan2", math_atan2, 2, false)?;
-    let seed_value = time::SystemTime::now().unix_nanoseconds().to_uint64() ^ MATH_RANDOM_SEED;
-    let random_state: Ref[uint64] = Ref::new(
+    let seed_value = time::SystemTime::now().unix_nanoseconds().to_u64() ^ MATH_RANDOM_SEED;
+    let random_state: Ref[u64] = Ref::new(
         if seed_value == 0 {
             MATH_RANDOM_SEED
         } else {
@@ -6193,7 +6238,7 @@ fn proxy_revocable(
     context: vm::Context,
     this_value: runtime::Value,
     arguments: Vec[runtime::Value],
-    depth: int,
+    depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     let _ = this_value;
     let _ = depth;
@@ -6315,15 +6360,17 @@ pub fn install(context: vm::Context) -> Result[Realm, BuiltinError] {
         Some(value) => value,
         None => return Result::Err(BuiltinError { message: "Object prototype is not installed" }),
     };
-    for value in Vec::[
-        global,
-        math_object,
-        console_object,
-        json_object,
-        std_object,
-        os_object,
-        performance_object,
-    ] {
+    for value in Vec::from_array(
+        [
+            global,
+            math_object,
+            console_object,
+            json_object,
+            std_object,
+            os_object,
+            performance_object,
+        ],
+    ) {
         if !runtime::set_prototype_of(heap, value, Option::Some(object_prototype)) {
             return Result::Err(BuiltinError { message: "cannot initialize object prototype" })
         } else {}
@@ -6432,44 +6479,46 @@ pub fn install(context: vm::Context) -> Result[Realm, BuiltinError] {
         regexp_install.states,
     )?;
     let _ = install_bjson(context, buffers, date)?;
-    for (value, name) in Vec::[
-        (regexp, "RegExp"),
-        (collections.map, "Map"),
-        (collections.set, "Set"),
-        (collections.weak_map, "WeakMap"),
-        (collections.weak_set, "WeakSet"),
-        (collections.weak_ref, "WeakRef"),
-        (collections.finalization_registry, "FinalizationRegistry"),
-        (errors.error, "Error"),
-        (errors.internal_error, "InternalError"),
-        (errors.eval_error, "EvalError"),
-        (errors.range_error, "RangeError"),
-        (errors.reference_error, "ReferenceError"),
-        (errors.syntax_error, "SyntaxError"),
-        (errors.type_error, "TypeError"),
-        (errors.uri_error, "URIError"),
-        (errors.aggregate_error, "AggregateError"),
-        (buffers.array_buffer, "ArrayBuffer"),
-        (buffers.shared_array_buffer, "SharedArrayBuffer"),
-        (buffers.data_view, "DataView"),
-        (buffers.uint8_array, "Uint8Array"),
-        (buffers.int32_array, "Int32Array"),
-        (buffers.float64_array, "Float64Array"),
-        (buffers.uint8_clamped_array, "Uint8ClampedArray"),
-        (buffers.int8_array, "Int8Array"),
-        (buffers.int16_array, "Int16Array"),
-        (buffers.uint16_array, "Uint16Array"),
-        (buffers.uint32_array, "Uint32Array"),
-        (buffers.float16_array, "Float16Array"),
-        (buffers.float32_array, "Float32Array"),
-        (buffers.bigint64_array, "BigInt64Array"),
-        (buffers.biguint64_array, "BigUint64Array"),
-        (promise, "Promise"),
-        (iterator, "Iterator"),
-        (function, "Function"),
-        (object, "Object"),
-        (array, "Array"),
-    ] {
+    for (value, name) in Vec::from_array(
+        [
+            (regexp, "RegExp"),
+            (collections.map, "Map"),
+            (collections.set, "Set"),
+            (collections.weak_map, "WeakMap"),
+            (collections.weak_set, "WeakSet"),
+            (collections.weak_ref, "WeakRef"),
+            (collections.finalization_registry, "FinalizationRegistry"),
+            (errors.error, "Error"),
+            (errors.internal_error, "InternalError"),
+            (errors.eval_error, "EvalError"),
+            (errors.range_error, "RangeError"),
+            (errors.reference_error, "ReferenceError"),
+            (errors.syntax_error, "SyntaxError"),
+            (errors.type_error, "TypeError"),
+            (errors.uri_error, "URIError"),
+            (errors.aggregate_error, "AggregateError"),
+            (buffers.array_buffer, "ArrayBuffer"),
+            (buffers.shared_array_buffer, "SharedArrayBuffer"),
+            (buffers.data_view, "DataView"),
+            (buffers.uint8_array, "Uint8Array"),
+            (buffers.int32_array, "Int32Array"),
+            (buffers.float64_array, "Float64Array"),
+            (buffers.uint8_clamped_array, "Uint8ClampedArray"),
+            (buffers.int8_array, "Int8Array"),
+            (buffers.int16_array, "Int16Array"),
+            (buffers.uint16_array, "Uint16Array"),
+            (buffers.uint32_array, "Uint32Array"),
+            (buffers.float16_array, "Float16Array"),
+            (buffers.float32_array, "Float32Array"),
+            (buffers.bigint64_array, "BigInt64Array"),
+            (buffers.biguint64_array, "BigUint64Array"),
+            (promise, "Promise"),
+            (iterator, "Iterator"),
+            (function, "Function"),
+            (object, "Object"),
+            (array, "Array"),
+        ],
+    ) {
         mark_constructor(context, value, name)?
     }
     define_function(context, console_object, "log", qjs_print)?;
@@ -6678,8 +6727,9 @@ pub fn install(context: vm::Context) -> Result[Realm, BuiltinError] {
         math_value: math_object,
         json_value: json_object,
         buffer_install_value: buffers,
+        promise_queue_value: promise_queue,
     };
-    let empty_arguments: Vec[string] = Vec::[];
+    let empty_arguments: Vec[string] = Vec::new();
     set_script_args(context, realm, empty_arguments)?;
     define_to_string_tag(context, global, "global")?;
     Result::Ok(realm)
