@@ -84,7 +84,10 @@ class methods, and exported functions return native Promise objects, suspend at
 route rejected awaited values through JavaScript catch/finally handlers. Async generators
 queue Promise-returning `next`, `throw`, and `return` requests, distinguish `await` from
 `yield`, await yielded values, and delegate to asynchronous or synchronous iterators with
-`yield *`. The first
+`yield *`. Async-from-sync iterator adapters cache `next`, assimilate yielded values, close on
+rejection, and share the intrinsic AsyncIterator prototype with async generators. `for await...of`
+supports asynchronous and synchronous sources, declaration and assignment destructuring, and
+awaited iterator closing across abrupt completions. The first
 built-in slice provides global numeric predicates, primitive conversion
 functions, Number and BigInt, primitive wrapper constructors and Object boxing,
 VM-aware numeric, string, and property-key object-to-primitive conversion through Symbol.toPrimitive and method fallbacks,
@@ -98,7 +101,11 @@ native-code formatting for host and bound callables, and QuickJS-compatible sour
 and column metadata accessors, restricted caller and arguments accessors,
 the shared Iterator prototype, Iterator.from and Iterator.concat, lazy map, filter, flatMap, take, and drop helpers,
 and every, some, find, forEach, reduce, and toArray consumers across Array, String, Map/Set, and RegExp iterators,
-Symbol descriptions and its registry, dynamic Function construction with separately validated parameters and body, catchable Error subtype objects with preserved explicit throw values and Error.isError branding,
+Symbol descriptions and its registry, dynamic Function construction with separately validated parameters and body,
+hidden AsyncFunction, GeneratorFunction, and AsyncGeneratorFunction constructors with their
+QuickJS prototype topology, dynamic grammar goals, per-function generator instance prototypes,
+custom `newTarget` inheritance, and Iterator-prototype generator helpers,
+catchable Error subtype objects with preserved explicit throw values and Error.isError branding,
 revocable Proxy objects with all thirteen fundamental traps, target invariants, lazy for-in enumeration,
 and the primary Reflect and Object ownership, descriptor, prototype, extensibility, and key-enumeration paths,
 RegExp with literal escaping, UTC Date helpers, Map/Set,
