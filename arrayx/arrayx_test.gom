@@ -29,7 +29,7 @@ fn arrayx_expect_result(value: Result[runtime::ObjectId, ArrayError]) -> runtime
     }
 }
 
-fn arrayx_define(heap: runtime::Heap, array: runtime::ObjectId, index: int, value: runtime::Value) -> unit {
+fn arrayx_define(heap: runtime::Heap, array: runtime::ObjectId, index: isize, value: runtime::Value) -> unit {
     testing::assert(
         runtime::define_own_property(
             heap,
@@ -43,7 +43,7 @@ fn arrayx_define(heap: runtime::Heap, array: runtime::ObjectId, index: int, valu
 fn arrayx_define_fixed(
     heap: runtime::Heap,
     array: runtime::ObjectId,
-    index: int,
+    index: isize,
     value: runtime::Value,
 ) -> unit {
     testing::assert(
@@ -70,7 +70,7 @@ fn arrayx_assert_hole(slot: ArraySlot) -> unit {
     }
 }
 
-fn arrayx_own_slot(heap: runtime::Heap, array: runtime::ObjectId, index: int) -> ArraySlot {
+fn arrayx_own_slot(heap: runtime::Heap, array: runtime::ObjectId, index: isize) -> ArraySlot {
     match heap.get(array) {
         Some(object) => match object.own_property(runtime::string_property_key(index.to_string())) {
             Some(descriptor) => match runtime::descriptor_value(descriptor) {
@@ -86,7 +86,7 @@ fn arrayx_own_slot(heap: runtime::Heap, array: runtime::ObjectId, index: int) ->
     }
 }
 
-fn arrayx_expect_length(heap: runtime::Heap, array: runtime::ObjectId) -> int {
+fn arrayx_expect_length(heap: runtime::Heap, array: runtime::ObjectId) -> isize {
     match length(heap, array) {
         Ok(value) => value,
         Err(error) => {
@@ -219,7 +219,7 @@ fn slice_and_concat_copy_inherited_values_without_materializing_holes() -> unit 
         concat(
             heap,
             source,
-            Vec::[ConcatItem::Value(runtime::Value::Int(20)), ConcatItem::Spread(tail)],
+            Vec::from_array([ConcatItem::Value(runtime::Value::Int(20)), ConcatItem::Spread(tail)]),
         ),
     );
     testing::assert_eq(arrayx_expect_length(heap, combined), 7);
@@ -264,7 +264,9 @@ fn push_and_pop_preserve_hole_results_and_update_length() -> unit {
     let array = arrayx_expect_array(runtime::new_array(heap, 2));
     arrayx_define(heap, array, 1, runtime::Value::Undefined);
     testing::assert_eq(
-        push(heap, array, Vec::[runtime::Value::Int(3), runtime::Value::Int(4)]).unwrap_or(-1),
+        push(heap, array, Vec::from_array([runtime::Value::Int(3), runtime::Value::Int(4)])).unwrap_or(
+            -1,
+        ),
         4,
     );
     testing::assert_eq(arrayx_expect_length(heap, array), 4);
@@ -288,10 +290,12 @@ fn shift_and_unshift_move_sparse_slots_without_filling_holes() -> unit {
         unshift(
             heap,
             array,
-            Vec::[
-                runtime::Value::String(arrayx_string("x")),
-                runtime::Value::String(arrayx_string("y")),
-            ],
+            Vec::from_array(
+                [
+                    runtime::Value::String(arrayx_string("x")),
+                    runtime::Value::String(arrayx_string("y")),
+                ],
+            ),
         ).unwrap_or(-1),
         4,
     );
@@ -331,10 +335,12 @@ fn splice_returns_sparse_removed_array_and_compacts_the_source() -> unit {
             array,
             1,
             3,
-            Vec::[
-                runtime::Value::String(arrayx_string("x")),
-                runtime::Value::String(arrayx_string("y")),
-            ],
+            Vec::from_array(
+                [
+                    runtime::Value::String(arrayx_string("x")),
+                    runtime::Value::String(arrayx_string("y")),
+                ],
+            ),
         ),
     );
     testing::assert_eq(arrayx_expect_length(heap, removed), 3);
@@ -368,10 +374,12 @@ fn splice_growth_moves_the_tail_backwards_and_keeps_source_holes() -> unit {
             array,
             -2,
             0,
-            Vec::[
-                runtime::Value::String(arrayx_string("x")),
-                runtime::Value::String(arrayx_string("y")),
-            ],
+            Vec::from_array(
+                [
+                    runtime::Value::String(arrayx_string("x")),
+                    runtime::Value::String(arrayx_string("y")),
+                ],
+            ),
         ),
     );
     testing::assert_eq(arrayx_expect_length(heap, removed), 0);
@@ -425,7 +433,7 @@ fn mutation_errors_preserve_length_and_report_the_failing_operation() -> unit {
             runtime::data_descriptor(runtime::Value::Int(1), false, false, false),
         ),
     );
-    match push(heap, fixed_length, Vec::[runtime::Value::Int(2)]) {
+    match push(heap, fixed_length, Vec::from_array([runtime::Value::Int(2)])) {
         Err(ArrayError::LengthNotWritable) => (),
         _ => testing::fail("expected non-writable length error"),
     };
@@ -441,7 +449,7 @@ fn mutation_errors_preserve_length_and_report_the_failing_operation() -> unit {
     arrayx_assert_value(arrayx_own_slot(heap, fixed_element, 0), runtime::Value::Int(1));
     let maximum = arrayx_expect_result(new_array(heap, 4294967295));
     testing::assert_eq(arrayx_expect_length(heap, maximum), 4294967295);
-    match push(heap, maximum, Vec::[runtime::Value::Int(1)]) {
+    match push(heap, maximum, Vec::from_array([runtime::Value::Int(1)])) {
         Err(ArrayError::LengthOutOfRange(_)) => (),
         _ => testing::fail("expected supported length bound error"),
     }

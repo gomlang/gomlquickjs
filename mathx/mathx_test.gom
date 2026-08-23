@@ -4,11 +4,11 @@ use std::math;
 use std::num;
 use std::testing;
 
-fn parsed(value: string) -> float64 {
+fn parsed(value: string) -> f64 {
     num::parse_float64(value).unwrap_or(0.0)
 }
 
-fn assert_close(actual: float64, expected: float64, tolerance: float64) -> unit {
+fn assert_close(actual: f64, expected: f64, tolerance: f64) -> unit {
     let difference = absolute(actual - expected);
     let scale = if absolute(expected) > 1.0 {
         absolute(expected)
@@ -20,12 +20,12 @@ fn assert_close(actual: float64, expected: float64, tolerance: float64) -> unit 
     } else {}
 }
 
-fn assert_positive_zero(value: float64) -> unit {
+fn assert_positive_zero(value: f64) -> unit {
     testing::assert(value == 0.0);
     testing::assert(!has_negative_sign(value))
 }
 
-fn assert_negative_zero(value: float64) -> unit {
+fn assert_negative_zero(value: f64) -> unit {
     testing::assert(value == 0.0);
     testing::assert(has_negative_sign(value))
 }
@@ -45,11 +45,11 @@ fn clz32_applies_ecmascript_uint32_conversion() -> unit {
 
 #[test]
 fn imul_multiplies_low_words_with_signed_result() -> unit {
-    testing::assert_eq(imul(4294967295.0, 5.0), (-5).to_int32());
-    testing::assert_eq(imul(2147483647.0, 2.0), (-2).to_int32());
-    testing::assert_eq(imul(4294967299.0, 7.0), 21.to_int32());
-    testing::assert_eq(imul(-1.5, 2.0), (-2).to_int32());
-    testing::assert_eq(imul(not_a_number(), 9.0), 0.to_int32())
+    testing::assert_eq(imul(4294967295.0, 5.0), (-5).to_i32());
+    testing::assert_eq(imul(2147483647.0, 2.0), (-2).to_i32());
+    testing::assert_eq(imul(4294967299.0, 7.0), 21.to_i32());
+    testing::assert_eq(imul(-1.5, 2.0), (-2).to_i32());
+    testing::assert_eq(imul(not_a_number(), 9.0), 0.to_i32())
 }
 
 #[test]
@@ -102,7 +102,7 @@ fn f16round_preserves_special_values_and_bit_roundtrips() -> unit {
 fn float16_codec_roundtrips_every_non_nan_encoding() -> unit {
     let mut encoded = 0;
     while encoded < 65536 {
-        let bits = encoded.to_uint16();
+        let bits = encoded.to_u16();
         let magnitude = bits & 0x7fff;
         let actual = float16_bits(float16_from_bits(bits));
         if magnitude > 0x7c00 {
@@ -116,17 +116,19 @@ fn float16_codec_roundtrips_every_non_nan_encoding() -> unit {
 
 #[test]
 fn hypot_scales_extremes_and_prioritizes_infinity_over_nan() -> unit {
-    assert_positive_zero(hypot(Vec::[]));
-    assert_positive_zero(hypot(Vec::[copy_sign(0.0, -1.0)]));
-    testing::assert_eq(hypot(Vec::[3.0, 4.0]), 5.0);
+    assert_positive_zero(hypot(Vec::new()));
+    assert_positive_zero(hypot(Vec::from_array([copy_sign(0.0, -1.0)])));
+    testing::assert_eq(hypot(Vec::from_array([3.0, 4.0])), 5.0);
     let large = parsed("1e308");
-    assert_close(hypot(Vec::[large, large]), parsed("1.4142135623730951e308"), 2e-16);
+    assert_close(hypot(Vec::from_array([large, large])), parsed("1.4142135623730951e308"), 2e-16);
     testing::assert_eq(
-        hypot(Vec::[4.9406564584124654e-324, 4.9406564584124654e-324]),
+        hypot(Vec::from_array([4.9406564584124654e-324, 4.9406564584124654e-324])),
         4.9406564584124654e-324,
     );
-    testing::assert(math::is_infinite(hypot(Vec::[not_a_number(), positive_infinity()])));
-    testing::assert(math::is_nan(hypot(Vec::[not_a_number(), 3.0])))
+    testing::assert(
+        math::is_infinite(hypot(Vec::from_array([not_a_number(), positive_infinity()]))),
+    );
+    testing::assert(math::is_nan(hypot(Vec::from_array([not_a_number(), 3.0]))))
 }
 
 #[test]
@@ -301,22 +303,30 @@ fn inverse_trigonometric_functions_cover_domains_and_signed_zero() -> unit {
 
 #[test]
 fn precise_sum_rounds_once_after_exact_accumulation() -> unit {
-    testing::assert_eq(sum_precise(Vec::[1e16, 1.0, -1e16]), 1.0);
+    testing::assert_eq(sum_precise(Vec::from_array([1e16, 1.0, -1e16])), 1.0);
     testing::assert_eq(
-        sum_precise(Vec::[1.0, 1.1102230246251565e-16, 4.9406564584124654e-324]),
+        sum_precise(Vec::from_array([1.0, 1.1102230246251565e-16, 4.9406564584124654e-324])),
         1.0000000000000002,
     );
-    testing::assert_eq(sum_precise(Vec::[1.0, 1.1102230246251565e-16]), 1.0)
+    testing::assert_eq(sum_precise(Vec::from_array([1.0, 1.1102230246251565e-16])), 1.0)
 }
 
 #[test]
 fn precise_sum_handles_special_values_and_zero_signs() -> unit {
-    assert_negative_zero(sum_precise(Vec::[]));
-    assert_negative_zero(sum_precise(Vec::[copy_sign(0.0, -1.0)]));
-    assert_positive_zero(sum_precise(Vec::[0.0]));
-    assert_positive_zero(sum_precise(Vec::[1.0, -1.0]));
-    testing::assert_eq(sum_precise(Vec::[positive_infinity(), 1.0]), positive_infinity());
-    testing::assert_eq(sum_precise(Vec::[-positive_infinity(), 1.0]), -positive_infinity());
-    testing::assert(math::is_nan(sum_precise(Vec::[positive_infinity(), -positive_infinity()])));
-    testing::assert(math::is_nan(sum_precise(Vec::[not_a_number(), 1.0])))
+    assert_negative_zero(sum_precise(Vec::new()));
+    assert_negative_zero(sum_precise(Vec::from_array([copy_sign(0.0, -1.0)])));
+    assert_positive_zero(sum_precise(Vec::from_array([0.0])));
+    assert_positive_zero(sum_precise(Vec::from_array([1.0, -1.0])));
+    testing::assert_eq(
+        sum_precise(Vec::from_array([positive_infinity(), 1.0])),
+        positive_infinity(),
+    );
+    testing::assert_eq(
+        sum_precise(Vec::from_array([-positive_infinity(), 1.0])),
+        -positive_infinity(),
+    );
+    testing::assert(
+        math::is_nan(sum_precise(Vec::from_array([positive_infinity(), -positive_infinity()]))),
+    );
+    testing::assert(math::is_nan(sum_precise(Vec::from_array([not_a_number(), 1.0]))))
 }

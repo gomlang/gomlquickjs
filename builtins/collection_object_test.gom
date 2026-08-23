@@ -23,7 +23,7 @@ fn collection_invoke(
     this_value: runtime::Value,
     arguments: Vec[runtime::Value],
 ) -> runtime::Value {
-    let code = Vec::[bytecode::Instruction::GetLoc(0), bytecode::Instruction::GetLoc(1)];
+    let code = Vec::from_array([bytecode::Instruction::GetLoc(0), bytecode::Instruction::GetLoc(1)]);
     let mut index = 0;
     while index < arguments.len() {
         code.push(bytecode::Instruction::GetLoc(index + 2));
@@ -31,11 +31,14 @@ fn collection_invoke(
     }
     code.push(bytecode::Instruction::CallMethod(arguments.len()));
     code.push(bytecode::Instruction::Return);
-    let locals = Vec::[this_value, callable];
+    let locals = Vec::from_array([this_value, callable]);
     for argument in arguments {
         locals.push(argument)
     }
-    match context.execute_with_locals(bytecode::Function::new(Vec::[], code, locals.len()), locals) {
+    match context.execute_with_locals(
+        bytecode::Function::new(Vec::new(), code, locals.len()),
+        locals,
+    ) {
         Ok(value) => value,
         Err(value) => {
             testing::fail(value.kind.debug());
@@ -57,15 +60,17 @@ fn collection_read(context: vm::Context, receiver: runtime::Value, name: string)
 fn construct_collection(context: vm::Context, constructor: runtime::Value) -> runtime::ObjectId {
     match context.execute_with_locals(
         bytecode::Function::new(
-            Vec::[],
-            Vec::[
-                bytecode::Instruction::GetLoc(0),
-                bytecode::Instruction::Construct(0),
-                bytecode::Instruction::Return,
-            ],
+            Vec::new(),
+            Vec::from_array(
+                [
+                    bytecode::Instruction::GetLoc(0),
+                    bytecode::Instruction::Construct(0),
+                    bytecode::Instruction::Return,
+                ],
+            ),
             1,
         ),
-        Vec::[constructor],
+        Vec::from_array([constructor]),
     ) {
         Ok(runtime::Value::Object(value)) => value,
         _ => {
@@ -122,13 +127,13 @@ fn map_and_set_builtins_preserve_same_value_zero_and_order() -> unit {
         context,
         set,
         runtime::Value::Object(map),
-        Vec::[runtime::Value::Float(nan), runtime::Value::Int(1)],
+        Vec::from_array([runtime::Value::Float(nan), runtime::Value::Int(1)]),
     );
     let _ = collection_invoke(
         context,
         set,
         runtime::Value::Object(map),
-        Vec::[runtime::Value::Float(nan), runtime::Value::Int(2)],
+        Vec::from_array([runtime::Value::Float(nan), runtime::Value::Int(2)]),
     );
     testing::assert_eq(
         expect_number(collection_read(context, runtime::Value::Object(map), "size")),
@@ -140,17 +145,27 @@ fn map_and_set_builtins_preserve_same_value_zero_and_order() -> unit {
                 context,
                 get,
                 runtime::Value::Object(map),
-                Vec::[runtime::Value::Float(nan)],
+                Vec::from_array([runtime::Value::Float(nan)]),
             ),
         ),
         2.0,
     );
-    let iterator = match collection_invoke(context, entries, runtime::Value::Object(map), Vec::[]) {
+    let iterator = match collection_invoke(
+        context,
+        entries,
+        runtime::Value::Object(map),
+        Vec::new(),
+    ) {
         runtime::Value::Object(value) => value,
         _ => map,
     };
     let next = collection_property(context.heap(), iterator, "next");
-    let result = match collection_invoke(context, next, runtime::Value::Object(iterator), Vec::[]) {
+    let result = match collection_invoke(
+        context,
+        next,
+        runtime::Value::Object(iterator),
+        Vec::new(),
+    ) {
         runtime::Value::Object(value) => value,
         _ => map,
     };
@@ -175,13 +190,13 @@ fn map_and_set_builtins_preserve_same_value_zero_and_order() -> unit {
         context,
         add,
         runtime::Value::Object(set_object),
-        Vec::[runtime::Value::Float(negative_zero)],
+        Vec::from_array([runtime::Value::Float(negative_zero)]),
     );
     match collection_invoke(
         context,
         has,
         runtime::Value::Object(set_object),
-        Vec::[runtime::Value::Float(0.0)],
+        Vec::from_array([runtime::Value::Float(0.0)]),
     ) {
         runtime::Value::Bool(value) => testing::assert(value),
         _ => testing::fail("expected Set.has result"),
@@ -216,7 +231,7 @@ fn weak_collections_accept_weak_keys_and_discard_stale_objects() -> unit {
         context,
         set,
         runtime::Value::Object(weak_map),
-        Vec::[runtime::Value::Object(key), runtime::Value::Int(42)],
+        Vec::from_array([runtime::Value::Object(key), runtime::Value::Int(42)]),
     );
     testing::assert_eq(
         expect_number(
@@ -224,7 +239,7 @@ fn weak_collections_accept_weak_keys_and_discard_stale_objects() -> unit {
                 context,
                 get,
                 runtime::Value::Object(weak_map),
-                Vec::[runtime::Value::Object(key)],
+                Vec::from_array([runtime::Value::Object(key)]),
             ),
         ),
         42.0,
@@ -234,7 +249,7 @@ fn weak_collections_accept_weak_keys_and_discard_stale_objects() -> unit {
         context,
         has,
         runtime::Value::Object(weak_map),
-        Vec::[runtime::Value::Object(key)],
+        Vec::from_array([runtime::Value::Object(key)]),
     ) {
         runtime::Value::Bool(value) => testing::assert(!value),
         _ => testing::fail("expected WeakMap.has result"),
@@ -251,8 +266,18 @@ fn weak_collections_accept_weak_keys_and_discard_stale_objects() -> unit {
     let add = collection_property(context.heap(), weak_set_prototype, "add");
     let has = collection_property(context.heap(), weak_set_prototype, "has");
     let symbol = runtime::Value::Symbol(runtime::Symbol::new(301, Option::Some("weak")));
-    let _ = collection_invoke(context, add, runtime::Value::Object(weak_set), Vec::[symbol]);
-    match collection_invoke(context, has, runtime::Value::Object(weak_set), Vec::[symbol]) {
+    let _ = collection_invoke(
+        context,
+        add,
+        runtime::Value::Object(weak_set),
+        Vec::from_array([symbol]),
+    );
+    match collection_invoke(
+        context,
+        has,
+        runtime::Value::Object(weak_set),
+        Vec::from_array([symbol]),
+    ) {
         runtime::Value::Bool(value) => testing::assert(value),
         _ => testing::fail("expected WeakSet.has result"),
     };
@@ -265,16 +290,18 @@ fn weak_collections_accept_weak_keys_and_discard_stale_objects() -> unit {
     };
     let reference = match context.execute_with_locals(
         bytecode::Function::new(
-            Vec::[],
-            Vec::[
-                bytecode::Instruction::GetLoc(0),
-                bytecode::Instruction::GetLoc(1),
-                bytecode::Instruction::Construct(1),
-                bytecode::Instruction::Return,
-            ],
+            Vec::new(),
+            Vec::from_array(
+                [
+                    bytecode::Instruction::GetLoc(0),
+                    bytecode::Instruction::GetLoc(1),
+                    bytecode::Instruction::Construct(1),
+                    bytecode::Instruction::Return,
+                ],
+            ),
             2,
         ),
-        Vec::[installed.weak_ref, runtime::Value::Object(target)],
+        Vec::from_array([installed.weak_ref, runtime::Value::Object(target)]),
     ) {
         Ok(runtime::Value::Object(value)) => value,
         _ => weak_set,
@@ -284,13 +311,13 @@ fn weak_collections_accept_weak_keys_and_discard_stale_objects() -> unit {
         context,
         deref,
         runtime::Value::Object(reference),
-        Vec::[runtime::Value::Object(target)],
+        Vec::from_array([runtime::Value::Object(target)]),
     ) {
         runtime::Value::Object(value) => testing::assert(value == target),
         _ => testing::fail("expected WeakRef target"),
     };
     testing::assert(context.heap().free(target));
-    match collection_invoke(context, deref, runtime::Value::Object(reference), Vec::[]) {
+    match collection_invoke(context, deref, runtime::Value::Object(reference), Vec::new()) {
         runtime::Value::Undefined => (),
         _ => testing::fail("expected collected WeakRef target"),
     }

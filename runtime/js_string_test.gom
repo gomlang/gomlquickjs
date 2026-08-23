@@ -7,19 +7,19 @@ fn expect_js_string(result: Result[JsString, JsStringUtf8Error]) -> JsString {
         Result::Ok(value) => value,
         Result::Err(error) => {
             testing::fail(error.to_string());
-            JsString::from_code_units(Vec::[])
+            JsString::from_code_units(Vec::new())
         },
     }
 }
 
 #[test]
 fn js_string_supplementary_code_point_uses_two_code_units() -> unit {
-    let utf8: Vec[byte] = Vec::[0xf0, 0x9f, 0x98, 0x80];
+    let utf8: Vec[byte] = Vec::from_array([0xf0, 0x9f, 0x98, 0x80]);
     let value = JsString::from_utf8(utf8.slice(0, utf8.len()));
     testing::assert_eq(value.len(), 2);
-    testing::assert_eq(value.get(0), 0xd83d.to_uint16());
-    testing::assert_eq(value.get(1), 0xde00.to_uint16());
-    testing::assert(value.code_units() == Vec::[0xd83d, 0xde00]);
+    testing::assert_eq(value.get(0), 0xd83d.to_u16());
+    testing::assert_eq(value.get(1), 0xde00.to_u16());
+    testing::assert(value.code_units() == Vec::from_array([0xd83d, 0xde00]));
     testing::assert(value.to_utf8() == utf8)
 }
 
@@ -38,14 +38,14 @@ fn js_string_surrogate_helpers_split_and_combine_code_points() -> unit {
 
 #[test]
 fn js_string_unpaired_surrogate_is_preserved_at_utf8_boundary() -> unit {
-    let source: Vec[uint16] = Vec::[0xd800];
+    let source: Vec[u16] = Vec::from_array([0xd800]);
     let value = JsString::from_code_units(source);
-    let encoded: Vec[byte] = Vec::[0xed, 0xa0, 0x80];
+    let encoded: Vec[byte] = Vec::from_array([0xed, 0xa0, 0x80]);
     testing::assert_eq(value.len(), 1);
-    testing::assert_eq(value.get(0), 0xd800.to_uint16());
+    testing::assert_eq(value.get(0), 0xd800.to_u16());
     testing::assert(value.to_utf8() == encoded);
     let decoded = expect_js_string(JsString::try_from_utf8(encoded.slice(0, encoded.len())));
-    testing::assert(decoded.code_units() == Vec::[0xd800])
+    testing::assert(decoded.code_units() == Vec::from_array([0xd800]))
 }
 
 #[test]
@@ -61,31 +61,31 @@ fn js_string_regular_utf8_round_trips() -> unit {
 
 #[test]
 fn js_string_slice_and_concat_operate_on_code_units() -> unit {
-    let first = JsString::from_code_units(Vec::[0x0041, 0xd83d]);
-    let second = JsString::from_code_units(Vec::[0xde00, 0x0042]);
+    let first = JsString::from_code_units(Vec::from_array([0x0041, 0xd83d]));
+    let second = JsString::from_code_units(Vec::from_array([0xde00, 0x0042]));
     let joined = first.concat(second);
-    testing::assert(joined.code_units() == Vec::[0x0041, 0xd83d, 0xde00, 0x0042]);
-    testing::assert(joined.slice(1, 3).code_units() == Vec::[0xd83d, 0xde00]);
-    testing::assert(joined.slice(1, 2).code_units() == Vec::[0xd83d])
+    testing::assert(joined.code_units() == Vec::from_array([0x0041, 0xd83d, 0xde00, 0x0042]));
+    testing::assert(joined.slice(1, 3).code_units() == Vec::from_array([0xd83d, 0xde00]));
+    testing::assert(joined.slice(1, 2).code_units() == Vec::from_array([0xd83d]))
 }
 
 #[test]
 fn js_string_code_unit_vectors_do_not_mutate_the_string() -> unit {
-    let source: Vec[uint16] = Vec::[0xd800];
+    let source: Vec[u16] = Vec::from_array([0xd800]);
     let value = from_code_units(source);
     source.set(0, 0x0041);
-    testing::assert_eq(value.get(0), 0xd800.to_uint16());
+    testing::assert_eq(value.get(0), 0xd800.to_u16());
     let copied = code_units(value);
     copied.set(0, 0x0042);
-    testing::assert_eq(value.get(0), 0xd800.to_uint16())
+    testing::assert_eq(value.get(0), 0xd800.to_u16())
 }
 
 #[test]
 fn js_string_strict_utf8_rejects_malformed_and_out_of_range_sequences() -> unit {
-    let overlong: Vec[byte] = Vec::[0xc0, 0x80];
-    let truncated: Vec[byte] = Vec::[0xe2, 0x82];
-    let invalid_continuation: Vec[byte] = Vec::[0xf0, 0x90, 0x40, 0x80];
-    let out_of_range: Vec[byte] = Vec::[0xf8, 0x88, 0x80, 0x80, 0x80];
+    let overlong: Vec[byte] = Vec::from_array([0xc0, 0x80]);
+    let truncated: Vec[byte] = Vec::from_array([0xe2, 0x82]);
+    let invalid_continuation: Vec[byte] = Vec::from_array([0xf0, 0x90, 0x40, 0x80]);
+    let out_of_range: Vec[byte] = Vec::from_array([0xf8, 0x88, 0x80, 0x80, 0x80]);
     testing::assert(try_from_utf8(overlong.slice(0, overlong.len())).is_err());
     testing::assert(try_from_utf8(truncated.slice(0, truncated.len())).is_err());
     testing::assert(
@@ -96,17 +96,22 @@ fn js_string_strict_utf8_rejects_malformed_and_out_of_range_sequences() -> unit 
 
 #[test]
 fn js_string_lossy_utf8_replaces_each_malformed_sequence() -> unit {
-    let overlong: Vec[byte] = Vec::[0xc0, 0x80];
-    let truncated: Vec[byte] = Vec::[0xe2, 0x82];
-    let invalid_continuation: Vec[byte] = Vec::[0xf0, 0x90, 0x40, 0x80];
-    let out_of_range: Vec[byte] = Vec::[0xf8, 0x88, 0x80, 0x80, 0x80];
-    testing::assert(from_utf8(overlong.slice(0, overlong.len())).code_units() == Vec::[0xfffd]);
-    testing::assert(from_utf8(truncated.slice(0, truncated.len())).code_units() == Vec::[0xfffd]);
+    let overlong: Vec[byte] = Vec::from_array([0xc0, 0x80]);
+    let truncated: Vec[byte] = Vec::from_array([0xe2, 0x82]);
+    let invalid_continuation: Vec[byte] = Vec::from_array([0xf0, 0x90, 0x40, 0x80]);
+    let out_of_range: Vec[byte] = Vec::from_array([0xf8, 0x88, 0x80, 0x80, 0x80]);
     testing::assert(
-        from_utf8(invalid_continuation.slice(0, invalid_continuation.len())).code_units()
-            == Vec::[0xfffd, 0x0040, 0xfffd],
+        from_utf8(overlong.slice(0, overlong.len())).code_units() == Vec::from_array([0xfffd]),
     );
     testing::assert(
-        from_utf8(out_of_range.slice(0, out_of_range.len())).code_units() == Vec::[0xfffd],
+        from_utf8(truncated.slice(0, truncated.len())).code_units() == Vec::from_array([0xfffd]),
+    );
+    testing::assert(
+        from_utf8(invalid_continuation.slice(0, invalid_continuation.len())).code_units()
+            == Vec::from_array([0xfffd, 0x0040, 0xfffd]),
+    );
+    testing::assert(
+        from_utf8(out_of_range.slice(0, out_of_range.len())).code_units()
+            == Vec::from_array([0xfffd]),
     )
 }

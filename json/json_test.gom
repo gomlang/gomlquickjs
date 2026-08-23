@@ -109,7 +109,7 @@ fn define_name(heap: runtime::Heap, object: runtime::ObjectId, name: string, val
     define(heap, object, runtime::string_property_key(name), value, true)
 }
 
-fn define_length(heap: runtime::Heap, object: runtime::ObjectId, length: int32) -> unit {
+fn define_length(heap: runtime::Heap, object: runtime::ObjectId, length: i32) -> unit {
     testing::assert(
         runtime::define_own_property(
             heap,
@@ -183,13 +183,16 @@ fn rejects_non_json_tokens_and_whitespace() -> unit {
     for value in invalid {
         assert_syntax_error(heap, js_string(value))
     }
-    assert_syntax_error(heap, runtime::JsString::from_code_units(Vec::[0x00a0, 49]));
-    assert_syntax_error(heap, runtime::JsString::from_code_units(Vec::[49, 0x00a0]));
-    assert_syntax_error(heap, runtime::JsString::from_code_units(Vec::[34, 10, 34]));
-    assert_syntax_error(heap, runtime::JsString::from_code_units(Vec::[34, 92, 120, 50, 48, 34]));
+    assert_syntax_error(heap, runtime::JsString::from_code_units(Vec::from_array([0x00a0, 49])));
+    assert_syntax_error(heap, runtime::JsString::from_code_units(Vec::from_array([49, 0x00a0])));
+    assert_syntax_error(heap, runtime::JsString::from_code_units(Vec::from_array([34, 10, 34])));
     assert_syntax_error(
         heap,
-        runtime::JsString::from_code_units(Vec::[34, 92, 117, 49, 50, 120, 52, 34]),
+        runtime::JsString::from_code_units(Vec::from_array([34, 92, 120, 50, 48, 34])),
+    );
+    assert_syntax_error(
+        heap,
+        runtime::JsString::from_code_units(Vec::from_array([34, 92, 117, 49, 50, 120, 52, 34])),
     )
 }
 
@@ -199,20 +202,24 @@ fn parses_escapes_and_preserves_utf16_code_units() -> unit {
     let escaped = expect_parse(heap, js_string("\"A\\\"\\\\\\/\\b\\f\\n\\r\\t\\u0042\""));
     match escaped {
         runtime::Value::String(value) => testing::assert(
-            value.code_units() == Vec::[65, 34, 92, 47, 8, 12, 10, 13, 9, 66],
+            value.code_units() == Vec::from_array([65, 34, 92, 47, 8, 12, 10, 13, 9, 66]),
         ),
         _ => testing::fail("expected escaped string"),
     };
     let surrogate = expect_parse(heap, js_string("\"\\ud83d\\ude00\\ud800\\udc00\\ud801\""));
     match surrogate {
         runtime::Value::String(value) => {
-            testing::assert(value.code_units() == Vec::[0xd83d, 0xde00, 0xd800, 0xdc00, 0xd801])
+            testing::assert(
+                value.code_units() == Vec::from_array([0xd83d, 0xde00, 0xd800, 0xdc00, 0xd801]),
+            )
         },
         _ => testing::fail("expected surrogate string"),
     };
-    let raw = runtime::JsString::from_code_units(Vec::[34, 0xd800, 34]);
+    let raw = runtime::JsString::from_code_units(Vec::from_array([34, 0xd800, 34]));
     match expect_parse(heap, raw) {
-        runtime::Value::String(value) => testing::assert(value.code_units() == Vec::[0xd800]),
+        runtime::Value::String(value) => testing::assert(
+            value.code_units() == Vec::from_array([0xd800]),
+        ),
         _ => testing::fail("expected raw surrogate string"),
     }
 }
@@ -249,13 +256,15 @@ fn parses_nested_values_and_keeps_last_duplicate_property() -> unit {
 fn stringifies_quickjs_compatible_utf16_escaping() -> unit {
     let heap = runtime::Heap::new();
     let value = runtime::JsString::from_code_units(
-        Vec::[34, 92, 8, 9, 10, 12, 13, 0, 0x1f, 0xd800, 0xd83d, 0xde00, 0xdc00, 0x2028, 0x2029],
+        Vec::from_array(
+            [34, 92, 8, 9, 10, 12, 13, 0, 0x1f, 0xd800, 0xd83d, 0xde00, 0xdc00, 0x2028, 0x2029],
+        ),
     );
     let encoded = expect_stringify(heap, runtime::Value::String(value));
     let prefix = js_string("\"\\\"\\\\\\b\\t\\n\\f\\r\\u0000\\u001f\\ud800");
-    let pair = runtime::JsString::from_code_units(Vec::[0xd83d, 0xde00]);
+    let pair = runtime::JsString::from_code_units(Vec::from_array([0xd83d, 0xde00]));
     let suffix = js_string("\\udc00").concat(
-        runtime::JsString::from_code_units(Vec::[0x2028, 0x2029, 34]),
+        runtime::JsString::from_code_units(Vec::from_array([0x2028, 0x2029, 34])),
     );
     testing::assert(encoded == prefix.concat(pair).concat(suffix));
     match expect_parse(heap, encoded) {

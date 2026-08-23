@@ -35,7 +35,7 @@ fn invoke(context: vm::Context, callable: runtime::Value, arguments: Vec[runtime
     runtime::Value,
     vm::VmError,
 ] {
-    let code: Vec[bytecode::Instruction] = Vec::[bytecode::Instruction::GetLoc(0)];
+    let code: Vec[bytecode::Instruction] = Vec::from_array([bytecode::Instruction::GetLoc(0)]);
     let mut index = 0;
     while index < arguments.len() {
         code.push(bytecode::Instruction::GetLoc(index + 1));
@@ -48,7 +48,7 @@ fn invoke(context: vm::Context, callable: runtime::Value, arguments: Vec[runtime
     for argument in arguments {
         locals.push(argument)
     }
-    context.execute_with_locals(bytecode::Function::new(Vec::[], code, locals.len()), locals)
+    context.execute_with_locals(bytecode::Function::new(Vec::new(), code, locals.len()), locals)
 }
 
 fn expect_value(value: Result[runtime::Value, vm::VmError]) -> runtime::Value {
@@ -65,7 +65,7 @@ fn assert_value(actual: runtime::Value, expected: runtime::Value) -> unit {
     testing::assert(runtime::same_value(actual, expected))
 }
 
-fn expect_number(value: runtime::Value) -> float64 {
+fn expect_number(value: runtime::Value) -> f64 {
     match value {
         runtime::Value::Int(value) => runtime::primitive_to_number(runtime::Value::Int(value)).unwrap_or(
             0.0,
@@ -118,14 +118,16 @@ fn global_number_predicates_apply_to_number() -> unit {
         invoke(
             context,
             is_nan,
-            Vec::[runtime::Value::String(runtime::JsString::from_utf8(bytes.slice(0, bytes.len())))],
+            Vec::from_array(
+                [runtime::Value::String(runtime::JsString::from_utf8(bytes.slice(0, bytes.len())))],
+            ),
         ),
     ) {
         runtime::Value::Bool(value) => testing::assert(value),
         _ => testing::fail("expected isNaN result"),
     };
     let is_finite = property(context.heap(), realm.global_object(), "isFinite");
-    match expect_value(invoke(context, is_finite, Vec::[runtime::Value::Int(42)])) {
+    match expect_value(invoke(context, is_finite, Vec::from_array([runtime::Value::Int(42)]))) {
         runtime::Value::Bool(value) => testing::assert(value),
         _ => testing::fail("expected isFinite result"),
     }
@@ -138,14 +140,20 @@ fn math_functions_execute_through_native_callables() -> unit {
     let math_object = realm.math_object();
     let abs = property(context.heap(), math_object, "abs");
     testing::assert_eq(
-        expect_number(expect_value(invoke(context, abs, Vec::[runtime::Value::Int(-7)]))),
+        expect_number(
+            expect_value(invoke(context, abs, Vec::from_array([runtime::Value::Int(-7)]))),
+        ),
         7.0,
     );
     let pow = property(context.heap(), math_object, "pow");
     testing::assert_eq(
         expect_number(
             expect_value(
-                invoke(context, pow, Vec::[runtime::Value::Int(2), runtime::Value::Int(5)]),
+                invoke(
+                    context,
+                    pow,
+                    Vec::from_array([runtime::Value::Int(2), runtime::Value::Int(5)]),
+                ),
             ),
         ),
         32.0,
@@ -157,7 +165,9 @@ fn math_functions_execute_through_native_callables() -> unit {
                 invoke(
                     context,
                     max,
-                    Vec::[runtime::Value::Int(-3), runtime::Value::Int(9), runtime::Value::Int(4)],
+                    Vec::from_array(
+                        [runtime::Value::Int(-3), runtime::Value::Int(9), runtime::Value::Int(4)],
+                    ),
                 ),
             ),
         ),
@@ -176,7 +186,7 @@ fn math_min_and_max_preserve_signed_zero() -> unit {
             invoke(
                 context,
                 max,
-                Vec::[runtime::Value::Float(negative_zero), runtime::Value::Float(0.0)],
+                Vec::from_array([runtime::Value::Float(negative_zero), runtime::Value::Float(0.0)]),
             ),
         ),
     );
@@ -187,7 +197,7 @@ fn math_min_and_max_preserve_signed_zero() -> unit {
             invoke(
                 context,
                 min,
-                Vec::[runtime::Value::Float(0.0), runtime::Value::Float(negative_zero)],
+                Vec::from_array([runtime::Value::Float(0.0), runtime::Value::Float(negative_zero)]),
             ),
         ),
     );
@@ -203,18 +213,24 @@ fn primitive_constructors_apply_ecmascript_coercions() -> unit {
     testing::assert_eq(
         expect_number(
             expect_value(
-                invoke(context, number, Vec::[runtime::Value::String(js_string(" 0x2a "))]),
+                invoke(
+                    context,
+                    number,
+                    Vec::from_array([runtime::Value::String(js_string(" 0x2a "))]),
+                ),
             ),
         ),
         42.0,
     );
     let boolean = property(context.heap(), global, "Boolean");
-    match expect_value(invoke(context, boolean, Vec::[runtime::Value::Int(0)])) {
+    match expect_value(invoke(context, boolean, Vec::from_array([runtime::Value::Int(0)]))) {
         runtime::Value::Bool(value) => testing::assert(!value),
         _ => testing::fail("expected Boolean result"),
     };
     let string_function = property(context.heap(), global, "String");
-    match expect_value(invoke(context, string_function, Vec::[runtime::Value::Float(1e21)])) {
+    match expect_value(
+        invoke(context, string_function, Vec::from_array([runtime::Value::Float(1e21)])),
+    ) {
         runtime::Value::String(value) => testing::assert(value == js_string("1e+21")),
         _ => testing::fail("expected String result"),
     }
@@ -233,21 +249,29 @@ fn number_static_predicates_do_not_coerce() -> unit {
     };
     let is_nan = property(context.heap(), number, "isNaN");
     match expect_value(
-        invoke(context, is_nan, Vec::[runtime::Value::String(js_string("not a number"))]),
+        invoke(
+            context,
+            is_nan,
+            Vec::from_array([runtime::Value::String(js_string("not a number"))]),
+        ),
     ) {
         runtime::Value::Bool(value) => testing::assert(!value),
         _ => testing::fail("expected Number.isNaN result"),
     };
-    match expect_value(invoke(context, is_nan, Vec::[runtime::Value::Float(nan())])) {
+    match expect_value(invoke(context, is_nan, Vec::from_array([runtime::Value::Float(nan())]))) {
         runtime::Value::Bool(value) => testing::assert(value),
         _ => testing::fail("expected Number.isNaN NaN result"),
     };
     let is_safe = property(context.heap(), number, "isSafeInteger");
-    match expect_value(invoke(context, is_safe, Vec::[runtime::Value::Float(9007199254740991.0)])) {
+    match expect_value(
+        invoke(context, is_safe, Vec::from_array([runtime::Value::Float(9007199254740991.0)])),
+    ) {
         runtime::Value::Bool(value) => testing::assert(value),
         _ => testing::fail("expected safe integer result"),
     };
-    match expect_value(invoke(context, is_safe, Vec::[runtime::Value::Float(9007199254740992.0)])) {
+    match expect_value(
+        invoke(context, is_safe, Vec::from_array([runtime::Value::Float(9007199254740992.0)])),
+    ) {
         runtime::Value::Bool(value) => testing::assert(!value),
         _ => testing::fail("expected unsafe integer result"),
     }
@@ -260,23 +284,27 @@ fn math_transcendentals_and_round_follow_number_semantics() -> unit {
     let math_object = realm.math_object();
     let log = property(context.heap(), math_object, "log");
     let exp = property(context.heap(), math_object, "exp");
-    let logged = expect_number(expect_value(invoke(context, log, Vec::[runtime::Value::Int(8)])));
+    let logged = expect_number(
+        expect_value(invoke(context, log, Vec::from_array([runtime::Value::Int(8)]))),
+    );
     let restored = expect_number(
-        expect_value(invoke(context, exp, Vec::[runtime::Value::Float(logged)])),
+        expect_value(invoke(context, exp, Vec::from_array([runtime::Value::Float(logged)]))),
     );
     testing::assert(restored > 7.999999999999 && restored < 8.000000000001);
     let round = property(context.heap(), math_object, "round");
     testing::assert_eq(
-        expect_number(expect_value(invoke(context, round, Vec::[runtime::Value::Float(-1.5)]))),
+        expect_number(
+            expect_value(invoke(context, round, Vec::from_array([runtime::Value::Float(-1.5)]))),
+        ),
         -1.0,
     );
     let negative_zero = expect_number(
-        expect_value(invoke(context, round, Vec::[runtime::Value::Float(-0.5)])),
+        expect_value(invoke(context, round, Vec::from_array([runtime::Value::Float(-0.5)]))),
     );
     testing::assert(1.0 / negative_zero < 0.0);
     let sign = property(context.heap(), math_object, "sign");
     let signed_zero = expect_number(
-        expect_value(invoke(context, sign, Vec::[runtime::Value::Float(negative_zero)])),
+        expect_value(invoke(context, sign, Vec::from_array([runtime::Value::Float(negative_zero)]))),
     );
     testing::assert(1.0 / signed_zero < 0.0)
 }
@@ -323,7 +351,11 @@ fn parse_int_uses_radix_and_longest_valid_prefix() -> unit {
     testing::assert_eq(
         expect_number(
             expect_value(
-                invoke(context, parse_int, Vec::[runtime::Value::String(js_string("  -0x10tail"))]),
+                invoke(
+                    context,
+                    parse_int,
+                    Vec::from_array([runtime::Value::String(js_string("  -0x10tail"))]),
+                ),
             ),
         ),
         -16.0,
@@ -334,7 +366,9 @@ fn parse_int_uses_radix_and_longest_valid_prefix() -> unit {
                 invoke(
                     context,
                     parse_int,
-                    Vec::[runtime::Value::String(js_string("101rest")), runtime::Value::Int(2)],
+                    Vec::from_array(
+                        [runtime::Value::String(js_string("101rest")), runtime::Value::Int(2)],
+                    ),
                 ),
             ),
         ),
@@ -347,7 +381,9 @@ fn parse_int_uses_radix_and_longest_valid_prefix() -> unit {
                     invoke(
                         context,
                         parse_int,
-                        Vec::[runtime::Value::String(js_string("10")), runtime::Value::Int(1)],
+                        Vec::from_array(
+                            [runtime::Value::String(js_string("10")), runtime::Value::Int(1)],
+                        ),
                     ),
                 ),
             ),
@@ -366,7 +402,7 @@ fn parse_float_uses_longest_decimal_prefix() -> unit {
                 invoke(
                     context,
                     parse_float,
-                    Vec::[runtime::Value::String(js_string("  -12.5e2tail"))],
+                    Vec::from_array([runtime::Value::String(js_string("  -12.5e2tail"))]),
                 ),
             ),
         ),
@@ -375,7 +411,11 @@ fn parse_float_uses_longest_decimal_prefix() -> unit {
     testing::assert_eq(
         expect_number(
             expect_value(
-                invoke(context, parse_float, Vec::[runtime::Value::String(js_string("1e+tail"))]),
+                invoke(
+                    context,
+                    parse_float,
+                    Vec::from_array([runtime::Value::String(js_string("1e+tail"))]),
+                ),
             ),
         ),
         1.0,
@@ -387,7 +427,7 @@ fn parse_float_uses_longest_decimal_prefix() -> unit {
                     invoke(
                         context,
                         parse_float,
-                        Vec::[runtime::Value::String(js_string("Infinity rest"))],
+                        Vec::from_array([runtime::Value::String(js_string("Infinity rest"))]),
                     ),
                 ),
             ),
@@ -397,7 +437,11 @@ fn parse_float_uses_longest_decimal_prefix() -> unit {
         math::is_nan(
             expect_number(
                 expect_value(
-                    invoke(context, parse_float, Vec::[runtime::Value::String(js_string("xyz"))]),
+                    invoke(
+                        context,
+                        parse_float,
+                        Vec::from_array([runtime::Value::String(js_string("xyz"))]),
+                    ),
                 ),
             ),
         ),
@@ -417,7 +461,7 @@ fn json_builtins_parse_and_stringify_heap_values() -> unit {
         invoke(
             context,
             parse,
-            Vec::[runtime::Value::String(js_string("{\"answer\":42,\"ok\":true}"))],
+            Vec::from_array([runtime::Value::String(js_string("{\"answer\":42,\"ok\":true}"))]),
         ),
     );
     let object = match parsed {
@@ -429,7 +473,7 @@ fn json_builtins_parse_and_stringify_heap_values() -> unit {
     };
     testing::assert_eq(expect_number(property(context.heap(), object, "answer")), 42.0);
     let stringify = property(context.heap(), realm.json_object(), "stringify");
-    match expect_value(invoke(context, stringify, Vec::[parsed])) {
+    match expect_value(invoke(context, stringify, Vec::from_array([parsed]))) {
         runtime::Value::String(value) => {
             testing::assert(value == js_string("{\"answer\":42,\"ok\":true}"))
         },
@@ -442,14 +486,14 @@ fn json_stringify_returns_undefined_or_raises_type_errors() -> unit {
     let context = vm::Context::new(runtime::Heap::new());
     let realm = expect_realm(install(context));
     let stringify = property(context.heap(), realm.json_object(), "stringify");
-    match expect_value(invoke(context, stringify, Vec::[runtime::Value::Undefined])) {
+    match expect_value(invoke(context, stringify, Vec::from_array([runtime::Value::Undefined]))) {
         runtime::Value::Undefined => (),
         _ => testing::fail("expected undefined JSON result"),
     };
     match invoke(
         context,
         stringify,
-        Vec::[runtime::Value::BigInt(runtime::BigInt::new(false, "1"))],
+        Vec::from_array([runtime::Value::BigInt(runtime::BigInt::new(false, "1"))]),
     ) {
         Err(vm::VmError { offset, kind: vm::VmErrorKind::TypeError(_) }) => {
             testing::assert_eq(offset, 2)
@@ -475,20 +519,26 @@ fn bigint_constructor_converts_exact_integral_primitives() -> unit {
             invoke(
                 context,
                 constructor,
-                Vec::[runtime::Value::String(js_string("0xffffffffffffffff"))],
+                Vec::from_array([runtime::Value::String(js_string("0xffffffffffffffff"))]),
             ),
         ),
         "18446744073709551615",
     );
     expect_bigint(
-        expect_value(invoke(context, constructor, Vec::[runtime::Value::Float(9007199254740992.0)])),
+        expect_value(
+            invoke(
+                context,
+                constructor,
+                Vec::from_array([runtime::Value::Float(9007199254740992.0)]),
+            ),
+        ),
         "9007199254740992",
     );
     expect_bigint(
-        expect_value(invoke(context, constructor, Vec::[runtime::Value::Bool(true)])),
+        expect_value(invoke(context, constructor, Vec::from_array([runtime::Value::Bool(true)]))),
         "1",
     );
-    match invoke(context, constructor, Vec::[runtime::Value::Float(1.5)]) {
+    match invoke(context, constructor, Vec::from_array([runtime::Value::Float(1.5)])) {
         Err(vm::VmError { kind: vm::VmErrorKind::RangeError(_), .. }) => (),
         _ => testing::fail("expected non-integral BigInt conversion error"),
     }
@@ -499,14 +549,16 @@ fn object_constructor_and_prototype_functions_use_heap_objects() -> unit {
     let context = vm::Context::new(runtime::Heap::new());
     let realm = expect_realm(install(context));
     let object_function = property(context.heap(), realm.global_object(), "Object");
-    let parent = match expect_value(invoke(context, object_function, Vec::[])) {
+    let parent = match expect_value(invoke(context, object_function, Vec::new())) {
         runtime::Value::Object(value) => value,
         _ => {
             testing::fail("expected Object result");
             realm.global_object()
         },
     };
-    match expect_value(invoke(context, object_function, Vec::[runtime::Value::Object(parent)])) {
+    match expect_value(
+        invoke(context, object_function, Vec::from_array([runtime::Value::Object(parent)])),
+    ) {
         runtime::Value::Object(value) => testing::assert(value == parent),
         _ => testing::fail("expected Object identity"),
     };
@@ -515,7 +567,9 @@ fn object_constructor_and_prototype_functions_use_heap_objects() -> unit {
         _ => realm.global_object(),
     };
     let create = property(context.heap(), object, "create");
-    let child = match expect_value(invoke(context, create, Vec::[runtime::Value::Object(parent)])) {
+    let child = match expect_value(
+        invoke(context, create, Vec::from_array([runtime::Value::Object(parent)])),
+    ) {
         runtime::Value::Object(value) => value,
         _ => {
             testing::fail("expected Object.create result");
@@ -523,12 +577,16 @@ fn object_constructor_and_prototype_functions_use_heap_objects() -> unit {
         },
     };
     let get_prototype = property(context.heap(), object, "getPrototypeOf");
-    match expect_value(invoke(context, get_prototype, Vec::[runtime::Value::Object(child)])) {
+    match expect_value(
+        invoke(context, get_prototype, Vec::from_array([runtime::Value::Object(child)])),
+    ) {
         runtime::Value::Object(value) => testing::assert(value == parent),
         _ => testing::fail("expected parent prototype"),
     };
     let prevent_extensions = property(context.heap(), object, "preventExtensions");
-    let _ = expect_value(invoke(context, prevent_extensions, Vec::[runtime::Value::Object(child)]));
+    let _ = expect_value(
+        invoke(context, prevent_extensions, Vec::from_array([runtime::Value::Object(child)])),
+    );
     match runtime::set_property(
         context.heap(),
         child,
@@ -587,7 +645,9 @@ fn object_reflection_reports_own_descriptors_and_extensibility() -> unit {
             invoke(
                 context,
                 has_own,
-                Vec::[runtime::Value::Object(target), runtime::Value::String(js_string("value"))],
+                Vec::from_array(
+                    [runtime::Value::Object(target), runtime::Value::String(js_string("value"))],
+                ),
             ),
         ),
         runtime::Value::Bool(true),
@@ -597,10 +657,9 @@ fn object_reflection_reports_own_descriptors_and_extensibility() -> unit {
             invoke(
                 context,
                 has_own,
-                Vec::[
-                    runtime::Value::Object(target),
-                    runtime::Value::String(js_string("inherited")),
-                ],
+                Vec::from_array(
+                    [runtime::Value::Object(target), runtime::Value::String(js_string("inherited"))],
+                ),
             ),
         ),
         runtime::Value::Bool(false),
@@ -610,7 +669,9 @@ fn object_reflection_reports_own_descriptors_and_extensibility() -> unit {
         invoke(
             context,
             get_descriptor,
-            Vec::[runtime::Value::Object(target), runtime::Value::String(js_string("value"))],
+            Vec::from_array(
+                [runtime::Value::Object(target), runtime::Value::String(js_string("value"))],
+            ),
         ),
     ) {
         runtime::Value::Object(value) => value,
@@ -625,13 +686,19 @@ fn object_reflection_reports_own_descriptors_and_extensibility() -> unit {
     assert_value(property(context.heap(), descriptor, "configurable"), runtime::Value::Bool(false));
     let is_extensible = property(context.heap(), object, "isExtensible");
     assert_value(
-        expect_value(invoke(context, is_extensible, Vec::[runtime::Value::Object(target)])),
+        expect_value(
+            invoke(context, is_extensible, Vec::from_array([runtime::Value::Object(target)])),
+        ),
         runtime::Value::Bool(true),
     );
     let prevent_extensions = property(context.heap(), object, "preventExtensions");
-    let _ = expect_value(invoke(context, prevent_extensions, Vec::[runtime::Value::Object(target)]));
+    let _ = expect_value(
+        invoke(context, prevent_extensions, Vec::from_array([runtime::Value::Object(target)])),
+    );
     assert_value(
-        expect_value(invoke(context, is_extensible, Vec::[runtime::Value::Object(target)])),
+        expect_value(
+            invoke(context, is_extensible, Vec::from_array([runtime::Value::Object(target)])),
+        ),
         runtime::Value::Bool(false),
     )
 }
@@ -698,11 +765,13 @@ fn object_definition_enumeration_assignment_and_freezing_compose() -> unit {
         invoke(
             context,
             define_property,
-            Vec::[
-                runtime::Value::Object(target),
-                runtime::Value::String(js_string("answer")),
-                runtime::Value::Object(descriptor),
-            ],
+            Vec::from_array(
+                [
+                    runtime::Value::Object(target),
+                    runtime::Value::String(js_string("answer")),
+                    runtime::Value::Object(descriptor),
+                ],
+            ),
         ),
     );
     assert_value(property(context.heap(), target, "answer"), runtime::Value::Int(9));
@@ -710,7 +779,7 @@ fn object_definition_enumeration_assignment_and_freezing_compose() -> unit {
         invoke(
             context,
             property(context.heap(), object, "getOwnPropertyNames"),
-            Vec::[runtime::Value::Object(target)],
+            Vec::from_array([runtime::Value::Object(target)]),
         ),
     ) {
         runtime::Value::Object(value) => value,
@@ -724,7 +793,7 @@ fn object_definition_enumeration_assignment_and_freezing_compose() -> unit {
         invoke(
             context,
             property(context.heap(), object, "values"),
-            Vec::[runtime::Value::Object(target)],
+            Vec::from_array([runtime::Value::Object(target)]),
         ),
     ) {
         runtime::Value::Object(value) => value,
@@ -738,7 +807,7 @@ fn object_definition_enumeration_assignment_and_freezing_compose() -> unit {
         invoke(
             context,
             property(context.heap(), object, "entries"),
-            Vec::[runtime::Value::Object(target)],
+            Vec::from_array([runtime::Value::Object(target)]),
         ),
     ) {
         runtime::Value::Object(value) => value,
@@ -770,7 +839,7 @@ fn object_definition_enumeration_assignment_and_freezing_compose() -> unit {
         invoke(
             context,
             property(context.heap(), object, "assign"),
-            Vec::[runtime::Value::Object(assigned), runtime::Value::Object(target)],
+            Vec::from_array([runtime::Value::Object(assigned), runtime::Value::Object(target)]),
         ),
     );
     assert_value(property(context.heap(), assigned, "answer"), runtime::Value::Int(9));
@@ -787,7 +856,7 @@ fn object_definition_enumeration_assignment_and_freezing_compose() -> unit {
         invoke(
             context,
             property(context.heap(), object, "getOwnPropertySymbols"),
-            Vec::[runtime::Value::Object(target)],
+            Vec::from_array([runtime::Value::Object(target)]),
         ),
     ) {
         runtime::Value::Object(value) => value,
@@ -801,7 +870,7 @@ fn object_definition_enumeration_assignment_and_freezing_compose() -> unit {
         invoke(
             context,
             property(context.heap(), object, "freeze"),
-            Vec::[runtime::Value::Object(target)],
+            Vec::from_array([runtime::Value::Object(target)]),
         ),
     );
     assert_value(
@@ -809,7 +878,7 @@ fn object_definition_enumeration_assignment_and_freezing_compose() -> unit {
             invoke(
                 context,
                 property(context.heap(), object, "isFrozen"),
-                Vec::[runtime::Value::Object(target)],
+                Vec::from_array([runtime::Value::Object(target)]),
             ),
         ),
         runtime::Value::Bool(true),
@@ -871,7 +940,7 @@ fn object_keys_returns_enumerable_string_keys_in_order() -> unit {
         invoke(
             context,
             property(context.heap(), object, "keys"),
-            Vec::[runtime::Value::Object(target)],
+            Vec::from_array([runtime::Value::Object(target)]),
         ),
     ) {
         runtime::Value::Object(value) => value,
@@ -896,7 +965,9 @@ fn array_constructor_and_is_array_distinguish_length_and_elements() -> unit {
     let context = vm::Context::new(runtime::Heap::new());
     let realm = expect_realm(install(context));
     let array_function = property(context.heap(), realm.global_object(), "Array");
-    let sparse = match expect_value(invoke(context, array_function, Vec::[runtime::Value::Int(3)])) {
+    let sparse = match expect_value(
+        invoke(context, array_function, Vec::from_array([runtime::Value::Int(3)])),
+    ) {
         runtime::Value::Object(value) => value,
         _ => {
             testing::fail("expected sparse array");
@@ -909,7 +980,11 @@ fn array_constructor_and_is_array_distinguish_length_and_elements() -> unit {
         _ => testing::fail("expected array hole"),
     };
     let values = match expect_value(
-        invoke(context, array_function, Vec::[runtime::Value::Int(3), runtime::Value::Int(4)]),
+        invoke(
+            context,
+            array_function,
+            Vec::from_array([runtime::Value::Int(3), runtime::Value::Int(4)]),
+        ),
     ) {
         runtime::Value::Object(value) => value,
         _ => {
@@ -924,7 +999,7 @@ fn array_constructor_and_is_array_distinguish_length_and_elements() -> unit {
         _ => realm.global_object(),
     };
     let is_array = property(context.heap(), array, "isArray");
-    match expect_value(invoke(context, is_array, Vec::[runtime::Value::Object(values)])) {
+    match expect_value(invoke(context, is_array, Vec::from_array([runtime::Value::Object(values)]))) {
         runtime::Value::Bool(value) => testing::assert(value),
         _ => testing::fail("expected Array.isArray result"),
     }
@@ -940,14 +1015,22 @@ fn object_is_uses_same_value_number_semantics() -> unit {
     };
     let is = property(context.heap(), object, "is");
     match expect_value(
-        invoke(context, is, Vec::[runtime::Value::Float(nan()), runtime::Value::Float(nan())]),
+        invoke(
+            context,
+            is,
+            Vec::from_array([runtime::Value::Float(nan()), runtime::Value::Float(nan())]),
+        ),
     ) {
         runtime::Value::Bool(value) => testing::assert(value),
         _ => testing::fail("expected Object.is NaN result"),
     };
     let negative_zero = num::parse_float64("-0").unwrap_or(0.0);
     match expect_value(
-        invoke(context, is, Vec::[runtime::Value::Float(negative_zero), runtime::Value::Float(0.0)]),
+        invoke(
+            context,
+            is,
+            Vec::from_array([runtime::Value::Float(negative_zero), runtime::Value::Float(0.0)]),
+        ),
     ) {
         runtime::Value::Bool(value) => testing::assert(!value),
         _ => testing::fail("expected Object.is zero result"),
@@ -964,21 +1047,31 @@ fn string_static_constructors_preserve_utf16_code_units() -> unit {
     };
     let from_char_code = property(context.heap(), string_object, "fromCharCode");
     match expect_value(
-        invoke(context, from_char_code, Vec::[runtime::Value::Int(65), runtime::Value::Int(0xd800)]),
+        invoke(
+            context,
+            from_char_code,
+            Vec::from_array([runtime::Value::Int(65), runtime::Value::Int(0xd800)]),
+        ),
     ) {
         runtime::Value::String(value) => {
-            testing::assert(value == runtime::JsString::from_code_units(Vec::[65, 0xd800]))
+            testing::assert(
+                value == runtime::JsString::from_code_units(Vec::from_array([65, 0xd800])),
+            )
         },
         _ => testing::fail("expected fromCharCode string"),
     };
     let from_code_point = property(context.heap(), string_object, "fromCodePoint");
-    match expect_value(invoke(context, from_code_point, Vec::[runtime::Value::Int(0x1f600)])) {
+    match expect_value(
+        invoke(context, from_code_point, Vec::from_array([runtime::Value::Int(0x1f600)])),
+    ) {
         runtime::Value::String(value) => {
-            testing::assert(value == runtime::JsString::from_code_units(Vec::[0xd83d, 0xde00]))
+            testing::assert(
+                value == runtime::JsString::from_code_units(Vec::from_array([0xd83d, 0xde00])),
+            )
         },
         _ => testing::fail("expected fromCodePoint string"),
     };
-    match invoke(context, from_code_point, Vec::[runtime::Value::Int(0x110000)]) {
+    match invoke(context, from_code_point, Vec::from_array([runtime::Value::Int(0x110000)])) {
         Err(vm::VmError { kind: vm::VmErrorKind::RangeError(_), .. }) => (),
         _ => testing::fail("expected invalid code point error"),
     }
@@ -999,7 +1092,9 @@ fn string_raw_interleaves_raw_segments_and_substitutions() -> unit {
         segments,
         runtime::string_property_key("0"),
         runtime::data_descriptor(
-            runtime::Value::String(runtime::JsString::from_code_units(Vec::[97, 0xd800])),
+            runtime::Value::String(
+                runtime::JsString::from_code_units(Vec::from_array([97, 0xd800])),
+            ),
             true,
             true,
             true,
@@ -1010,7 +1105,7 @@ fn string_raw_interleaves_raw_segments_and_substitutions() -> unit {
         segments,
         runtime::string_property_key("1"),
         runtime::data_descriptor(
-            runtime::Value::String(runtime::JsString::from_code_units(Vec::[98])),
+            runtime::Value::String(runtime::JsString::from_code_units(Vec::from_array([98]))),
             true,
             true,
             true,
@@ -1021,7 +1116,7 @@ fn string_raw_interleaves_raw_segments_and_substitutions() -> unit {
         segments,
         runtime::string_property_key("2"),
         runtime::data_descriptor(
-            runtime::Value::String(runtime::JsString::from_code_units(Vec::[99])),
+            runtime::Value::String(runtime::JsString::from_code_units(Vec::from_array([99]))),
             true,
             true,
             true,
@@ -1040,18 +1135,20 @@ fn string_raw_interleaves_raw_segments_and_substitutions() -> unit {
         invoke(
             context,
             raw_function,
-            Vec::[
-                runtime::Value::Object(template),
-                runtime::Value::Int(1),
-                runtime::Value::Bool(false),
-            ],
+            Vec::from_array(
+                [
+                    runtime::Value::Object(template),
+                    runtime::Value::Int(1),
+                    runtime::Value::Bool(false),
+                ],
+            ),
         ),
     ) {
         runtime::Value::String(value) => {
             testing::assert(
                 value
                     == runtime::JsString::from_code_units(
-                        Vec::[97, 0xd800, 49, 98, 102, 97, 108, 115, 101, 99],
+                        Vec::from_array([97, 0xd800, 49, 98, 102, 97, 108, 115, 101, 99]),
                     ),
             )
         },
@@ -1083,12 +1180,16 @@ fn bigint_width_truncation_uses_twos_complement() -> unit {
     let as_uint_n = property(context.heap(), bigint_object, "asUintN");
     let as_int_n = property(context.heap(), bigint_object, "asIntN");
     let negative_one = runtime::Value::BigInt(runtime::BigInt::from_int64(-1));
-    match expect_value(invoke(context, as_uint_n, Vec::[runtime::Value::Int(8), negative_one])) {
+    match expect_value(
+        invoke(context, as_uint_n, Vec::from_array([runtime::Value::Int(8), negative_one])),
+    ) {
         runtime::Value::BigInt(value) => testing::assert_eq(value.to_string(), "255"),
         _ => testing::fail("expected unsigned truncated BigInt"),
     };
     let two_fifty_five = runtime::Value::BigInt(runtime::BigInt::from_int64(255));
-    match expect_value(invoke(context, as_int_n, Vec::[runtime::Value::Int(8), two_fifty_five])) {
+    match expect_value(
+        invoke(context, as_int_n, Vec::from_array([runtime::Value::Int(8), two_fifty_five])),
+    ) {
         runtime::Value::BigInt(value) => testing::assert_eq(value.to_string(), "-1"),
         _ => testing::fail("expected signed truncated BigInt"),
     }
@@ -1104,26 +1205,30 @@ fn uri_globals_follow_uri_and_component_escape_rules() -> unit {
     let decode_uri = property(context.heap(), global, "decodeURI");
     let decode_component = property(context.heap(), global, "decodeURIComponent");
     let input = runtime::Value::String(
-        runtime::JsString::from_code_units(Vec::[0x61, 0x2f, 0x20, 0xd83d, 0xde00]),
+        runtime::JsString::from_code_units(Vec::from_array([0x61, 0x2f, 0x20, 0xd83d, 0xde00])),
     );
-    match expect_value(invoke(context, encode_uri, Vec::[input])) {
+    match expect_value(invoke(context, encode_uri, Vec::from_array([input]))) {
         runtime::Value::String(value) => testing::assert(value == js_string("a/%20%F0%9F%98%80")),
         _ => testing::fail("expected encodeURI string"),
     };
-    match expect_value(invoke(context, encode_component, Vec::[input])) {
+    match expect_value(invoke(context, encode_component, Vec::from_array([input]))) {
         runtime::Value::String(value) => testing::assert(value == js_string("a%2F%20%F0%9F%98%80")),
         _ => testing::fail("expected encodeURIComponent string"),
     };
     let escaped = runtime::Value::String(js_string("%2f%3F%F0%9F%98%80"));
-    match expect_value(invoke(context, decode_uri, Vec::[escaped])) {
+    match expect_value(invoke(context, decode_uri, Vec::from_array([escaped]))) {
         runtime::Value::String(value) => testing::assert(value == js_string("%2f%3F😀")),
         _ => testing::fail("expected decodeURI string"),
     };
-    match expect_value(invoke(context, decode_component, Vec::[escaped])) {
+    match expect_value(invoke(context, decode_component, Vec::from_array([escaped]))) {
         runtime::Value::String(value) => testing::assert(value == js_string("/?😀")),
         _ => testing::fail("expected decodeURIComponent string"),
     };
-    match invoke(context, decode_component, Vec::[runtime::Value::String(js_string("%E0%A4"))]) {
+    match invoke(
+        context,
+        decode_component,
+        Vec::from_array([runtime::Value::String(js_string("%E0%A4"))]),
+    ) {
         Err(vm::VmError { kind: vm::VmErrorKind::UriError(_), .. }) => (),
         _ => testing::fail("expected malformed URI error"),
     }
@@ -1140,7 +1245,7 @@ fn extended_math_functions_preserve_integer_float_and_boundary_semantics() -> un
                 invoke(
                     context,
                     property(context.heap(), math_object, "clz32"),
-                    Vec::[runtime::Value::Int(1)],
+                    Vec::from_array([runtime::Value::Int(1)]),
                 ),
             ),
         ),
@@ -1152,7 +1257,7 @@ fn extended_math_functions_preserve_integer_float_and_boundary_semantics() -> un
                 invoke(
                     context,
                     property(context.heap(), math_object, "imul"),
-                    Vec::[runtime::Value::Float(4294967295.0), runtime::Value::Int(5)],
+                    Vec::from_array([runtime::Value::Float(4294967295.0), runtime::Value::Int(5)]),
                 ),
             ),
         ),
@@ -1164,7 +1269,7 @@ fn extended_math_functions_preserve_integer_float_and_boundary_semantics() -> un
                 invoke(
                     context,
                     property(context.heap(), math_object, "hypot"),
-                    Vec::[runtime::Value::Int(3), runtime::Value::Int(4)],
+                    Vec::from_array([runtime::Value::Int(3), runtime::Value::Int(4)]),
                 ),
             ),
         ),
@@ -1176,7 +1281,7 @@ fn extended_math_functions_preserve_integer_float_and_boundary_semantics() -> un
                 invoke(
                     context,
                     property(context.heap(), math_object, "fround"),
-                    Vec::[runtime::Value::Float(1.5)],
+                    Vec::from_array([runtime::Value::Float(1.5)]),
                 ),
             ),
         ),
@@ -1188,17 +1293,19 @@ fn extended_math_functions_preserve_integer_float_and_boundary_semantics() -> un
                 invoke(
                     context,
                     property(context.heap(), math_object, "atan2"),
-                    Vec::[runtime::Value::Int(1), runtime::Value::Int(0)],
+                    Vec::from_array([runtime::Value::Int(1), runtime::Value::Int(0)]),
                 ),
             ),
         ),
         1.5707963267948966,
     );
-    let precise_values = Vec::[
-        runtime::Value::Float(1.0),
-        runtime::Value::Float(1.1102230246251565e-16),
-        runtime::Value::Float(4.9406564584124654e-324),
-    ];
+    let precise_values = Vec::from_array(
+        [
+            runtime::Value::Float(1.0),
+            runtime::Value::Float(1.1102230246251565e-16),
+            runtime::Value::Float(4.9406564584124654e-324),
+        ],
+    );
     let precise_input = match allocate_array(context.heap(), precise_values, 3) {
         Ok(value) => value,
         Err(value) => {
@@ -1212,13 +1319,13 @@ fn extended_math_functions_preserve_integer_float_and_boundary_semantics() -> un
                 invoke(
                     context,
                     property(context.heap(), math_object, "sumPrecise"),
-                    Vec::[runtime::Value::Object(precise_input)],
+                    Vec::from_array([runtime::Value::Object(precise_input)]),
                 ),
             ),
         ),
         1.0000000000000002,
     );
-    let invalid_values = Vec::[runtime::Value::String(js_string("1"))];
+    let invalid_values = Vec::from_array([runtime::Value::String(js_string("1"))]);
     let invalid_input = match allocate_array(context.heap(), invalid_values, 1) {
         Ok(value) => value,
         Err(value) => {
@@ -1229,7 +1336,7 @@ fn extended_math_functions_preserve_integer_float_and_boundary_semantics() -> un
     match invoke(
         context,
         property(context.heap(), math_object, "sumPrecise"),
-        Vec::[runtime::Value::Object(invalid_input)],
+        Vec::from_array([runtime::Value::Object(invalid_input)]),
     ) {
         Err(vm::VmError { kind: vm::VmErrorKind::TypeError(_), .. }) => (),
         _ => testing::fail("expected Math.sumPrecise number type error"),

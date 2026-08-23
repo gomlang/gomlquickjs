@@ -57,7 +57,7 @@ fn promise_builtin_invoke(
     callable: runtime::Value,
     arguments: Vec[runtime::Value],
 ) -> Result[runtime::Value, vm::VmError] {
-    let code: Vec[bytecode::Instruction] = Vec::[bytecode::Instruction::GetLoc(0)];
+    let code: Vec[bytecode::Instruction] = Vec::from_array([bytecode::Instruction::GetLoc(0)]);
     let mut index = 0;
     while index < arguments.len() {
         code.push(bytecode::Instruction::GetLoc(index + 1));
@@ -70,7 +70,7 @@ fn promise_builtin_invoke(
     for value in arguments {
         locals.push(value)
     }
-    context.execute_with_locals(bytecode::Function::new(Vec::[], code, locals.len()), locals)
+    context.execute_with_locals(bytecode::Function::new(Vec::new(), code, locals.len()), locals)
 }
 
 fn promise_builtin_invoke_method(
@@ -79,10 +79,9 @@ fn promise_builtin_invoke_method(
     callable: runtime::Value,
     arguments: Vec[runtime::Value],
 ) -> Result[runtime::Value, vm::VmError] {
-    let code: Vec[bytecode::Instruction] = Vec::[
-        bytecode::Instruction::GetLoc(0),
-        bytecode::Instruction::GetLoc(1),
-    ];
+    let code: Vec[bytecode::Instruction] = Vec::from_array(
+        [bytecode::Instruction::GetLoc(0), bytecode::Instruction::GetLoc(1)],
+    );
     let mut index = 0;
     while index < arguments.len() {
         code.push(bytecode::Instruction::GetLoc(index + 2));
@@ -96,7 +95,7 @@ fn promise_builtin_invoke_method(
     for value in arguments {
         locals.push(value)
     }
-    context.execute_with_locals(bytecode::Function::new(Vec::[], code, locals.len()), locals)
+    context.execute_with_locals(bytecode::Function::new(Vec::new(), code, locals.len()), locals)
 }
 
 fn promise_builtin_static(
@@ -172,9 +171,9 @@ fn promise_builtin_array(heap: runtime::Heap, values: Vec[runtime::Value]) -> ru
     }
 }
 
-fn promise_builtin_drain(context: vm::Context, constructor: runtime::Value) -> int {
-    match promise_builtin_static(context, constructor, "drainJobs", Vec::[]) {
-        runtime::Value::Int(value) => value.to_int(),
+fn promise_builtin_drain(context: vm::Context, constructor: runtime::Value) -> isize {
+    match promise_builtin_static(context, constructor, "drainJobs", Vec::new()) {
+        runtime::Value::Int(value) => value.to_isize(),
         _ => {
             testing::fail("expected Promise job count");
             0
@@ -196,12 +195,16 @@ fn promise_constructor_runs_executor_and_then_is_asynchronous() -> unit {
         |_, _, arguments| {
             executor_called.set(true);
             let resolve = arguments[0];
-            let _ = promise_builtin_invoke(context, resolve, Vec::[runtime::Value::Int(7)]);
+            let _ = promise_builtin_invoke(
+                context,
+                resolve,
+                Vec::from_array([runtime::Value::Int(7)]),
+            );
             Result::Ok(runtime::Value::Undefined)
         },
     );
     let instance = promise_builtin_expect_value(
-        promise_builtin_invoke(context, constructor, Vec::[executor]),
+        promise_builtin_invoke(context, constructor, Vec::from_array([executor])),
     );
     testing::assert(executor_called.get());
     let observed = Ref::new(runtime::Value::Undefined);
@@ -212,7 +215,7 @@ fn promise_constructor_runs_executor_and_then_is_asynchronous() -> unit {
             Result::Ok(runtime::Value::Int(8))
         },
     );
-    let child = promise_builtin_method(context, instance, "then", Vec::[handler]);
+    let child = promise_builtin_method(context, instance, "then", Vec::from_array([handler]));
     match observed.get() {
         runtime::Value::Undefined => (),
         _ => testing::fail("Promise handler ran synchronously"),
@@ -227,7 +230,7 @@ fn promise_constructor_runs_executor_and_then_is_asynchronous() -> unit {
             Result::Ok(runtime::Value::Undefined)
         },
     );
-    let _ = promise_builtin_method(context, child, "then", Vec::[child_handler]);
+    let _ = promise_builtin_method(context, child, "then", Vec::from_array([child_handler]));
     testing::assert(promise_builtin_drain(context, constructor) >= 1);
     promise_builtin_assert_same(child_observed.get(), runtime::Value::Int(8))
 }
@@ -240,7 +243,7 @@ fn promise_rejection_catch_and_finally_preserve_chain_semantics() -> unit {
         context,
         constructor,
         "reject",
-        Vec::[runtime::Value::Int(11)],
+        Vec::from_array([runtime::Value::Int(11)]),
     );
     let recovered_reason = Ref::new(runtime::Value::Undefined);
     let recover = promise_builtin_native(
@@ -250,7 +253,7 @@ fn promise_rejection_catch_and_finally_preserve_chain_semantics() -> unit {
             Result::Ok(runtime::Value::Int(12))
         },
     );
-    let recovered = promise_builtin_method(context, rejected, "catch", Vec::[recover]);
+    let recovered = promise_builtin_method(context, rejected, "catch", Vec::from_array([recover]));
     let finally_calls = Ref::new(0);
     let cleanup = promise_builtin_native(
         context,
@@ -260,7 +263,12 @@ fn promise_rejection_catch_and_finally_preserve_chain_semantics() -> unit {
             Result::Ok(runtime::Value::Undefined)
         },
     );
-    let preserved = promise_builtin_method(context, recovered, "finally", Vec::[cleanup]);
+    let preserved = promise_builtin_method(
+        context,
+        recovered,
+        "finally",
+        Vec::from_array([cleanup]),
+    );
     let result = Ref::new(runtime::Value::Undefined);
     let observer = promise_builtin_native(
         context,
@@ -269,7 +277,7 @@ fn promise_rejection_catch_and_finally_preserve_chain_semantics() -> unit {
             Result::Ok(runtime::Value::Undefined)
         },
     );
-    let _ = promise_builtin_method(context, preserved, "then", Vec::[observer]);
+    let _ = promise_builtin_method(context, preserved, "then", Vec::from_array([observer]));
     testing::assert(promise_builtin_drain(context, constructor) >= 3);
     promise_builtin_assert_same(recovered_reason.get(), runtime::Value::Int(11));
     promise_builtin_assert_same(result.get(), runtime::Value::Int(12));
@@ -284,9 +292,9 @@ fn promise_resolve_adopts_promises_and_data_thenables() -> unit {
         context,
         constructor,
         "resolve",
-        Vec::[runtime::Value::Int(21)],
+        Vec::from_array([runtime::Value::Int(21)]),
     );
-    let same = promise_builtin_static(context, constructor, "resolve", Vec::[original]);
+    let same = promise_builtin_static(context, constructor, "resolve", Vec::from_array([original]));
     promise_builtin_assert_same(same, original);
     let thenable = match runtime::new_ordinary_object(context.heap(), Option::None) {
         Ok(value) => value,
@@ -301,8 +309,16 @@ fn promise_resolve_adopts_promises_and_data_thenables() -> unit {
             promise_builtin_assert_same(this_value, runtime::Value::Object(thenable));
             let resolve = arguments[0];
             let reject = arguments[1];
-            let _ = promise_builtin_invoke(context, resolve, Vec::[runtime::Value::Int(22)]);
-            let _ = promise_builtin_invoke(context, reject, Vec::[runtime::Value::Int(23)]);
+            let _ = promise_builtin_invoke(
+                context,
+                resolve,
+                Vec::from_array([runtime::Value::Int(22)]),
+            );
+            let _ = promise_builtin_invoke(
+                context,
+                reject,
+                Vec::from_array([runtime::Value::Int(23)]),
+            );
             Result::Ok(runtime::Value::Undefined)
         },
     );
@@ -318,7 +334,7 @@ fn promise_resolve_adopts_promises_and_data_thenables() -> unit {
         context,
         constructor,
         "resolve",
-        Vec::[runtime::Value::Object(thenable)],
+        Vec::from_array([runtime::Value::Object(thenable)]),
     );
     let observed = Ref::new(runtime::Value::Undefined);
     let handler = promise_builtin_native(
@@ -328,7 +344,7 @@ fn promise_resolve_adopts_promises_and_data_thenables() -> unit {
             Result::Ok(runtime::Value::Undefined)
         },
     );
-    let _ = promise_builtin_method(context, adopted, "then", Vec::[handler]);
+    let _ = promise_builtin_method(context, adopted, "then", Vec::from_array([handler]));
     testing::assert(promise_builtin_drain(context, constructor) >= 2);
     promise_builtin_assert_same(observed.get(), runtime::Value::Int(22))
 }
@@ -341,13 +357,13 @@ fn promise_handler_throw_becomes_child_rejection() -> unit {
         context,
         constructor,
         "resolve",
-        Vec::[runtime::Value::Int(30)],
+        Vec::from_array([runtime::Value::Int(30)]),
     );
     let handler = promise_builtin_native(
         context,
         |_, _, _| Result::Err(vm::NativeError { message: "handler failure" }),
     );
-    let child = promise_builtin_method(context, source, "then", Vec::[handler]);
+    let child = promise_builtin_method(context, source, "then", Vec::from_array([handler]));
     let caught = Ref::new(runtime::Value::Undefined);
     let catcher = promise_builtin_native(
         context,
@@ -356,7 +372,7 @@ fn promise_handler_throw_becomes_child_rejection() -> unit {
             Result::Ok(runtime::Value::Undefined)
         },
     );
-    let _ = promise_builtin_method(context, child, "catch", Vec::[catcher]);
+    let _ = promise_builtin_method(context, child, "catch", Vec::from_array([catcher]));
     let _ = promise_builtin_drain(context, constructor);
     promise_builtin_assert_same(
         caught.get(),
@@ -372,10 +388,18 @@ fn promise_all_and_all_settled_return_ecmascript_shaped_arrays() -> unit {
         context,
         constructor,
         "reject",
-        Vec::[runtime::Value::Int(42)],
+        Vec::from_array([runtime::Value::Int(42)]),
     );
-    let input = promise_builtin_array(context.heap(), Vec::[runtime::Value::Int(41), rejected]);
-    let all_settled = promise_builtin_static(context, constructor, "allSettled", Vec::[input]);
+    let input = promise_builtin_array(
+        context.heap(),
+        Vec::from_array([runtime::Value::Int(41), rejected]),
+    );
+    let all_settled = promise_builtin_static(
+        context,
+        constructor,
+        "allSettled",
+        Vec::from_array([input]),
+    );
     let settled_result = Ref::new(runtime::Value::Undefined);
     let settled_handler = promise_builtin_native(
         context,
@@ -384,17 +408,19 @@ fn promise_all_and_all_settled_return_ecmascript_shaped_arrays() -> unit {
             Result::Ok(runtime::Value::Undefined)
         },
     );
-    let _ = promise_builtin_method(context, all_settled, "then", Vec::[settled_handler]);
+    let _ = promise_builtin_method(context, all_settled, "then", Vec::from_array([settled_handler]));
     let all = promise_builtin_static(
         context,
         constructor,
         "all",
-        Vec::[
-            promise_builtin_array(
-                context.heap(),
-                Vec::[runtime::Value::Int(43), runtime::Value::Int(44)],
-            ),
-        ],
+        Vec::from_array(
+            [
+                promise_builtin_array(
+                    context.heap(),
+                    Vec::from_array([runtime::Value::Int(43), runtime::Value::Int(44)]),
+                ),
+            ],
+        ),
     );
     let all_result = Ref::new(runtime::Value::Undefined);
     let all_handler = promise_builtin_native(
@@ -404,7 +430,7 @@ fn promise_all_and_all_settled_return_ecmascript_shaped_arrays() -> unit {
             Result::Ok(runtime::Value::Undefined)
         },
     );
-    let _ = promise_builtin_method(context, all, "then", Vec::[all_handler]);
+    let _ = promise_builtin_method(context, all, "then", Vec::from_array([all_handler]));
     let _ = promise_builtin_drain(context, constructor);
     let settled_array = promise_builtin_expect_object(settled_result.get());
     let first = promise_builtin_expect_object(
@@ -448,19 +474,21 @@ fn promise_race_any_and_aggregate_failure_are_exposed() -> unit {
         context,
         constructor,
         "reject",
-        Vec::[runtime::Value::Int(51)],
+        Vec::from_array([runtime::Value::Int(51)]),
     );
     let fulfilled = promise_builtin_static(
         context,
         constructor,
         "resolve",
-        Vec::[runtime::Value::Int(52)],
+        Vec::from_array([runtime::Value::Int(52)]),
     );
     let raced = promise_builtin_static(
         context,
         constructor,
         "race",
-        Vec::[promise_builtin_array(context.heap(), Vec::[rejected_first, fulfilled])],
+        Vec::from_array(
+            [promise_builtin_array(context.heap(), Vec::from_array([rejected_first, fulfilled]))],
+        ),
     );
     let race_reason = Ref::new(runtime::Value::Undefined);
     let race_catcher = promise_builtin_native(
@@ -470,30 +498,34 @@ fn promise_race_any_and_aggregate_failure_are_exposed() -> unit {
             Result::Ok(runtime::Value::Undefined)
         },
     );
-    let _ = promise_builtin_method(context, raced, "catch", Vec::[race_catcher]);
+    let _ = promise_builtin_method(context, raced, "catch", Vec::from_array([race_catcher]));
     let any = promise_builtin_static(
         context,
         constructor,
         "any",
-        Vec::[
-            promise_builtin_array(
-                context.heap(),
-                Vec::[
-                    promise_builtin_static(
-                        context,
-                        constructor,
-                        "reject",
-                        Vec::[runtime::Value::Int(53)],
+        Vec::from_array(
+            [
+                promise_builtin_array(
+                    context.heap(),
+                    Vec::from_array(
+                        [
+                            promise_builtin_static(
+                                context,
+                                constructor,
+                                "reject",
+                                Vec::from_array([runtime::Value::Int(53)]),
+                            ),
+                            promise_builtin_static(
+                                context,
+                                constructor,
+                                "reject",
+                                Vec::from_array([runtime::Value::Int(54)]),
+                            ),
+                        ],
                     ),
-                    promise_builtin_static(
-                        context,
-                        constructor,
-                        "reject",
-                        Vec::[runtime::Value::Int(54)],
-                    ),
-                ],
-            ),
-        ],
+                ),
+            ],
+        ),
     );
     let aggregate_value = Ref::new(runtime::Value::Undefined);
     let any_catcher = promise_builtin_native(
@@ -503,7 +535,7 @@ fn promise_race_any_and_aggregate_failure_are_exposed() -> unit {
             Result::Ok(runtime::Value::Undefined)
         },
     );
-    let _ = promise_builtin_method(context, any, "catch", Vec::[any_catcher]);
+    let _ = promise_builtin_method(context, any, "catch", Vec::from_array([any_catcher]));
     let _ = promise_builtin_drain(context, constructor);
     promise_builtin_assert_same(race_reason.get(), runtime::Value::Int(51));
     let aggregate = promise_builtin_expect_object(aggregate_value.get());
@@ -528,7 +560,12 @@ fn promise_race_any_and_aggregate_failure_are_exposed() -> unit {
 fn promise_combinator_array_limit_rejects_instead_of_throwing() -> unit {
     let context = vm::Context::new(runtime::Heap::new());
     let constructor = promise_builtin_expect_install(install_promise(context));
-    let result = promise_builtin_static(context, constructor, "all", Vec::[runtime::Value::Int(1)]);
+    let result = promise_builtin_static(
+        context,
+        constructor,
+        "all",
+        Vec::from_array([runtime::Value::Int(1)]),
+    );
     let reason = Ref::new(runtime::Value::Undefined);
     let catcher = promise_builtin_native(
         context,
@@ -537,7 +574,7 @@ fn promise_combinator_array_limit_rejects_instead_of_throwing() -> unit {
             Result::Ok(runtime::Value::Undefined)
         },
     );
-    let _ = promise_builtin_method(context, result, "catch", Vec::[catcher]);
+    let _ = promise_builtin_method(context, result, "catch", Vec::from_array([catcher]));
     let _ = promise_builtin_drain(context, constructor);
     let error = promise_builtin_expect_object(reason.get());
     promise_builtin_assert_same(
@@ -558,13 +595,15 @@ fn nested_promise_combinators_keep_array_values_scalar() -> unit {
         context,
         constructor,
         "all",
-        Vec::[promise_builtin_array(context.heap(), Vec::[runtime::Value::Int(71)])],
+        Vec::from_array(
+            [promise_builtin_array(context.heap(), Vec::from_array([runtime::Value::Int(71)]))],
+        ),
     );
     let outer = promise_builtin_static(
         context,
         constructor,
         "all",
-        Vec::[promise_builtin_array(context.heap(), Vec::[inner])],
+        Vec::from_array([promise_builtin_array(context.heap(), Vec::from_array([inner]))]),
     );
     let result = Ref::new(runtime::Value::Undefined);
     let observer = promise_builtin_native(
@@ -574,7 +613,7 @@ fn nested_promise_combinators_keep_array_values_scalar() -> unit {
             Result::Ok(runtime::Value::Undefined)
         },
     );
-    let _ = promise_builtin_method(context, outer, "then", Vec::[observer]);
+    let _ = promise_builtin_method(context, outer, "then", Vec::from_array([observer]));
     let _ = promise_builtin_drain(context, constructor);
     let outer_array = promise_builtin_expect_object(result.get());
     let inner_array = promise_builtin_expect_object(

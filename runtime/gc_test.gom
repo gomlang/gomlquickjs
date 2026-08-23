@@ -33,7 +33,7 @@ fn gc_root_preserves_the_reachable_graph() -> unit {
     gc_link(heap, root, "child", child);
     gc_link(heap, child, "leaf", leaf);
     gc_link(heap, root, "duplicate", leaf);
-    let stats = heap.collect(Vec::[Value::Object(root), Value::Object(root)]);
+    let stats = heap.collect(Vec::from_array([Value::Object(root), Value::Object(root)]));
     testing::assert_eq(stats.live_before, 3);
     testing::assert_eq(stats.reachable, 3);
     testing::assert_eq(stats.collected, 0);
@@ -51,7 +51,7 @@ fn gc_collects_an_unreachable_cycle() -> unit {
     let right = gc_expect_object(new_ordinary_object(heap, Option::None));
     gc_link(heap, left, "right", right);
     gc_link(heap, right, "left", left);
-    let roots: Vec[Value] = Vec::[];
+    let roots: Vec[Value] = Vec::new();
     let stats = heap.collect(roots);
     testing::assert_eq(stats.live_before, 2);
     testing::assert_eq(stats.reachable, 0);
@@ -82,7 +82,7 @@ fn gc_traces_prototypes_and_accessor_values() -> unit {
         ),
     );
     let child = gc_expect_object(new_ordinary_object(heap, Option::Some(prototype)));
-    let stats = heap.collect(Vec::[Value::Object(child)]);
+    let stats = heap.collect(Vec::from_array([Value::Object(child)]));
     testing::assert_eq(stats.live_before, 4);
     testing::assert_eq(stats.reachable, 4);
     testing::assert_eq(stats.collected, 0);
@@ -113,7 +113,7 @@ fn gc_traces_hidden_private_names_and_values() -> unit {
     );
     testing::assert_eq(own_property_keys(heap, target).len(), 0);
     testing::assert(has_private_element(heap, target, field_name));
-    let stats = heap.collect(Vec::[Value::Object(target)]);
+    let stats = heap.collect(Vec::from_array([Value::Object(target)]));
     testing::assert_eq(stats.reachable, 8);
     testing::assert_eq(stats.collected, 0);
     testing::assert(heap.contains(field_name));
@@ -135,7 +135,9 @@ fn gc_ignores_foreign_and_stale_roots_and_reuses_slots() -> unit {
     let foreign_heap = Heap::new();
     let foreign = gc_expect_object(new_ordinary_object(foreign_heap, Option::None));
     let stats = heap.collect(
-        Vec::[Value::Object(stale), Value::Object(foreign), Value::Int(1), Value::Undefined],
+        Vec::from_array(
+            [Value::Object(stale), Value::Object(foreign), Value::Int(1), Value::Undefined],
+        ),
     );
     testing::assert_eq(stats.live_before, 1);
     testing::assert_eq(stats.reachable, 0);
@@ -164,12 +166,14 @@ fn gc_marks_weak_map_values_to_an_ephemeron_fixed_point() -> unit {
     testing::assert(weak_map_set(heap, first_map, Value::Object(key), Value::Object(middle)));
     testing::assert(weak_map_set(heap, second_map, Value::Object(middle), Value::Object(leaf)));
     let kept = heap.collect(
-        Vec::[Value::Object(first_map), Value::Object(second_map), Value::Object(key)],
+        Vec::from_array([Value::Object(first_map), Value::Object(second_map), Value::Object(key)]),
     );
     testing::assert_eq(kept.reachable, 5);
     testing::assert(heap.contains(middle));
     testing::assert(heap.contains(leaf));
-    let dropped = heap.collect(Vec::[Value::Object(first_map), Value::Object(second_map)]);
+    let dropped = heap.collect(
+        Vec::from_array([Value::Object(first_map), Value::Object(second_map)]),
+    );
     testing::assert_eq(dropped.reachable, 2);
     testing::assert(!heap.contains(key));
     testing::assert(!heap.contains(middle));
@@ -187,7 +191,7 @@ fn gc_does_not_mark_a_weak_ref_target() -> unit {
         Some(Value::Object(value)) => testing::assert(value == target),
         _ => testing::fail("expected live weak reference target"),
     };
-    let stats = heap.collect(Vec::[Value::Object(reference)]);
+    let stats = heap.collect(Vec::from_array([Value::Object(reference)]));
     testing::assert_eq(stats.reachable, 1);
     testing::assert(!heap.contains(target));
     testing::assert(weak_ref_deref(heap, reference).is_none())
@@ -199,12 +203,12 @@ fn gc_tracks_strong_symbol_roots_for_weak_references() -> unit {
     let reference = expect_object(new_ordinary_object(heap, Option::None));
     let symbol = Value::Symbol(Symbol::new(9001, Option::Some("weak")));
     testing::assert(weak_ref_set(heap, reference, symbol));
-    let _ = heap.collect(Vec::[Value::Object(reference), symbol]);
+    let _ = heap.collect(Vec::from_array([Value::Object(reference), symbol]));
     match weak_ref_deref(heap, reference) {
         Some(value) => testing::assert(same_value(value, symbol)),
         None => testing::fail("strongly rooted symbol was cleared"),
     };
-    let _ = heap.collect(Vec::[Value::Object(reference)]);
+    let _ = heap.collect(Vec::from_array([Value::Object(reference)]));
     testing::assert(weak_ref_deref(heap, reference).is_none())
 }
 
@@ -227,7 +231,9 @@ fn gc_queues_finalization_jobs_and_honors_unregister_tokens() -> unit {
         ),
     );
     let retained = heap.collect(
-        Vec::[Value::Object(registry), Value::Object(first_target), Value::Object(token)],
+        Vec::from_array(
+            [Value::Object(registry), Value::Object(first_target), Value::Object(token)],
+        ),
     );
     testing::assert_eq(retained.reachable, 5);
     match finalization_unregister(heap, registry, Value::Object(token)) {
@@ -245,7 +251,7 @@ fn gc_queues_finalization_jobs_and_honors_unregister_tokens() -> unit {
             Option::None,
         ),
     );
-    let finalized = heap.collect(Vec::[Value::Object(registry)]);
+    let finalized = heap.collect(Vec::from_array([Value::Object(registry)]));
     testing::assert_eq(finalized.reachable, 3);
     testing::assert(!heap.contains(first_target));
     testing::assert(!heap.contains(second_target));
@@ -265,11 +271,11 @@ fn gc_traces_proxy_target_and_handler_until_revocation() -> unit {
     let target = gc_expect_object(new_ordinary_object(heap, Option::None));
     let handler = gc_expect_object(new_ordinary_object(heap, Option::None));
     let proxy = gc_expect_object(new_proxy(heap, target, handler));
-    let retained = heap.collect(Vec::[Value::Object(proxy)]);
+    let retained = heap.collect(Vec::from_array([Value::Object(proxy)]));
     testing::assert_eq(retained.reachable, 3);
     testing::assert(heap.contains(target) && heap.contains(handler));
     testing::assert(revoke_proxy(heap, proxy));
-    let revoked = heap.collect(Vec::[Value::Object(proxy)]);
+    let revoked = heap.collect(Vec::from_array([Value::Object(proxy)]));
     testing::assert_eq(revoked.reachable, 1);
     testing::assert(!heap.contains(target) && !heap.contains(handler))
 }
