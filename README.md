@@ -125,12 +125,15 @@ changes shared by file and process APIs, and queued signal handlers interoperate
 `os.Worker` provides isolated JavaScript realms, queued message events, structured
 cloning with cyclic object support, and shared SharedArrayBuffer backing stores through a
 deterministic cooperative scheduler. Promise reactions drain
-before timer jobs, including when a reaction requests garbage collection. The upstream QuickJS
-`tests/test_std.js`, `tests/test_rw_handler.js`, `tests/test_bjson.js`, and `tests/test_worker.js`
-scripts pass against this host layer.
+before timer jobs, including when a reaction requests garbage collection. Unhandled Promise
+rejections are tracked through chained and adopted promises, retained across host garbage
+collection, and reported at job checkpoints before timer and other host events after dynamic
+import jobs and Promise reactions drain. The upstream QuickJS
+`tests/test_builtin.js`, `tests/test_std.js`, `tests/test_rw_handler.js`, `tests/test_bjson.js`,
+and `tests/test_worker.js` scripts pass against this host layer.
 Uncaught JavaScript errors retain source stack information in qjs diagnostics.
 The command accepts forced module, script, and strict execution modes, preloaded `-I` scripts,
-`--std`, and runtime-only `-q` initialization. File execution treats `.mjs` inputs as modules,
+`--std`, `--no-unhandled-rejection`, and runtime-only `-q` initialization. File execution treats `.mjs` inputs as modules,
 otherwise detects module syntax, and uses a path-aware ES module loader with named,
 default, namespace, and side-effect imports, declaration, named, default, and star exports,
 live binding cells, immutable namespace accessors, relative resolution, star ambiguity checks,
@@ -157,9 +160,10 @@ timer delays are not observed. Workers are cooperatively scheduled rather than b
 threads, and transfer lists, blocking Atomics waits, and parallel execution are not implemented. `std.parseExtJSON`
 currently evaluates its input through the JavaScript compiler and must not be used as a security
 boundary. Garbage collection is deferred while opaque Promise reaction closures remain queued.
-Suspended async function frames and pending async generator requests are retained until their
-awaited chain or request queue settles because native Promise reaction captures are not yet
-exposed as precise heap edges.
+Settled Promise values and reasons and pending JavaScript reaction handlers are exposed as heap
+edges. Suspended async function frames and pending async generator requests are retained until
+their awaited chain or request queue settles because their remaining native captures are not yet
+all exposed as precise heap edges.
 The Test262 runner parses metadata, loads harness files, handles strict/sloppy,
 module, and positive/negative variants, executes synchronous and asynchronous module graphs with
 harness setup in the same realm, and executes script and module async variants
