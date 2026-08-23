@@ -4,27 +4,27 @@ use std::bincode;
 use std::math;
 use std::num;
 
-const FLOAT64_SIGN_MASK: uint64 = 0x8000000000000000;
+const FLOAT64_SIGN_MASK: u64 = 0x8000000000000000;
 
-const FLOAT64_EXPONENT_MASK: uint64 = 0x7ff0000000000000;
+const FLOAT64_EXPONENT_MASK: u64 = 0x7ff0000000000000;
 
-const FLOAT64_FRACTION_MASK: uint64 = 0x000fffffffffffff;
+const FLOAT64_FRACTION_MASK: u64 = 0x000fffffffffffff;
 
-const POSITIVE_INFINITY_BITS: uint64 = 0x7ff0000000000000;
+const POSITIVE_INFINITY_BITS: u64 = 0x7ff0000000000000;
 
-const QUIET_NAN_BITS: uint64 = 0x7ff8000000000000;
+const QUIET_NAN_BITS: u64 = 0x7ff8000000000000;
 
-const LN_2: float64 = 0.69314718055994530942;
+const LN_2: f64 = 0.69314718055994530942;
 
-const PI: float64 = 3.14159265358979323846;
+const PI: f64 = 3.14159265358979323846;
 
-const PRECISE_SUM_LIMB_BITS: int = 56;
+const PRECISE_SUM_LIMB_BITS: isize = 56;
 
-const PRECISE_SUM_ROUND_BITS: int = 3;
+const PRECISE_SUM_ROUND_BITS: isize = 3;
 
-const PRECISE_SUM_ACCUMULATOR_LENGTH: int = 39;
+const PRECISE_SUM_ACCUMULATOR_LENGTH: isize = 39;
 
-const PRECISE_SUM_COUNTER_INITIAL: int = 250;
+const PRECISE_SUM_COUNTER_INITIAL: isize = 250;
 
 enum PreciseSumKind {
     Finite,
@@ -35,22 +35,22 @@ enum PreciseSumKind {
 
 pub struct PreciseSum {
     kind: Ref[PreciseSumKind],
-    counter: Ref[int],
-    limb_count: Ref[int],
-    limbs: Vec[int64],
+    counter: Ref[isize],
+    limb_count: Ref[isize],
+    limbs: Vec[i64],
 }
 
 fn ieee_config() -> bincode::Config {
     bincode::with_little_endian(bincode::legacy())
 }
 
-fn float64_bits(value: float64) -> uint64 {
+fn float64_bits(value: f64) -> u64 {
     match bincode::encode_to_vec(value, ieee_config()) {
         Ok(values) => {
-            let mut bits: uint64 = 0;
+            let mut bits: u64 = 0;
             let mut index = 0;
             while index < values.len() {
-                bits |= values[index].to_uint64() << (index * 8);
+                bits |= values[index].to_u64() << (index * 8);
                 index += 1;
             }
             bits
@@ -59,14 +59,14 @@ fn float64_bits(value: float64) -> uint64 {
     }
 }
 
-fn float64_from_bits(bits: uint64) -> float64 {
+fn float64_from_bits(bits: u64) -> f64 {
     let values: Vec[byte] = Vec::with_capacity(8);
     let mut index = 0;
     while index < 8 {
-        values.push(((bits >> (index * 8)) & 0xff).to_uint8());
+        values.push(((bits >> (index * 8)) & 0xff).to_u8());
         index += 1;
     }
-    let decoded: Result[(float64, int), string] = bincode::decode_from_slice(
+    let decoded: Result[(f64, isize), string] = bincode::decode_from_slice(
         slice(values, 0, values.len()),
         ieee_config(),
     );
@@ -80,34 +80,34 @@ fn float64_from_bits(bits: uint64) -> float64 {
     }
 }
 
-fn positive_infinity() -> float64 {
+fn positive_infinity() -> f64 {
     float64_from_bits(POSITIVE_INFINITY_BITS)
 }
 
-fn not_a_number() -> float64 {
+fn not_a_number() -> f64 {
     float64_from_bits(QUIET_NAN_BITS)
 }
 
-fn has_negative_sign(value: float64) -> bool {
+fn has_negative_sign(value: f64) -> bool {
     float64_bits(value) & FLOAT64_SIGN_MASK != 0
 }
 
-fn copy_sign(magnitude: float64, sign: float64) -> float64 {
+fn copy_sign(magnitude: f64, sign: f64) -> f64 {
     float64_from_bits(
         (float64_bits(magnitude) & ~FLOAT64_SIGN_MASK) | (float64_bits(sign) & FLOAT64_SIGN_MASK),
     )
 }
 
-fn absolute(value: float64) -> float64 {
+fn absolute(value: f64) -> f64 {
     float64_from_bits(float64_bits(value) & ~FLOAT64_SIGN_MASK)
 }
 
-fn leading_zeroes_64(value: uint64) -> int {
+fn leading_zeroes_64(value: u64) -> isize {
     if value == 0 {
         return 64
     } else {};
     let mut count = 0;
-    let mut mask = 1.to_uint64() << 63;
+    let mut mask = 1.to_u64() << 63;
     while value & mask == 0 {
         count += 1;
         mask >>= 1;
@@ -117,10 +117,10 @@ fn leading_zeroes_64(value: uint64) -> int {
 
 impl PreciseSum {
     pub fn new() -> PreciseSum {
-        let limbs: Vec[int64] = Vec::with_capacity(PRECISE_SUM_ACCUMULATOR_LENGTH);
+        let limbs: Vec[i64] = Vec::with_capacity(PRECISE_SUM_ACCUMULATOR_LENGTH);
         let mut index = 0;
         while index < PRECISE_SUM_ACCUMULATOR_LENGTH {
-            limbs.push(0.to_int64());
+            limbs.push(0.to_i64());
             index += 1;
         }
         PreciseSum {
@@ -132,12 +132,12 @@ impl PreciseSum {
     }
 
     fn renormalize(self: PreciseSum) -> unit {
-        let mask = (1.to_uint64() << PRECISE_SUM_LIMB_BITS) - 1;
-        let mut carry = 0.to_int64();
+        let mask = (1.to_u64() << PRECISE_SUM_LIMB_BITS) - 1;
+        let mut carry = 0.to_i64();
         let mut index = 0;
         while index < self.limb_count.get() {
             let value = self.limbs[index] + carry;
-            self.limbs[index] = (value.to_uint64() & mask).to_int64();
+            self.limbs[index] = (value.to_u64() & mask).to_i64();
             carry = value >> PRECISE_SUM_LIMB_BITS;
             index += 1;
         }
@@ -147,10 +147,10 @@ impl PreciseSum {
         } else {}
     }
 
-    pub fn add(self: PreciseSum, value: float64) -> unit {
+    pub fn add(self: PreciseSum, value: f64) -> unit {
         let bits = float64_bits(value);
         let negative = bits >> 63 != 0;
-        let exponent = ((bits >> 52) & 0x7ff).to_int();
+        let exponent = ((bits >> 52) & 0x7ff).to_isize();
         let mut significand = bits & FLOAT64_FRACTION_MASK;
         if exponent == 2047 {
             if significand != 0 {
@@ -183,20 +183,20 @@ impl PreciseSum {
                 return
             } else {}
         } else {
-            significand |= 1.to_uint64() << 52;
+            significand |= 1.to_u64() << 52;
             shift = exponent - 1;
             position = shift / PRECISE_SUM_LIMB_BITS;
             shift %= PRECISE_SUM_LIMB_BITS;
         };
-        let mask = (1.to_uint64() << PRECISE_SUM_LIMB_BITS) - 1;
+        let mask = (1.to_u64() << PRECISE_SUM_LIMB_BITS) - 1;
         let low = (significand << shift) & mask;
         let high = significand >> (PRECISE_SUM_LIMB_BITS - shift);
         if negative {
-            self.limbs[position] -= low.to_int64();
-            self.limbs[position + 1] -= high.to_int64();
+            self.limbs[position] -= low.to_i64();
+            self.limbs[position + 1] -= high.to_i64();
         } else {
-            self.limbs[position] += low.to_int64();
-            self.limbs[position + 1] += high.to_int64();
+            self.limbs[position] += low.to_i64();
+            self.limbs[position + 1] += high.to_i64();
         };
         let required = position + 2;
         if required > self.limb_count.get() {
@@ -209,7 +209,7 @@ impl PreciseSum {
         } else {}
     }
 
-    pub fn result(self: PreciseSum) -> float64 {
+    pub fn result(self: PreciseSum) -> f64 {
         match self.kind.get() {
             PreciseSumKind::PositiveInfinity => return positive_infinity(),
             PreciseSumKind::NegativeInfinity => return -positive_infinity(),
@@ -228,32 +228,32 @@ impl PreciseSum {
             return 0.0
         } else {};
         let negative = self.limbs[count - 1] < 0;
-        let mask = (1.to_uint64() << PRECISE_SUM_LIMB_BITS) - 1;
+        let mask = (1.to_u64() << PRECISE_SUM_LIMB_BITS) - 1;
         if negative {
-            let mut carry = 1.to_uint64();
+            let mut carry = 1.to_u64();
             let mut index = 0;
             while index < count - 1 {
-                let value = mask - self.limbs[index].to_uint64() + carry;
+                let value = mask - self.limbs[index].to_u64() + carry;
                 carry = value >> PRECISE_SUM_LIMB_BITS;
-                self.limbs[index] = (value & mask).to_int64();
+                self.limbs[index] = (value & mask).to_i64();
                 index += 1;
             }
-            self.limbs[count - 1] = -self.limbs[count - 1] + carry.to_int64() - 1;
+            self.limbs[count - 1] = -self.limbs[count - 1] + carry.to_i64() - 1;
             while count > 1 && self.limbs[count - 1] == 0 {
                 count -= 1;
             }
         } else {};
-        if count == 1 && self.limbs[0] < (1.to_int64() << 52) {
+        if count == 1 && self.limbs[0] < (1.to_i64() << 52) {
             let sign = if negative {
-                1.to_uint64() << 63
+                1.to_u64() << 63
             } else {
-                0.to_uint64()
+                0.to_u64()
             };
-            return float64_from_bits(sign | self.limbs[0].to_uint64())
+            return float64_from_bits(sign | self.limbs[0].to_u64())
         } else {};
         let mut exponent = count * PRECISE_SUM_LIMB_BITS;
         let mut position = count - 1;
-        let mut significand = self.limbs[position].to_uint64();
+        let mut significand = self.limbs[position].to_u64();
         let shift = leading_zeroes_64(significand) - (64 - PRECISE_SUM_LIMB_BITS);
         exponent = exponent - shift - 52;
         if shift != 0 {
@@ -261,17 +261,15 @@ impl PreciseSum {
             if position > 0 {
                 position -= 1;
                 let lower_shift = PRECISE_SUM_LIMB_BITS - shift;
-                let nonzero = self.limbs[position].to_uint64()
-                    & ((1.to_uint64() << lower_shift) - 1)
-                    != 0;
-                significand |= self.limbs[position].to_uint64() >> lower_shift;
+                let nonzero = self.limbs[position].to_u64() & ((1.to_u64() << lower_shift) - 1) != 0;
+                significand |= self.limbs[position].to_u64() >> lower_shift;
                 if nonzero {
                     significand |= 1;
                 } else {}
             } else {}
         } else {};
-        let round_mask = (1.to_uint64() << PRECISE_SUM_ROUND_BITS) - 1;
-        let halfway = 1.to_uint64() << (PRECISE_SUM_ROUND_BITS - 1);
+        let round_mask = (1.to_u64() << PRECISE_SUM_ROUND_BITS) - 1;
+        let halfway = 1.to_u64() << (PRECISE_SUM_ROUND_BITS - 1);
         if significand & round_mask == halfway {
             while position > 0 {
                 position -= 1;
@@ -283,24 +281,24 @@ impl PreciseSum {
         } else {};
         let addend = halfway - 1 + ((significand >> PRECISE_SUM_ROUND_BITS) & 1);
         significand = (significand + addend) >> PRECISE_SUM_ROUND_BITS;
-        if significand == 1.to_uint64() << 53 {
+        if significand == 1.to_u64() << 53 {
             exponent += 1;
         } else {};
         let sign = if negative {
-            1.to_uint64() << 63
+            1.to_u64() << 63
         } else {
-            0.to_uint64()
+            0.to_u64()
         };
         if exponent >= 2047 {
-            float64_from_bits(sign | (2047.to_uint64() << 52))
+            float64_from_bits(sign | (2047.to_u64() << 52))
         } else {
             significand &= FLOAT64_FRACTION_MASK;
-            float64_from_bits(sign | (exponent.to_uint64() << 52) | significand)
+            float64_from_bits(sign | (exponent.to_u64() << 52) | significand)
         }
     }
 }
 
-pub fn sum_precise(values: Vec[float64]) -> float64 {
+pub fn sum_precise(values: Vec[f64]) -> f64 {
     let sum = PreciseSum::new();
     for value in values {
         sum.add(value);
@@ -308,24 +306,24 @@ pub fn sum_precise(values: Vec[float64]) -> float64 {
     sum.result()
 }
 
-fn int_float(value: int) -> float64 {
+fn int_float(value: isize) -> f64 {
     num::parse_float64(value.to_string()).unwrap_or(0.0)
 }
 
-fn uint32_float(value: uint32) -> float64 {
+fn uint32_float(value: u32) -> f64 {
     num::parse_float64(value.to_string()).unwrap_or(0.0)
 }
 
-fn truncated_int(value: float64) -> int {
+fn truncated_int(value: f64) -> isize {
     num::parse_int(math::trunc(value).to_string()).unwrap_or(0)
 }
 
-pub fn to_uint32(value: float64) -> uint32 {
+pub fn to_u32(value: f64) -> u32 {
     if !math::is_finite(value) || value == 0.0 {
         return 0
     } else {};
     let bits = float64_bits(value);
-    let encoded_exponent = ((bits & FLOAT64_EXPONENT_MASK) >> 52).to_int();
+    let encoded_exponent = ((bits & FLOAT64_EXPONENT_MASK) >> 52).to_isize();
     if encoded_exponent == 0 {
         return 0
     } else {};
@@ -333,7 +331,7 @@ pub fn to_uint32(value: float64) -> uint32 {
     if exponent < 0 {
         return 0
     } else {};
-    let significand = (1.to_uint64() << 52) | (bits & FLOAT64_FRACTION_MASK);
+    let significand = (1.to_u64() << 52) | (bits & FLOAT64_FRACTION_MASK);
     let magnitude = if exponent >= 52 {
         let shift = exponent - 52;
         if shift >= 32 {
@@ -343,19 +341,19 @@ pub fn to_uint32(value: float64) -> uint32 {
     } else {
         significand >> (52 - exponent)
     };
-    let result = (magnitude & 0xffffffff).to_uint32();
+    let result = (magnitude & 0xffffffff).to_u32();
     if bits & FLOAT64_SIGN_MASK != 0 {
-        0.to_uint32() - result
+        0.to_u32() - result
     } else {
         result
     }
 }
 
-fn rounded_right_shift(value: uint64, shift: int) -> uint64 {
+fn rounded_right_shift(value: u64, shift: isize) -> u64 {
     let truncated = value >> shift;
-    let remainder_mask = (1.to_uint64() << shift) - 1;
+    let remainder_mask = (1.to_u64() << shift) - 1;
     let remainder = value & remainder_mask;
-    let halfway = 1.to_uint64() << (shift - 1);
+    let halfway = 1.to_u64() << (shift - 1);
     if remainder > halfway || (remainder == halfway && truncated & 1 != 0) {
         truncated + 1
     } else {
@@ -363,9 +361,9 @@ fn rounded_right_shift(value: uint64, shift: int) -> uint64 {
     }
 }
 
-fn float32_bits_as_float64(bits: uint32) -> float64 {
+fn float32_bits_as_float64(bits: u32) -> f64 {
     let negative = bits & 0x80000000 != 0;
-    let exponent = ((bits >> 23) & 0xff).to_int();
+    let exponent = ((bits >> 23) & 0xff).to_isize();
     let fraction = bits & 0x007fffff;
     if exponent == 255 {
         if fraction == 0 {
@@ -403,14 +401,14 @@ fn float32_bits_as_float64(bits: uint32) -> float64 {
     }
 }
 
-fn scale_normal_power_of_two(value: float64, exponent: int) -> float64 {
+fn scale_normal_power_of_two(value: f64, exponent: isize) -> f64 {
     let bits = float64_bits(value);
     let magnitude = if exponent < 0 {
         -exponent
     } else {
         exponent
     };
-    let shift = magnitude.to_uint64() << 52;
+    let shift = magnitude.to_u64() << 52;
     if exponent < 0 {
         float64_from_bits(bits - shift)
     } else {
@@ -418,18 +416,18 @@ fn scale_normal_power_of_two(value: float64, exponent: int) -> float64 {
     }
 }
 
-fn large_hyperbolic(magnitude: float64) -> float64 {
+fn large_hyperbolic(magnitude: f64) -> f64 {
     let half_exponential = math::exp(magnitude * 0.5);
     (half_exponential * 0.5) * half_exponential
 }
 
-pub fn clz32(value: float64) -> int {
-    let converted = to_uint32(value);
+pub fn clz32(value: f64) -> isize {
+    let converted = to_u32(value);
     if converted == 0 {
         return 32
     } else {};
     let mut count = 0;
-    let mut mask: uint32 = 0x80000000;
+    let mut mask: u32 = 0x80000000;
     while converted & mask == 0 {
         count += 1;
         mask >>= 1;
@@ -437,22 +435,22 @@ pub fn clz32(value: float64) -> int {
     count
 }
 
-pub fn imul(left: float64, right: float64) -> int32 {
-    (to_uint32(left) * to_uint32(right)).to_int32()
+pub fn imul(left: f64, right: f64) -> i32 {
+    (to_u32(left) * to_u32(right)).to_i32()
 }
 
-pub fn fround(value: float64) -> float64 {
+pub fn fround(value: f64) -> f64 {
     if value == 0.0 || math::is_nan(value) || math::is_infinite(value) {
         return value
     } else {};
     let bits = float64_bits(value);
-    let sign = ((bits >> 32) & 0x80000000).to_uint32();
-    let encoded_exponent = ((bits >> 52) & 0x7ff).to_int();
+    let sign = ((bits >> 32) & 0x80000000).to_u32();
+    let encoded_exponent = ((bits >> 52) & 0x7ff).to_isize();
     if encoded_exponent == 0 {
         return float32_bits_as_float64(sign)
     } else {};
     let exponent = encoded_exponent - 1023;
-    let significand = (1.to_uint64() << 52) | (bits & FLOAT64_FRACTION_MASK);
+    let significand = (1.to_u64() << 52) | (bits & FLOAT64_FRACTION_MASK);
     if exponent >= -126 {
         let mut rounded = rounded_right_shift(significand, 29);
         let mut output_exponent = exponent;
@@ -463,8 +461,8 @@ pub fn fround(value: float64) -> float64 {
         if output_exponent > 127 {
             float32_bits_as_float64(sign | 0x7f800000)
         } else {
-            let exponent_bits = (output_exponent + 127).to_uint32() << 23;
-            let fraction = rounded.to_uint32() - 0x00800000;
+            let exponent_bits = (output_exponent + 127).to_u32() << 23;
+            let fraction = rounded.to_u32() - 0x00800000;
             float32_bits_as_float64(sign | exponent_bits | fraction)
         }
     } else {
@@ -476,16 +474,16 @@ pub fn fround(value: float64) -> float64 {
         if rounded >= 0x00800000 {
             float32_bits_as_float64(sign | 0x00800000)
         } else {
-            float32_bits_as_float64(sign | rounded.to_uint32())
+            float32_bits_as_float64(sign | rounded.to_u32())
         }
     }
 }
 
-pub fn float16_bits(value: float64) -> uint16 {
+pub fn float16_bits(value: f64) -> u16 {
     let bits = float64_bits(value);
-    let sign = ((bits >> 48) & 0x8000).to_uint16();
+    let sign = ((bits >> 48) & 0x8000).to_u16();
     let magnitude = bits & ~FLOAT64_SIGN_MASK;
-    let encoded_exponent = ((magnitude >> 52) & 0x7ff).to_int();
+    let encoded_exponent = ((magnitude >> 52) & 0x7ff).to_isize();
     let fraction = magnitude & FLOAT64_FRACTION_MASK;
     if encoded_exponent == 0x7ff {
         if fraction == 0 {
@@ -497,7 +495,7 @@ pub fn float16_bits(value: float64) -> uint16 {
         return sign
     } else {};
     let exponent = encoded_exponent - 1023;
-    let significand = (1.to_uint64() << 52) | fraction;
+    let significand = (1.to_u64() << 52) | fraction;
     if exponent >= -14 {
         let mut rounded = rounded_right_shift(significand, 42);
         let mut output_exponent = exponent;
@@ -508,8 +506,8 @@ pub fn float16_bits(value: float64) -> uint16 {
         if output_exponent > 15 {
             sign | 0x7c00
         } else {
-            let exponent_bits = (output_exponent + 15).to_uint16() << 10;
-            sign | exponent_bits | (rounded.to_uint16() - 0x0400)
+            let exponent_bits = (output_exponent + 15).to_u16() << 10;
+            sign | exponent_bits | (rounded.to_u16() - 0x0400)
         }
     } else {
         let shift = 28 - exponent;
@@ -520,25 +518,25 @@ pub fn float16_bits(value: float64) -> uint16 {
         if rounded >= 0x0400 {
             sign | 0x0400
         } else {
-            sign | rounded.to_uint16()
+            sign | rounded.to_u16()
         }
     }
 }
 
-pub fn float16_from_bits(bits: uint16) -> float64 {
-    let sign = bits.to_uint64() >> 15;
-    let mut magnitude = (bits & 0x7fff).to_uint64();
+pub fn float16_from_bits(bits: u16) -> f64 {
+    let sign = bits.to_u64() >> 15;
+    let mut magnitude = (bits & 0x7fff).to_u64();
     if magnitude >= 0x7c00 {
         magnitude += 0x1f8000;
     } else {};
     float64_from_bits(sign << 63 | magnitude << 42) * math::pow(2.0, 1008.0)
 }
 
-pub fn f16round(value: float64) -> float64 {
+pub fn f16round(value: f64) -> f64 {
     float16_from_bits(float16_bits(value))
 }
 
-pub fn hypot(values: Vec[float64]) -> float64 {
+pub fn hypot(values: Vec[f64]) -> f64 {
     let mut maximum = 0.0;
     let mut saw_nan = false;
     for value in values {
@@ -568,18 +566,16 @@ pub fn hypot(values: Vec[float64]) -> float64 {
     maximum * math::sqrt(sum)
 }
 
-pub fn cbrt(value: float64) -> float64 {
+pub fn cbrt(value: f64) -> f64 {
     if value == 0.0 || math::is_nan(value) || math::is_infinite(value) {
         return value
     } else {};
     let negative = has_negative_sign(value);
     let magnitude = absolute(value);
-    let mut estimate = float64_from_bits(
-        float64_bits(magnitude) / 3 + (715094163.to_uint64() << 32),
-    );
+    let mut estimate = float64_from_bits(float64_bits(magnitude) / 3 + (715094163.to_u64() << 32));
     if magnitude < 2.2250738585072014e-308 {
         estimate = 18014398509481984.0 * magnitude;
-        estimate = float64_from_bits(float64_bits(estimate) / 3 + (696219795.to_uint64() << 32));
+        estimate = float64_from_bits(float64_bits(estimate) / 3 + (696219795.to_u64() << 32));
     } else {};
     let mut ratio = estimate * estimate / magnitude;
     let combined = 0.5428571428571428 + ratio * estimate;
@@ -598,7 +594,7 @@ pub fn cbrt(value: float64) -> float64 {
     }
 }
 
-pub fn log1p(value: float64) -> float64 {
+pub fn log1p(value: f64) -> f64 {
     if math::is_nan(value) {
         return value
     } else if value < -1.0 {
@@ -613,7 +609,7 @@ pub fn log1p(value: float64) -> float64 {
         return value
     } else {};
     let mut reduced = 0.0;
-    let mut encoded: uint64 = 0;
+    let mut encoded: u64 = 0;
     let mut exponent = 1;
     let mut correction = 0.0;
     if magnitude < 0.41421356237309503 {
@@ -629,7 +625,7 @@ pub fn log1p(value: float64) -> float64 {
         let mut normalized = if magnitude < 9007199254740992.0 {
             let sum = 1.0 + value;
             encoded = float64_bits(sum);
-            exponent = ((encoded >> 52) & 0x7ff).to_int() - 1023;
+            exponent = ((encoded >> 52) & 0x7ff).to_isize() - 1023;
             if exponent > 0 {
                 correction = 1.0 - (sum - value);
             } else {
@@ -639,7 +635,7 @@ pub fn log1p(value: float64) -> float64 {
             sum
         } else {
             encoded = float64_bits(value);
-            exponent = ((encoded >> 52) & 0x7ff).to_int() - 1023;
+            exponent = ((encoded >> 52) & 0x7ff).to_isize() - 1023;
             value
         };
         let _ = normalized;
@@ -697,7 +693,7 @@ pub fn log1p(value: float64) -> float64 {
     }
 }
 
-pub fn expm1(value: float64) -> float64 {
+pub fn expm1(value: f64) -> f64 {
     if math::is_nan(value) || (math::is_infinite(value) && value > 0.0) {
         return value
     } else if math::is_infinite(value) {
@@ -771,16 +767,16 @@ pub fn expm1(value: float64) -> float64 {
     } else if exponent <= -2 || exponent > 56 {
         scale_normal_power_of_two(1.0 - (error - reduced), exponent) - 1.0
     } else if exponent < 20 {
-        let adjustment = 0x0020000000000000.to_uint64() >> exponent;
+        let adjustment = 0x0020000000000000.to_u64() >> exponent;
         let target = float64_from_bits(0x3ff0000000000000 - adjustment);
         scale_normal_power_of_two(target - (error - reduced), exponent)
     } else {
-        let target = float64_from_bits((0x3ff - exponent).to_uint64() << 52);
+        let target = float64_from_bits((0x3ff - exponent).to_u64() << 52);
         scale_normal_power_of_two(reduced - (error + target) + 1.0, exponent)
     }
 }
 
-pub fn sinh(value: float64) -> float64 {
+pub fn sinh(value: f64) -> f64 {
     if value == 0.0 || math::is_nan(value) || math::is_infinite(value) {
         return value
     } else {};
@@ -808,7 +804,7 @@ pub fn sinh(value: float64) -> float64 {
     }
 }
 
-pub fn cosh(value: float64) -> float64 {
+pub fn cosh(value: f64) -> f64 {
     if math::is_nan(value) {
         return value
     } else {};
@@ -823,7 +819,7 @@ pub fn cosh(value: float64) -> float64 {
     }
 }
 
-pub fn tanh(value: float64) -> float64 {
+pub fn tanh(value: f64) -> f64 {
     if value == 0.0 || math::is_nan(value) {
         return value
     } else {};
@@ -849,7 +845,7 @@ pub fn tanh(value: float64) -> float64 {
     }
 }
 
-pub fn asinh(value: float64) -> float64 {
+pub fn asinh(value: f64) -> f64 {
     if value == 0.0 || math::is_nan(value) || math::is_infinite(value) {
         return value
     } else {};
@@ -871,7 +867,7 @@ pub fn asinh(value: float64) -> float64 {
     }
 }
 
-pub fn acosh(value: float64) -> float64 {
+pub fn acosh(value: f64) -> f64 {
     if math::is_nan(value) {
         return value
     } else if value < 1.0 {
@@ -887,7 +883,7 @@ pub fn acosh(value: float64) -> float64 {
     log1p(difference + math::sqrt(2.0 * difference + difference * difference))
 }
 
-pub fn atanh(value: float64) -> float64 {
+pub fn atanh(value: f64) -> f64 {
     if math::is_nan(value) {
         return value
     } else if value < -1.0 || value > 1.0 {
@@ -916,7 +912,7 @@ pub fn atanh(value: float64) -> float64 {
     }
 }
 
-fn atan_kernel(value: float64) -> float64 {
+fn atan_kernel(value: f64) -> f64 {
     let square = value * value;
     let numerator = (((-0.8750608600031904 * square - 16.15753718733365) * square
         - 75.00855792314705)
@@ -933,7 +929,7 @@ fn atan_kernel(value: float64) -> float64 {
     value + value * square * numerator / denominator
 }
 
-fn atan_positive(value: float64) -> float64 {
+fn atan_positive(value: f64) -> f64 {
     if value <= 0.66 {
         atan_kernel(value)
     } else if value > 2.414213562373095 {
@@ -943,7 +939,7 @@ fn atan_positive(value: float64) -> float64 {
     }
 }
 
-pub fn atan(value: float64) -> float64 {
+pub fn atan(value: f64) -> f64 {
     if value == 0.0 || math::is_nan(value) {
         value
     } else if value > 0.0 {
@@ -953,7 +949,7 @@ pub fn atan(value: float64) -> float64 {
     }
 }
 
-pub fn asin(value: float64) -> float64 {
+pub fn asin(value: f64) -> f64 {
     if math::is_nan(value) || value < -1.0 || value > 1.0 {
         not_a_number()
     } else if value == 0.0 {
@@ -963,7 +959,7 @@ pub fn asin(value: float64) -> float64 {
     }
 }
 
-pub fn acos(value: float64) -> float64 {
+pub fn acos(value: f64) -> f64 {
     if math::is_nan(value) || value < -1.0 || value > 1.0 {
         not_a_number()
     } else if value == 1.0 {
@@ -975,7 +971,7 @@ pub fn acos(value: float64) -> float64 {
     }
 }
 
-pub fn atan2(y: float64, x: float64) -> float64 {
+pub fn atan2(y: f64, x: f64) -> f64 {
     if math::is_nan(y) || math::is_nan(x) {
         return not_a_number()
     } else if y == 0.0 {

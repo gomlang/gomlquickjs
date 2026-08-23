@@ -30,9 +30,9 @@ struct ArraySortSlot {
     string_value: Ref[Option[runtime::JsString]],
 }
 
-const ARRAY_FROM_LIMIT: int = 16777216;
+const ARRAY_FROM_LIMIT: isize = 16777216;
 
-const ARRAY_FLAT_RECURSION_LIMIT: int = 256;
+const ARRAY_FLAT_RECURSION_LIMIT: isize = 256;
 
 fn array_builtin_receiver(value: runtime::Value) -> Result[runtime::ObjectId, vm::NativeError] {
     match value {
@@ -45,7 +45,10 @@ fn array_builtin_error(value: arrayx::ArrayError) -> vm::NativeError {
     native_error(value.to_string())
 }
 
-fn array_builtin_integer(value: runtime::Value, default_value: int) -> Result[int, vm::NativeError] {
+fn array_builtin_integer(value: runtime::Value, default_value: isize) -> Result[
+    isize,
+    vm::NativeError,
+] {
     match value {
         runtime::Value::Undefined => Result::Ok(default_value),
         value => {
@@ -164,7 +167,7 @@ fn array_builtin_index_of(
     let array = array_builtin_receiver(this_value)?;
     let index = array_builtin_integer(argument(arguments, 1), 0)?;
     match arrayx::index_of(heap, array, argument(arguments, 0), index) {
-        Ok(value) => Result::Ok(runtime::Value::Int(value.to_int32())),
+        Ok(value) => Result::Ok(runtime::Value::Int(value.to_i32())),
         Err(value) => Result::Err(array_builtin_error(value)),
     }
 }
@@ -180,7 +183,7 @@ fn array_builtin_last_index_of(
         value => Option::Some(array_builtin_integer(value, 0)?),
     };
     match arrayx::last_index_of(heap, array, argument(arguments, 0), index) {
-        Ok(value) => Result::Ok(runtime::Value::Int(value.to_int32())),
+        Ok(value) => Result::Ok(runtime::Value::Int(value.to_i32())),
         Err(value) => Result::Err(array_builtin_error(value)),
     }
 }
@@ -264,7 +267,7 @@ fn array_builtin_splice(
     } else {
         array_builtin_integer(argument(arguments, 1), 0)?
     };
-    let items: Vec[runtime::Value] = Vec::[];
+    let items: Vec[runtime::Value] = Vec::new();
     let mut index = 2;
     while index < arguments.len() {
         items.push(arguments[index]);
@@ -276,10 +279,12 @@ fn array_builtin_splice(
     }
 }
 
-fn array_copy_integer(context: vm::Context, value: runtime::Value, default_value: int, depth: int) -> Result[
-    int,
-    vm::VmError,
-] {
+fn array_copy_integer(
+    context: vm::Context,
+    value: runtime::Value,
+    default_value: isize,
+    depth: isize,
+) -> Result[isize, vm::VmError] {
     match value {
         runtime::Value::Undefined => Result::Ok(default_value),
         _ => {
@@ -301,7 +306,7 @@ fn array_copy_integer(context: vm::Context, value: runtime::Value, default_value
     }
 }
 
-fn array_copy_start(index: int, length: int) -> int {
+fn array_copy_start(index: isize, length: isize) -> isize {
     if index < 0 {
         let value = length + index;
         if value < 0 {
@@ -316,7 +321,7 @@ fn array_copy_start(index: int, length: int) -> int {
     }
 }
 
-fn array_copy_read(context: vm::Context, object: runtime::Value, index: int, depth: int) -> Result[
+fn array_copy_read(context: vm::Context, object: runtime::Value, index: isize, depth: isize) -> Result[
     runtime::Value,
     vm::VmError,
 ] {
@@ -333,7 +338,7 @@ fn array_object_value(context: vm::Context, value: runtime::Value) -> Result[
     }
 }
 
-fn array_property_present(context: vm::Context, object: runtime::Value, index: int) -> Result[
+fn array_property_present(context: vm::Context, object: runtime::Value, index: isize) -> Result[
     bool,
     vm::VmError,
 ] {
@@ -354,9 +359,9 @@ fn array_property_present(context: vm::Context, object: runtime::Value, index: i
 fn array_set_value(
     context: vm::Context,
     object: runtime::Value,
-    index: int,
+    index: isize,
     value: runtime::Value,
-    depth: int,
+    depth: isize,
 ) -> Result[unit, vm::VmError] {
     if context.reflect_set_at_depth(object, array_length_value(index), value, object, depth)? {
         Result::Ok(())
@@ -365,7 +370,7 @@ fn array_set_value(
     }
 }
 
-fn array_delete_value(context: vm::Context, object: runtime::Value, index: int) -> Result[
+fn array_delete_value(context: vm::Context, object: runtime::Value, index: isize) -> Result[
     unit,
     vm::VmError,
 ] {
@@ -408,7 +413,7 @@ fn array_value_is_array(heap: runtime::Heap, value: runtime::Value) -> bool {
     }
 }
 
-fn array_species_create(context: vm::Context, original: runtime::Value, length: int, depth: int) -> Result[
+fn array_species_create(context: vm::Context, original: runtime::Value, length: isize, depth: isize) -> Result[
     runtime::Value,
     vm::VmError,
 ] {
@@ -452,7 +457,7 @@ fn array_species_create(context: vm::Context, original: runtime::Value, length: 
     };
     let result = context.construct_with_new_target_at_depth(
         selected,
-        Vec::[array_length_value(length)],
+        Vec::from_array([array_length_value(length)]),
         selected,
         depth,
     )?;
@@ -466,7 +471,7 @@ fn array_to_reversed(
     context: vm::Context,
     this_value: runtime::Value,
     arguments: Vec[runtime::Value],
-    depth: int,
+    depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     let _ = arguments;
     let object = array_object_value(context, this_value)?;
@@ -487,7 +492,7 @@ fn array_with(
     context: vm::Context,
     this_value: runtime::Value,
     arguments: Vec[runtime::Value],
-    depth: int,
+    depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     let object = array_object_value(context, this_value)?;
     let length = array_iterator_length(context, object, depth)?;
@@ -520,7 +525,7 @@ fn array_to_spliced(
     context: vm::Context,
     this_value: runtime::Value,
     arguments: Vec[runtime::Value],
-    depth: int,
+    depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     let object = array_object_value(context, this_value)?;
     let length = array_iterator_length(context, object, depth)?;
@@ -570,7 +575,7 @@ fn array_to_spliced(
     array_copy_result(context, values)
 }
 
-fn array_sort_string_compare(left: runtime::JsString, right: runtime::JsString) -> int {
+fn array_sort_string_compare(left: runtime::JsString, right: runtime::JsString) -> isize {
     let mut index = 0;
     let length = if left.len() < right.len() {
         left.len()
@@ -594,7 +599,7 @@ fn array_sort_string_compare(left: runtime::JsString, right: runtime::JsString) 
     }
 }
 
-fn array_sort_slot_string(context: vm::Context, slot: ArraySortSlot, depth: int) -> Result[
+fn array_sort_slot_string(context: vm::Context, slot: ArraySortSlot, depth: isize) -> Result[
     runtime::JsString,
     vm::VmError,
 ] {
@@ -615,8 +620,8 @@ fn array_sort_compare_slots(
     callback: runtime::Value,
     left: ArraySortSlot,
     right: ArraySortSlot,
-    depth: int,
-) -> Result[int, vm::VmError] {
+    depth: isize,
+) -> Result[isize, vm::VmError] {
     match callback {
         runtime::Value::Undefined => Result::Ok(
             array_sort_string_compare(
@@ -629,7 +634,7 @@ fn array_sort_compare_slots(
         } else {
             let result = context.invoke_with_this_at_depth(
                 callback,
-                Vec::[left.value, right.value],
+                Vec::from_array([left.value, right.value]),
                 runtime::Value::Undefined,
                 depth,
             )?;
@@ -653,7 +658,7 @@ fn array_sort_slots(
     context: vm::Context,
     values: Vec[ArraySortSlot],
     callback: runtime::Value,
-    depth: int,
+    depth: isize,
 ) -> Result[unit, vm::VmError] {
     let mut index = 1;
     while index < values.len() {
@@ -673,11 +678,11 @@ fn array_sort_slots(
 fn array_collect_sort_values(
     context: vm::Context,
     object: runtime::Value,
-    length: int,
+    length: isize,
     dense: bool,
-    depth: int,
-) -> Result[(Vec[ArraySortSlot], int), vm::VmError] {
-    let values: Vec[ArraySortSlot] = Vec::[];
+    depth: isize,
+) -> Result[(Vec[ArraySortSlot], isize), vm::VmError] {
+    let values: Vec[ArraySortSlot] = Vec::new();
     let mut undefined_count = 0;
     let mut index = 0;
     while index < length {
@@ -701,7 +706,7 @@ fn array_to_sorted(
     context: vm::Context,
     this_value: runtime::Value,
     arguments: Vec[runtime::Value],
-    depth: int,
+    depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     let callback = argument(arguments, 0);
     match callback {
@@ -732,7 +737,7 @@ fn array_fill(
     context: vm::Context,
     this_value: runtime::Value,
     arguments: Vec[runtime::Value],
-    depth: int,
+    depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     let object = array_object_value(context, this_value)?;
     let length = array_iterator_length(context, object, depth)?;
@@ -758,7 +763,7 @@ fn array_copy_within(
     context: vm::Context,
     this_value: runtime::Value,
     arguments: Vec[runtime::Value],
-    depth: int,
+    depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     let object = array_object_value(context, this_value)?;
     let length = array_iterator_length(context, object, depth)?;
@@ -810,7 +815,7 @@ fn array_sort(
     context: vm::Context,
     this_value: runtime::Value,
     arguments: Vec[runtime::Value],
-    depth: int,
+    depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     let callback = argument(arguments, 0);
     match callback {
@@ -847,15 +852,15 @@ fn array_flatten_into(
     context: vm::Context,
     target: runtime::Value,
     source: runtime::Value,
-    source_length: int,
-    target_index: int,
-    flatten_depth: int,
+    source_length: isize,
+    target_index: isize,
+    flatten_depth: isize,
     mapper: runtime::Value,
     mapper_this: runtime::Value,
     map_values: bool,
-    depth: int,
-    recursion: int,
-) -> Result[int, vm::VmError] {
+    depth: isize,
+    recursion: isize,
+) -> Result[isize, vm::VmError] {
     if recursion > ARRAY_FLAT_RECURSION_LIMIT {
         return Result::Err(function_range_error("Array flattening exceeds recursion limit"))
     } else {};
@@ -867,7 +872,7 @@ fn array_flatten_into(
             let element = if map_values {
                 context.invoke_with_this_at_depth(
                     mapper,
-                    Vec::[original, array_length_value(source_index), source],
+                    Vec::from_array([original, array_length_value(source_index), source]),
                     mapper_this,
                     depth,
                 )?
@@ -914,7 +919,7 @@ fn array_flatten(
     map_values: bool,
     this_value: runtime::Value,
     arguments: Vec[runtime::Value],
-    depth: int,
+    depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     let object = array_object_value(context, this_value)?;
     let length = array_iterator_length(context, object, depth)?;
@@ -955,7 +960,7 @@ fn array_flatten(
     Result::Ok(target)
 }
 
-fn array_concat_spreadable(context: vm::Context, value: runtime::Value, depth: int) -> Result[
+fn array_concat_spreadable(context: vm::Context, value: runtime::Value, depth: isize) -> Result[
     bool,
     vm::VmError,
 ] {
@@ -984,7 +989,7 @@ fn array_concat(
     context: vm::Context,
     this_value: runtime::Value,
     arguments: Vec[runtime::Value],
-    depth: int,
+    depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     let source = array_object_value(context, this_value)?;
     let target = array_species_create(context, source, 0, depth)?;
@@ -1050,8 +1055,8 @@ fn array_iteration_result_array(
     context: vm::Context,
     mode: ArrayIterationMode,
     source: runtime::Value,
-    length: int,
-    depth: int,
+    length: isize,
+    depth: isize,
 ) -> Result[Option[runtime::Value], vm::VmError] {
     match mode {
         ArrayIterationMode::Map => {
@@ -1083,7 +1088,7 @@ fn array_iterate(
     mode: ArrayIterationMode,
     this_value: runtime::Value,
     arguments: Vec[runtime::Value],
-    depth: int,
+    depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     let object = array_object_value(context, this_value)?;
     let length = array_iterator_length(context, object, depth)?;
@@ -1106,12 +1111,12 @@ fn array_iterate(
         if present || array_iteration_visits_holes(mode) {
             let value = context.read_property_at_depth(
                 object,
-                runtime::Value::Int(index.to_int32()),
+                runtime::Value::Int(index.to_i32()),
                 depth,
             )?;
             let selected = context.invoke_with_this_at_depth(
                 callback,
-                Vec::[value, array_length_value(index), object],
+                Vec::from_array([value, array_length_value(index), object]),
                 callback_this,
                 depth,
             )?;
@@ -1192,7 +1197,7 @@ fn array_reduce(
     this_value: runtime::Value,
     arguments: Vec[runtime::Value],
     reverse: bool,
-    depth: int,
+    depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     let object = array_object_value(context, this_value)?;
     let length = array_iterator_length(context, object, depth)?;
@@ -1215,7 +1220,7 @@ fn array_reduce(
         } {
         if array_property_present(context, object, index)? {
             accumulator = Option::Some(
-                context.read_property_at_depth(object, runtime::Value::Int(index.to_int32()), depth)?,
+                context.read_property_at_depth(object, runtime::Value::Int(index.to_i32()), depth)?,
             );
         } else {};
         if reverse {
@@ -1236,12 +1241,12 @@ fn array_reduce(
         if array_property_present(context, object, index)? {
             let value = context.read_property_at_depth(
                 object,
-                runtime::Value::Int(index.to_int32()),
+                runtime::Value::Int(index.to_i32()),
                 depth,
             )?;
             result = context.invoke_with_this_at_depth(
                 callback,
-                Vec::[result, value, array_length_value(index), object],
+                Vec::from_array([result, value, array_length_value(index), object]),
                 runtime::Value::Undefined,
                 depth,
             )?;
@@ -1295,7 +1300,7 @@ fn array_to_locale_string(
     context: vm::Context,
     this_value: runtime::Value,
     arguments: Vec[runtime::Value],
-    depth: int,
+    depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     let _ = arguments;
     let object = array_object_value(context, this_value)?;
@@ -1320,7 +1325,7 @@ fn array_to_locale_string(
                     runtime::Value::String(js_string("toLocaleString")),
                     depth,
                 )?;
-                let call_arguments: Vec[runtime::Value] = Vec::[];
+                let call_arguments: Vec[runtime::Value] = Vec::new();
                 let localized = context.invoke_with_this_at_depth(
                     method,
                     call_arguments,
@@ -1348,7 +1353,7 @@ fn array_to_string(
     context: vm::Context,
     this_value: runtime::Value,
     arguments: Vec[runtime::Value],
-    depth: int,
+    depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     let _ = arguments;
     let object = match object_coercion(context.heap(), this_value) {
@@ -1360,7 +1365,7 @@ fn array_to_string(
         runtime::Value::String(js_string("join")),
         depth,
     )?;
-    let empty: Vec[runtime::Value] = Vec::[];
+    let empty: Vec[runtime::Value] = Vec::new();
     match join {
         runtime::Value::Object(value) => if value.is_callable() {
             context.invoke_with_this_at_depth(join, empty, object, depth)
@@ -1371,8 +1376,8 @@ fn array_to_string(
     }
 }
 
-fn array_iterator_length(context: vm::Context, object: runtime::Value, depth: int) -> Result[
-    int,
+fn array_iterator_length(context: vm::Context, object: runtime::Value, depth: isize) -> Result[
+    isize,
     vm::VmError,
 ] {
     let value = context.read_property_at_depth(
@@ -1398,15 +1403,15 @@ fn array_from_map(
     mapper: runtime::Value,
     this_argument: runtime::Value,
     value: runtime::Value,
-    index: int,
-    depth: int,
+    index: isize,
+    depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     match mapper {
         runtime::Value::Undefined => Result::Ok(value),
         runtime::Value::Object(object) => if object.is_callable() {
             context.invoke_with_this_at_depth(
                 mapper,
-                Vec::[value, array_length_value(index)],
+                Vec::from_array([value, array_length_value(index)]),
                 this_argument,
                 depth,
             )
@@ -1417,7 +1422,7 @@ fn array_from_map(
     }
 }
 
-fn array_from_close(context: vm::Context, iterator: runtime::Value, depth: int) -> Result[
+fn array_from_close(context: vm::Context, iterator: runtime::Value, depth: isize) -> Result[
     unit,
     vm::VmError,
 ] {
@@ -1429,7 +1434,7 @@ fn array_from_close(context: vm::Context, iterator: runtime::Value, depth: int) 
     match method {
         runtime::Value::Undefined | runtime::Value::Null => Result::Ok(()),
         runtime::Value::Object(object) => if object.is_callable() {
-            let arguments: Vec[runtime::Value] = Vec::[];
+            let arguments: Vec[runtime::Value] = Vec::new();
             let result = context.invoke_with_this_at_depth(method, arguments, iterator, depth)?;
             match result {
                 runtime::Value::Object(_) => Result::Ok(()),
@@ -1450,9 +1455,9 @@ fn array_from_iterator(
     method: runtime::Value,
     mapper: runtime::Value,
     this_argument: runtime::Value,
-    depth: int,
+    depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
-    let iterator_arguments: Vec[runtime::Value] = Vec::[];
+    let iterator_arguments: Vec[runtime::Value] = Vec::new();
     let iterator = context.invoke_with_this_at_depth(method, iterator_arguments, source, depth)?;
     match iterator {
         runtime::Value::Object(_) => (),
@@ -1469,9 +1474,9 @@ fn array_from_iterator(
         } else {},
         _ => return Result::Err(function_vm_error("iterator next is not callable")),
     };
-    let values: Vec[runtime::Value] = Vec::[];
+    let values: Vec[runtime::Value] = Vec::new();
     while values.len() < ARRAY_FROM_LIMIT {
-        let next_arguments: Vec[runtime::Value] = Vec::[];
+        let next_arguments: Vec[runtime::Value] = Vec::new();
         let result = context.invoke_with_this_at_depth(next, next_arguments, iterator, depth)?;
         match result {
             runtime::Value::Object(_) => (),
@@ -1519,7 +1524,7 @@ fn array_from(
     context: vm::Context,
     this_value: runtime::Value,
     arguments: Vec[runtime::Value],
-    depth: int,
+    depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     let _ = this_value;
     let source = argument(arguments, 0);
@@ -1581,8 +1586,8 @@ fn array_iterator_value(
     context: vm::Context,
     kind: ArrayIteratorKind,
     object: runtime::Value,
-    index: int,
-    depth: int,
+    index: isize,
+    depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     let key = array_length_value(index);
     match kind {
@@ -1590,7 +1595,7 @@ fn array_iterator_value(
         ArrayIteratorKind::Values => context.read_property_at_depth(object, key, depth),
         ArrayIteratorKind::Entries => {
             let value = context.read_property_at_depth(object, key, depth)?;
-            let values: Vec[runtime::Value] = Vec::[key, value];
+            let values: Vec[runtime::Value] = Vec::from_array([key, value]);
             match allocate_array(context.heap(), values, 2) {
                 Ok(value) => Result::Ok(runtime::Value::Object(value)),
                 Err(value) => Result::Err(function_vm_error(value.message)),
@@ -1717,20 +1722,22 @@ fn install_array_prototype(context: vm::Context, constructor: runtime::Value) ->
         },
         None => (),
     };
-    for (name, callback) in Vec::[
-        ("at", array_builtin_at),
-        ("join", array_builtin_join),
-        ("reverse", array_builtin_reverse),
-        ("slice", array_builtin_slice),
-        ("indexOf", array_builtin_index_of),
-        ("lastIndexOf", array_builtin_last_index_of),
-        ("includes", array_builtin_includes),
-        ("push", array_builtin_push),
-        ("pop", array_builtin_pop),
-        ("shift", array_builtin_shift),
-        ("unshift", array_builtin_unshift),
-        ("splice", array_builtin_splice),
-    ] {
+    for (name, callback) in Vec::from_array(
+        [
+            ("at", array_builtin_at),
+            ("join", array_builtin_join),
+            ("reverse", array_builtin_reverse),
+            ("slice", array_builtin_slice),
+            ("indexOf", array_builtin_index_of),
+            ("lastIndexOf", array_builtin_last_index_of),
+            ("includes", array_builtin_includes),
+            ("push", array_builtin_push),
+            ("pop", array_builtin_pop),
+            ("shift", array_builtin_shift),
+            ("unshift", array_builtin_unshift),
+            ("splice", array_builtin_splice),
+        ],
+    ) {
         define_function(context, prototype, name, callback)?;
         if name == "join" {
             define_value(
@@ -1763,17 +1770,19 @@ fn install_array_prototype(context: vm::Context, constructor: runtime::Value) ->
         true,
         true,
     )?;
-    for (name, mode) in Vec::[
-        ("forEach", ArrayIterationMode::ForEach),
-        ("map", ArrayIterationMode::Map),
-        ("filter", ArrayIterationMode::Filter),
-        ("every", ArrayIterationMode::Every),
-        ("some", ArrayIterationMode::Some),
-        ("find", ArrayIterationMode::Find),
-        ("findIndex", ArrayIterationMode::FindIndex),
-        ("findLast", ArrayIterationMode::FindLast),
-        ("findLastIndex", ArrayIterationMode::FindLastIndex),
-    ] {
+    for (name, mode) in Vec::from_array(
+        [
+            ("forEach", ArrayIterationMode::ForEach),
+            ("map", ArrayIterationMode::Map),
+            ("filter", ArrayIterationMode::Filter),
+            ("every", ArrayIterationMode::Every),
+            ("some", ArrayIterationMode::Some),
+            ("find", ArrayIterationMode::Find),
+            ("findIndex", ArrayIterationMode::FindIndex),
+            ("findLast", ArrayIterationMode::FindLast),
+            ("findLastIndex", ArrayIterationMode::FindLastIndex),
+        ],
+    ) {
         define_value(
             context.heap(),
             prototype,
@@ -1789,16 +1798,18 @@ fn install_array_prototype(context: vm::Context, constructor: runtime::Value) ->
             true,
         )?
     }
-    for (name, callback) in Vec::[
-        ("toReversed", array_to_reversed),
-        ("toSorted", array_to_sorted),
-        ("with", array_with),
-        ("toSpliced", array_to_spliced),
-        ("fill", array_fill),
-        ("copyWithin", array_copy_within),
-        ("sort", array_sort),
-        ("concat", array_concat),
-    ] {
+    for (name, callback) in Vec::from_array(
+        [
+            ("toReversed", array_to_reversed),
+            ("toSorted", array_to_sorted),
+            ("with", array_with),
+            ("toSpliced", array_to_spliced),
+            ("fill", array_fill),
+            ("copyWithin", array_copy_within),
+            ("sort", array_sort),
+            ("concat", array_concat),
+        ],
+    ) {
         define_value(
             context.heap(),
             prototype,
@@ -1814,7 +1825,7 @@ fn install_array_prototype(context: vm::Context, constructor: runtime::Value) ->
             true,
         )?
     }
-    for (name, reverse) in Vec::[("reduce", false), ("reduceRight", true)] {
+    for (name, reverse) in Vec::from_array([("reduce", false), ("reduceRight", true)]) {
         define_value(
             context.heap(),
             prototype,
@@ -1830,7 +1841,7 @@ fn install_array_prototype(context: vm::Context, constructor: runtime::Value) ->
             true,
         )?
     }
-    for (name, map_values) in Vec::[("flat", false), ("flatMap", true)] {
+    for (name, map_values) in Vec::from_array([("flat", false), ("flatMap", true)]) {
         define_value(
             context.heap(),
             prototype,
@@ -1893,24 +1904,26 @@ fn install_array_prototype(context: vm::Context, constructor: runtime::Value) ->
                 Ok(value) => value,
                 Err(value) => return Result::Err(BuiltinError { message: value.message }),
             };
-            for name in Vec::[
-                "at",
-                "copyWithin",
-                "entries",
-                "fill",
-                "find",
-                "findIndex",
-                "findLast",
-                "findLastIndex",
-                "flat",
-                "flatMap",
-                "includes",
-                "keys",
-                "toReversed",
-                "toSorted",
-                "toSpliced",
-                "values",
-            ] {
+            for name in Vec::from_array(
+                [
+                    "at",
+                    "copyWithin",
+                    "entries",
+                    "fill",
+                    "find",
+                    "findIndex",
+                    "findLast",
+                    "findLastIndex",
+                    "flat",
+                    "flatMap",
+                    "includes",
+                    "keys",
+                    "toReversed",
+                    "toSorted",
+                    "toSpliced",
+                    "values",
+                ],
+            ) {
                 define_value(
                     context.heap(),
                     unscopables,

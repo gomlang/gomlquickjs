@@ -19,7 +19,7 @@ pub enum JsonErrorKind {
 #[derive(PartialEq, Eq, Debug)]
 pub struct JsonError {
     pub kind: JsonErrorKind,
-    pub offset: int,
+    pub offset: isize,
     pub message: string,
 }
 
@@ -92,7 +92,7 @@ impl ToString for JsonError {
 struct Parser {
     heap: runtime::Heap,
     input: runtime::JsString,
-    position: Ref[int],
+    position: Ref[isize],
     sources: JsonParseSources,
     latest_source: Ref[Option[JsonSourceEntry]],
 }
@@ -105,7 +105,7 @@ fn allocation_error(parser: Parser, message: string) -> JsonError {
     JsonError { kind: JsonErrorKind::Allocation, offset: parser.position.get(), message }
 }
 
-fn peek(parser: Parser) -> Option[uint16] {
+fn peek(parser: Parser) -> Option[u16] {
     if parser.position.get() < parser.input.len() {
         Option::Some(parser.input.get(parser.position.get()))
     } else {
@@ -113,7 +113,7 @@ fn peek(parser: Parser) -> Option[uint16] {
     }
 }
 
-fn take(parser: Parser) -> Option[uint16] {
+fn take(parser: Parser) -> Option[u16] {
     match peek(parser) {
         Some(value) => {
             parser.position.set(parser.position.get() + 1);
@@ -123,7 +123,7 @@ fn take(parser: Parser) -> Option[uint16] {
     }
 }
 
-fn json_whitespace(value: uint16) -> bool {
+fn json_whitespace(value: u16) -> bool {
     value == 0x09 || value == 0x0a || value == 0x0d || value == 0x20
 }
 
@@ -142,7 +142,7 @@ fn ascii_literal(parser: Parser, value: string) -> bool {
     let mut index = 0;
     while index < bytes.len() {
         if parser.position.get() >= parser.input.len()
-            || parser.input.get(parser.position.get()) != bytes[index].to_uint16() {
+            || parser.input.get(parser.position.get()) != bytes[index].to_u16() {
             parser.position.set(start);
             return false
         } else {};
@@ -152,7 +152,7 @@ fn ascii_literal(parser: Parser, value: string) -> bool {
     true
 }
 
-fn hex_value(value: uint16) -> Option[uint16] {
+fn hex_value(value: u16) -> Option[u16] {
     if value >= 48 && value <= 57 {
         Option::Some(value - 48)
     } else if value >= 65 && value <= 70 {
@@ -164,8 +164,8 @@ fn hex_value(value: uint16) -> Option[uint16] {
     }
 }
 
-fn parse_unicode_escape(parser: Parser) -> Result[uint16, JsonError] {
-    let mut result: uint16 = 0;
+fn parse_unicode_escape(parser: Parser) -> Result[u16, JsonError] {
+    let mut result: u16 = 0;
     let mut count = 0;
     while count < 4 {
         let current = match take(parser) {
@@ -186,7 +186,7 @@ fn parse_string(parser: Parser) -> Result[runtime::JsString, JsonError] {
     if take(parser) != Option::Some(34) {
         return Result::Err(syntax_error(parser, "expected string"))
     } else {};
-    let output: Vec[uint16] = Vec::[];
+    let output: Vec[u16] = Vec::new();
     loop {
         let current = match take(parser) {
             Some(value) => value,
@@ -217,15 +217,15 @@ fn parse_string(parser: Parser) -> Result[runtime::JsString, JsonError] {
     }
 }
 
-fn digit(value: uint16) -> bool {
+fn digit(value: u16) -> bool {
     value >= 48 && value <= 57
 }
 
-fn nonzero_digit(value: uint16) -> bool {
+fn nonzero_digit(value: u16) -> bool {
     value >= 49 && value <= 57
 }
 
-fn consume_digits(parser: Parser) -> int {
+fn consume_digits(parser: Parser) -> isize {
     let start = parser.position.get();
     while match peek(parser) {
         Some(value) => digit(value),
@@ -236,11 +236,11 @@ fn consume_digits(parser: Parser) -> int {
     parser.position.get() - start
 }
 
-fn ascii_slice(input: runtime::JsString, start: int, end: int) -> string {
+fn ascii_slice(input: runtime::JsString, start: isize, end: isize) -> string {
     let bytes: Vec[byte] = Vec::with_capacity(end - start);
     let mut index = start;
     while index < end {
-        bytes.push(input.get(index).to_uint8());
+        bytes.push(input.get(index).to_u8());
         index += 1;
     }
     let (_, value) = string_from_utf8(bytes);
@@ -356,7 +356,7 @@ fn allocate_object(parser: Parser, kind: runtime::ObjectKind) -> Result[
     }
 }
 
-fn finish_array(parser: Parser, object: runtime::ObjectId, length: int) -> Result[
+fn finish_array(parser: Parser, object: runtime::ObjectId, length: isize) -> Result[
     runtime::Value,
     JsonError,
 ] {
@@ -364,7 +364,7 @@ fn finish_array(parser: Parser, object: runtime::ObjectId, length: int) -> Resul
         parser.heap,
         object,
         runtime::string_property_key("length"),
-        runtime::data_descriptor(runtime::Value::Int(length.to_int32()), true, false, false),
+        runtime::data_descriptor(runtime::Value::Int(length.to_i32()), true, false, false),
     ) {
         Result::Ok(runtime::Value::Object(object))
     } else {
@@ -372,7 +372,7 @@ fn finish_array(parser: Parser, object: runtime::ObjectId, length: int) -> Resul
     }
 }
 
-fn parse_array(parser: Parser, depth: int) -> Result[runtime::Value, JsonError] {
+fn parse_array(parser: Parser, depth: isize) -> Result[runtime::Value, JsonError] {
     let _ = take(parser);
     let object = allocate_object(parser, runtime::ObjectKind::Array)?;
     skip_whitespace(parser);
@@ -402,7 +402,7 @@ fn parse_array(parser: Parser, depth: int) -> Result[runtime::Value, JsonError] 
     }
 }
 
-fn parse_object(parser: Parser, depth: int) -> Result[runtime::Value, JsonError] {
+fn parse_object(parser: Parser, depth: isize) -> Result[runtime::Value, JsonError] {
     let _ = take(parser);
     let object = allocate_object(parser, runtime::ObjectKind::Ordinary)?;
     skip_whitespace(parser);
@@ -438,7 +438,7 @@ fn parse_object(parser: Parser, depth: int) -> Result[runtime::Value, JsonError]
     }
 }
 
-fn parse_value(parser: Parser, depth: int) -> Result[runtime::Value, JsonError] {
+fn parse_value(parser: Parser, depth: isize) -> Result[runtime::Value, JsonError] {
     if depth > 512 {
         return Result::Err(syntax_error(parser, "JSON nesting limit exceeded"))
     } else {};
@@ -485,7 +485,7 @@ pub fn parse_with_sources(heap: runtime::Heap, input: runtime::JsString) -> Resu
     JsonError,
 ] {
     let sources = JsonParseSources {
-        values_value: HashMap::{},
+        values_value: HashMap::new(),
         seen_values: collections::HashSet::new(),
         duplicate_values: collections::HashSet::new(),
         root_value: Ref::new(Option::None),
@@ -515,16 +515,16 @@ fn stringify_error(kind: JsonErrorKind, message: string) -> JsonError {
     JsonError { kind, offset: -1, message }
 }
 
-fn append_ascii(output: Vec[uint16], value: string) -> unit {
+fn append_ascii(output: Vec[u16], value: string) -> unit {
     let bytes = value.to_bytes();
     let mut index = 0;
     while index < bytes.len() {
-        output.push(bytes[index].to_uint16());
+        output.push(bytes[index].to_u16());
         index += 1;
     }
 }
 
-fn hex_character(value: uint16) -> uint16 {
+fn hex_character(value: u16) -> u16 {
     if value < 10 {
         48 + value
     } else {
@@ -532,7 +532,7 @@ fn hex_character(value: uint16) -> uint16 {
     }
 }
 
-fn append_unicode_escape(output: Vec[uint16], value: uint16) -> unit {
+fn append_unicode_escape(output: Vec[u16], value: u16) -> unit {
     output.push(92);
     output.push(117);
     output.push(hex_character((value >> 12) & 15));
@@ -541,7 +541,7 @@ fn append_unicode_escape(output: Vec[uint16], value: uint16) -> unit {
     output.push(hex_character(value & 15));
 }
 
-fn append_quoted(output: Vec[uint16], value: runtime::JsString) -> unit {
+fn append_quoted(output: Vec[u16], value: runtime::JsString) -> unit {
     output.push(34);
     let mut index = 0;
     while index < value.len() {
@@ -597,7 +597,7 @@ fn unsupported_value(heap: runtime::Heap, value: runtime::Value) -> Result[bool,
     }
 }
 
-fn array_length(heap: runtime::Heap, id: runtime::ObjectId) -> Result[int, JsonError] {
+fn array_length(heap: runtime::Heap, id: runtime::ObjectId) -> Result[isize, JsonError] {
     let value = match runtime::get_property(heap, id, runtime::string_property_key("length")) {
         Ok(Some(value)) => value,
         Ok(None) => return Result::Ok(0),
@@ -606,7 +606,7 @@ fn array_length(heap: runtime::Heap, id: runtime::ObjectId) -> Result[int, JsonE
     match value {
         runtime::Value::Undefined | runtime::Value::Null => Result::Ok(0),
         runtime::Value::Int(value) => if value >= 0 {
-            Result::Ok(value.to_int())
+            Result::Ok(value.to_isize())
         } else {
             Result::Err(stringify_error(JsonErrorKind::InvalidArrayLength, "negative array length"))
         },
@@ -631,7 +631,7 @@ fn array_length(heap: runtime::Heap, id: runtime::ObjectId) -> Result[int, JsonE
     }
 }
 
-fn array_value(heap: runtime::Heap, id: runtime::ObjectId, index: int) -> Result[
+fn array_value(heap: runtime::Heap, id: runtime::ObjectId, index: isize) -> Result[
     runtime::Value,
     JsonError,
 ] {
@@ -676,7 +676,7 @@ fn enumerable_property_value(heap: runtime::Heap, id: runtime::ObjectId, key: ru
 fn write_array(
     heap: runtime::Heap,
     id: runtime::ObjectId,
-    output: Vec[uint16],
+    output: Vec[u16],
     stack: collections::HashSet[runtime::ObjectId],
 ) -> Result[unit, JsonError] {
     let length = array_length(heap, id)?;
@@ -699,7 +699,7 @@ fn write_array(
 fn write_object(
     heap: runtime::Heap,
     id: runtime::ObjectId,
-    output: Vec[uint16],
+    output: Vec[u16],
     stack: collections::HashSet[runtime::ObjectId],
 ) -> Result[unit, JsonError] {
     output.push(123);
@@ -732,7 +732,7 @@ fn write_object(
 fn write_value(
     heap: runtime::Heap,
     value: runtime::Value,
-    output: Vec[uint16],
+    output: Vec[u16],
     stack: collections::HashSet[runtime::ObjectId],
 ) -> Result[bool, JsonError] {
     match value {
@@ -801,7 +801,7 @@ fn write_value(
 }
 
 pub fn stringify(heap: runtime::Heap, value: runtime::Value) -> Result[runtime::JsString, JsonError] {
-    let output: Vec[uint16] = Vec::[];
+    let output: Vec[u16] = Vec::new();
     let stack: collections::HashSet[runtime::ObjectId] = collections::HashSet::new();
     if write_value(heap, value, output, stack)? {
         Result::Ok(runtime::JsString::from_code_units(output))

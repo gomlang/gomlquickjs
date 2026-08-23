@@ -1,17 +1,17 @@
 package unicode;
 
-pub const QUICKJS_UTF8_MAX: uint32 = 0x7fffffff;
+pub const QUICKJS_UTF8_MAX: u32 = 0x7fffffff;
 
-pub const QUICKJS_UTF8_MAX_BYTES: int = 6;
+pub const QUICKJS_UTF8_MAX_BYTES: isize = 6;
 
 pub enum Utf8Error {
     EmptyInput,
-    OffsetOutOfBounds(int),
-    CodePointOutOfRange(uint32),
+    OffsetOutOfBounds(isize),
+    CodePointOutOfRange(u32),
     InvalidLeadingByte(byte),
-    InvalidContinuationByte(int, byte),
-    TruncatedSequence(int, int),
-    OverlongEncoding(uint32, int),
+    InvalidContinuationByte(isize, byte),
+    TruncatedSequence(isize, isize),
+    OverlongEncoding(u32, isize),
 }
 
 impl ToString for Utf8Error {
@@ -48,48 +48,48 @@ impl Debug for Utf8Error {
 }
 
 pub struct Utf8Decoded {
-    code_point_value: uint32,
-    length_value: int,
+    code_point_value: u32,
+    length_value: isize,
 }
 
 impl Utf8Decoded {
-    pub fn code_point(self: Utf8Decoded) -> uint32 {
+    pub fn code_point(self: Utf8Decoded) -> u32 {
         self.code_point_value
     }
 
-    pub fn length(self: Utf8Decoded) -> int {
+    pub fn length(self: Utf8Decoded) -> isize {
         self.length_value
     }
 }
 
-fn continuation(value: uint32) -> byte {
-    ((value & 0x3f) | 0x80).to_uint8()
+fn continuation(value: u32) -> byte {
+    ((value & 0x3f) | 0x80).to_u8()
 }
 
-pub fn unicode_to_utf8(code_point: uint32) -> Result[Vec[byte], Utf8Error] {
+pub fn unicode_to_utf8(code_point: u32) -> Result[Vec[byte], Utf8Error] {
     let output: Vec[byte] = Vec::with_capacity(QUICKJS_UTF8_MAX_BYTES);
     if code_point < 0x80 {
-        output.push(code_point.to_uint8());
+        output.push(code_point.to_u8());
     } else if code_point < 0x800 {
-        output.push(((code_point >> 6) | 0xc0).to_uint8());
+        output.push(((code_point >> 6) | 0xc0).to_u8());
         output.push(continuation(code_point));
     } else if code_point < 0x10000 {
-        output.push(((code_point >> 12) | 0xe0).to_uint8());
+        output.push(((code_point >> 12) | 0xe0).to_u8());
         output.push(continuation(code_point >> 6));
         output.push(continuation(code_point));
     } else if code_point < 0x00200000 {
-        output.push(((code_point >> 18) | 0xf0).to_uint8());
+        output.push(((code_point >> 18) | 0xf0).to_u8());
         output.push(continuation(code_point >> 12));
         output.push(continuation(code_point >> 6));
         output.push(continuation(code_point));
     } else if code_point < 0x04000000 {
-        output.push(((code_point >> 24) | 0xf8).to_uint8());
+        output.push(((code_point >> 24) | 0xf8).to_u8());
         output.push(continuation(code_point >> 18));
         output.push(continuation(code_point >> 12));
         output.push(continuation(code_point >> 6));
         output.push(continuation(code_point));
     } else if code_point <= QUICKJS_UTF8_MAX {
-        output.push(((code_point >> 30) | 0xfc).to_uint8());
+        output.push(((code_point >> 30) | 0xfc).to_u8());
         output.push(continuation(code_point >> 24));
         output.push(continuation(code_point >> 18));
         output.push(continuation(code_point >> 12));
@@ -101,15 +101,15 @@ pub fn unicode_to_utf8(code_point: uint32) -> Result[Vec[byte], Utf8Error] {
     Result::Ok(output)
 }
 
-pub fn try_unicode_to_utf8(code_point: uint32) -> Option[Vec[byte]] {
+pub fn try_unicode_to_utf8(code_point: u32) -> Option[Vec[byte]] {
     match unicode_to_utf8(code_point) {
         Result::Ok(output) => Option::Some(output),
         Result::Err(_) => Option::None,
     }
 }
 
-fn leading_byte_shape(first: byte) -> Result[(int, uint32, uint32), Utf8Error] {
-    let value = first.to_uint32();
+fn leading_byte_shape(first: byte) -> Result[(isize, u32, u32), Utf8Error] {
+    let value = first.to_u32();
     if first >= 0xc0 && first <= 0xdf {
         Result::Ok((2, value & 0x1f, 0x80))
     } else if first >= 0xe0 && first <= 0xef {
@@ -125,7 +125,7 @@ fn leading_byte_shape(first: byte) -> Result[(int, uint32, uint32), Utf8Error] {
     }
 }
 
-pub fn unicode_from_utf8_at(input: Slice[byte], offset: int) -> Result[Utf8Decoded, Utf8Error] {
+pub fn unicode_from_utf8_at(input: Slice[byte], offset: isize) -> Result[Utf8Decoded, Utf8Error] {
     if offset < 0 || offset > input.len() {
         return Result::Err(Utf8Error::OffsetOutOfBounds(offset))
     } else if offset == input.len() {
@@ -133,7 +133,7 @@ pub fn unicode_from_utf8_at(input: Slice[byte], offset: int) -> Result[Utf8Decod
     } else {};
     let first = input.get(offset);
     if first < 0x80 {
-        return Result::Ok(Utf8Decoded { code_point_value: first.to_uint32(), length_value: 1 })
+        return Result::Ok(Utf8Decoded { code_point_value: first.to_u32(), length_value: 1 })
     } else {};
     let (length, initial, minimum) = leading_byte_shape(first)?;
     let available = input.len() - offset;
@@ -148,7 +148,7 @@ pub fn unicode_from_utf8_at(input: Slice[byte], offset: int) -> Result[Utf8Decod
         if current < 0x80 || current >= 0xc0 {
             return Result::Err(Utf8Error::InvalidContinuationByte(byte_index, current))
         } else {};
-        code_point = (code_point << 6) | (current.to_uint32() & 0x3f);
+        code_point = (code_point << 6) | (current.to_u32() & 0x3f);
         index += 1;
     }
     if code_point < minimum {
@@ -162,7 +162,7 @@ pub fn unicode_from_utf8(input: Slice[byte]) -> Result[Utf8Decoded, Utf8Error] {
     unicode_from_utf8_at(input, 0)
 }
 
-pub fn try_unicode_from_utf8_at(input: Slice[byte], offset: int) -> Option[Utf8Decoded] {
+pub fn try_unicode_from_utf8_at(input: Slice[byte], offset: isize) -> Option[Utf8Decoded] {
     match unicode_from_utf8_at(input, offset) {
         Result::Ok(decoded) => Option::Some(decoded),
         Result::Err(_) => Option::None,

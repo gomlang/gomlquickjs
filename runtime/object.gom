@@ -66,10 +66,10 @@ struct TypedArrayState {
 
 enum TypedArrayNumericIndex {
     Invalid,
-    Index(int),
+    Index(isize),
 }
 
-fn typed_array_length(view: TypedArrayView) -> int {
+fn typed_array_length(view: TypedArrayView) -> isize {
     match view {
         TypedArrayView::Uint8(value) => value.length(),
         TypedArrayView::Int32(value) => value.length(),
@@ -79,13 +79,13 @@ fn typed_array_length(view: TypedArrayView) -> int {
     }
 }
 
-fn typed_array_element(view: TypedArrayView, index: int) -> Option[Value] {
+fn typed_array_element(view: TypedArrayView, index: isize) -> Option[Value] {
     if index < 0 || index >= typed_array_length(view) {
         Option::None
     } else {
         match view {
             TypedArrayView::Uint8(value) => match value.get(index) {
-                Ok(value) => Option::Some(Value::Int(value.to_int32())),
+                Ok(value) => Option::Some(Value::Int(value.to_i32())),
                 Err(_) => Option::None,
             },
             TypedArrayView::Int32(value) => match value.get(index) {
@@ -108,7 +108,7 @@ fn typed_array_element(view: TypedArrayView, index: int) -> Option[Value] {
     }
 }
 
-fn typed_array_set_element(view: TypedArrayView, index: int, value: float64) -> bool {
+fn typed_array_set_element(view: TypedArrayView, index: isize, value: f64) -> bool {
     if index < 0 || index >= typed_array_length(view) {
         false
     } else {
@@ -122,7 +122,10 @@ fn typed_array_set_element(view: TypedArrayView, index: int, value: float64) -> 
     }
 }
 
-fn typed_array_set_value(view: TypedArrayView, index: int, value: Value) -> Result[bool, TypeError] {
+fn typed_array_set_value(view: TypedArrayView, index: isize, value: Value) -> Result[
+    bool,
+    TypeError,
+] {
     match view {
         TypedArrayView::BigInt(target) => {
             let converted = primitive_to_bigint(value)?;
@@ -179,17 +182,17 @@ pub enum PrimitivePrototypeKind {
 
 pub struct ObjectId {
     heap_identity_value: Ref[bool],
-    slot_value: int,
-    generation_value: uint64,
+    slot_value: isize,
+    generation_value: u64,
     callable_value: bool,
 }
 
 impl ObjectId {
-    pub fn slot(self: ObjectId) -> int {
+    pub fn slot(self: ObjectId) -> isize {
         self.slot_value
     }
 
-    pub fn generation(self: ObjectId) -> uint64 {
+    pub fn generation(self: ObjectId) -> u64 {
         self.generation_value
     }
 
@@ -208,7 +211,7 @@ impl PartialEq for ObjectId {
 impl Eq for ObjectId {}
 
 impl Hash for ObjectId {
-    fn hash(self: ObjectId) -> uint64 {
+    fn hash(self: ObjectId) -> u64 {
         ptr_hash(self.heap_identity_value) * 1099511628211 + Hash::hash(self.slot_value) * 16777619
             + self.generation_value
     }
@@ -227,7 +230,7 @@ pub struct Object {
     properties_value: collections::IndexMap[PropertyKey, PropertyDescriptor],
     private_elements_value: HashMap[ObjectId, PrivateElement],
     primitive_value_value: Ref[Option[Value]],
-    argument_map_value: HashMap[uint32, Ref[Value]],
+    argument_map_value: HashMap[u32, Ref[Value]],
     typed_array_value: Ref[Option[TypedArrayState]],
     proxy_value: Ref[Option[ProxyData]],
 }
@@ -275,7 +278,7 @@ impl Object {
         }
     }
 
-    pub fn own_property_count(self: Object) -> int {
+    pub fn own_property_count(self: Object) -> isize {
         self.properties_value.len()
             + match self.typed_array_value.get() {
                 Some(value) => typed_array_length(value.view),
@@ -327,12 +330,12 @@ impl Object {
 
 enum HeapSlot {
     Occupied {
-        generation: uint64,
+        generation: u64,
         object: Object,
     },
     Vacant {
-        generation: uint64,
-        next: Option[int],
+        generation: u64,
+        next: Option[isize],
     },
 }
 
@@ -358,8 +361,8 @@ pub struct FinalizationJob {
 pub struct Heap {
     identity_value: Ref[bool],
     slots_value: Vec[HeapSlot],
-    free_head_value: Ref[Option[int]],
-    live_count_value: Ref[int],
+    free_head_value: Ref[Option[isize]],
+    live_count_value: Ref[isize],
     object_prototype_value: Ref[Option[ObjectId]],
     function_prototype_value: Ref[Option[ObjectId]],
     array_prototype_value: Ref[Option[ObjectId]],
@@ -374,10 +377,10 @@ pub struct Heap {
 }
 
 pub struct GcStats {
-    pub live_before: int,
-    pub reachable: int,
-    pub collected: int,
-    pub live_after: int,
+    pub live_before: isize,
+    pub reachable: isize,
+    pub collected: isize,
+    pub live_after: isize,
 }
 
 pub struct GcEdge {
@@ -398,9 +401,9 @@ fn make_object(kind: ObjectKind, prototype: Option[ObjectId]) -> Object {
         prototype_value: Ref::new(prototype),
         extensible_value: Ref::new(true),
         properties_value: collections::IndexMap::new(),
-        private_elements_value: HashMap::{},
+        private_elements_value: HashMap::new(),
         primitive_value_value: Ref::new(Option::None),
-        argument_map_value: HashMap::{},
+        argument_map_value: HashMap::new(),
         typed_array_value: Ref::new(Option::None),
         proxy_value: Ref::new(Option::None),
     }
@@ -424,7 +427,7 @@ fn enqueue_value(
     heap: Heap,
     value: Value,
     marked: Vec[bool],
-    symbols: collections::HashSet[uint64],
+    symbols: collections::HashSet[u64],
     pending: Vec[ObjectId],
 ) -> unit {
     match value {
@@ -440,7 +443,7 @@ fn enqueue_optional_value(
     heap: Heap,
     value: Option[Value],
     marked: Vec[bool],
-    symbols: collections::HashSet[uint64],
+    symbols: collections::HashSet[u64],
     pending: Vec[ObjectId],
 ) -> unit {
     match value {
@@ -453,7 +456,7 @@ fn enqueue_descriptor(
     heap: Heap,
     descriptor: PropertyDescriptor,
     marked: Vec[bool],
-    symbols: collections::HashSet[uint64],
+    symbols: collections::HashSet[u64],
     pending: Vec[ObjectId],
 ) -> unit {
     match descriptor {
@@ -475,7 +478,7 @@ fn enqueue_private_element(
     heap: Heap,
     element: PrivateElement,
     marked: Vec[bool],
-    symbols: collections::HashSet[uint64],
+    symbols: collections::HashSet[u64],
     pending: Vec[ObjectId],
 ) -> unit {
     match element {
@@ -492,7 +495,7 @@ fn enqueue_private_element(
 fn drain_pending(
     heap: Heap,
     marked: Vec[bool],
-    symbols: collections::HashSet[uint64],
+    symbols: collections::HashSet[u64],
     pending: Vec[ObjectId],
 ) -> unit {
     while !pending.is_empty() {
@@ -565,12 +568,7 @@ fn marked_object(heap: Heap, id: ObjectId, marked: Vec[bool]) -> bool {
     }
 }
 
-fn marked_weak_key(
-    heap: Heap,
-    value: Value,
-    marked: Vec[bool],
-    symbols: collections::HashSet[uint64],
-) -> bool {
+fn marked_weak_key(heap: Heap, value: Value, marked: Vec[bool], symbols: collections::HashSet[u64]) -> bool {
     match value {
         Value::Object(object) => marked_object(heap, object, marked),
         Value::Symbol(value) => symbols.contains(value.id()),
@@ -582,7 +580,7 @@ fn enqueue_conditional_value(
     heap: Heap,
     value: Value,
     marked: Vec[bool],
-    symbols: collections::HashSet[uint64],
+    symbols: collections::HashSet[u64],
     pending: Vec[ObjectId],
 ) -> bool {
     match value {
@@ -600,7 +598,7 @@ fn enqueue_conditional_value(
 fn mark_conditional_edges(
     heap: Heap,
     marked: Vec[bool],
-    symbols: collections::HashSet[uint64],
+    symbols: collections::HashSet[u64],
     pending: Vec[ObjectId],
     edges: Vec[GcEdge],
 ) -> unit {
@@ -650,10 +648,10 @@ fn mark_reachable(
     heap: Heap,
     roots: Vec[Value],
     marked: Vec[bool],
-    symbols: collections::HashSet[uint64],
+    symbols: collections::HashSet[u64],
     edges: Vec[GcEdge],
-) -> int {
-    let pending: Vec[ObjectId] = Vec::[];
+) -> isize {
+    let pending: Vec[ObjectId] = Vec::new();
     for root in roots {
         enqueue_value(heap, root, marked, symbols, pending)
     }
@@ -674,7 +672,7 @@ impl Heap {
     pub fn new() -> Heap {
         Heap {
             identity_value: Ref::new(false),
-            slots_value: Vec::[],
+            slots_value: Vec::new(),
             free_head_value: Ref::new(Option::None),
             live_count_value: Ref::new(0),
             object_prototype_value: Ref::new(Option::None),
@@ -685,13 +683,13 @@ impl Heap {
             string_prototype_value: Ref::new(Option::None),
             bigint_prototype_value: Ref::new(Option::None),
             symbol_prototype_value: Ref::new(Option::None),
-            weak_entries_value: Vec::[],
-            finalization_cells_value: Vec::[],
-            finalization_jobs_value: Vec::[],
+            weak_entries_value: Vec::new(),
+            finalization_cells_value: Vec::new(),
+            finalization_jobs_value: Vec::new(),
         }
     }
 
-    fn make_id(self: Heap, slot: int, generation: uint64, callable: bool) -> ObjectId {
+    fn make_id(self: Heap, slot: isize, generation: u64, callable: bool) -> ObjectId {
         ObjectId {
             heap_identity_value: self.identity_value,
             slot_value: slot,
@@ -792,11 +790,11 @@ impl Heap {
         }
     }
 
-    pub fn live_count(self: Heap) -> int {
+    pub fn live_count(self: Heap) -> isize {
         self.live_count_value.get()
     }
 
-    pub fn slot_count(self: Heap) -> int {
+    pub fn slot_count(self: Heap) -> isize {
         self.slots_value.len()
     }
 
@@ -875,7 +873,7 @@ impl Heap {
     }
 
     pub fn collect(self: Heap, roots: Vec[Value]) -> GcStats {
-        let edges: Vec[GcEdge] = Vec::[];
+        let edges: Vec[GcEdge] = Vec::new();
         self.collect_with_edges(roots, edges)
     }
 
@@ -900,13 +898,15 @@ impl Heap {
             Some(value) => all_roots.push(Value::Object(value)),
             None => (),
         };
-        for prototype in Vec::[
-            self.boolean_prototype_value,
-            self.number_prototype_value,
-            self.string_prototype_value,
-            self.bigint_prototype_value,
-            self.symbol_prototype_value,
-        ] {
+        for prototype in Vec::from_array(
+            [
+                self.boolean_prototype_value,
+                self.number_prototype_value,
+                self.string_prototype_value,
+                self.bigint_prototype_value,
+                self.symbol_prototype_value,
+            ],
+        ) {
             match prototype.get() {
                 Some(value) => all_roots.push(Value::Object(value)),
                 None => (),
@@ -916,7 +916,7 @@ impl Heap {
             all_roots.push(job.callback);
             all_roots.push(job.held)
         }
-        let marked_symbols: collections::HashSet[uint64] = collections::HashSet::new();
+        let marked_symbols: collections::HashSet[u64] = collections::HashSet::new();
         let reachable = mark_reachable(self, all_roots, marked, marked_symbols, edges);
         let mut finalization_index = 0;
         while finalization_index < self.finalization_cells_value.len() {
@@ -1000,7 +1000,7 @@ pub fn is_weak_target(heap: Heap, value: Value) -> bool {
     weak_key_live(heap, value)
 }
 
-fn weak_entry_index(heap: Heap, owner: ObjectId, key: Value) -> Option[int] {
+fn weak_entry_index(heap: Heap, owner: ObjectId, key: Value) -> Option[isize] {
     let mut index = 0;
     while index < heap.weak_entries_value.len() {
         match heap.weak_entries_value[index] {
@@ -1236,7 +1236,7 @@ pub fn is_typed_array(heap: Heap, object: ObjectId) -> bool {
     }
 }
 
-pub fn typed_array_element_length(heap: Heap, object: ObjectId) -> Option[int] {
+pub fn typed_array_element_length(heap: Heap, object: ObjectId) -> Option[isize] {
     match heap.get(object) {
         Some(value) => match value.typed_array_value.get() {
             Some(value) => Option::Some(typed_array_length(value.view)),
@@ -1366,15 +1366,15 @@ pub fn new_null_prototype_object(heap: Heap) -> Result[ObjectId, TypeError] {
     new_object(heap, ObjectKind::Ordinary, Option::None)
 }
 
-fn array_length_value(length: int) -> Value {
+fn array_length_value(length: isize) -> Value {
     if length <= 2147483647 {
-        Value::Int(length.to_int32())
+        Value::Int(length.to_i32())
     } else {
         Value::Float(num::parse_float64(length.to_string()).unwrap_or(0.0))
     }
 }
 
-pub fn new_array(heap: Heap, length: int) -> Result[ObjectId, TypeError] {
+pub fn new_array(heap: Heap, length: isize) -> Result[ObjectId, TypeError] {
     if length < 0 || length > 4294967295 {
         return Result::Err(TypeError { message: "invalid array length" })
     } else {};
@@ -1409,7 +1409,7 @@ pub fn set_primitive_value(heap: Heap, object: ObjectId, value: Value) -> bool {
     }
 }
 
-pub fn map_argument_index(heap: Heap, object: ObjectId, index: uint32, cell: Ref[Value]) -> bool {
+pub fn map_argument_index(heap: Heap, object: ObjectId, index: u32, cell: Ref[Value]) -> bool {
     match heap.get(object) {
         Some(target) => {
             target.argument_map_value[index] = cell;
@@ -1543,7 +1543,7 @@ pub fn compatible_property_descriptor(
     }
 }
 
-fn argument_index(key: PropertyKey) -> Option[uint32] {
+fn argument_index(key: PropertyKey) -> Option[u32] {
     match key {
         PropertyKey::String(value) => canonical_array_index(value),
         PropertyKey::Symbol(_) => Option::None,
@@ -1675,10 +1675,10 @@ fn ordinary_define_own_property(
     }
 }
 
-fn array_descriptor_length(descriptor: PropertyDescriptor) -> Option[int] {
+fn array_descriptor_length(descriptor: PropertyDescriptor) -> Option[isize] {
     match descriptor {
         PropertyDescriptor::Data { value: Value::Int(value), .. } => if value >= 0 {
-            Option::Some(value.to_int())
+            Option::Some(value.to_isize())
         } else {
             Option::None
         },
@@ -1697,7 +1697,7 @@ fn array_descriptor_length(descriptor: PropertyDescriptor) -> Option[int] {
     }
 }
 
-fn array_current_length(target: Object) -> Option[(int, bool)] {
+fn array_current_length(target: Object) -> Option[(isize, bool)] {
     match target.properties_value.get(string_property_key("length")) {
         Some(descriptor) => match array_descriptor_length(descriptor) {
             Some(length) => Option::Some((length, descriptor_writable(descriptor))),
@@ -1707,7 +1707,7 @@ fn array_current_length(target: Object) -> Option[(int, bool)] {
     }
 }
 
-fn normalized_array_length_descriptor(descriptor: PropertyDescriptor, length: int) -> Option[
+fn normalized_array_length_descriptor(descriptor: PropertyDescriptor, length: isize) -> Option[
     PropertyDescriptor,
 ] {
     match descriptor {
@@ -1775,10 +1775,10 @@ fn array_define_length(heap: Heap, object: ObjectId, descriptor: PropertyDescrip
         let key = keys[cursor];
         match key {
             PropertyKey::String(value) => match canonical_array_index(value) {
-                Some(index) => if index.to_int() >= new_length
+                Some(index) => if index.to_isize() >= new_length
                     && !delete_property(heap, object, key) {
                     let rollback = data_descriptor(
-                        array_length_value(index.to_int() + 1),
+                        array_length_value(index.to_isize() + 1),
                         final_writable,
                         false,
                         false,
@@ -1817,7 +1817,7 @@ fn array_define_index(
     heap: Heap,
     object: ObjectId,
     key: PropertyKey,
-    index: uint32,
+    index: u32,
     descriptor: PropertyDescriptor,
 ) -> bool {
     let target = match heap.get(object) {
@@ -1828,18 +1828,18 @@ fn array_define_index(
         Some(value) => value,
         None => return false,
     };
-    if index.to_int() >= length && !writable {
+    if index.to_isize() >= length && !writable {
         return false
     } else if !ordinary_define_own_property(heap, object, key, descriptor) {
         return false
-    } else if index.to_int() < length {
+    } else if index.to_isize() < length {
         return true
     } else {};
     ordinary_define_own_property(
         heap,
         object,
         string_property_key("length"),
-        data_descriptor(array_length_value(index.to_int() + 1), writable, false, false),
+        data_descriptor(array_length_value(index.to_isize() + 1), writable, false, false),
     )
 }
 
@@ -2319,31 +2319,31 @@ pub fn set_property(heap: Heap, object: ObjectId, key: PropertyKey, value: Value
     }
 }
 
-fn canonical_array_index(value: JsString) -> Option[uint32] {
+fn canonical_array_index(value: JsString) -> Option[u32] {
     if value.len() == 1 && value.get(0) == 48 {
         Option::Some(0)
     } else if value.len() == 0 || value.get(0) == 48 {
         Option::None
     } else {
         let mut index = 0;
-        let mut result: uint64 = 0;
+        let mut result: u64 = 0;
         while index < value.len() {
             let current = value.get(index);
             if current < 48 || current > 57 {
                 return Option::None
             } else {
-                result = result * 10 + (current - 48).to_uint64();
+                result = result * 10 + (current - 48).to_u64();
                 if result > 4294967294 {
                     return Option::None
                 } else {}
             };
             index += 1;
         }
-        Option::Some(result.to_uint32())
+        Option::Some(result.to_u32())
     }
 }
 
-fn compare_indexed_key(left: (uint32, PropertyKey), right: (uint32, PropertyKey)) -> int {
+fn compare_indexed_key(left: (u32, PropertyKey), right: (u32, PropertyKey)) -> isize {
     if left.0 < right.0 {
         -1
     } else if left.0 > right.0 {
@@ -2356,11 +2356,11 @@ fn compare_indexed_key(left: (uint32, PropertyKey), right: (uint32, PropertyKey)
 pub fn own_property_keys(heap: Heap, object: ObjectId) -> Vec[PropertyKey] {
     let target = match heap.get(object) {
         Some(value) => value,
-        None => return Vec::[],
+        None => return Vec::new(),
     };
-    let indexed: Vec[(uint32, PropertyKey)] = Vec::[];
-    let strings: Vec[PropertyKey] = Vec::[];
-    let symbols: Vec[PropertyKey] = Vec::[];
+    let indexed: Vec[(u32, PropertyKey)] = Vec::new();
+    let strings: Vec[PropertyKey] = Vec::new();
+    let symbols: Vec[PropertyKey] = Vec::new();
     for key in target.properties_value.keys() {
         match key {
             PropertyKey::String(value) => match canonical_array_index(value) {

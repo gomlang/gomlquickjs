@@ -38,7 +38,7 @@ pub struct ModuleImport {
     pub source: string,
     pub imported: string,
     pub local: string,
-    pub local_index: int,
+    pub local_index: isize,
     pub attributes: Vec[ModuleAttribute],
     pub span: ast::Span,
 }
@@ -47,7 +47,7 @@ pub struct ModuleExport {
     pub exported: string,
     pub source: Option[string],
     pub imported: string,
-    pub local_index: int,
+    pub local_index: isize,
     pub attributes: Vec[ModuleAttribute],
     pub span: ast::Span,
 }
@@ -56,8 +56,8 @@ pub struct CompiledModule {
     pub function: bytecode::Function,
     pub imports: Vec[ModuleImport],
     pub exports: Vec[ModuleExport],
-    pub import_meta_index: int,
-    pub dynamic_import_referrer_index: int,
+    pub import_meta_index: isize,
+    pub dynamic_import_referrer_index: isize,
 }
 
 #[derive(PartialEq, Eq)]
@@ -70,7 +70,7 @@ enum BindingKind {
 
 struct Binding {
     name: string,
-    index: int,
+    index: isize,
     kind: BindingKind,
     span: ast::Span,
 }
@@ -93,29 +93,29 @@ struct Scope {
 
 struct WithBinding {
     name: string,
-    scope_index: int,
+    scope_index: isize,
 }
 
 struct LoopContext {
-    continue_jumps: Vec[int],
-    finalizer_depth: int,
+    continue_jumps: Vec[isize],
+    finalizer_depth: isize,
     label: Option[string],
 }
 
 struct BreakContext {
-    break_jumps: Vec[int],
-    finalizer_depth: int,
+    break_jumps: Vec[isize],
+    finalizer_depth: isize,
     label: Option[string],
 }
 
 struct SwitchJump {
-    case_index: int,
-    offset: int,
+    case_index: isize,
+    offset: isize,
 }
 
 enum FinalizerKind {
     Statements(Vec[ast::Stmt]),
-    Iterator(int),
+    Iterator(isize),
 }
 
 struct FinallyContext {
@@ -124,9 +124,9 @@ struct FinallyContext {
 }
 
 struct ProtectedContext {
-    segments: Vec[(int, int)],
-    segment_start: int,
-    finalizer_depth: int,
+    segments: Vec[(isize, isize)],
+    segment_start: isize,
+    finalizer_depth: isize,
     active: bool,
 }
 
@@ -135,15 +135,15 @@ struct Compiler {
     code: Vec[bytecode::Instruction],
     eval_sites: Vec[Vec[bytecode::EvalBinding]],
     scopes: Vec[Scope],
-    var_indices: Vec[int],
-    var_scope_index: Ref[int],
-    next_local: Ref[int],
+    var_indices: Vec[isize],
+    var_scope_index: Ref[isize],
+    next_local: Ref[isize],
     loops: Vec[LoopContext],
     breakables: Vec[BreakContext],
     outer_bindings: Vec[OuterBinding],
     upvalues: Vec[Upvalue],
-    parameter_count: int,
-    function_length: int,
+    parameter_count: isize,
+    function_length: isize,
     strict: bool,
     arguments_available: bool,
     lexical_this: bool,
@@ -153,7 +153,7 @@ struct Compiler {
     generator: bool,
     asynchronous: bool,
     used_await: Ref[bool],
-    completion_local: Ref[Option[int]],
+    completion_local: Ref[Option[isize]],
     errors: Vec[CompileError],
     exception_handlers: Vec[bytecode::ExceptionHandler],
     generator_return_handlers: Vec[bytecode::GeneratorReturnHandler],
@@ -162,42 +162,42 @@ struct Compiler {
     source: Ref[string],
     source_name: Ref[string],
     source_locations: Vec[bytecode::SourceLocation],
-    current_source_offset: Ref[int],
+    current_source_offset: Ref[isize],
     allow_unknown_globals: Ref[bool],
     pending_loop_label: Ref[Option[string]],
     direct_eval: Ref[bool],
     predeclaring_eval: Ref[bool],
     dynamic_eval_vars: Vec[string],
     with_bindings: Vec[WithBinding],
-    next_with_binding: Ref[int],
+    next_with_binding: Ref[isize],
     module_mode: Ref[bool],
 }
 
 enum AssignmentStorage {
-    Local(int),
-    Upvalue(int),
-    Global(int),
-    Eval(int),
+    Local(isize),
+    Upvalue(isize),
+    Global(isize),
+    Eval(isize),
     Field {
-        object: int,
-        property: int,
+        object: isize,
+        property: isize,
     },
     Element {
-        object: int,
-        property: int,
+        object: isize,
+        property: isize,
     },
     WithIdentifier {
-        receiver: int,
-        property: int,
+        receiver: isize,
+        property: isize,
         name: string,
         span: ast::Span,
     },
     Private {
-        object: int,
-        name: int,
+        object: isize,
+        name: isize,
     },
-    SuperField(int),
-    SuperElement(int),
+    SuperField(isize),
+    SuperElement(isize),
     Invalid,
 }
 
@@ -205,19 +205,19 @@ struct AssignmentTarget {
     storage: AssignmentStorage,
     writable: bool,
     throws_on_write: bool,
-    source_offset: int,
+    source_offset: isize,
 }
 
 enum ExcludedBindingKey {
-    Constant(int),
-    Local(int),
+    Constant(isize),
+    Local(isize),
 }
 
 fn compile_error(compiler: Compiler, message: string, span: ast::Span) -> unit {
     compiler.errors.push(CompileError { message, span })
 }
 
-fn emit(compiler: Compiler, instruction: bytecode::Instruction) -> int {
+fn emit(compiler: Compiler, instruction: bytecode::Instruction) -> isize {
     let offset = compiler.code.len();
     compiler.code.push(instruction);
     compiler.source_locations.push(
@@ -226,7 +226,7 @@ fn emit(compiler: Compiler, instruction: bytecode::Instruction) -> int {
     offset
 }
 
-fn source_location(source: string, target: int) -> bytecode::SourceLocation {
+fn source_location(source: string, target: isize) -> bytecode::SourceLocation {
     let bytes = source.to_bytes();
     let limit = if target < 0 {
         0
@@ -265,16 +265,16 @@ fn source_location(source: string, target: int) -> bytecode::SourceLocation {
     bytecode::SourceLocation { line, column }
 }
 
-fn set_source_offset(compiler: Compiler, offset: int) -> unit {
+fn set_source_offset(compiler: Compiler, offset: isize) -> unit {
     compiler.current_source_offset.set(offset)
 }
 
-fn emit_at(compiler: Compiler, instruction: bytecode::Instruction, source_offset: int) -> int {
+fn emit_at(compiler: Compiler, instruction: bytecode::Instruction, source_offset: isize) -> isize {
     set_source_offset(compiler, source_offset);
     emit(compiler, instruction)
 }
 
-fn first_source_byte_between(compiler: Compiler, start: int, end: int) -> int {
+fn first_source_byte_between(compiler: Compiler, start: isize, end: isize) -> isize {
     let source = compiler.source.get();
     let limit = if end < source.byte_len() {
         end
@@ -300,11 +300,11 @@ fn first_source_byte_between(compiler: Compiler, start: int, end: int) -> int {
     }
 }
 
-fn current_offset(compiler: Compiler) -> int {
+fn current_offset(compiler: Compiler) -> isize {
     compiler.code.len()
 }
 
-fn patch_jump(compiler: Compiler, offset: int, target: int) -> bool {
+fn patch_jump(compiler: Compiler, offset: isize, target: isize) -> bool {
     if offset < 0 || offset >= compiler.code.len() {
         false
     } else {
@@ -326,7 +326,7 @@ fn patch_jump(compiler: Compiler, offset: int, target: int) -> bool {
     }
 }
 
-fn add_constant(compiler: Compiler, value: bytecode::Constant) -> int {
+fn add_constant(compiler: Compiler, value: bytecode::Constant) -> isize {
     let index = compiler.constants.len();
     compiler.constants.push(value);
     index
@@ -348,7 +348,7 @@ fn pop_scope(compiler: Compiler) -> unit {
     let _ = compiler.scopes.pop();
 }
 
-fn new_local(compiler: Compiler) -> int {
+fn new_local(compiler: Compiler) -> isize {
     let index = compiler.next_local.get();
     compiler.next_local.set(index + 1);
     index
@@ -356,7 +356,7 @@ fn new_local(compiler: Compiler) -> int {
 
 fn declare_in_scope(
     compiler: Compiler,
-    scope_index: int,
+    scope_index: isize,
     name: string,
     kind: BindingKind,
     span: ast::Span,
@@ -396,7 +396,7 @@ fn lookup_binding(compiler: Compiler, name: string) -> Option[Binding] {
     }
 }
 
-fn binding_scope_index(compiler: Compiler, name: string) -> Option[int] {
+fn binding_scope_index(compiler: Compiler, name: string) -> Option[isize] {
     let mut index = compiler.scopes.len() - 1;
     loop {
         if compiler.scopes[index].bindings.get(name).is_some() {
@@ -492,7 +492,7 @@ fn upvalue_index(
     name: string,
     source: bytecode::UpvalueSource,
     kind: BindingKind,
-) -> int {
+) -> isize {
     let mut index = 0;
     while index < compiler.upvalues.len() {
         if compiler.upvalues[index].name == name {
@@ -504,7 +504,7 @@ fn upvalue_index(
     compiler.upvalues.len() - 1
 }
 
-fn resolve_upvalue(compiler: Compiler, name: string) -> Option[(int, BindingKind)] {
+fn resolve_upvalue(compiler: Compiler, name: string) -> Option[(isize, BindingKind)] {
     match lookup_outer_binding(compiler, name) {
         Some(binding) => {
             let index = upvalue_index(compiler, name, binding.source, binding.kind);
@@ -515,7 +515,7 @@ fn resolve_upvalue(compiler: Compiler, name: string) -> Option[(int, BindingKind
 }
 
 fn visible_bindings(compiler: Compiler) -> Vec[OuterBinding] {
-    let bindings: Vec[OuterBinding] = Vec::[];
+    let bindings: Vec[OuterBinding] = Vec::new();
     let mut scope_index = compiler.scopes.len();
     while scope_index > 0 {
         scope_index -= 1;
@@ -592,7 +592,7 @@ fn arrow_outer_bindings(compiler: Compiler) -> Vec[OuterBinding] {
 }
 
 fn current_eval_bindings(compiler: Compiler) -> Vec[bytecode::EvalBinding] {
-    let result: Vec[bytecode::EvalBinding] = Vec::[];
+    let result: Vec[bytecode::EvalBinding] = Vec::new();
     for binding in arrow_outer_bindings(compiler) {
         if binding.name == IMPORT_META_BINDING {
             continue
@@ -644,7 +644,7 @@ fn current_eval_bindings(compiler: Compiler) -> Vec[bytecode::EvalBinding] {
     result
 }
 
-fn add_eval_site(compiler: Compiler, bindings: Vec[bytecode::EvalBinding]) -> int {
+fn add_eval_site(compiler: Compiler, bindings: Vec[bytecode::EvalBinding]) -> isize {
     let index = compiler.eval_sites.len();
     compiler.eval_sites.push(bindings);
     index
@@ -695,7 +695,7 @@ fn ensure_super_this_capture(compiler: Compiler) -> unit {
 }
 
 fn declare_var_pattern(compiler: Compiler, pattern: ast::BindingPattern) -> unit {
-    let names: Vec[(string, ast::Span)] = Vec::[];
+    let names: Vec[(string, ast::Span)] = Vec::new();
     collect_parameter_names(pattern, names);
     for (name, span) in names {
         if compiler.direct_eval.get() && compiler.strict && (name == "arguments" || name == "eval") {
@@ -814,7 +814,7 @@ fn collect_var_body(compiler: Compiler, body: Vec[ast::Stmt]) -> unit {
 fn initialize_var_bindings(compiler: Compiler) -> unit {
     let var_scope_index = compiler.var_scope_index.get();
     for index in compiler.var_indices {
-        let mut parameter_source: Option[int] = Option::None;
+        let mut parameter_source: Option[isize] = Option::None;
         if var_scope_index > 0 {
             for (name, binding) in compiler.scopes[var_scope_index].bindings.entries() {
                 if binding.index == index {
@@ -848,7 +848,7 @@ fn declare_lexical_statement(compiler: Compiler, statement: ast::Stmt) -> unit {
         ast::Stmt::VariableDeclaration { kind, declarations, .. } => {
             if kind != ast::VariableKind::Var {
                 for declaration in declarations {
-                    let names: Vec[(string, ast::Span)] = Vec::[];
+                    let names: Vec[(string, ast::Span)] = Vec::new();
                     collect_parameter_names(declaration.pattern.get(), names);
                     for (name, span) in names {
                         if dynamic_eval_var_conflicts_current_scope(compiler, name) {
@@ -931,23 +931,23 @@ fn push_loop(compiler: Compiler) -> unit {
     let finalizer_depth = compiler.finalizers.len();
     let label = compiler.pending_loop_label.get();
     compiler.pending_loop_label.set(Option::None);
-    compiler.loops.push(LoopContext { continue_jumps: Vec::[], finalizer_depth, label });
+    compiler.loops.push(LoopContext { continue_jumps: Vec::new(), finalizer_depth, label });
     compiler.breakables.push(
-        BreakContext { break_jumps: Vec::[], finalizer_depth, label: Option::None },
+        BreakContext { break_jumps: Vec::new(), finalizer_depth, label: Option::None },
     )
 }
 
 fn pop_loop(compiler: Compiler) -> LoopContext {
     match compiler.loops.pop() {
         Some(context) => context,
-        None => LoopContext { continue_jumps: Vec::[], finalizer_depth: 0, label: Option::None },
+        None => LoopContext { continue_jumps: Vec::new(), finalizer_depth: 0, label: Option::None },
     }
 }
 
 fn push_breakable(compiler: Compiler) -> unit {
     compiler.breakables.push(
         BreakContext {
-            break_jumps: Vec::[],
+            break_jumps: Vec::new(),
             finalizer_depth: compiler.finalizers.len(),
             label: Option::None,
         },
@@ -957,7 +957,7 @@ fn push_breakable(compiler: Compiler) -> unit {
 fn push_label_breakable(compiler: Compiler, label: string) -> unit {
     compiler.breakables.push(
         BreakContext {
-            break_jumps: Vec::[],
+            break_jumps: Vec::new(),
             finalizer_depth: compiler.finalizers.len(),
             label: Option::Some(label),
         },
@@ -967,7 +967,7 @@ fn push_label_breakable(compiler: Compiler, label: string) -> unit {
 fn pop_breakable(compiler: Compiler) -> BreakContext {
     match compiler.breakables.pop() {
         Some(context) => context,
-        None => BreakContext { break_jumps: Vec::[], finalizer_depth: 0, label: Option::None },
+        None => BreakContext { break_jumps: Vec::new(), finalizer_depth: 0, label: Option::None },
     }
 }
 
@@ -975,8 +975,8 @@ fn patch_loop_jumps(
     compiler: Compiler,
     break_context: BreakContext,
     loop_context: LoopContext,
-    break_target: int,
-    continue_target: int,
+    break_target: isize,
+    continue_target: isize,
 ) -> unit {
     for offset in break_context.break_jumps {
         let _ = patch_jump(compiler, offset, break_target);
@@ -1032,7 +1032,7 @@ fn compile_loop_jump(compiler: Compiler, is_continue: bool, label: Option[string
 fn begin_protected_region(compiler: Compiler) -> unit {
     compiler.protected_regions.push(
         ProtectedContext {
-            segments: Vec::[],
+            segments: Vec::new(),
             segment_start: current_offset(compiler),
             finalizer_depth: compiler.finalizers.len(),
             active: true,
@@ -1040,7 +1040,7 @@ fn begin_protected_region(compiler: Compiler) -> unit {
     )
 }
 
-fn close_protected_segment(compiler: Compiler, index: int) -> unit {
+fn close_protected_segment(compiler: Compiler, index: isize) -> unit {
     let start = compiler.protected_regions[index].segment_start;
     let end = current_offset(compiler);
     if compiler.protected_regions[index].active && start < end {
@@ -1048,17 +1048,17 @@ fn close_protected_segment(compiler: Compiler, index: int) -> unit {
     } else {}
 }
 
-fn finish_protected_region(compiler: Compiler) -> Vec[(int, int)] {
+fn finish_protected_region(compiler: Compiler) -> Vec[(isize, isize)] {
     let index = compiler.protected_regions.len() - 1;
     close_protected_segment(compiler, index);
     match compiler.protected_regions.pop() {
         Some(context) => context.segments,
-        None => Vec::[],
+        None => Vec::new(),
     }
 }
 
-fn suspend_protected_regions(compiler: Compiler, finalizer_index: int) -> Vec[int] {
-    let suspended: Vec[int] = Vec::[];
+fn suspend_protected_regions(compiler: Compiler, finalizer_index: isize) -> Vec[isize] {
+    let suspended: Vec[isize] = Vec::new();
     let mut index = 0;
     while index < compiler.protected_regions.len() {
         if compiler.protected_regions[index].active
@@ -1072,7 +1072,7 @@ fn suspend_protected_regions(compiler: Compiler, finalizer_index: int) -> Vec[in
     suspended
 }
 
-fn resume_protected_regions(compiler: Compiler, suspended: Vec[int]) -> unit {
+fn resume_protected_regions(compiler: Compiler, suspended: Vec[isize]) -> unit {
     let start = current_offset(compiler);
     for index in suspended {
         compiler.protected_regions[index].segment_start = start;
@@ -1080,7 +1080,7 @@ fn resume_protected_regions(compiler: Compiler, suspended: Vec[int]) -> unit {
     }
 }
 
-fn compile_active_finalizers_from(compiler: Compiler, finalizer_depth: int) -> unit {
+fn compile_active_finalizers_from(compiler: Compiler, finalizer_depth: isize) -> unit {
     let mut index = compiler.finalizers.len();
     while index > finalizer_depth {
         index -= 1;
@@ -1141,9 +1141,9 @@ fn set_function_source(function: bytecode::Function, source: string, span: ast::
     } else {}
 }
 
-fn append_literal_code_point(output: Vec[uint16], code_point: uint32) -> unit {
+fn append_literal_code_point(output: Vec[u16], code_point: u32) -> unit {
     if code_point <= 0xffff {
-        output.push(code_point.to_uint16())
+        output.push(code_point.to_u16())
     } else {
         match runtime::split_code_point(code_point) {
             Some((high, low)) => {
@@ -1155,18 +1155,18 @@ fn append_literal_code_point(output: Vec[uint16], code_point: uint32) -> unit {
     }
 }
 
-fn literal_hex_value(raw: string, start: int, count: int) -> uint32 {
-    let mut value = 0.to_uint32();
+fn literal_hex_value(raw: string, start: isize, count: isize) -> u32 {
+    let mut value = 0.to_u32();
     for index in start..start + count {
-        value = value * 16 + digit_value(raw.byte_get(index)).unwrap_or(0).to_uint32();
+        value = value * 16 + digit_value(raw.byte_get(index)).unwrap_or(0).to_u32();
     }
     value
 }
 
-fn append_literal_character(output: Vec[uint16], raw: string, index: int) -> int {
+fn append_literal_character(output: Vec[u16], raw: string, index: isize) -> isize {
     match raw.decode_at(index) {
         Some((character, width)) => {
-            append_literal_code_point(output, character.to_uint32());
+            append_literal_code_point(output, character.to_u32());
             index + width
         },
         None => {
@@ -1181,7 +1181,7 @@ fn string_literal(raw: string) -> runtime::JsString {
         return js_string(raw)
     } else {};
     let template = raw.byte_get(0) == b'`' || raw.byte_get(0) == b'}';
-    let output: Vec[uint16] = Vec::with_capacity(raw.byte_len() - 2);
+    let output: Vec[u16] = Vec::with_capacity(raw.byte_len() - 2);
     let limit = if template && raw.byte_len() >= 2 && raw.byte_get(raw.byte_len() - 2) == b'$'
         && raw.byte_get(raw.byte_len() - 1) == b'{' {
         raw.byte_len() - 2
@@ -1225,7 +1225,7 @@ fn string_literal(raw: string) -> runtime::JsString {
                 output.push(0);
                 index += 2;
             } else if escaped == b'x' && index + 3 < limit {
-                output.push(literal_hex_value(raw, index + 2, 2).to_uint16());
+                output.push(literal_hex_value(raw, index + 2, 2).to_u16());
                 index += 4;
             } else if escaped == b'u' && index + 2 < limit && raw.byte_get(index + 2) == b'{' {
                 let start = index + 3;
@@ -1240,7 +1240,7 @@ fn string_literal(raw: string) -> runtime::JsString {
                     end
                 };
             } else if escaped == b'u' && index + 5 < limit {
-                output.push(literal_hex_value(raw, index + 2, 4).to_uint16());
+                output.push(literal_hex_value(raw, index + 2, 4).to_u16());
                 index += 6;
             } else if escaped == b'\r' {
                 if index + 2 < limit && raw.byte_get(index + 2) == b'\n' {
@@ -1251,7 +1251,7 @@ fn string_literal(raw: string) -> runtime::JsString {
             } else if escaped == b'\n' {
                 index += 2;
             } else if escaped < 128 {
-                output.push(escaped.to_uint16());
+                output.push(escaped.to_u16());
                 index += 2;
             } else {
                 index = append_literal_character(output, raw, index + 1);
@@ -1261,11 +1261,11 @@ fn string_literal(raw: string) -> runtime::JsString {
     runtime::JsString::from_code_units(output)
 }
 
-fn string_constant(compiler: Compiler, value: string) -> int {
+fn string_constant(compiler: Compiler, value: string) -> isize {
     add_constant(compiler, bytecode::Constant::String(js_string(value)))
 }
 
-fn template_constant(compiler: Compiler, cooked: Vec[Option[string]], raw: Vec[string]) -> int {
+fn template_constant(compiler: Compiler, cooked: Vec[Option[string]], raw: Vec[string]) -> isize {
     let cooked_values: Vec[Option[runtime::JsString]] = Vec::with_capacity(cooked.len());
     for value in cooked {
         cooked_values.push(
@@ -1291,19 +1291,19 @@ fn normalized_numeric_text(value: string) -> string {
     text::replace(value, "_", "")
 }
 
-fn digit_value(value: byte) -> Option[int] {
+fn digit_value(value: byte) -> Option[isize] {
     if value >= b'0' && value <= b'9' {
-        Option::Some((value - b'0').to_int())
+        Option::Some((value - b'0').to_isize())
     } else if value >= b'a' && value <= b'f' {
-        Option::Some((value - b'a').to_int() + 10)
+        Option::Some((value - b'a').to_isize() + 10)
     } else if value >= b'A' && value <= b'F' {
-        Option::Some((value - b'A').to_int() + 10)
+        Option::Some((value - b'A').to_isize() + 10)
     } else {
         Option::None
     }
 }
 
-fn prefixed_parts(value: string) -> Option[(int, int)] {
+fn prefixed_parts(value: string) -> Option[(isize, isize)] {
     if value.byte_len() < 2 || value.byte_get(0) != b'0' {
         Option::None
     } else {
@@ -1316,7 +1316,7 @@ fn prefixed_parts(value: string) -> Option[(int, int)] {
     }
 }
 
-fn parse_radix_float(value: string, start: int, radix: int) -> Result[float64, string] {
+fn parse_radix_float(value: string, start: isize, radix: isize) -> Result[f64, string] {
     let mut result = 0.0;
     let radix_value = num::parse_float64(radix.to_string()).unwrap_or(0.0);
     let mut index = start;
@@ -1338,7 +1338,7 @@ fn parse_radix_float(value: string, start: int, radix: int) -> Result[float64, s
     Result::Ok(result)
 }
 
-fn parse_number(value: string) -> Result[(bool, int32, float64), string] {
+fn parse_number(value: string) -> Result[(bool, i32, f64), string] {
     let normalized = normalized_numeric_text(value);
     if normalized.byte_len() > 1 && normalized.byte_get(0) == b'0'
         && text::find_bytes(normalized, ".").is_none()
@@ -1346,7 +1346,7 @@ fn parse_number(value: string) -> Result[(bool, int32, float64), string] {
         && text::find_bytes(normalized, "E").is_none() {
         match num::parse_uint_radix(normalized, 8) {
             Ok(integer) => if integer <= 2147483647 {
-                return Result::Ok((true, integer.to_int32(), 0.0))
+                return Result::Ok((true, integer.to_i32(), 0.0))
             } else {},
             Err(_) => (),
         }
@@ -1357,7 +1357,7 @@ fn parse_number(value: string) -> Result[(bool, int32, float64), string] {
             radix,
         ) {
             Ok(integer) => if integer <= 2147483647 {
-                Result::Ok((true, integer.to_int32(), 0.0))
+                Result::Ok((true, integer.to_i32(), 0.0))
             } else {
                 match parse_radix_float(normalized, start, radix) {
                     Ok(number) => Result::Ok((false, 0, number)),
@@ -1374,7 +1374,7 @@ fn parse_number(value: string) -> Result[(bool, int32, float64), string] {
             && text::find_bytes(normalized, "E").is_none() {
             match num::parse_int(normalized) {
                 Ok(integer) => if integer >= -2147483648 && integer <= 2147483647 {
-                    Result::Ok((true, integer.to_int32(), 0.0))
+                    Result::Ok((true, integer.to_i32(), 0.0))
                 } else {
                     match num::parse_float64(normalized) {
                         Ok(number) => Result::Ok((false, 0, number)),
@@ -1472,8 +1472,8 @@ fn compile_identifier(compiler: Compiler, name: string, span: ast::Span) -> unit
         return
     } else {};
     let property = string_constant(compiler, name);
-    let misses: Vec[int] = Vec::[];
-    let ends: Vec[int] = Vec::[];
+    let misses: Vec[isize] = Vec::new();
+    let ends: Vec[isize] = Vec::new();
     let local_scope = binding_scope_index(compiler, name);
     for binding in compiler.with_bindings {
         match local_scope {
@@ -1581,7 +1581,7 @@ fn compile_optional_member(
     object: ast::Expr,
     property: ast::Expr,
     computed: bool,
-    member_offset: int,
+    member_offset: isize,
 ) -> unit {
     compile_expression(compiler, object);
     let _ = emit(compiler, bytecode::Instruction::Dup);
@@ -1758,7 +1758,7 @@ fn compile_optional_member_call(
     computed: bool,
     arguments: Vec[ast::Expr],
     spread: bool,
-    call_offset: int,
+    call_offset: isize,
 ) -> unit {
     compile_expression(compiler, object);
     let _ = emit(compiler, bytecode::Instruction::Dup);
@@ -1973,7 +1973,7 @@ fn compile_call(compiler: Compiler, callee: ast::Expr, arguments: Vec[ast::Expr]
 
 fn compile_tagged_arguments(
     compiler: Compiler,
-    template_index: int,
+    template_index: isize,
     substitutions: Vec[Ref[ast::Expr]],
 ) -> unit {
     let _ = emit(compiler, bytecode::Instruction::PushConst(template_index));
@@ -2086,8 +2086,8 @@ fn compile_plain_identifier_delete(compiler: Compiler, name: string) -> unit {
 
 fn compile_with_identifier_delete(compiler: Compiler, name: string, span: ast::Span) -> unit {
     let property = string_constant(compiler, name);
-    let misses: Vec[int] = Vec::[];
-    let ends: Vec[int] = Vec::[];
+    let misses: Vec[isize] = Vec::new();
+    let ends: Vec[isize] = Vec::new();
     let local_scope = binding_scope_index(compiler, name);
     for binding in compiler.with_bindings {
         match local_scope {
@@ -2352,7 +2352,7 @@ fn compile_binary(
 fn local_assignment_target(
     compiler: Compiler,
     name: string,
-    index: int,
+    index: isize,
     kind: BindingKind,
     span: ast::Span,
     upvalue: bool,
@@ -2406,8 +2406,8 @@ fn with_identifier_assignment_target(compiler: Compiler, name: string, span: ast
     let property = string_constant(compiler, name);
     let _ = emit(compiler, bytecode::Instruction::Undefined);
     let _ = emit(compiler, bytecode::Instruction::PutLoc(receiver));
-    let misses: Vec[int] = Vec::[];
-    let ends: Vec[int] = Vec::[];
+    let misses: Vec[isize] = Vec::new();
+    let ends: Vec[isize] = Vec::new();
     let local_scope = binding_scope_index(compiler, name);
     for binding in compiler.with_bindings {
         match local_scope {
@@ -3065,7 +3065,7 @@ fn compile_nested_function(
         pop_scope(child)
     } else {};
     let eval_bindings = current_eval_bindings(child);
-    let sources: Vec[bytecode::UpvalueSource] = Vec::[];
+    let sources: Vec[bytecode::UpvalueSource] = Vec::new();
     for upvalue in child.upvalues {
         sources.push(upvalue.source)
     }
@@ -3606,7 +3606,7 @@ fn class_constructor_element(elements: Vec[ast::ClassElement]) -> Option[ast::Cl
 
 fn compile_default_derived_constructor(parent: Compiler, name: Option[string], span: ast::Span) -> bytecode::Function {
     let child = compiler_new(
-        Vec::[],
+        Vec::new(),
         visible_bindings(parent),
         name,
         true,
@@ -3623,7 +3623,7 @@ fn compile_default_derived_constructor(parent: Compiler, name: Option[string], s
     let _ = emit(child, bytecode::Instruction::PushRest(0));
     let _ = emit(child, bytecode::Instruction::CallSuperArray);
     let _ = emit(child, bytecode::Instruction::Return);
-    let sources: Vec[bytecode::UpvalueSource] = Vec::[];
+    let sources: Vec[bytecode::UpvalueSource] = Vec::new();
     for upvalue in child.upvalues {
         sources.push(upvalue.source)
     }
@@ -3652,14 +3652,14 @@ fn compile_default_derived_constructor(parent: Compiler, name: Option[string], s
 fn compile_class_field_initializer(
     parent: Compiler,
     elements: Vec[ast::ClassElement],
-    computed_key_locals: Vec[int],
-    private_key_locals: Vec[int],
-    private_method_locals: Vec[int],
+    computed_key_locals: Vec[isize],
+    private_key_locals: Vec[isize],
+    private_method_locals: Vec[isize],
     static_member: bool,
     span: ast::Span,
 ) -> Option[bytecode::Function] {
     let child = compiler_new(
-        Vec::[],
+        Vec::new(),
         visible_bindings(parent),
         Option::None,
         false,
@@ -3753,7 +3753,7 @@ fn compile_class_field_initializer(
         Option::None
     } else {
         let _ = emit(child, bytecode::Instruction::ReturnUndef);
-        let sources: Vec[bytecode::UpvalueSource] = Vec::[];
+        let sources: Vec[bytecode::UpvalueSource] = Vec::new();
         for upvalue in child.upvalues {
             sources.push(upvalue.source)
         }
@@ -3783,11 +3783,11 @@ fn compile_class_field_initializer(
 fn compile_class_static_initializer(
     parent: Compiler,
     element: ast::ClassElement,
-    computed_key_local: int,
-    private_key_local: int,
+    computed_key_local: isize,
+    private_key_local: isize,
 ) -> bytecode::Function {
     let child = compiler_new(
-        Vec::[],
+        Vec::new(),
         visible_bindings(parent),
         Option::None,
         false,
@@ -3840,7 +3840,7 @@ fn compile_class_static_initializer(
         compile_body(child, element.body)
     };
     let _ = emit(child, bytecode::Instruction::ReturnUndef);
-    let sources: Vec[bytecode::UpvalueSource] = Vec::[];
+    let sources: Vec[bytecode::UpvalueSource] = Vec::new();
     for upvalue in child.upvalues {
         sources.push(upvalue.source)
     }
@@ -3869,13 +3869,13 @@ fn compile_class_static_initializer(
 fn compile_class_private_method_initializer(
     parent: Compiler,
     elements: Vec[ast::ClassElement],
-    private_key_locals: Vec[int],
-    private_method_locals: Vec[int],
+    private_key_locals: Vec[isize],
+    private_method_locals: Vec[isize],
     static_member: bool,
     span: ast::Span,
 ) -> Option[bytecode::Function] {
     let child = compiler_new(
-        Vec::[],
+        Vec::new(),
         visible_bindings(parent),
         Option::None,
         false,
@@ -3931,7 +3931,7 @@ fn compile_class_private_method_initializer(
         Option::None
     } else {
         let _ = emit(child, bytecode::Instruction::ReturnUndef);
-        let sources: Vec[bytecode::UpvalueSource] = Vec::[];
+        let sources: Vec[bytecode::UpvalueSource] = Vec::new();
         for upvalue in child.upvalues {
             sources.push(upvalue.source)
         }
@@ -3964,7 +3964,7 @@ fn compile_class_value(
     heritage: Option[Ref[ast::Expr]],
     elements: Vec[ast::ClassElement],
     span: ast::Span,
-    binding_index: Option[int],
+    binding_index: Option[isize],
 ) -> unit {
     push_scope(compiler);
     for element in elements {
@@ -3989,7 +3989,7 @@ fn compile_class_value(
     let constructor = class_constructor_element(elements);
     let (parameters, body, constructor_span) = match constructor {
         Some(element) => (element.parameters, element.body, element.span),
-        None => (Vec::[], Vec::[], span),
+        None => (Vec::new(), Vec::new(), span),
     };
     let function = if derived && constructor.is_none() {
         compile_default_derived_constructor(compiler, name, constructor_span)
@@ -4029,7 +4029,7 @@ fn compile_class_value(
     let prototype_name = string_constant(compiler, "prototype");
     let _ = emit(compiler, bytecode::Instruction::GetField(prototype_name));
     let _ = emit(compiler, bytecode::Instruction::PutLoc(prototype));
-    let computed_key_locals: Vec[int] = Vec::[];
+    let computed_key_locals: Vec[isize] = Vec::new();
     for element in elements {
         match element.computed_name {
             Some(value) => {
@@ -4041,8 +4041,8 @@ fn compile_class_value(
             None => computed_key_locals.push(-1),
         }
     }
-    let private_key_locals: Vec[int] = Vec::[];
-    let private_method_locals: Vec[int] = Vec::[];
+    let private_key_locals: Vec[isize] = Vec::new();
+    let private_method_locals: Vec[isize] = Vec::new();
     for element in elements {
         if element.private_member {
             match lookup_binding(compiler, private_binding_name(element.name)) {
@@ -4376,7 +4376,7 @@ fn compile_for(
     body: ast::Stmt,
 ) -> unit {
     push_scope(compiler);
-    let iteration_bindings: Vec[int] = Vec::[];
+    let iteration_bindings: Vec[isize] = Vec::new();
     match initializer {
         Some(value) => {
             declare_lexical_statement(compiler, value.get());
@@ -4492,7 +4492,7 @@ fn compile_for_iteration(
     } else {
         compiler.loops.push(
             LoopContext {
-                continue_jumps: Vec::[],
+                continue_jumps: Vec::new(),
                 finalizer_depth: compiler.finalizers.len(),
                 label: compiler.pending_loop_label.get(),
             },
@@ -4500,7 +4500,7 @@ fn compile_for_iteration(
         compiler.pending_loop_label.set(Option::None);
         compiler.breakables.push(
             BreakContext {
-                break_jumps: Vec::[],
+                break_jumps: Vec::new(),
                 finalizer_depth: iterator_finalizer_depth,
                 label: Option::None,
             },
@@ -4508,7 +4508,7 @@ fn compile_for_iteration(
     };
     compile_statement(compiler, body);
     let protected_segments = if enumerate {
-        Vec::[]
+        Vec::new()
     } else {
         finish_protected_region(compiler)
     };
@@ -4583,8 +4583,8 @@ fn compile_switch(compiler: Compiler, discriminant: ast::Expr, cases: Vec[ast::S
     let discriminant_local = new_local(compiler);
     compile_expression(compiler, discriminant);
     let _ = emit(compiler, bytecode::Instruction::PutLoc(discriminant_local));
-    let dispatches: Vec[SwitchJump] = Vec::[];
-    let mut default_index: Option[int] = Option::None;
+    let dispatches: Vec[SwitchJump] = Vec::new();
+    let mut default_index: Option[isize] = Option::None;
     let mut case_index = 0;
     while case_index < cases.len() {
         match cases[case_index].test {
@@ -4602,7 +4602,7 @@ fn compile_switch(compiler: Compiler, discriminant: ast::Expr, cases: Vec[ast::S
         case_index += 1;
     }
     let no_match = emit(compiler, bytecode::Instruction::Goto(-1));
-    let case_targets: Vec[int] = Vec::[];
+    let case_targets: Vec[isize] = Vec::new();
     push_breakable(compiler);
     for clause in cases {
         case_targets.push(current_offset(compiler));
@@ -4627,7 +4627,7 @@ fn compile_switch(compiler: Compiler, discriminant: ast::Expr, cases: Vec[ast::S
     pop_scope(compiler)
 }
 
-fn add_exception_handler(compiler: Compiler, start: int, end: int, target: int) -> unit {
+fn add_exception_handler(compiler: Compiler, start: isize, end: isize, target: isize) -> unit {
     if start < end {
         compiler.exception_handlers.push(bytecode::ExceptionHandler { start, end, target })
     } else {}
@@ -4662,7 +4662,7 @@ fn compile_try_without_finally(compiler: Compiler, block: Vec[ast::Stmt], handle
     let _ = patch_jump(compiler, skip, current_offset(compiler));
 }
 
-fn compile_finally_body(compiler: Compiler, finalizer_index: int) -> unit {
+fn compile_finally_body(compiler: Compiler, finalizer_index: isize) -> unit {
     compiler.finalizers[finalizer_index].active = false;
     compile_finalizer_kind(compiler, compiler.finalizers[finalizer_index].kind);
     compiler.finalizers[finalizer_index].active = true;
@@ -5012,7 +5012,7 @@ fn collect_parameter_names(pattern: ast::BindingPattern, names: Vec[(string, ast
 
 fn declare_parameter_bindings(compiler: Compiler, parameters: Vec[ast::FunctionParameter]) -> unit {
     let allow_duplicates = simple_parameter_list(parameters);
-    let names: Vec[(string, ast::Span)] = Vec::[];
+    let names: Vec[(string, ast::Span)] = Vec::new();
     for parameter in parameters {
         collect_parameter_names(parameter.pattern.get(), names)
     }
@@ -5033,8 +5033,8 @@ fn declare_parameter_bindings(compiler: Compiler, parameters: Vec[ast::FunctionP
 }
 
 fn validate_unique_parameter_names(compiler: Compiler, parameters: Vec[ast::FunctionParameter]) -> unit {
-    let names: Vec[(string, ast::Span)] = Vec::[];
-    let seen: HashMap[string, bool] = HashMap::{};
+    let names: Vec[(string, ast::Span)] = Vec::new();
+    let seen: HashMap[string, bool] = HashMap::new();
     for parameter in parameters {
         collect_parameter_names(parameter.pattern.get(), names)
     }
@@ -5052,15 +5052,15 @@ fn mapped_argument_locals(
     parameters: Vec[ast::FunctionParameter],
     strict: bool,
     arrow: bool,
-) -> Vec[int] {
+) -> Vec[isize] {
     if strict || arrow || !simple_parameter_list(parameters) {
-        return Vec::[]
+        return Vec::new()
     } else {};
-    let mapped: Vec[int] = Vec::with_capacity(parameters.len());
+    let mapped: Vec[isize] = Vec::with_capacity(parameters.len());
     for _ in parameters {
         mapped.push(-1)
     }
-    let seen: HashMap[string, bool] = HashMap::{};
+    let seen: HashMap[string, bool] = HashMap::new();
     let mut index = parameters.len();
     while index > 0 {
         index -= 1;
@@ -5081,16 +5081,16 @@ fn mapped_argument_locals(
 }
 
 fn declare_pattern_bindings(compiler: Compiler, pattern: ast::BindingPattern, kind: BindingKind) -> unit {
-    let names: Vec[(string, ast::Span)] = Vec::[];
+    let names: Vec[(string, ast::Span)] = Vec::new();
     collect_parameter_names(pattern, names);
     for (name, span) in names {
         let _ = declare_current(compiler, name, kind, span);
     }
 }
 
-fn pattern_binding_indices(compiler: Compiler, pattern: ast::BindingPattern) -> Vec[int] {
-    let indices: Vec[int] = Vec::[];
-    let names: Vec[(string, ast::Span)] = Vec::[];
+fn pattern_binding_indices(compiler: Compiler, pattern: ast::BindingPattern) -> Vec[isize] {
+    let indices: Vec[isize] = Vec::new();
+    let names: Vec[(string, ast::Span)] = Vec::new();
     collect_parameter_names(pattern, names);
     let scope = compiler.scopes[compiler.scopes.len() - 1];
     for (name, _) in names {
@@ -5102,8 +5102,8 @@ fn pattern_binding_indices(compiler: Compiler, pattern: ast::BindingPattern) -> 
     indices
 }
 
-fn lexical_statement_binding_indices(compiler: Compiler, statement: ast::Stmt) -> Vec[int] {
-    let indices: Vec[int] = Vec::[];
+fn lexical_statement_binding_indices(compiler: Compiler, statement: ast::Stmt) -> Vec[isize] {
+    let indices: Vec[isize] = Vec::new();
     match statement {
         ast::Stmt::VariableDeclaration { kind, declarations, .. } => {
             if kind != ast::VariableKind::Var {
@@ -5119,7 +5119,7 @@ fn lexical_statement_binding_indices(compiler: Compiler, statement: ast::Stmt) -
     indices
 }
 
-fn clone_local_bindings(compiler: Compiler, indices: Vec[int]) -> unit {
+fn clone_local_bindings(compiler: Compiler, indices: Vec[isize]) -> unit {
     for index in indices {
         let _ = emit(compiler, bytecode::Instruction::CloneLoc(index));
     }
@@ -5177,7 +5177,7 @@ fn bind_identifier(compiler: Compiler, name: string, span: ast::Span) -> unit {
     }
 }
 
-fn compile_iterator_binding_value(compiler: Compiler, iterator: int, next: int, done: int) -> unit {
+fn compile_iterator_binding_value(compiler: Compiler, iterator: isize, next: isize, done: isize) -> unit {
     let _ = emit(compiler, bytecode::Instruction::GetLoc(done));
     let already_done = emit(compiler, bytecode::Instruction::IfTrue(-1));
     let _ = emit(compiler, bytecode::Instruction::GetLoc(iterator));
@@ -5201,9 +5201,9 @@ fn compile_iterator_binding_value(compiler: Compiler, iterator: int, next: int, 
 fn compile_array_rest_binding(
     compiler: Compiler,
     pattern: ast::BindingPattern,
-    iterator: int,
-    next: int,
-    done: int,
+    iterator: isize,
+    next: isize,
+    done: isize,
 ) -> unit {
     let array = new_local(compiler);
     let value = new_local(compiler);
@@ -5299,7 +5299,7 @@ fn compile_object_binding_pattern(compiler: Compiler, properties: Vec[ast::Objec
     let _ = emit(compiler, bytecode::Instruction::RequireObjectCoercible);
     let source = new_local(compiler);
     let _ = emit(compiler, bytecode::Instruction::PutLoc(source));
-    let excluded: Vec[ExcludedBindingKey] = Vec::[];
+    let excluded: Vec[ExcludedBindingKey] = Vec::new();
     for property in properties {
         match property {
             ast::ObjectBindingProperty::Property { key, pattern, initializer, span } => {
@@ -5393,9 +5393,9 @@ fn compile_assignment_pattern_target(compiler: Compiler, target: ast::Expr, span
 fn compile_array_rest_assignment(
     compiler: Compiler,
     pattern: ast::AssignmentPattern,
-    iterator: int,
-    next: int,
-    done: int,
+    iterator: isize,
+    next: isize,
+    done: isize,
 ) -> unit {
     let array = new_local(compiler);
     let value = new_local(compiler);
@@ -5483,7 +5483,7 @@ fn compile_object_assignment_pattern(
     let _ = emit(compiler, bytecode::Instruction::RequireObjectCoercible);
     let source = new_local(compiler);
     let _ = emit(compiler, bytecode::Instruction::PutLoc(source));
-    let excluded: Vec[ExcludedBindingKey] = Vec::[];
+    let excluded: Vec[ExcludedBindingKey] = Vec::new();
     for property in properties {
         match property {
             ast::ObjectAssignmentProperty::Property { key, pattern, initializer, span } => {
@@ -5578,17 +5578,17 @@ fn compiler_new(
         }
     }
     let compiler = Compiler {
-        constants: Vec::[],
-        code: Vec::[],
-        eval_sites: Vec::[],
-        scopes: Vec::[Scope { bindings: HashMap::new() }],
-        var_indices: Vec::[],
+        constants: Vec::new(),
+        code: Vec::new(),
+        eval_sites: Vec::new(),
+        scopes: Vec::from_array([Scope { bindings: HashMap::new() }]),
+        var_indices: Vec::new(),
         var_scope_index: Ref::new(0),
         next_local: Ref::new(0),
-        loops: Vec::[],
-        breakables: Vec::[],
+        loops: Vec::new(),
+        breakables: Vec::new(),
         outer_bindings,
-        upvalues: Vec::[],
+        upvalues: Vec::new(),
         parameter_count,
         function_length,
         strict,
@@ -5601,21 +5601,21 @@ fn compiler_new(
         asynchronous,
         used_await: Ref::new(false),
         completion_local: Ref::new(Option::None),
-        errors: Vec::[],
-        exception_handlers: Vec::[],
-        generator_return_handlers: Vec::[],
-        finalizers: Vec::[],
-        protected_regions: Vec::[],
+        errors: Vec::new(),
+        exception_handlers: Vec::new(),
+        generator_return_handlers: Vec::new(),
+        finalizers: Vec::new(),
+        protected_regions: Vec::new(),
         source: Ref::new(""),
         source_name: Ref::new("<input>"),
-        source_locations: Vec::[],
+        source_locations: Vec::new(),
         current_source_offset: Ref::new(0),
         allow_unknown_globals: Ref::new(false),
         pending_loop_label: Ref::new(Option::None),
         direct_eval: Ref::new(false),
         predeclaring_eval: Ref::new(false),
-        dynamic_eval_vars: Vec::[],
-        with_bindings: Vec::[],
+        dynamic_eval_vars: Vec::new(),
+        with_bindings: Vec::new(),
         next_with_binding: Ref::new(0),
         module_mode: Ref::new(false),
     };
@@ -5665,7 +5665,7 @@ fn append_verifier_errors(compiler: Compiler, function: bytecode::Function, span
     }
 }
 
-fn module_binding_index(compiler: Compiler, name: string, span: ast::Span) -> int {
+fn module_binding_index(compiler: Compiler, name: string, span: ast::Span) -> isize {
     match lookup_binding(compiler, name) {
         Some(binding) => binding.index,
         None => {
@@ -5693,7 +5693,7 @@ fn collect_module_declaration_exports(
     match declaration {
         ast::Stmt::VariableDeclaration { declarations, .. } => {
             for declaration in declarations {
-                let names: Vec[(string, ast::Span)] = Vec::[];
+                let names: Vec[(string, ast::Span)] = Vec::new();
                 collect_parameter_names(declaration.pattern.get(), names);
                 for (name, span) in names {
                     push_module_export(
@@ -5704,7 +5704,7 @@ fn collect_module_declaration_exports(
                             source: Option::None,
                             imported: name,
                             local_index: module_binding_index(compiler, name, span),
-                            attributes: Vec::[],
+                            attributes: Vec::new(),
                             span,
                         },
                     )
@@ -5723,7 +5723,7 @@ fn collect_module_declaration_exports(
                 source: Option::None,
                 imported: name,
                 local_index: module_binding_index(compiler, name, span),
-                attributes: Vec::[],
+                attributes: Vec::new(),
                 span,
             },
         ),
@@ -5735,10 +5735,10 @@ fn collect_module_metadata(compiler: Compiler, body: Vec[ast::Stmt]) -> (
     Vec[ModuleImport],
     Vec[ModuleExport],
 ) {
-    let imports: Vec[ModuleImport] = Vec::[];
-    let exports: Vec[ModuleExport] = Vec::[];
+    let imports: Vec[ModuleImport] = Vec::new();
+    let exports: Vec[ModuleExport] = Vec::new();
     let convert_attributes = |values: Vec[ast::ImportAttribute]| {
-        let result: Vec[ModuleAttribute] = Vec::[];
+        let result: Vec[ModuleAttribute] = Vec::new();
         for value in values {
             result.push(ModuleAttribute { key: value.key, value: value.value })
         }
@@ -5821,7 +5821,7 @@ fn collect_module_metadata(compiler: Compiler, body: Vec[ast::Stmt]) -> (
                     source: Option::None,
                     imported: local,
                     local_index: module_binding_index(compiler, local, span),
-                    attributes: Vec::[],
+                    attributes: Vec::new(),
                     span,
                 },
             ),
@@ -5848,8 +5848,8 @@ fn compile_module_program_with_source(program: ast::Program, source: string, sou
     Vec[CompileError],
 ] {
     let compiler = compiler_new(
-        Vec::[],
-        Vec::[],
+        Vec::new(),
+        Vec::new(),
         Option::None,
         false,
         false,
@@ -5894,10 +5894,10 @@ fn compile_module_program_with_source(program: ast::Program, source: string, sou
         compiler.code,
         0,
         compiler.next_local.get(),
-        Vec::[],
+        Vec::new(),
         compiler.exception_handlers,
     );
-    let mapped_arguments: Vec[int] = Vec::[];
+    let mapped_arguments: Vec[isize] = Vec::new();
     function.set_arguments_semantics(true, mapped_arguments);
     function.set_asynchronous(compiler.used_await.get());
     function.set_eval_bindings(current_eval_bindings(compiler));
@@ -5926,8 +5926,8 @@ fn compile_program_with_source(program: ast::Program, source: string, source_nam
 ] {
     let strict = function_body_is_strict(program.body);
     let compiler = compiler_new(
-        Vec::[],
-        Vec::[],
+        Vec::new(),
+        Vec::new(),
         Option::None,
         false,
         false,
@@ -5953,10 +5953,10 @@ fn compile_program_with_source(program: ast::Program, source: string, source_nam
         compiler.code,
         0,
         compiler.next_local.get(),
-        Vec::[],
+        Vec::new(),
         compiler.exception_handlers,
     );
-    let mapped_arguments: Vec[int] = Vec::[];
+    let mapped_arguments: Vec[isize] = Vec::new();
     function.set_arguments_semantics(strict, mapped_arguments);
     function.set_eval_bindings(eval_bindings);
     function.set_eval_sites(compiler.eval_sites);
@@ -5983,7 +5983,7 @@ pub fn compile_with_source_name(source: string, source_name: string) -> Result[
     Vec[CompileError],
 ] {
     let parsed = parser::parse(source);
-    let errors: Vec[CompileError] = Vec::[];
+    let errors: Vec[CompileError] = Vec::new();
     for error in parsed.errors {
         errors.push(CompileError { message: error.message, span: error.span })
     }
@@ -6011,7 +6011,7 @@ pub fn compile_module_with_source_name(source: string, source_name: string) -> R
     Vec[CompileError],
 ] {
     let parsed = parser::parse(source);
-    let errors: Vec[CompileError] = Vec::[];
+    let errors: Vec[CompileError] = Vec::new();
     for error in parsed.errors {
         errors.push(CompileError { message: error.message, span: error.span })
     }
@@ -6046,7 +6046,7 @@ pub fn source_is_module(source: string) -> bool {
 }
 
 fn dynamic_parse_errors(value: parser::ParseResult) -> Vec[CompileError] {
-    let errors: Vec[CompileError] = Vec::[];
+    let errors: Vec[CompileError] = Vec::new();
     for error in value.errors {
         errors.push(CompileError { message: error.message, span: error.span })
     }
@@ -6061,12 +6061,14 @@ fn dynamic_parameters(source: string) -> Result[Vec[ast::FunctionParameter], Vec
     } else {};
     if parsed.program.body.len() != 1 {
         return Result::Err(
-            Vec::[
-                CompileError {
-                    message: "invalid dynamic function parameters",
-                    span: parsed.program.span,
-                },
-            ],
+            Vec::from_array(
+                [
+                    CompileError {
+                        message: "invalid dynamic function parameters",
+                        span: parsed.program.span,
+                    },
+                ],
+            ),
         )
     } else {};
     match parsed.program.body[0] {
@@ -6076,16 +6078,20 @@ fn dynamic_parameters(source: string) -> Result[Vec[ast::FunctionParameter], Vec
             Result::Ok(parameters)
         } else {
             Result::Err(
-                Vec::[CompileError { message: "invalid dynamic function parameters", span }],
+                Vec::from_array(
+                    [CompileError { message: "invalid dynamic function parameters", span }],
+                ),
             )
         },
         _ => Result::Err(
-            Vec::[
-                CompileError {
-                    message: "invalid dynamic function parameters",
-                    span: parsed.program.span,
-                },
-            ],
+            Vec::from_array(
+                [
+                    CompileError {
+                        message: "invalid dynamic function parameters",
+                        span: parsed.program.span,
+                    },
+                ],
+            ),
         ),
     }
 }
@@ -6098,9 +6104,14 @@ fn dynamic_body(source: string) -> Result[(Vec[ast::Stmt], ast::Span), Vec[Compi
     } else {};
     if parsed.program.body.len() != 1 {
         return Result::Err(
-            Vec::[
-                CompileError { message: "invalid dynamic function body", span: parsed.program.span },
-            ],
+            Vec::from_array(
+                [
+                    CompileError {
+                        message: "invalid dynamic function body",
+                        span: parsed.program.span,
+                    },
+                ],
+            ),
         )
     } else {};
     match parsed.program.body[0] {
@@ -6109,12 +6120,19 @@ fn dynamic_body(source: string) -> Result[(Vec[ast::Stmt], ast::Span), Vec[Compi
             && parameters.is_empty() {
             Result::Ok((body, span))
         } else {
-            Result::Err(Vec::[CompileError { message: "invalid dynamic function body", span }])
+            Result::Err(
+                Vec::from_array([CompileError { message: "invalid dynamic function body", span }]),
+            )
         },
         _ => Result::Err(
-            Vec::[
-                CompileError { message: "invalid dynamic function body", span: parsed.program.span },
-            ],
+            Vec::from_array(
+                [
+                    CompileError {
+                        message: "invalid dynamic function body",
+                        span: parsed.program.span,
+                    },
+                ],
+            ),
         ),
     }
 }
@@ -6126,8 +6144,8 @@ pub fn compile_dynamic_function(parameter_source: string, body_source: string) -
     let parameters = dynamic_parameters(parameter_source)?;
     let (body, span) = dynamic_body(body_source)?;
     let parent = compiler_new(
-        Vec::[],
-        Vec::[],
+        Vec::new(),
+        Vec::new(),
         Option::None,
         false,
         false,
@@ -6162,8 +6180,10 @@ pub fn compile_dynamic_function(parameter_source: string, body_source: string) -
     } else {
         Result::Ok(
             bytecode::Function::new(
-                Vec::[bytecode::Constant::Function(Ref::new(function))],
-                Vec::[bytecode::Instruction::PushConst(0), bytecode::Instruction::Return],
+                Vec::from_array([bytecode::Constant::Function(Ref::new(function))]),
+                Vec::from_array(
+                    [bytecode::Instruction::PushConst(0), bytecode::Instruction::Return],
+                ),
                 0,
             ),
         )
@@ -6195,7 +6215,7 @@ fn compile_dynamic_eval(source: string, bindings: Vec[bytecode::EvalBinding]) ->
     if !errors.is_empty() {
         return Result::Err(errors)
     } else {};
-    let outer: Vec[OuterBinding] = Vec::[];
+    let outer: Vec[OuterBinding] = Vec::new();
     let mut lexical_this = false;
     let mut lexical_arguments = false;
     let mut inherited_strict = false;
@@ -6235,7 +6255,7 @@ fn compile_dynamic_eval(source: string, bindings: Vec[bytecode::EvalBinding]) ->
     }
     let strict = inherited_strict || function_body_is_strict(parsed.program.body);
     let compiler = compiler_new(
-        Vec::[],
+        Vec::new(),
         outer,
         Option::None,
         false,
@@ -6262,7 +6282,7 @@ fn compile_dynamic_eval(source: string, bindings: Vec[bytecode::EvalBinding]) ->
     let _ = emit(compiler, bytecode::Instruction::GetLoc(completion));
     let _ = emit(compiler, bytecode::Instruction::Return);
     let nested_eval_bindings = current_eval_bindings(compiler);
-    let sources: Vec[bytecode::UpvalueSource] = Vec::[];
+    let sources: Vec[bytecode::UpvalueSource] = Vec::new();
     for upvalue in compiler.upvalues {
         sources.push(upvalue.source)
     }
@@ -6280,7 +6300,7 @@ fn compile_dynamic_eval(source: string, bindings: Vec[bytecode::EvalBinding]) ->
         false,
         lexical_this,
     );
-    let mapped_arguments: Vec[int] = Vec::[];
+    let mapped_arguments: Vec[isize] = Vec::new();
     function.set_arguments_semantics(strict, mapped_arguments);
     function.set_eval_bindings(nested_eval_bindings);
     function.set_eval_sites(compiler.eval_sites);

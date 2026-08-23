@@ -5,55 +5,55 @@ use std::fs;
 
 struct TimeZoneHeader {
     version: byte,
-    transition_count: int,
-    type_count: int,
-    abbreviation_count: int,
-    leap_count: int,
-    standard_count: int,
-    utc_count: int,
+    transition_count: isize,
+    type_count: isize,
+    abbreviation_count: isize,
+    leap_count: isize,
+    standard_count: isize,
+    utc_count: isize,
 }
 
 enum PosixRuleKind {
-    JulianNoLeap(int),
-    Julian(int),
-    MonthWeekDay(int, int, int),
+    JulianNoLeap(isize),
+    Julian(isize),
+    MonthWeekDay(isize, isize, isize),
 }
 
 struct PosixRule {
     kind: PosixRuleKind,
-    seconds: int64,
+    seconds: i64,
 }
 
 struct PosixTimeZone {
-    standard_offset: int,
-    daylight_offset: int,
+    standard_offset: isize,
+    daylight_offset: isize,
     start: PosixRule,
     end: PosixRule,
 }
 
 struct PosixParser {
     value: Vec[byte],
-    index: Ref[int],
+    index: Ref[isize],
 }
 
 pub struct TimeZone {
-    transitions: Vec[int64],
-    transition_types: Vec[int],
-    offsets: Vec[int],
+    transitions: Vec[i64],
+    transition_types: Vec[isize],
+    offsets: Vec[isize],
     future: Option[PosixTimeZone],
 }
 
 impl TimeZone {
     pub fn utc() -> TimeZone {
         TimeZone {
-            transitions: Vec::[],
-            transition_types: Vec::[],
-            offsets: Vec::[0],
+            transitions: Vec::new(),
+            transition_types: Vec::new(),
+            offsets: Vec::from_array([0]),
             future: Option::None,
         }
     }
 
-    pub fn offset_minutes_at(self: TimeZone, milliseconds: int64) -> int {
+    pub fn offset_minutes_at(self: TimeZone, milliseconds: i64) -> isize {
         if self.offsets.is_empty() {
             return 0
         } else {};
@@ -91,43 +91,43 @@ impl TimeZone {
     }
 }
 
-fn timezone_u32(value: Vec[byte], offset: int) -> Option[uint32] {
+fn timezone_u32(value: Vec[byte], offset: isize) -> Option[u32] {
     if offset < 0 || offset + 4 > value.len() {
         Option::None
     } else {
         Option::Some(
-            value[offset].to_uint32() << 24 | value[offset + 1].to_uint32() << 16
-                | value[offset + 2].to_uint32() << 8
-                | value[offset + 3].to_uint32(),
+            value[offset].to_u32() << 24 | value[offset + 1].to_u32() << 16
+                | value[offset + 2].to_u32() << 8
+                | value[offset + 3].to_u32(),
         )
     }
 }
 
-fn timezone_i32(value: Vec[byte], offset: int) -> Option[int] {
+fn timezone_i32(value: Vec[byte], offset: isize) -> Option[isize] {
     match timezone_u32(value, offset) {
-        Some(value) => Option::Some(value.to_int32().to_int()),
+        Some(value) => Option::Some(value.to_i32().to_isize()),
         None => Option::None,
     }
 }
 
-fn timezone_i64(value: Vec[byte], offset: int) -> Option[int64] {
+fn timezone_i64(value: Vec[byte], offset: isize) -> Option[i64] {
     if offset < 0 || offset + 8 > value.len() {
         Option::None
     } else {
-        let mut result = 0.to_uint64();
+        let mut result = 0.to_u64();
         let mut index = 0;
         while index < 8 {
-            result = result << 8 | value[offset + index].to_uint64();
+            result = result << 8 | value[offset + index].to_u64();
             index += 1;
         }
-        Option::Some(result.to_int64())
+        Option::Some(result.to_i64())
     }
 }
 
-fn timezone_count(value: Vec[byte], offset: int) -> Option[int] {
+fn timezone_count(value: Vec[byte], offset: isize) -> Option[isize] {
     match timezone_u32(value, offset) {
         Some(value) => {
-            let result = value.to_int();
+            let result = value.to_isize();
             if result < 0 || result > 1000000 {
                 Option::None
             } else {
@@ -138,7 +138,7 @@ fn timezone_count(value: Vec[byte], offset: int) -> Option[int] {
     }
 }
 
-fn timezone_header(value: Vec[byte], offset: int) -> Option[TimeZoneHeader] {
+fn timezone_header(value: Vec[byte], offset: isize) -> Option[TimeZoneHeader] {
     if offset < 0 || offset + 44 > value.len() || value[offset] != b'T' || value[offset + 1] != b'Z'
         || value[offset + 2] != b'i'
         || value[offset + 3] != b'f' {
@@ -157,7 +157,7 @@ fn timezone_header(value: Vec[byte], offset: int) -> Option[TimeZoneHeader] {
     )
 }
 
-fn timezone_block_size(header: TimeZoneHeader, width: int) -> int {
+fn timezone_block_size(header: TimeZoneHeader, width: isize) -> isize {
     header.transition_count * width + header.transition_count + header.type_count * 6
         + header.abbreviation_count
         + header.leap_count * (width + 4)
@@ -165,30 +165,30 @@ fn timezone_block_size(header: TimeZoneHeader, width: int) -> int {
         + header.utc_count
 }
 
-fn timezone_parse_block(value: Vec[byte], header: TimeZoneHeader, offset: int, width: int) -> Option[
+fn timezone_parse_block(value: Vec[byte], header: TimeZoneHeader, offset: isize, width: isize) -> Option[
     TimeZone,
 ] {
     let end = offset + timezone_block_size(header, width);
     if header.type_count == 0 || end < offset || end > value.len() {
         return Option::None
     } else {};
-    let transitions: Vec[int64] = Vec::with_capacity(header.transition_count);
+    let transitions: Vec[i64] = Vec::with_capacity(header.transition_count);
     let mut index = 0;
     while index < header.transition_count {
         let position = offset + index * width;
         let transition = if width == 8 {
             timezone_i64(value, position)?
         } else {
-            timezone_i32(value, position)?.to_int64()
+            timezone_i32(value, position)?.to_i64()
         };
         transitions.push(transition);
         index += 1;
     }
     let type_start = offset + header.transition_count * width;
-    let transition_types: Vec[int] = Vec::with_capacity(header.transition_count);
+    let transition_types: Vec[isize] = Vec::with_capacity(header.transition_count);
     index = 0;
     while index < header.transition_count {
-        let type_index = value[type_start + index].to_int();
+        let type_index = value[type_start + index].to_isize();
         if type_index >= header.type_count {
             return Option::None
         } else {};
@@ -196,7 +196,7 @@ fn timezone_parse_block(value: Vec[byte], header: TimeZoneHeader, offset: int, w
         index += 1;
     }
     let information_start = type_start + header.transition_count;
-    let offsets: Vec[int] = Vec::with_capacity(header.type_count);
+    let offsets: Vec[isize] = Vec::with_capacity(header.type_count);
     index = 0;
     while index < header.type_count {
         offsets.push(timezone_i32(value, information_start + index * 6)? / 60);
@@ -229,14 +229,14 @@ fn posix_digit(value: byte) -> bool {
     value >= b'0' && value <= b'9'
 }
 
-fn posix_number(parser: PosixParser, minimum: int, maximum: int) -> Option[int] {
+fn posix_number(parser: PosixParser, minimum: isize, maximum: isize) -> Option[isize] {
     let start = parser.index.get();
     let mut value = 0;
     let mut count = 0;
     while count < maximum {
         match posix_current(parser) {
             Some(current) => if posix_digit(current) {
-                value = value * 10 + (current - b'0').to_int();
+                value = value * 10 + (current - b'0').to_isize();
                 parser.index.set(parser.index.get() + 1);
                 count += 1;
             } else {
@@ -285,7 +285,7 @@ fn posix_name(parser: PosixParser) -> bool {
     }
 }
 
-fn posix_seconds(parser: PosixParser, reverse: bool) -> Option[int64] {
+fn posix_seconds(parser: PosixParser, reverse: bool) -> Option[i64] {
     let sign = if posix_consume(parser, b'-') {
         -1
     } else {
@@ -304,8 +304,7 @@ fn posix_seconds(parser: PosixParser, reverse: bool) -> Option[int64] {
     if hour > 167 || minute > 59 || second > 59 {
         Option::None
     } else {
-        let value = sign.to_int64()
-            * (hour.to_int64() * 3600 + minute.to_int64() * 60 + second.to_int64());
+        let value = sign.to_i64() * (hour.to_i64() * 3600 + minute.to_i64() * 60 + second.to_i64());
         Option::Some(
             if reverse {
                 -value
@@ -382,8 +381,8 @@ fn parse_posix_time_zone(value: Vec[byte]) -> Option[PosixTimeZone] {
     } else {
         Option::Some(
             PosixTimeZone {
-                standard_offset: standard_offset.to_int() / 60,
-                daylight_offset: daylight_offset.to_int() / 60,
+                standard_offset: standard_offset.to_isize() / 60,
+                daylight_offset: daylight_offset.to_isize() / 60,
                 start,
                 end,
             },
@@ -391,11 +390,11 @@ fn parse_posix_time_zone(value: Vec[byte]) -> Option[PosixTimeZone] {
     }
 }
 
-fn posix_footer(value: Vec[byte], offset: int) -> Option[PosixTimeZone] {
+fn posix_footer(value: Vec[byte], offset: isize) -> Option[PosixTimeZone] {
     if offset < 0 || offset >= value.len() || value[offset] != b'\n' {
         return Option::None
     } else {};
-    let content: Vec[byte] = Vec::[];
+    let content: Vec[byte] = Vec::new();
     let mut index = offset + 1;
     while index < value.len() && value[index] != b'\n' {
         content.push(value[index]);
@@ -408,7 +407,7 @@ fn posix_footer(value: Vec[byte], offset: int) -> Option[PosixTimeZone] {
     }
 }
 
-fn posix_rule_days(year: int64, rule: PosixRule) -> Option[int64] {
+fn posix_rule_days(year: i64, rule: PosixRule) -> Option[i64] {
     let first = match days_from_civil(year, 1, 1) {
         Ok(value) => value,
         Err(_) => return Option::None,
@@ -420,16 +419,16 @@ fn posix_rule_days(year: int64, rule: PosixRule) -> Option[int64] {
             } else {
                 0
             };
-            Option::Some(first + day.to_int64() - 1 + adjustment)
+            Option::Some(first + day.to_i64() - 1 + adjustment)
         },
-        PosixRuleKind::Julian(day) => Option::Some(first + day.to_int64()),
+        PosixRuleKind::Julian(day) => Option::Some(first + day.to_i64()),
         PosixRuleKind::MonthWeekDay(month, week, weekday) => {
             let month_first = match days_from_civil(year, month, 1) {
                 Ok(value) => value,
                 Err(_) => return Option::None,
             };
             let first_weekday = ((month_first + 4) % 7 + 7) % 7;
-            let mut day = 1 + ((weekday.to_int64() - first_weekday + 7) % 7).to_int()
+            let mut day = 1 + ((weekday.to_i64() - first_weekday + 7) % 7).to_isize()
                 + (week - 1) * 7;
             let maximum = match days_in_month(year, month) {
                 Ok(value) => value,
@@ -438,18 +437,18 @@ fn posix_rule_days(year: int64, rule: PosixRule) -> Option[int64] {
             if day > maximum {
                 day -= 7;
             } else {};
-            Option::Some(month_first + day.to_int64() - 1)
+            Option::Some(month_first + day.to_i64() - 1)
         },
     }
 }
 
-fn posix_transition(year: int64, rule: PosixRule, previous_offset: int) -> Option[int64] {
+fn posix_transition(year: i64, rule: PosixRule, previous_offset: isize) -> Option[i64] {
     Option::Some(
-        posix_rule_days(year, rule)? * 86400 + rule.seconds - previous_offset.to_int64() * 60,
+        posix_rule_days(year, rule)? * 86400 + rule.seconds - previous_offset.to_i64() * 60,
     )
 }
 
-fn posix_offset_at(value: PosixTimeZone, milliseconds: int64) -> int {
+fn posix_offset_at(value: PosixTimeZone, milliseconds: i64) -> isize {
     let year = match civil_from_utc(milliseconds) {
         Ok(value) => value.year,
         Err(_) => return value.standard_offset,

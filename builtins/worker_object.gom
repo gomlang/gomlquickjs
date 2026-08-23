@@ -12,7 +12,7 @@ struct WorkerClone {
     target_buffers: ArrayBufferInstall,
     source_objects: Vec[runtime::ObjectId],
     target_objects: Vec[Ref[Option[runtime::ObjectId]]],
-    depth: int,
+    depth: isize,
 }
 
 struct WorkerEndpoint {
@@ -28,12 +28,12 @@ fn worker_new_endpoint(context: vm::Context, buffers: ArrayBufferInstall) -> Wor
         context,
         buffers,
         handler: Ref::new(runtime::Value::Undefined),
-        pending: Vec::[],
+        pending: Vec::new(),
         peer: Ref::new(Option::None),
     }
 }
 
-fn worker_clone_index(clone: WorkerClone, object: runtime::ObjectId) -> Option[int] {
+fn worker_clone_index(clone: WorkerClone, object: runtime::ObjectId) -> Option[isize] {
     let mut index = 0;
     while index < clone.source_objects.len() {
         if clone.source_objects[index] == object {
@@ -138,7 +138,7 @@ fn worker_clone_ordinary(
 }
 
 fn worker_clone_array_length(clone: WorkerClone, source: runtime::ObjectId) -> Result[
-    int,
+    isize,
     vm::VmError,
 ] {
     json_builtin_array_length(clone.source_context, source, clone.depth)
@@ -197,7 +197,7 @@ fn worker_clone_buffer(
     };
     let target_value = clone.target_context.construct_with_new_target_at_depth(
         constructor,
-        Vec::[runtime::Value::Int(0)],
+        Vec::from_array([runtime::Value::Int(0)]),
         constructor,
         clone.depth,
     )?;
@@ -252,7 +252,7 @@ fn worker_typed_constructor(buffers: ArrayBufferInstall, view: runtime::TypedArr
     }
 }
 
-fn worker_typed_offset(view: runtime::TypedArrayView) -> int {
+fn worker_typed_offset(view: runtime::TypedArrayView) -> isize {
     match view {
         runtime::TypedArrayView::Uint8(value) => value.byte_offset(),
         runtime::TypedArrayView::Int32(value) => value.byte_offset(),
@@ -283,11 +283,13 @@ fn worker_clone_typed_array(
     let constructor = worker_typed_constructor(clone.target_buffers, view);
     let target_value = clone.target_context.construct_with_new_target_at_depth(
         constructor,
-        Vec::[
-            buffer,
-            runtime::Value::Int(worker_typed_offset(view).to_int32()),
-            runtime::Value::Int(length.to_int32()),
-        ],
+        Vec::from_array(
+            [
+                buffer,
+                runtime::Value::Int(worker_typed_offset(view).to_i32()),
+                runtime::Value::Int(length.to_i32()),
+            ],
+        ),
         constructor,
         clone.depth,
     )?;
@@ -328,7 +330,7 @@ fn worker_clone_date(
         runtime::Value::String(js_string("valueOf")),
         clone.depth,
     )?;
-    let arguments: Vec[runtime::Value] = Vec::[];
+    let arguments: Vec[runtime::Value] = Vec::new();
     let time = clone.source_context.invoke_with_this_at_depth(
         value_of,
         arguments,
@@ -338,7 +340,7 @@ fn worker_clone_date(
     let constructor = worker_target_global_value(clone, "Date")?;
     let result = clone.target_context.construct_with_new_target_at_depth(
         constructor,
-        Vec::[time],
+        Vec::from_array([time]),
         constructor,
         clone.depth,
     )?;
@@ -444,7 +446,7 @@ fn worker_clone_message(
     source: WorkerEndpoint,
     target: WorkerEndpoint,
     value: runtime::Value,
-    depth: int,
+    depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     worker_clone_value(
         WorkerClone {
@@ -452,8 +454,8 @@ fn worker_clone_message(
             target_context: target.context,
             source_buffers: source.buffers,
             target_buffers: target.buffers,
-            source_objects: Vec::[],
-            target_objects: Vec::[],
+            source_objects: Vec::new(),
+            target_objects: Vec::new(),
             depth,
         },
         value,
@@ -491,7 +493,7 @@ fn worker_handler_callable(endpoint: WorkerEndpoint) -> bool {
     }
 }
 
-fn worker_deliver(endpoint: WorkerEndpoint, value: runtime::Value, depth: int) -> Result[
+fn worker_deliver(endpoint: WorkerEndpoint, value: runtime::Value, depth: isize) -> Result[
     runtime::Value,
     vm::VmError,
 ] {
@@ -501,7 +503,7 @@ fn worker_deliver(endpoint: WorkerEndpoint, value: runtime::Value, depth: int) -
     } else {};
     endpoint.context.invoke_with_this_at_depth(
         endpoint.handler.get(),
-        Vec::[worker_event(endpoint, value)?],
+        Vec::from_array([worker_event(endpoint, value)?]),
         runtime::Value::Undefined,
         depth,
     )
@@ -518,13 +520,13 @@ fn worker_schedule(endpoint: WorkerEndpoint) -> Result[unit, vm::VmError] {
                 worker_deliver(endpoint, value, depth)
             },
         )?;
-        let arguments: Vec[runtime::Value] = Vec::[];
+        let arguments: Vec[runtime::Value] = Vec::new();
         endpoint.context.enqueue_host_job(callback, arguments)?
     }
     Result::Ok(())
 }
 
-fn worker_post_message(endpoint: WorkerEndpoint, arguments: Vec[runtime::Value], depth: int) -> Result[
+fn worker_post_message(endpoint: WorkerEndpoint, arguments: Vec[runtime::Value], depth: isize) -> Result[
     runtime::Value,
     vm::VmError,
 ] {
@@ -659,7 +661,7 @@ fn worker_initialize_receiver(
     buffers: ArrayBufferInstall,
     receiver: runtime::ObjectId,
     arguments: Vec[runtime::Value],
-    depth: int,
+    depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     let module_path = worker_source_path(context, argument(arguments, 0))?;
     let child_context = vm::Context::new(runtime::Heap::new());
@@ -676,7 +678,7 @@ fn worker_initialize_receiver(
         Err(error) => return Result::Err(function_vm_error(error.message)),
     };
     worker_install_parent(child_context, child_realm.global_object(), child_endpoint)?;
-    for name in Vec::["postMessage", "onmessage"] {
+    for name in Vec::from_array(["postMessage", "onmessage"]) {
         let descriptor = match context.heap().get(parent_port) {
             Some(value) => value.own_property(runtime::string_property_key(name)),
             None => Option::None,

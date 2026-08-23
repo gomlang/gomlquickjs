@@ -3,8 +3,8 @@ package runtime;
 use gomlang::quickjs::unicode;
 
 pub enum JsStringUtf8Error {
-    InvalidSequence(int, unicode::Utf8Error),
-    CodePointOutOfRange(int, uint32),
+    InvalidSequence(isize, unicode::Utf8Error),
+    CodePointOutOfRange(isize, u32),
 }
 
 impl ToString for JsStringUtf8Error {
@@ -28,7 +28,7 @@ impl Debug for JsStringUtf8Error {
 }
 
 pub struct JsString {
-    code_units_value: Vec[uint16],
+    code_units_value: Vec[u16],
 }
 
 impl PartialEq for JsString {
@@ -40,8 +40,8 @@ impl PartialEq for JsString {
 impl Eq for JsString {}
 
 impl Hash for JsString {
-    fn hash(self: JsString) -> uint64 {
-        let mut result: uint64 = 14695981039346656037;
+    fn hash(self: JsString) -> u64 {
+        let mut result: u64 = 14695981039346656037;
         let mut index = 0;
         while index < self.code_units_value.len() {
             result = (result ^ Hash::hash(self.code_units_value.get(index))) * 1099511628211;
@@ -51,8 +51,8 @@ impl Hash for JsString {
     }
 }
 
-fn copy_code_units(input: Slice[uint16]) -> Vec[uint16] {
-    let output: Vec[uint16] = Vec::with_capacity(input.len());
+fn copy_code_units(input: Slice[u16]) -> Vec[u16] {
+    let output: Vec[u16] = Vec::with_capacity(input.len());
     let mut index = 0;
     while index < input.len() {
         output.push(input.get(index));
@@ -61,42 +61,42 @@ fn copy_code_units(input: Slice[uint16]) -> Vec[uint16] {
     output
 }
 
-fn make_js_string(input: Slice[uint16]) -> JsString {
+fn make_js_string(input: Slice[u16]) -> JsString {
     JsString { code_units_value: copy_code_units(input) }
 }
 
-pub fn is_surrogate(code_unit: uint16) -> bool {
+pub fn is_surrogate(code_unit: u16) -> bool {
     code_unit >= 0xd800 && code_unit <= 0xdfff
 }
 
-pub fn is_high_surrogate(code_unit: uint16) -> bool {
+pub fn is_high_surrogate(code_unit: u16) -> bool {
     code_unit >= 0xd800 && code_unit <= 0xdbff
 }
 
-pub fn is_low_surrogate(code_unit: uint16) -> bool {
+pub fn is_low_surrogate(code_unit: u16) -> bool {
     code_unit >= 0xdc00 && code_unit <= 0xdfff
 }
 
-pub fn split_code_point(code_point: uint32) -> Option[(uint16, uint16)] {
+pub fn split_code_point(code_point: u32) -> Option[(u16, u16)] {
     if code_point < 0x10000 || code_point > 0x10ffff {
         Option::None
     } else {
         let value = code_point - 0x10000;
-        Option::Some(((0xd800 + (value >> 10)).to_uint16(), (0xdc00 + (value & 0x3ff)).to_uint16()))
+        Option::Some(((0xd800 + (value >> 10)).to_u16(), (0xdc00 + (value & 0x3ff)).to_u16()))
     }
 }
 
-pub fn combine_surrogates(high: uint16, low: uint16) -> Option[uint32] {
+pub fn combine_surrogates(high: u16, low: u16) -> Option[u32] {
     if is_high_surrogate(high) && is_low_surrogate(low) {
-        Option::Some(0x10000 + (high.to_uint32() - 0xd800) * 0x400 + (low.to_uint32() - 0xdc00))
+        Option::Some(0x10000 + (high.to_u32() - 0xd800) * 0x400 + (low.to_u32() - 0xdc00))
     } else {
         Option::None
     }
 }
 
-fn append_code_point(output: Vec[uint16], code_point: uint32) -> bool {
+fn append_code_point(output: Vec[u16], code_point: u32) -> bool {
     if code_point <= 0xffff {
-        output.push(code_point.to_uint16());
+        output.push(code_point.to_u16());
         true
     } else {
         match split_code_point(code_point) {
@@ -114,7 +114,7 @@ fn continuation_byte(value: byte) -> bool {
     value >= 0x80 && value < 0xc0
 }
 
-fn next_lossy_offset(input: Slice[byte], offset: int) -> int {
+fn next_lossy_offset(input: Slice[byte], offset: isize) -> isize {
     let mut next = offset + 1;
     while next < input.len() && continuation_byte(input.get(next)) {
         next += 1;
@@ -123,7 +123,7 @@ fn next_lossy_offset(input: Slice[byte], offset: int) -> int {
 }
 
 fn decode_utf8_lossy(input: Slice[byte]) -> JsString {
-    let output: Vec[uint16] = Vec::with_capacity(input.len());
+    let output: Vec[u16] = Vec::with_capacity(input.len());
     let mut offset = 0;
     while offset < input.len() {
         match unicode::unicode_from_utf8_at(input, offset) {
@@ -143,7 +143,7 @@ fn decode_utf8_lossy(input: Slice[byte]) -> JsString {
 }
 
 fn decode_utf8_strict(input: Slice[byte]) -> Result[JsString, JsStringUtf8Error] {
-    let output: Vec[uint16] = Vec::with_capacity(input.len());
+    let output: Vec[u16] = Vec::with_capacity(input.len());
     let mut offset = 0;
     while offset < input.len() {
         let decoded = match unicode::unicode_from_utf8_at(input, offset) {
@@ -169,29 +169,29 @@ pub fn try_from_utf8(input: Slice[byte]) -> Result[JsString, JsStringUtf8Error] 
     decode_utf8_strict(input)
 }
 
-pub fn from_code_units(input: Vec[uint16]) -> JsString {
+pub fn from_code_units(input: Vec[u16]) -> JsString {
     make_js_string(input.slice(0, input.len()))
 }
 
-pub fn code_units(value: JsString) -> Vec[uint16] {
+pub fn code_units(value: JsString) -> Vec[u16] {
     value.code_units()
 }
 
-fn append_utf8(output: Vec[byte], code_point: uint32) -> unit {
+fn append_utf8(output: Vec[byte], code_point: u32) -> unit {
     if code_point < 0x80 {
-        output.push(code_point.to_uint8());
+        output.push(code_point.to_u8());
     } else if code_point < 0x800 {
-        output.push(((code_point >> 6) | 0xc0).to_uint8());
-        output.push(((code_point & 0x3f) | 0x80).to_uint8());
+        output.push(((code_point >> 6) | 0xc0).to_u8());
+        output.push(((code_point & 0x3f) | 0x80).to_u8());
     } else if code_point < 0x10000 {
-        output.push(((code_point >> 12) | 0xe0).to_uint8());
-        output.push((((code_point >> 6) & 0x3f) | 0x80).to_uint8());
-        output.push(((code_point & 0x3f) | 0x80).to_uint8());
+        output.push(((code_point >> 12) | 0xe0).to_u8());
+        output.push((((code_point >> 6) & 0x3f) | 0x80).to_u8());
+        output.push(((code_point & 0x3f) | 0x80).to_u8());
     } else {
-        output.push(((code_point >> 18) | 0xf0).to_uint8());
-        output.push((((code_point >> 12) & 0x3f) | 0x80).to_uint8());
-        output.push((((code_point >> 6) & 0x3f) | 0x80).to_uint8());
-        output.push(((code_point & 0x3f) | 0x80).to_uint8());
+        output.push(((code_point >> 18) | 0xf0).to_u8());
+        output.push((((code_point >> 12) & 0x3f) | 0x80).to_u8());
+        output.push((((code_point >> 6) & 0x3f) | 0x80).to_u8());
+        output.push(((code_point & 0x3f) | 0x80).to_u8());
     }
 }
 
@@ -208,12 +208,12 @@ fn encode_utf8(value: JsString) -> Vec[byte] {
                     index += 2;
                 },
                 None => {
-                    append_utf8(output, first.to_uint32());
+                    append_utf8(output, first.to_u32());
                     index += 1;
                 },
             }
         } else {
-            append_utf8(output, first.to_uint32());
+            append_utf8(output, first.to_u32());
             index += 1;
         }
     }
@@ -233,24 +233,24 @@ impl JsString {
         decode_utf8_strict(input)
     }
 
-    pub fn from_code_units(input: Vec[uint16]) -> JsString {
+    pub fn from_code_units(input: Vec[u16]) -> JsString {
         make_js_string(input.slice(0, input.len()))
     }
 
-    pub fn code_units(self: JsString) -> Vec[uint16] {
+    pub fn code_units(self: JsString) -> Vec[u16] {
         copy_code_units(self.code_units_value.slice(0, self.code_units_value.len()))
     }
 
-    pub fn len(self: JsString) -> int {
+    pub fn len(self: JsString) -> isize {
         self.code_units_value.len()
     }
 
-    pub fn get(self: JsString, index: int) -> uint16 {
+    pub fn get(self: JsString, index: isize) -> u16 {
         self.code_units_value.get(index)
     }
 
     pub fn concat(self: JsString, other: JsString) -> JsString {
-        let output: Vec[uint16] = Vec::with_capacity(self.len() + other.len());
+        let output: Vec[u16] = Vec::with_capacity(self.len() + other.len());
         let mut index = 0;
         while index < self.len() {
             output.push(self.get(index));
@@ -264,7 +264,7 @@ impl JsString {
         JsString { code_units_value: output }
     }
 
-    pub fn slice(self: JsString, start: int, end: int) -> JsString {
+    pub fn slice(self: JsString, start: isize, end: isize) -> JsString {
         make_js_string(self.code_units_value.slice(start, end))
     }
 

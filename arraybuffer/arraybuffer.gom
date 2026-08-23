@@ -6,7 +6,7 @@ use std::bincode;
 use std::math;
 use std::num;
 
-pub const MAX_BUFFER_BYTE_LENGTH: int = 2147483647;
+pub const MAX_BUFFER_BYTE_LENGTH: isize = 2147483647;
 
 #[derive(PartialEq, Eq, Debug)]
 pub enum BufferErrorClass {
@@ -30,8 +30,8 @@ pub enum BufferErrorReason {
 pub struct BufferError {
     pub class: BufferErrorClass,
     pub reason: BufferErrorReason,
-    pub value: int,
-    pub limit: int,
+    pub value: isize,
+    pub limit: isize,
 }
 
 impl ToString for BufferError {
@@ -56,8 +56,8 @@ impl ToString for BufferError {
 
 struct BackingStore {
     bytes: Ref[Vec[byte]],
-    byte_length: Ref[int],
-    max_byte_length: Ref[int],
+    byte_length: Ref[isize],
+    max_byte_length: Ref[isize],
     resizable: Ref[bool],
     detached: Ref[bool],
     shared: bool,
@@ -69,26 +69,26 @@ pub struct ArrayBuffer {
 
 pub struct DataView {
     store: BackingStore,
-    view_offset: int,
-    view_length: int,
+    view_offset: isize,
+    view_length: isize,
 }
 
 pub struct Uint8Array {
     store: BackingStore,
-    view_offset: int,
-    element_length: int,
+    view_offset: isize,
+    element_length: isize,
 }
 
 pub struct Int32Array {
     store: BackingStore,
-    view_offset: int,
-    element_length: int,
+    view_offset: isize,
+    element_length: isize,
 }
 
 pub struct Float64Array {
     store: BackingStore,
-    view_offset: int,
-    element_length: int,
+    view_offset: isize,
+    element_length: isize,
 }
 
 #[derive(PartialEq, Eq, Debug)]
@@ -104,8 +104,8 @@ pub enum NumericArrayKind {
 
 pub struct NumericArray {
     store: BackingStore,
-    view_offset: int,
-    element_length: int,
+    view_offset: isize,
+    element_length: isize,
     kind_value: NumericArrayKind,
 }
 
@@ -117,12 +117,12 @@ pub enum BigIntArrayKind {
 
 pub struct BigIntArray {
     store: BackingStore,
-    view_offset: int,
-    element_length: int,
+    view_offset: isize,
+    element_length: isize,
     kind_value: BigIntArrayKind,
 }
 
-fn buffer_error(class: BufferErrorClass, reason: BufferErrorReason, value: int, limit: int) -> BufferError {
+fn buffer_error(class: BufferErrorClass, reason: BufferErrorReason, value: isize, limit: isize) -> BufferError {
     BufferError { class, reason, value, limit }
 }
 
@@ -130,11 +130,11 @@ fn type_error(reason: BufferErrorReason) -> BufferError {
     buffer_error(BufferErrorClass::TypeError, reason, 0, 0)
 }
 
-fn range_error(reason: BufferErrorReason, value: int, limit: int) -> BufferError {
+fn range_error(reason: BufferErrorReason, value: isize, limit: isize) -> BufferError {
     buffer_error(BufferErrorClass::RangeError, reason, value, limit)
 }
 
-fn allocate_bytes(length: int) -> Result[Vec[byte], BufferError] {
+fn allocate_bytes(length: isize) -> Result[Vec[byte], BufferError] {
     if length < 0 {
         return Result::Err(range_error(BufferErrorReason::NegativeLength, length, 0))
     } else if length > MAX_BUFFER_BYTE_LENGTH {
@@ -151,7 +151,7 @@ fn allocate_bytes(length: int) -> Result[Vec[byte], BufferError] {
     Result::Ok(values)
 }
 
-fn copy_bytes(values: Vec[byte], start: int, length: int) -> Vec[byte] {
+fn copy_bytes(values: Vec[byte], start: isize, length: isize) -> Vec[byte] {
     let output: Vec[byte] = Vec::with_capacity(length);
     let mut index = 0;
     while index < length {
@@ -161,7 +161,7 @@ fn copy_bytes(values: Vec[byte], start: int, length: int) -> Vec[byte] {
     output
 }
 
-fn new_store(values: Vec[byte], shared: bool, max_byte_length: int, resizable: bool) -> BackingStore {
+fn new_store(values: Vec[byte], shared: bool, max_byte_length: isize, resizable: bool) -> BackingStore {
     let length = values.len();
     BackingStore {
         bytes: Ref::new(values),
@@ -183,7 +183,7 @@ fn require_attached(store: BackingStore) -> Result[unit, BufferError] {
 
 fn detach_store(store: BackingStore) -> Result[unit, BufferError] {
     require_attached(store)?;
-    let empty: Vec[byte] = Vec::[];
+    let empty: Vec[byte] = Vec::new();
     store.bytes.set(empty);
     store.byte_length.set(0);
     store.max_byte_length.set(0);
@@ -192,7 +192,7 @@ fn detach_store(store: BackingStore) -> Result[unit, BufferError] {
     Result::Ok(())
 }
 
-fn check_range(offset: int, length: int, total: int) -> Result[unit, BufferError] {
+fn check_range(offset: isize, length: isize, total: isize) -> Result[unit, BufferError] {
     if offset < 0 || offset > total {
         Result::Err(range_error(BufferErrorReason::OffsetOutOfRange, offset, total))
     } else if length < 0 {
@@ -204,7 +204,7 @@ fn check_range(offset: int, length: int, total: int) -> Result[unit, BufferError
     }
 }
 
-fn check_index(index: int, length: int) -> Result[unit, BufferError] {
+fn check_index(index: isize, length: isize) -> Result[unit, BufferError] {
     if index < 0 || index >= length {
         Result::Err(range_error(BufferErrorReason::IndexOutOfRange, index, length))
     } else {
@@ -212,7 +212,7 @@ fn check_index(index: int, length: int) -> Result[unit, BufferError] {
     }
 }
 
-fn normalize_relative_index(index: int, length: int) -> int {
+fn normalize_relative_index(index: isize, length: isize) -> isize {
     if index < 0 {
         if index < -length {
             0
@@ -230,9 +230,9 @@ fn optional_endianness(value: Option[bool]) -> bool {
     value.unwrap_or(false)
 }
 
-fn read_unsigned_at(store: BackingStore, offset: int, width: int, little_endian: bool) -> uint64 {
+fn read_unsigned_at(store: BackingStore, offset: isize, width: isize, little_endian: bool) -> u64 {
     let values = store.bytes.get();
-    let mut result = 0.to_uint64();
+    let mut result = 0.to_u64();
     let mut index = 0;
     while index < width {
         let source = if little_endian {
@@ -240,7 +240,7 @@ fn read_unsigned_at(store: BackingStore, offset: int, width: int, little_endian:
         } else {
             offset + width - index - 1
         };
-        result = result | (values[source].to_uint64() << (index * 8));
+        result = result | (values[source].to_u64() << (index * 8));
         index += 1;
     }
     result
@@ -248,9 +248,9 @@ fn read_unsigned_at(store: BackingStore, offset: int, width: int, little_endian:
 
 fn write_unsigned_at(
     store: BackingStore,
-    offset: int,
-    width: int,
-    value: uint64,
+    offset: isize,
+    width: isize,
+    value: u64,
     little_endian: bool,
 ) -> unit {
     let values = store.bytes.get();
@@ -261,7 +261,7 @@ fn write_unsigned_at(
         } else {
             offset + width - index - 1
         };
-        values[target] = ((value >> (index * 8)) & 0xff).to_uint8();
+        values[target] = ((value >> (index * 8)) & 0xff).to_u8();
         index += 1;
     }
 }
@@ -274,25 +274,22 @@ fn bincode_config(little_endian: bool) -> bincode::Config {
     }
 }
 
-fn encode_float32(value: float32, little_endian: bool) -> Result[Vec[byte], BufferError] {
+fn encode_float32(value: f32, little_endian: bool) -> Result[Vec[byte], BufferError] {
     match bincode::encode_to_vec(value, bincode_config(little_endian)) {
         Ok(values) => Result::Ok(values),
         Err(_) => Result::Err(type_error(BufferErrorReason::CodecFailure)),
     }
 }
 
-fn encode_float64(value: float64, little_endian: bool) -> Result[Vec[byte], BufferError] {
+fn encode_float64(value: f64, little_endian: bool) -> Result[Vec[byte], BufferError] {
     match bincode::encode_to_vec(value, bincode_config(little_endian)) {
         Ok(values) => Result::Ok(values),
         Err(_) => Result::Err(type_error(BufferErrorReason::CodecFailure)),
     }
 }
 
-fn decode_float32(values: Vec[byte], start: int, little_endian: bool) -> Result[
-    float32,
-    BufferError,
-] {
-    let decoded: Result[(float32, int), string] = bincode::decode_from_slice(
+fn decode_float32(values: Vec[byte], start: isize, little_endian: bool) -> Result[f32, BufferError] {
+    let decoded: Result[(f32, isize), string] = bincode::decode_from_slice(
         values.slice(start, start + 4),
         bincode_config(little_endian),
     );
@@ -306,11 +303,8 @@ fn decode_float32(values: Vec[byte], start: int, little_endian: bool) -> Result[
     }
 }
 
-fn decode_float64(values: Vec[byte], start: int, little_endian: bool) -> Result[
-    float64,
-    BufferError,
-] {
-    let decoded: Result[(float64, int), string] = bincode::decode_from_slice(
+fn decode_float64(values: Vec[byte], start: isize, little_endian: bool) -> Result[f64, BufferError] {
+    let decoded: Result[(f64, isize), string] = bincode::decode_from_slice(
         values.slice(start, start + 8),
         bincode_config(little_endian),
     );
@@ -324,7 +318,7 @@ fn decode_float64(values: Vec[byte], start: int, little_endian: bool) -> Result[
     }
 }
 
-fn write_encoded(store: BackingStore, offset: int, encoded: Vec[byte]) -> unit {
+fn write_encoded(store: BackingStore, offset: isize, encoded: Vec[byte]) -> unit {
     let values = store.bytes.get();
     let mut index = 0;
     while index < encoded.len() {
@@ -333,15 +327,15 @@ fn write_encoded(store: BackingStore, offset: int, encoded: Vec[byte]) -> unit {
     }
 }
 
-fn to_uint32(value: float64) -> uint32 {
+fn to_u32(value: f64) -> u32 {
     if !math::is_finite(value) || value == 0.0 {
         0
     } else {
         let integer = math::trunc(value);
         let mut remaining = integer - math::floor(integer / 4294967296.0) * 4294967296.0;
         let mut place = 2147483648.0;
-        let mut mask: uint32 = 0x80000000;
-        let mut result: uint32 = 0;
+        let mut mask: u32 = 0x80000000;
+        let mut result: u32 = 0;
         while mask != 0 {
             if remaining >= place {
                 result = result | mask;
@@ -355,7 +349,7 @@ fn to_uint32(value: float64) -> uint32 {
 }
 
 impl ArrayBuffer {
-    pub fn new(byte_length: int) -> Result[ArrayBuffer, BufferError] {
+    pub fn new(byte_length: isize) -> Result[ArrayBuffer, BufferError] {
         Result::Ok(
             ArrayBuffer {
                 store: new_store(allocate_bytes(byte_length)?, false, byte_length, false),
@@ -363,13 +357,13 @@ impl ArrayBuffer {
         )
     }
 
-    pub fn new_shared(byte_length: int) -> Result[ArrayBuffer, BufferError] {
+    pub fn new_shared(byte_length: isize) -> Result[ArrayBuffer, BufferError] {
         Result::Ok(
             ArrayBuffer { store: new_store(allocate_bytes(byte_length)?, true, byte_length, false) },
         )
     }
 
-    pub fn new_growable_shared(byte_length: int, max_byte_length: int) -> Result[
+    pub fn new_growable_shared(byte_length: isize, max_byte_length: isize) -> Result[
         ArrayBuffer,
         BufferError,
     ] {
@@ -393,7 +387,10 @@ impl ArrayBuffer {
         )
     }
 
-    pub fn new_resizable(byte_length: int, max_byte_length: int) -> Result[ArrayBuffer, BufferError] {
+    pub fn new_resizable(byte_length: isize, max_byte_length: isize) -> Result[
+        ArrayBuffer,
+        BufferError,
+    ] {
         if max_byte_length < byte_length || max_byte_length < 0 {
             return Result::Err(
                 range_error(BufferErrorReason::LengthOutOfRange, max_byte_length, byte_length),
@@ -431,7 +428,7 @@ impl ArrayBuffer {
         Result::Ok(ArrayBuffer { store: new_store(copied, false, values.len(), false) })
     }
 
-    pub fn from_bytes_resizable(values: Slice[byte], max_byte_length: int) -> Result[
+    pub fn from_bytes_resizable(values: Slice[byte], max_byte_length: isize) -> Result[
         ArrayBuffer,
         BufferError,
     ] {
@@ -440,7 +437,7 @@ impl ArrayBuffer {
         Result::Ok(result)
     }
 
-    pub fn byte_length(self: ArrayBuffer) -> int {
+    pub fn byte_length(self: ArrayBuffer) -> isize {
         self.store.byte_length.get()
     }
 
@@ -452,7 +449,7 @@ impl ArrayBuffer {
         self.store.shared
     }
 
-    pub fn max_byte_length(self: ArrayBuffer) -> int {
+    pub fn max_byte_length(self: ArrayBuffer) -> isize {
         if self.store.detached.get() {
             0
         } else {
@@ -468,7 +465,7 @@ impl ArrayBuffer {
         !self.store.detached.get() && self.store.shared && self.store.resizable.get()
     }
 
-    pub fn resize(self: ArrayBuffer, new_byte_length: int) -> Result[unit, BufferError] {
+    pub fn resize(self: ArrayBuffer, new_byte_length: isize) -> Result[unit, BufferError] {
         require_attached(self.store)?;
         if !self.store.resizable.get() || self.store.shared {
             return Result::Err(type_error(BufferErrorReason::LengthOutOfRange))
@@ -500,7 +497,7 @@ impl ArrayBuffer {
         Result::Ok(())
     }
 
-    pub fn grow(self: ArrayBuffer, new_byte_length: int) -> Result[unit, BufferError] {
+    pub fn grow(self: ArrayBuffer, new_byte_length: isize) -> Result[unit, BufferError] {
         require_attached(self.store)?;
         if !self.store.shared || !self.store.resizable.get() {
             return Result::Err(type_error(BufferErrorReason::LengthOutOfRange))
@@ -540,7 +537,7 @@ impl ArrayBuffer {
         Result::Ok(copy_bytes(self.store.bytes.get(), 0, self.store.byte_length.get()))
     }
 
-    pub fn write_bytes(self: ArrayBuffer, byte_offset: int, values: Slice[byte]) -> Result[
+    pub fn write_bytes(self: ArrayBuffer, byte_offset: isize, values: Slice[byte]) -> Result[
         unit,
         BufferError,
     ] {
@@ -555,7 +552,7 @@ impl ArrayBuffer {
         Result::Ok(())
     }
 
-    pub fn slice(self: ArrayBuffer, begin: int, end: int) -> Result[ArrayBuffer, BufferError] {
+    pub fn slice(self: ArrayBuffer, begin: isize, end: isize) -> Result[ArrayBuffer, BufferError] {
         require_attached(self.store)?;
         let length = self.store.byte_length.get();
         let first = normalize_relative_index(begin, length);
@@ -577,7 +574,7 @@ impl ArrayBuffer {
         )
     }
 
-    fn transfer_with_mode(self: ArrayBuffer, new_byte_length: Option[int], fixed_length: bool) -> Result[
+    fn transfer_with_mode(self: ArrayBuffer, new_byte_length: Option[isize], fixed_length: bool) -> Result[
         ArrayBuffer,
         BufferError,
     ] {
@@ -629,14 +626,14 @@ impl ArrayBuffer {
         Result::Ok(result)
     }
 
-    pub fn transfer(self: ArrayBuffer, new_byte_length: Option[int]) -> Result[
+    pub fn transfer(self: ArrayBuffer, new_byte_length: Option[isize]) -> Result[
         ArrayBuffer,
         BufferError,
     ] {
         self.transfer_with_mode(new_byte_length, false)
     }
 
-    pub fn transfer_to_fixed_length(self: ArrayBuffer, new_byte_length: Option[int]) -> Result[
+    pub fn transfer_to_fixed_length(self: ArrayBuffer, new_byte_length: Option[isize]) -> Result[
         ArrayBuffer,
         BufferError,
     ] {
@@ -652,7 +649,7 @@ impl ArrayBuffer {
 }
 
 impl DataView {
-    pub fn new(buffer: ArrayBuffer, byte_offset: int, byte_length: Option[int]) -> Result[
+    pub fn new(buffer: ArrayBuffer, byte_offset: isize, byte_length: Option[isize]) -> Result[
         DataView,
         BufferError,
     ] {
@@ -685,7 +682,7 @@ impl DataView {
         ArrayBuffer { store: self.store }
     }
 
-    pub fn byte_offset(self: DataView) -> Result[int, BufferError] {
+    pub fn byte_offset(self: DataView) -> Result[isize, BufferError] {
         require_attached(self.store)?;
         if self.view_offset > self.store.byte_length.get()
             || self.view_length >= 0
@@ -696,7 +693,7 @@ impl DataView {
         }
     }
 
-    pub fn byte_length(self: DataView) -> Result[int, BufferError] {
+    pub fn byte_length(self: DataView) -> Result[isize, BufferError] {
         require_attached(self.store)?;
         if self.view_offset > self.store.byte_length.get() {
             Result::Err(type_error(BufferErrorReason::LengthOutOfRange))
@@ -709,62 +706,62 @@ impl DataView {
         }
     }
 
-    fn checked_offset(self: DataView, offset: int, width: int) -> Result[int, BufferError] {
+    fn checked_offset(self: DataView, offset: isize, width: isize) -> Result[isize, BufferError] {
         check_range(offset, width, self.byte_length()?)?;
         Result::Ok(self.view_offset + offset)
     }
 
-    pub fn get_int8(self: DataView, byte_offset: int) -> Result[int8, BufferError] {
+    pub fn get_int8(self: DataView, byte_offset: isize) -> Result[i8, BufferError] {
         let offset = self.checked_offset(byte_offset, 1)?;
-        Result::Ok(read_unsigned_at(self.store, offset, 1, false).to_int8())
+        Result::Ok(read_unsigned_at(self.store, offset, 1, false).to_i8())
     }
 
-    pub fn get_uint8(self: DataView, byte_offset: int) -> Result[uint8, BufferError] {
+    pub fn get_uint8(self: DataView, byte_offset: isize) -> Result[u8, BufferError] {
         let offset = self.checked_offset(byte_offset, 1)?;
-        Result::Ok(read_unsigned_at(self.store, offset, 1, false).to_uint8())
+        Result::Ok(read_unsigned_at(self.store, offset, 1, false).to_u8())
     }
 
-    pub fn get_int16(self: DataView, byte_offset: int, little_endian: Option[bool]) -> Result[
-        int16,
+    pub fn get_int16(self: DataView, byte_offset: isize, little_endian: Option[bool]) -> Result[
+        i16,
         BufferError,
     ] {
         let offset = self.checked_offset(byte_offset, 2)?;
         Result::Ok(
-            read_unsigned_at(self.store, offset, 2, optional_endianness(little_endian)).to_int16(),
+            read_unsigned_at(self.store, offset, 2, optional_endianness(little_endian)).to_i16(),
         )
     }
 
-    pub fn get_uint16(self: DataView, byte_offset: int, little_endian: Option[bool]) -> Result[
-        uint16,
+    pub fn get_uint16(self: DataView, byte_offset: isize, little_endian: Option[bool]) -> Result[
+        u16,
         BufferError,
     ] {
         let offset = self.checked_offset(byte_offset, 2)?;
         Result::Ok(
-            read_unsigned_at(self.store, offset, 2, optional_endianness(little_endian)).to_uint16(),
+            read_unsigned_at(self.store, offset, 2, optional_endianness(little_endian)).to_u16(),
         )
     }
 
-    pub fn get_int32(self: DataView, byte_offset: int, little_endian: Option[bool]) -> Result[
-        int32,
+    pub fn get_int32(self: DataView, byte_offset: isize, little_endian: Option[bool]) -> Result[
+        i32,
         BufferError,
     ] {
         let offset = self.checked_offset(byte_offset, 4)?;
         Result::Ok(
-            read_unsigned_at(self.store, offset, 4, optional_endianness(little_endian)).to_int32(),
+            read_unsigned_at(self.store, offset, 4, optional_endianness(little_endian)).to_i32(),
         )
     }
 
-    pub fn get_uint32(self: DataView, byte_offset: int, little_endian: Option[bool]) -> Result[
-        uint32,
+    pub fn get_uint32(self: DataView, byte_offset: isize, little_endian: Option[bool]) -> Result[
+        u32,
         BufferError,
     ] {
         let offset = self.checked_offset(byte_offset, 4)?;
         Result::Ok(
-            read_unsigned_at(self.store, offset, 4, optional_endianness(little_endian)).to_uint32(),
+            read_unsigned_at(self.store, offset, 4, optional_endianness(little_endian)).to_u32(),
         )
     }
 
-    pub fn get_big_int64(self: DataView, byte_offset: int, little_endian: Option[bool]) -> Result[
+    pub fn get_big_int64(self: DataView, byte_offset: isize, little_endian: Option[bool]) -> Result[
         bigint::BigInteger,
         BufferError,
     ] {
@@ -777,7 +774,7 @@ impl DataView {
         )
     }
 
-    pub fn get_big_uint64(self: DataView, byte_offset: int, little_endian: Option[bool]) -> Result[
+    pub fn get_big_uint64(self: DataView, byte_offset: isize, little_endian: Option[bool]) -> Result[
         bigint::BigInteger,
         BufferError,
     ] {
@@ -790,47 +787,47 @@ impl DataView {
         )
     }
 
-    pub fn get_float32(self: DataView, byte_offset: int, little_endian: Option[bool]) -> Result[
-        float32,
+    pub fn get_float32(self: DataView, byte_offset: isize, little_endian: Option[bool]) -> Result[
+        f32,
         BufferError,
     ] {
         let offset = self.checked_offset(byte_offset, 4)?;
         decode_float32(self.store.bytes.get(), offset, optional_endianness(little_endian))
     }
 
-    pub fn get_float16(self: DataView, byte_offset: int, little_endian: Option[bool]) -> Result[
-        float64,
+    pub fn get_float16(self: DataView, byte_offset: isize, little_endian: Option[bool]) -> Result[
+        f64,
         BufferError,
     ] {
         let offset = self.checked_offset(byte_offset, 2)?;
         Result::Ok(
             mathx::float16_from_bits(
-                read_unsigned_at(self.store, offset, 2, optional_endianness(little_endian)).to_uint16(),
+                read_unsigned_at(self.store, offset, 2, optional_endianness(little_endian)).to_u16(),
             ),
         )
     }
 
-    pub fn get_float64(self: DataView, byte_offset: int, little_endian: Option[bool]) -> Result[
-        float64,
+    pub fn get_float64(self: DataView, byte_offset: isize, little_endian: Option[bool]) -> Result[
+        f64,
         BufferError,
     ] {
         let offset = self.checked_offset(byte_offset, 8)?;
         decode_float64(self.store.bytes.get(), offset, optional_endianness(little_endian))
     }
 
-    pub fn set_int8(self: DataView, byte_offset: int, value: float64) -> Result[unit, BufferError] {
+    pub fn set_int8(self: DataView, byte_offset: isize, value: f64) -> Result[unit, BufferError] {
         let offset = self.checked_offset(byte_offset, 1)?;
-        write_unsigned_at(self.store, offset, 1, to_uint32(value).to_uint64(), false);
+        write_unsigned_at(self.store, offset, 1, to_u32(value).to_u64(), false);
         Result::Ok(())
     }
 
-    pub fn set_uint8(self: DataView, byte_offset: int, value: float64) -> Result[unit, BufferError] {
+    pub fn set_uint8(self: DataView, byte_offset: isize, value: f64) -> Result[unit, BufferError] {
         let offset = self.checked_offset(byte_offset, 1)?;
-        write_unsigned_at(self.store, offset, 1, to_uint32(value).to_uint64(), false);
+        write_unsigned_at(self.store, offset, 1, to_u32(value).to_u64(), false);
         Result::Ok(())
     }
 
-    pub fn set_int16(self: DataView, byte_offset: int, value: float64, little_endian: Option[bool]) -> Result[
+    pub fn set_int16(self: DataView, byte_offset: isize, value: f64, little_endian: Option[bool]) -> Result[
         unit,
         BufferError,
     ] {
@@ -839,13 +836,13 @@ impl DataView {
             self.store,
             offset,
             2,
-            to_uint32(value).to_uint64(),
+            to_u32(value).to_u64(),
             optional_endianness(little_endian),
         );
         Result::Ok(())
     }
 
-    pub fn set_uint16(self: DataView, byte_offset: int, value: float64, little_endian: Option[bool]) -> Result[
+    pub fn set_uint16(self: DataView, byte_offset: isize, value: f64, little_endian: Option[bool]) -> Result[
         unit,
         BufferError,
     ] {
@@ -854,13 +851,13 @@ impl DataView {
             self.store,
             offset,
             2,
-            to_uint32(value).to_uint64(),
+            to_u32(value).to_u64(),
             optional_endianness(little_endian),
         );
         Result::Ok(())
     }
 
-    pub fn set_int32(self: DataView, byte_offset: int, value: float64, little_endian: Option[bool]) -> Result[
+    pub fn set_int32(self: DataView, byte_offset: isize, value: f64, little_endian: Option[bool]) -> Result[
         unit,
         BufferError,
     ] {
@@ -869,13 +866,13 @@ impl DataView {
             self.store,
             offset,
             4,
-            to_uint32(value).to_uint64(),
+            to_u32(value).to_u64(),
             optional_endianness(little_endian),
         );
         Result::Ok(())
     }
 
-    pub fn set_uint32(self: DataView, byte_offset: int, value: float64, little_endian: Option[bool]) -> Result[
+    pub fn set_uint32(self: DataView, byte_offset: isize, value: f64, little_endian: Option[bool]) -> Result[
         unit,
         BufferError,
     ] {
@@ -884,7 +881,7 @@ impl DataView {
             self.store,
             offset,
             4,
-            to_uint32(value).to_uint64(),
+            to_u32(value).to_u64(),
             optional_endianness(little_endian),
         );
         Result::Ok(())
@@ -892,7 +889,7 @@ impl DataView {
 
     pub fn set_big_int64(
         self: DataView,
-        byte_offset: int,
+        byte_offset: isize,
         value: bigint::BigInteger,
         little_endian: Option[bool],
     ) -> Result[unit, BufferError] {
@@ -909,19 +906,17 @@ impl DataView {
 
     pub fn set_big_uint64(
         self: DataView,
-        byte_offset: int,
+        byte_offset: isize,
         value: bigint::BigInteger,
         little_endian: Option[bool],
     ) -> Result[unit, BufferError] {
         self.set_big_int64(byte_offset, value, little_endian)
     }
 
-    pub fn set_float32(
-        self: DataView,
-        byte_offset: int,
-        value: float32,
-        little_endian: Option[bool],
-    ) -> Result[unit, BufferError] {
+    pub fn set_float32(self: DataView, byte_offset: isize, value: f32, little_endian: Option[bool]) -> Result[
+        unit,
+        BufferError,
+    ] {
         let offset = self.checked_offset(byte_offset, 4)?;
         write_encoded(
             self.store,
@@ -931,29 +926,25 @@ impl DataView {
         Result::Ok(())
     }
 
-    pub fn set_float16(
-        self: DataView,
-        byte_offset: int,
-        value: float64,
-        little_endian: Option[bool],
-    ) -> Result[unit, BufferError] {
+    pub fn set_float16(self: DataView, byte_offset: isize, value: f64, little_endian: Option[bool]) -> Result[
+        unit,
+        BufferError,
+    ] {
         let offset = self.checked_offset(byte_offset, 2)?;
         write_unsigned_at(
             self.store,
             offset,
             2,
-            mathx::float16_bits(value).to_uint64(),
+            mathx::float16_bits(value).to_u64(),
             optional_endianness(little_endian),
         );
         Result::Ok(())
     }
 
-    pub fn set_float64(
-        self: DataView,
-        byte_offset: int,
-        value: float64,
-        little_endian: Option[bool],
-    ) -> Result[unit, BufferError] {
+    pub fn set_float64(self: DataView, byte_offset: isize, value: f64, little_endian: Option[bool]) -> Result[
+        unit,
+        BufferError,
+    ] {
         let offset = self.checked_offset(byte_offset, 8)?;
         write_encoded(
             self.store,
@@ -964,7 +955,7 @@ impl DataView {
     }
 }
 
-fn checked_element_byte_length(length: int, element_size: int) -> Result[int, BufferError] {
+fn checked_element_byte_length(length: isize, element_size: isize) -> Result[isize, BufferError] {
     if length < 0 {
         Result::Err(range_error(BufferErrorReason::NegativeLength, length, 0))
     } else if length > MAX_BUFFER_BYTE_LENGTH / element_size {
@@ -980,10 +971,12 @@ fn checked_element_byte_length(length: int, element_size: int) -> Result[int, Bu
     }
 }
 
-fn typed_view_layout(store: BackingStore, byte_offset: int, length: Option[int], element_size: int) -> Result[
-    (int, int),
-    BufferError,
-] {
+fn typed_view_layout(
+    store: BackingStore,
+    byte_offset: isize,
+    length: Option[isize],
+    element_size: isize,
+) -> Result[(isize, isize), BufferError] {
     require_attached(store)?;
     let buffer_length = store.byte_length.get();
     if byte_offset < 0 || byte_offset > buffer_length {
@@ -1019,7 +1012,7 @@ fn typed_view_layout(store: BackingStore, byte_offset: int, length: Option[int],
     Result::Ok((byte_offset, element_length))
 }
 
-fn typed_out_of_bounds(store: BackingStore, offset: int, length: int, element_size: int) -> bool {
+fn typed_out_of_bounds(store: BackingStore, offset: isize, length: isize, element_size: isize) -> bool {
     if store.detached.get() || offset > store.byte_length.get() {
         true
     } else {
@@ -1027,7 +1020,7 @@ fn typed_out_of_bounds(store: BackingStore, offset: int, length: int, element_si
     }
 }
 
-fn typed_length(store: BackingStore, offset: int, length: int, element_size: int) -> int {
+fn typed_length(store: BackingStore, offset: isize, length: isize, element_size: isize) -> isize {
     if typed_out_of_bounds(store, offset, length, element_size) {
         0
     } else if length < 0 {
@@ -1037,7 +1030,7 @@ fn typed_length(store: BackingStore, offset: int, length: int, element_size: int
     }
 }
 
-fn typed_byte_offset(store: BackingStore, offset: int, length: int, element_size: int) -> int {
+fn typed_byte_offset(store: BackingStore, offset: isize, length: isize, element_size: isize) -> isize {
     if typed_out_of_bounds(store, offset, length, element_size) {
         0
     } else {
@@ -1045,7 +1038,7 @@ fn typed_byte_offset(store: BackingStore, offset: int, length: int, element_size
     }
 }
 
-fn check_set_range(target_offset: int, source_length: int, target_length: int) -> Result[
+fn check_set_range(target_offset: isize, source_length: isize, target_length: isize) -> Result[
     unit,
     BufferError,
 ] {
@@ -1064,7 +1057,7 @@ fn check_set_range(target_offset: int, source_length: int, target_length: int) -
     }
 }
 
-fn numeric_array_element_size(kind: NumericArrayKind) -> int {
+fn numeric_array_element_size(kind: NumericArrayKind) -> isize {
     match kind {
         NumericArrayKind::Uint8Clamped | NumericArrayKind::Int8 => 1,
         NumericArrayKind::Int16 | NumericArrayKind::Uint16 | NumericArrayKind::Float16 => 2,
@@ -1072,13 +1065,13 @@ fn numeric_array_element_size(kind: NumericArrayKind) -> int {
     }
 }
 
-fn numeric_array_float(value: string) -> float64 {
+fn numeric_array_float(value: string) -> f64 {
     num::parse_float64(value).unwrap_or(0.0)
 }
 
-fn float32_bits_as_float64(bits: uint32) -> float64 {
+fn float32_bits_as_float64(bits: u32) -> f64 {
     let negative = bits & 0x80000000 != 0;
-    let exponent = ((bits >> 23) & 0xff).to_int();
+    let exponent = ((bits >> 23) & 0xff).to_isize();
     let fraction = bits & 0x007fffff;
     let zero = 0.0;
     if exponent == 255 {
@@ -1112,11 +1105,11 @@ fn float32_bits_as_float64(bits: uint32) -> float64 {
     }
 }
 
-pub fn widen_float32(value: float32) -> float64 {
+pub fn widen_float32(value: f32) -> f64 {
     match encode_float32(value, true) {
         Ok(bytes) => float32_bits_as_float64(
-            bytes[0].to_uint32() | bytes[1].to_uint32() << 8 | bytes[2].to_uint32() << 16
-                | bytes[3].to_uint32() << 24,
+            bytes[0].to_u32() | bytes[1].to_u32() << 8 | bytes[2].to_u32() << 16
+                | bytes[3].to_u32() << 24,
         ),
         Err(_) => {
             let zero = 0.0;
@@ -1125,7 +1118,7 @@ pub fn widen_float32(value: float32) -> float64 {
     }
 }
 
-fn uint8_clamped(value: float64) -> uint8 {
+fn uint8_clamped(value: f64) -> u8 {
     if math::is_nan(value) || value <= 0.0 {
         0
     } else if value >= 255.0 {
@@ -1135,15 +1128,15 @@ fn uint8_clamped(value: float64) -> uint8 {
         let fraction = value - lower;
         let integer = num::parse_int(lower.to_string()).unwrap_or(0);
         if fraction > 0.5 || fraction == 0.5 && integer % 2 != 0 {
-            (integer + 1).to_uint8()
+            (integer + 1).to_u8()
         } else {
-            integer.to_uint8()
+            integer.to_u8()
         }
     }
 }
 
 impl NumericArray {
-    pub fn new(kind: NumericArrayKind, length: int) -> Result[NumericArray, BufferError] {
+    pub fn new(kind: NumericArrayKind, length: isize) -> Result[NumericArray, BufferError] {
         let size = numeric_array_element_size(kind);
         let buffer = ArrayBuffer::new(checked_element_byte_length(length, size)?)?;
         Result::Ok(
@@ -1159,8 +1152,8 @@ impl NumericArray {
     pub fn from_buffer(
         kind: NumericArrayKind,
         buffer: ArrayBuffer,
-        byte_offset: int,
-        length: Option[int],
+        byte_offset: isize,
+        length: Option[isize],
     ) -> Result[NumericArray, BufferError] {
         let size = numeric_array_element_size(kind);
         let (offset, element_length) = typed_view_layout(buffer.store, byte_offset, length, size)?;
@@ -1195,7 +1188,7 @@ impl NumericArray {
         self.element_length < 0
     }
 
-    pub fn length(self: NumericArray) -> int {
+    pub fn length(self: NumericArray) -> isize {
         typed_length(
             self.store,
             self.view_offset,
@@ -1204,11 +1197,11 @@ impl NumericArray {
         )
     }
 
-    pub fn byte_length(self: NumericArray) -> int {
+    pub fn byte_length(self: NumericArray) -> isize {
         self.length() * numeric_array_element_size(self.kind_value)
     }
 
-    pub fn byte_offset(self: NumericArray) -> int {
+    pub fn byte_offset(self: NumericArray) -> isize {
         typed_byte_offset(
             self.store,
             self.view_offset,
@@ -1217,7 +1210,7 @@ impl NumericArray {
         )
     }
 
-    pub fn get(self: NumericArray, index: int) -> Result[float64, BufferError] {
+    pub fn get(self: NumericArray, index: isize) -> Result[f64, BufferError] {
         require_attached(self.store)?;
         check_index(index, self.length())?;
         let size = numeric_array_element_size(self.kind_value);
@@ -1225,31 +1218,31 @@ impl NumericArray {
         match self.kind_value {
             NumericArrayKind::Uint8Clamped => Result::Ok(
                 numeric_array_float(
-                    read_unsigned_at(self.store, offset, 1, true).to_uint8().to_string(),
+                    read_unsigned_at(self.store, offset, 1, true).to_u8().to_string(),
                 ),
             ),
             NumericArrayKind::Int8 => Result::Ok(
                 numeric_array_float(
-                    read_unsigned_at(self.store, offset, 1, true).to_int8().to_string(),
+                    read_unsigned_at(self.store, offset, 1, true).to_i8().to_string(),
                 ),
             ),
             NumericArrayKind::Int16 => Result::Ok(
                 numeric_array_float(
-                    read_unsigned_at(self.store, offset, 2, true).to_int16().to_string(),
+                    read_unsigned_at(self.store, offset, 2, true).to_i16().to_string(),
                 ),
             ),
             NumericArrayKind::Uint16 => Result::Ok(
                 numeric_array_float(
-                    read_unsigned_at(self.store, offset, 2, true).to_uint16().to_string(),
+                    read_unsigned_at(self.store, offset, 2, true).to_u16().to_string(),
                 ),
             ),
             NumericArrayKind::Uint32 => Result::Ok(
                 numeric_array_float(
-                    read_unsigned_at(self.store, offset, 4, true).to_uint32().to_string(),
+                    read_unsigned_at(self.store, offset, 4, true).to_u32().to_string(),
                 ),
             ),
             NumericArrayKind::Float16 => Result::Ok(
-                mathx::float16_from_bits(read_unsigned_at(self.store, offset, 2, true).to_uint16()),
+                mathx::float16_from_bits(read_unsigned_at(self.store, offset, 2, true).to_u16()),
             ),
             NumericArrayKind::Float32 => Result::Ok(
                 widen_float32(decode_float32(self.store.bytes.get(), offset, true)?),
@@ -1257,36 +1250,30 @@ impl NumericArray {
         }
     }
 
-    pub fn set(self: NumericArray, index: int, value: float64) -> Result[unit, BufferError] {
+    pub fn set(self: NumericArray, index: isize, value: f64) -> Result[unit, BufferError] {
         require_attached(self.store)?;
         check_index(index, self.length())?;
         let size = numeric_array_element_size(self.kind_value);
         let offset = self.view_offset + index * size;
         match self.kind_value {
             NumericArrayKind::Uint8Clamped => {
-                write_unsigned_at(self.store, offset, 1, uint8_clamped(value).to_uint64(), true);
+                write_unsigned_at(self.store, offset, 1, uint8_clamped(value).to_u64(), true);
                 Result::Ok(())
             },
             NumericArrayKind::Int8 => {
-                write_unsigned_at(self.store, offset, 1, to_uint32(value).to_uint64(), true);
+                write_unsigned_at(self.store, offset, 1, to_u32(value).to_u64(), true);
                 Result::Ok(())
             },
             NumericArrayKind::Int16 | NumericArrayKind::Uint16 => {
-                write_unsigned_at(self.store, offset, 2, to_uint32(value).to_uint64(), true);
+                write_unsigned_at(self.store, offset, 2, to_u32(value).to_u64(), true);
                 Result::Ok(())
             },
             NumericArrayKind::Uint32 => {
-                write_unsigned_at(self.store, offset, 4, to_uint32(value).to_uint64(), true);
+                write_unsigned_at(self.store, offset, 4, to_u32(value).to_u64(), true);
                 Result::Ok(())
             },
             NumericArrayKind::Float16 => {
-                write_unsigned_at(
-                    self.store,
-                    offset,
-                    2,
-                    mathx::float16_bits(value).to_uint64(),
-                    true,
-                );
+                write_unsigned_at(self.store, offset, 2, mathx::float16_bits(value).to_u64(), true);
                 Result::Ok(())
             },
             NumericArrayKind::Float32 => {
@@ -1297,7 +1284,10 @@ impl NumericArray {
         }
     }
 
-    pub fn subarray(self: NumericArray, begin: int, end: int) -> Result[NumericArray, BufferError] {
+    pub fn subarray(self: NumericArray, begin: isize, end: isize) -> Result[
+        NumericArray,
+        BufferError,
+    ] {
         require_attached(self.store)?;
         let current_length = self.length();
         let first = normalize_relative_index(begin, current_length);
@@ -1318,17 +1308,17 @@ impl NumericArray {
     }
 }
 
-fn bigint_low_uint64(value: bigint::BigInteger) -> uint64 {
+fn bigint_low_uint64(value: bigint::BigInteger) -> u64 {
     let limbs = value.limbs();
     let low = if limbs.is_empty() {
-        0.to_uint64()
+        0.to_u64()
     } else {
-        limbs[0].to_uint64()
+        limbs[0].to_u64()
     };
     let high = if limbs.len() < 2 {
-        0.to_uint64()
+        0.to_u64()
     } else {
-        limbs[1].to_uint64()
+        limbs[1].to_u64()
     };
     let magnitude = low | high << 32;
     if value.is_negative() {
@@ -1338,20 +1328,20 @@ fn bigint_low_uint64(value: bigint::BigInteger) -> uint64 {
     }
 }
 
-fn bigint_from_uint64(value: uint64, kind: BigIntArrayKind) -> bigint::BigInteger {
+fn bigint_from_uint64(value: u64, kind: BigIntArrayKind) -> bigint::BigInteger {
     let unsigned = bigint::BigInteger::from_uint64(value);
     match kind {
         BigIntArrayKind::Unsigned => unsigned,
         BigIntArrayKind::Signed => if value & 0x8000000000000000 == 0 {
             unsigned
         } else {
-            unsigned.subtract(bigint::BigInteger::from_parts(false, Vec::[0, 0, 1]))
+            unsigned.subtract(bigint::BigInteger::from_parts(false, Vec::from_array([0, 0, 1])))
         },
     }
 }
 
 impl BigIntArray {
-    pub fn new(kind: BigIntArrayKind, length: int) -> Result[BigIntArray, BufferError] {
+    pub fn new(kind: BigIntArrayKind, length: isize) -> Result[BigIntArray, BufferError] {
         let buffer = ArrayBuffer::new(checked_element_byte_length(length, 8)?)?;
         Result::Ok(
             BigIntArray {
@@ -1366,8 +1356,8 @@ impl BigIntArray {
     pub fn from_buffer(
         kind: BigIntArrayKind,
         buffer: ArrayBuffer,
-        byte_offset: int,
-        length: Option[int],
+        byte_offset: isize,
+        length: Option[isize],
     ) -> Result[BigIntArray, BufferError] {
         let (offset, element_length) = typed_view_layout(buffer.store, byte_offset, length, 8)?;
         Result::Ok(
@@ -1396,19 +1386,19 @@ impl BigIntArray {
         self.element_length < 0
     }
 
-    pub fn length(self: BigIntArray) -> int {
+    pub fn length(self: BigIntArray) -> isize {
         typed_length(self.store, self.view_offset, self.element_length, 8)
     }
 
-    pub fn byte_length(self: BigIntArray) -> int {
+    pub fn byte_length(self: BigIntArray) -> isize {
         self.length() * 8
     }
 
-    pub fn byte_offset(self: BigIntArray) -> int {
+    pub fn byte_offset(self: BigIntArray) -> isize {
         typed_byte_offset(self.store, self.view_offset, self.element_length, 8)
     }
 
-    pub fn get(self: BigIntArray, index: int) -> Result[bigint::BigInteger, BufferError] {
+    pub fn get(self: BigIntArray, index: isize) -> Result[bigint::BigInteger, BufferError] {
         require_attached(self.store)?;
         check_index(index, self.length())?;
         Result::Ok(
@@ -1419,7 +1409,7 @@ impl BigIntArray {
         )
     }
 
-    pub fn set(self: BigIntArray, index: int, value: bigint::BigInteger) -> Result[
+    pub fn set(self: BigIntArray, index: isize, value: bigint::BigInteger) -> Result[
         unit,
         BufferError,
     ] {
@@ -1435,7 +1425,7 @@ impl BigIntArray {
         Result::Ok(())
     }
 
-    pub fn subarray(self: BigIntArray, begin: int, end: int) -> Result[BigIntArray, BufferError] {
+    pub fn subarray(self: BigIntArray, begin: isize, end: isize) -> Result[BigIntArray, BufferError] {
         require_attached(self.store)?;
         let current_length = self.length();
         let first = normalize_relative_index(begin, current_length);
@@ -1457,13 +1447,13 @@ impl BigIntArray {
 }
 
 impl Uint8Array {
-    pub fn new(length: int) -> Result[Uint8Array, BufferError] {
+    pub fn new(length: isize) -> Result[Uint8Array, BufferError] {
         let byte_length = checked_element_byte_length(length, 1)?;
         let buffer = ArrayBuffer::new(byte_length)?;
         Result::Ok(Uint8Array { store: buffer.store, view_offset: 0, element_length: length })
     }
 
-    pub fn from_buffer(buffer: ArrayBuffer, byte_offset: int, length: Option[int]) -> Result[
+    pub fn from_buffer(buffer: ArrayBuffer, byte_offset: isize, length: Option[isize]) -> Result[
         Uint8Array,
         BufferError,
     ] {
@@ -1483,32 +1473,32 @@ impl Uint8Array {
         self.element_length < 0
     }
 
-    pub fn length(self: Uint8Array) -> int {
+    pub fn length(self: Uint8Array) -> isize {
         typed_length(self.store, self.view_offset, self.element_length, 1)
     }
 
-    pub fn byte_length(self: Uint8Array) -> int {
+    pub fn byte_length(self: Uint8Array) -> isize {
         self.length()
     }
 
-    pub fn byte_offset(self: Uint8Array) -> int {
+    pub fn byte_offset(self: Uint8Array) -> isize {
         typed_byte_offset(self.store, self.view_offset, self.element_length, 1)
     }
 
-    pub fn get(self: Uint8Array, index: int) -> Result[uint8, BufferError] {
+    pub fn get(self: Uint8Array, index: isize) -> Result[u8, BufferError] {
         require_attached(self.store)?;
         check_index(index, self.length())?;
         Result::Ok(self.store.bytes.get()[self.view_offset + index])
     }
 
-    pub fn set(self: Uint8Array, index: int, value: float64) -> Result[unit, BufferError] {
+    pub fn set(self: Uint8Array, index: isize, value: f64) -> Result[unit, BufferError] {
         require_attached(self.store)?;
         check_index(index, self.length())?;
-        self.store.bytes.get()[self.view_offset + index] = to_uint32(value).to_uint8();
+        self.store.bytes.get()[self.view_offset + index] = to_u32(value).to_u8();
         Result::Ok(())
     }
 
-    pub fn subarray(self: Uint8Array, begin: int, end: int) -> Result[Uint8Array, BufferError] {
+    pub fn subarray(self: Uint8Array, begin: isize, end: isize) -> Result[Uint8Array, BufferError] {
         require_attached(self.store)?;
         let current_length = self.length();
         let first = normalize_relative_index(begin, current_length);
@@ -1527,7 +1517,7 @@ impl Uint8Array {
         )
     }
 
-    pub fn set_from(self: Uint8Array, source: Uint8Array, target_offset: int) -> Result[
+    pub fn set_from(self: Uint8Array, source: Uint8Array, target_offset: isize) -> Result[
         unit,
         BufferError,
     ] {
@@ -1554,13 +1544,13 @@ impl Uint8Array {
 }
 
 impl Int32Array {
-    pub fn new(length: int) -> Result[Int32Array, BufferError] {
+    pub fn new(length: isize) -> Result[Int32Array, BufferError] {
         let byte_length = checked_element_byte_length(length, 4)?;
         let buffer = ArrayBuffer::new(byte_length)?;
         Result::Ok(Int32Array { store: buffer.store, view_offset: 0, element_length: length })
     }
 
-    pub fn from_buffer(buffer: ArrayBuffer, byte_offset: int, length: Option[int]) -> Result[
+    pub fn from_buffer(buffer: ArrayBuffer, byte_offset: isize, length: Option[isize]) -> Result[
         Int32Array,
         BufferError,
     ] {
@@ -1580,38 +1570,32 @@ impl Int32Array {
         self.element_length < 0
     }
 
-    pub fn length(self: Int32Array) -> int {
+    pub fn length(self: Int32Array) -> isize {
         typed_length(self.store, self.view_offset, self.element_length, 4)
     }
 
-    pub fn byte_length(self: Int32Array) -> int {
+    pub fn byte_length(self: Int32Array) -> isize {
         self.length() * 4
     }
 
-    pub fn byte_offset(self: Int32Array) -> int {
+    pub fn byte_offset(self: Int32Array) -> isize {
         typed_byte_offset(self.store, self.view_offset, self.element_length, 4)
     }
 
-    pub fn get(self: Int32Array, index: int) -> Result[int32, BufferError] {
+    pub fn get(self: Int32Array, index: isize) -> Result[i32, BufferError] {
         require_attached(self.store)?;
         check_index(index, self.length())?;
-        Result::Ok(read_unsigned_at(self.store, self.view_offset + index * 4, 4, true).to_int32())
+        Result::Ok(read_unsigned_at(self.store, self.view_offset + index * 4, 4, true).to_i32())
     }
 
-    pub fn set(self: Int32Array, index: int, value: float64) -> Result[unit, BufferError] {
+    pub fn set(self: Int32Array, index: isize, value: f64) -> Result[unit, BufferError] {
         require_attached(self.store)?;
         check_index(index, self.length())?;
-        write_unsigned_at(
-            self.store,
-            self.view_offset + index * 4,
-            4,
-            to_uint32(value).to_uint64(),
-            true,
-        );
+        write_unsigned_at(self.store, self.view_offset + index * 4, 4, to_u32(value).to_u64(), true);
         Result::Ok(())
     }
 
-    pub fn subarray(self: Int32Array, begin: int, end: int) -> Result[Int32Array, BufferError] {
+    pub fn subarray(self: Int32Array, begin: isize, end: isize) -> Result[Int32Array, BufferError] {
         require_attached(self.store)?;
         let current_length = self.length();
         let first = normalize_relative_index(begin, current_length);
@@ -1630,7 +1614,7 @@ impl Int32Array {
         )
     }
 
-    pub fn set_from(self: Int32Array, source: Int32Array, target_offset: int) -> Result[
+    pub fn set_from(self: Int32Array, source: Int32Array, target_offset: isize) -> Result[
         unit,
         BufferError,
     ] {
@@ -1639,11 +1623,11 @@ impl Int32Array {
         let source_length = source.length();
         let target_length = self.length();
         check_set_range(target_offset, source_length, target_length)?;
-        let snapshot: Vec[int32] = Vec::with_capacity(source_length);
+        let snapshot: Vec[i32] = Vec::with_capacity(source_length);
         let mut index = 0;
         while index < source_length {
             snapshot.push(
-                read_unsigned_at(source.store, source.view_offset + index * 4, 4, true).to_int32(),
+                read_unsigned_at(source.store, source.view_offset + index * 4, 4, true).to_i32(),
             );
             index += 1;
         }
@@ -1653,7 +1637,7 @@ impl Int32Array {
                 self.store,
                 self.view_offset + (target_offset + index) * 4,
                 4,
-                snapshot[index].to_uint32().to_uint64(),
+                snapshot[index].to_u32().to_u64(),
                 true,
             );
             index += 1;
@@ -1663,13 +1647,13 @@ impl Int32Array {
 }
 
 impl Float64Array {
-    pub fn new(length: int) -> Result[Float64Array, BufferError] {
+    pub fn new(length: isize) -> Result[Float64Array, BufferError] {
         let byte_length = checked_element_byte_length(length, 8)?;
         let buffer = ArrayBuffer::new(byte_length)?;
         Result::Ok(Float64Array { store: buffer.store, view_offset: 0, element_length: length })
     }
 
-    pub fn from_buffer(buffer: ArrayBuffer, byte_offset: int, length: Option[int]) -> Result[
+    pub fn from_buffer(buffer: ArrayBuffer, byte_offset: isize, length: Option[isize]) -> Result[
         Float64Array,
         BufferError,
     ] {
@@ -1689,32 +1673,35 @@ impl Float64Array {
         self.element_length < 0
     }
 
-    pub fn length(self: Float64Array) -> int {
+    pub fn length(self: Float64Array) -> isize {
         typed_length(self.store, self.view_offset, self.element_length, 8)
     }
 
-    pub fn byte_length(self: Float64Array) -> int {
+    pub fn byte_length(self: Float64Array) -> isize {
         self.length() * 8
     }
 
-    pub fn byte_offset(self: Float64Array) -> int {
+    pub fn byte_offset(self: Float64Array) -> isize {
         typed_byte_offset(self.store, self.view_offset, self.element_length, 8)
     }
 
-    pub fn get(self: Float64Array, index: int) -> Result[float64, BufferError] {
+    pub fn get(self: Float64Array, index: isize) -> Result[f64, BufferError] {
         require_attached(self.store)?;
         check_index(index, self.length())?;
         decode_float64(self.store.bytes.get(), self.view_offset + index * 8, true)
     }
 
-    pub fn set(self: Float64Array, index: int, value: float64) -> Result[unit, BufferError] {
+    pub fn set(self: Float64Array, index: isize, value: f64) -> Result[unit, BufferError] {
         require_attached(self.store)?;
         check_index(index, self.length())?;
         write_encoded(self.store, self.view_offset + index * 8, encode_float64(value, true)?);
         Result::Ok(())
     }
 
-    pub fn subarray(self: Float64Array, begin: int, end: int) -> Result[Float64Array, BufferError] {
+    pub fn subarray(self: Float64Array, begin: isize, end: isize) -> Result[
+        Float64Array,
+        BufferError,
+    ] {
         require_attached(self.store)?;
         let current_length = self.length();
         let first = normalize_relative_index(begin, current_length);
@@ -1733,7 +1720,7 @@ impl Float64Array {
         )
     }
 
-    pub fn set_from(self: Float64Array, source: Float64Array, target_offset: int) -> Result[
+    pub fn set_from(self: Float64Array, source: Float64Array, target_offset: isize) -> Result[
         unit,
         BufferError,
     ] {
@@ -1742,7 +1729,7 @@ impl Float64Array {
         let source_length = source.length();
         let target_length = self.length();
         check_set_range(target_offset, source_length, target_length)?;
-        let snapshot: Vec[float64] = Vec::with_capacity(source_length);
+        let snapshot: Vec[f64] = Vec::with_capacity(source_length);
         let mut index = 0;
         while index < source_length {
             snapshot.push(

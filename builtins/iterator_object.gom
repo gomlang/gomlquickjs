@@ -30,8 +30,8 @@ struct IteratorHelperState {
     source: IteratorRecord,
     kind: IteratorHelperKind,
     callback: runtime::Value,
-    remaining: Ref[int],
-    counter: Ref[int],
+    remaining: Ref[isize],
+    counter: Ref[isize],
     inner: Ref[Option[IteratorRecord]],
     running: Ref[bool],
     done: Ref[bool],
@@ -44,17 +44,17 @@ struct IteratorIterable {
 
 struct IteratorConcatState {
     values: Vec[IteratorIterable],
-    index: Ref[int],
+    index: Ref[isize],
     current: Ref[Option[IteratorRecord]],
     running: Ref[bool],
     done: Ref[bool],
 }
 
 fn iterator_no_arguments() -> Vec[runtime::Value] {
-    Vec::[]
+    Vec::new()
 }
 
-fn iterator_property(context: vm::Context, receiver: runtime::Value, name: string, depth: int) -> Result[
+fn iterator_property(context: vm::Context, receiver: runtime::Value, name: string, depth: isize) -> Result[
     runtime::Value,
     vm::VmError,
 ] {
@@ -72,7 +72,7 @@ fn iterator_callable(value: runtime::Value, message: string) -> Result[runtime::
     }
 }
 
-fn iterator_record(context: vm::Context, value: runtime::Value, depth: int) -> Result[
+fn iterator_record(context: vm::Context, value: runtime::Value, depth: isize) -> Result[
     IteratorRecord,
     vm::VmError,
 ] {
@@ -84,7 +84,7 @@ fn iterator_record(context: vm::Context, value: runtime::Value, depth: int) -> R
     Result::Ok(IteratorRecord { iterator: value, next })
 }
 
-fn iterator_step(context: vm::Context, record: IteratorRecord, depth: int) -> Result[
+fn iterator_step(context: vm::Context, record: IteratorRecord, depth: isize) -> Result[
     Option[runtime::Value],
     vm::VmError,
 ] {
@@ -105,7 +105,7 @@ fn iterator_step(context: vm::Context, record: IteratorRecord, depth: int) -> Re
     }
 }
 
-fn iterator_close_record(context: vm::Context, record: IteratorRecord, depth: int) -> Result[
+fn iterator_close_record(context: vm::Context, record: IteratorRecord, depth: isize) -> Result[
     unit,
     vm::VmError,
 ] {
@@ -132,7 +132,7 @@ fn iterator_return_record(
     context: vm::Context,
     record: IteratorRecord,
     allow_missing: bool,
-    depth: int,
+    depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     let method = iterator_property(context, record.iterator, "return", depth)?;
     match method {
@@ -157,7 +157,7 @@ fn iterator_return_record(
     }
 }
 
-fn iterator_close_value(context: vm::Context, value: runtime::Value, depth: int) -> unit {
+fn iterator_close_value(context: vm::Context, value: runtime::Value, depth: isize) -> unit {
     match value {
         runtime::Value::Object(_) => {
             let _ = iterator_close_record(
@@ -170,7 +170,7 @@ fn iterator_close_value(context: vm::Context, value: runtime::Value, depth: int)
     }
 }
 
-fn iterator_close_after_error(context: vm::Context, record: IteratorRecord, depth: int) -> unit {
+fn iterator_close_after_error(context: vm::Context, record: IteratorRecord, depth: isize) -> unit {
     let _ = iterator_close_record(context, record, depth);
 }
 
@@ -314,7 +314,7 @@ fn iterator_create_object(
     Result::Ok(runtime::Value::Object(object))
 }
 
-fn iterator_from_iterable(context: vm::Context, value: runtime::Value, depth: int) -> Result[
+fn iterator_from_iterable(context: vm::Context, value: runtime::Value, depth: isize) -> Result[
     IteratorRecord,
     vm::VmError,
 ] {
@@ -397,7 +397,7 @@ fn iterator_from(
     context: vm::Context,
     this_value: runtime::Value,
     arguments: Vec[runtime::Value],
-    depth: int,
+    depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     let _ = this_value;
     let record = iterator_from_iterable(context, argument(arguments, 0), depth)?;
@@ -419,8 +419,8 @@ fn iterator_from(
     }
 }
 
-fn iterator_limit(context: vm::Context, value: runtime::Value, depth: int) -> Result[
-    int,
+fn iterator_limit(context: vm::Context, value: runtime::Value, depth: isize) -> Result[
+    isize,
     vm::VmError,
 ] {
     let primitive = context.to_primitive_number_at_depth(value, depth)?;
@@ -453,7 +453,7 @@ fn iterator_callback(arguments: Vec[runtime::Value], message: string) -> Result[
     iterator_callable(argument(arguments, 0), message)
 }
 
-fn iterator_flatten_record(context: vm::Context, value: runtime::Value, depth: int) -> Result[
+fn iterator_flatten_record(context: vm::Context, value: runtime::Value, depth: isize) -> Result[
     IteratorRecord,
     vm::VmError,
 ] {
@@ -494,7 +494,7 @@ fn iterator_flatten_record(context: vm::Context, value: runtime::Value, depth: i
 fn iterator_helper_fail(
     context: vm::Context,
     state: IteratorHelperState,
-    depth: int,
+    depth: isize,
     error: vm::VmError,
 ) -> Result[runtime::Value, vm::VmError] {
     match state.inner.get() {
@@ -506,7 +506,7 @@ fn iterator_helper_fail(
     Result::Err(error)
 }
 
-fn iterator_helper_next_value(context: vm::Context, state: IteratorHelperState, depth: int) -> Result[
+fn iterator_helper_next_value(context: vm::Context, state: IteratorHelperState, depth: isize) -> Result[
     runtime::Value,
     vm::VmError,
 ] {
@@ -542,7 +542,7 @@ fn iterator_helper_next_value(context: vm::Context, state: IteratorHelperState, 
             state.counter.set(index + 1);
             let selected = match context.invoke_with_this_at_depth(
                 state.callback,
-                Vec::[value, array_length_value(index)],
+                Vec::from_array([value, array_length_value(index)]),
                 runtime::Value::Undefined,
                 depth,
             ) {
@@ -578,7 +578,7 @@ fn iterator_helper_next_value(context: vm::Context, state: IteratorHelperState, 
                     state.counter.set(index + 1);
                     let mapped = match context.invoke_with_this_at_depth(
                         state.callback,
-                        Vec::[value, array_length_value(index)],
+                        Vec::from_array([value, array_length_value(index)]),
                         runtime::Value::Undefined,
                         depth,
                     ) {
@@ -605,7 +605,7 @@ fn iterator_helper_next_value(context: vm::Context, state: IteratorHelperState, 
             state.counter.set(index + 1);
             match context.invoke_with_this_at_depth(
                 state.callback,
-                Vec::[value, array_length_value(index)],
+                Vec::from_array([value, array_length_value(index)]),
                 runtime::Value::Undefined,
                 depth,
             ) {
@@ -637,7 +637,7 @@ fn iterator_helper_next_value(context: vm::Context, state: IteratorHelperState, 
     }
 }
 
-fn iterator_helper_next(context: vm::Context, state: IteratorHelperState, depth: int) -> Result[
+fn iterator_helper_next(context: vm::Context, state: IteratorHelperState, depth: isize) -> Result[
     runtime::Value,
     vm::VmError,
 ] {
@@ -652,7 +652,7 @@ fn iterator_helper_next(context: vm::Context, state: IteratorHelperState, depth:
     result
 }
 
-fn iterator_helper_return(context: vm::Context, state: IteratorHelperState, depth: int) -> Result[
+fn iterator_helper_return(context: vm::Context, state: IteratorHelperState, depth: isize) -> Result[
     runtime::Value,
     vm::VmError,
 ] {
@@ -684,7 +684,7 @@ fn iterator_create_helper(
     kind: IteratorHelperKind,
     this_value: runtime::Value,
     arguments: Vec[runtime::Value],
-    depth: int,
+    depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     match this_value {
         runtime::Value::Object(_) => (),
@@ -753,7 +753,7 @@ fn iterator_terminal(
     kind: IteratorTerminalKind,
     this_value: runtime::Value,
     arguments: Vec[runtime::Value],
-    depth: int,
+    depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     match this_value {
         runtime::Value::Object(_) => (),
@@ -781,7 +781,7 @@ fn iterator_terminal(
         };
         let selected = match context.invoke_with_this_at_depth(
             callback,
-            Vec::[value, array_length_value(index)],
+            Vec::from_array([value, array_length_value(index)]),
             runtime::Value::Undefined,
             depth,
         ) {
@@ -814,7 +814,7 @@ fn iterator_reduce(
     context: vm::Context,
     this_value: runtime::Value,
     arguments: Vec[runtime::Value],
-    depth: int,
+    depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     match this_value {
         runtime::Value::Object(_) => (),
@@ -850,7 +850,7 @@ fn iterator_reduce(
         };
         accumulator = match context.invoke_with_this_at_depth(
             callback,
-            Vec::[accumulator, value, array_length_value(index)],
+            Vec::from_array([accumulator, value, array_length_value(index)]),
             runtime::Value::Undefined,
             depth,
         ) {
@@ -868,11 +868,11 @@ fn iterator_to_array(
     context: vm::Context,
     this_value: runtime::Value,
     arguments: Vec[runtime::Value],
-    depth: int,
+    depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     let _ = arguments;
     let record = iterator_record(context, this_value, depth)?;
-    let values: Vec[runtime::Value] = Vec::[];
+    let values: Vec[runtime::Value] = Vec::new();
     while values.len() < ARRAY_FROM_LIMIT {
         match iterator_step(context, record, depth)? {
             Some(value) => values.push(value),
@@ -886,7 +886,7 @@ fn iterator_to_array(
     Result::Err(function_range_error("iterator result exceeds implementation limit"))
 }
 
-fn iterator_concat_next_value(context: vm::Context, state: IteratorConcatState, depth: int) -> Result[
+fn iterator_concat_next_value(context: vm::Context, state: IteratorConcatState, depth: isize) -> Result[
     runtime::Value,
     vm::VmError,
 ] {
@@ -916,7 +916,7 @@ fn iterator_concat_next_value(context: vm::Context, state: IteratorConcatState, 
     }
 }
 
-fn iterator_concat_next(context: vm::Context, state: IteratorConcatState, depth: int) -> Result[
+fn iterator_concat_next(context: vm::Context, state: IteratorConcatState, depth: isize) -> Result[
     runtime::Value,
     vm::VmError,
 ] {
@@ -931,7 +931,7 @@ fn iterator_concat_next(context: vm::Context, state: IteratorConcatState, depth:
     result
 }
 
-fn iterator_concat_return(context: vm::Context, state: IteratorConcatState, depth: int) -> Result[
+fn iterator_concat_return(context: vm::Context, state: IteratorConcatState, depth: isize) -> Result[
     runtime::Value,
     vm::VmError,
 ] {
@@ -956,14 +956,14 @@ fn iterator_concat(
     context: vm::Context,
     this_value: runtime::Value,
     arguments: Vec[runtime::Value],
-    depth: int,
+    depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     let _ = this_value;
     let symbol = match context.iterator_symbol() {
         Some(value) => value,
         None => return Result::Err(function_vm_error("iterator symbol is not installed")),
     };
-    let values: Vec[IteratorIterable] = Vec::[];
+    let values: Vec[IteratorIterable] = Vec::new();
     for value in arguments {
         match value {
             runtime::Value::Object(_) => (),
@@ -1003,7 +1003,7 @@ fn iterator_constructor_call(
     context: vm::Context,
     this_value: runtime::Value,
     arguments: Vec[runtime::Value],
-    depth: int,
+    depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     let _ = context;
     let _ = this_value;
@@ -1016,7 +1016,7 @@ fn iterator_constructor_set(
     context: vm::Context,
     this_value: runtime::Value,
     arguments: Vec[runtime::Value],
-    depth: int,
+    depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     let _ = depth;
     let receiver = match this_value {
@@ -1046,7 +1046,7 @@ fn iterator_tag_set(
     symbol: runtime::Symbol,
     this_value: runtime::Value,
     arguments: Vec[runtime::Value],
-    depth: int,
+    depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     let _ = depth;
     let receiver = match this_value {
@@ -1170,13 +1170,15 @@ fn install_iterator(context: vm::Context) -> Result[runtime::Value, BuiltinError
         true,
         true,
     )?;
-    for (name, kind) in Vec::[
-        ("drop", IteratorHelperKind::Drop),
-        ("filter", IteratorHelperKind::Filter),
-        ("flatMap", IteratorHelperKind::FlatMap),
-        ("map", IteratorHelperKind::Map),
-        ("take", IteratorHelperKind::Take),
-    ] {
+    for (name, kind) in Vec::from_array(
+        [
+            ("drop", IteratorHelperKind::Drop),
+            ("filter", IteratorHelperKind::Filter),
+            ("flatMap", IteratorHelperKind::FlatMap),
+            ("map", IteratorHelperKind::Map),
+            ("take", IteratorHelperKind::Take),
+        ],
+    ) {
         define_value(
             context.heap(),
             prototype,
@@ -1192,12 +1194,14 @@ fn install_iterator(context: vm::Context) -> Result[runtime::Value, BuiltinError
             true,
         )?
     }
-    for (name, kind) in Vec::[
-        ("every", IteratorTerminalKind::Every),
-        ("find", IteratorTerminalKind::Find),
-        ("forEach", IteratorTerminalKind::ForEach),
-        ("some", IteratorTerminalKind::Some),
-    ] {
+    for (name, kind) in Vec::from_array(
+        [
+            ("every", IteratorTerminalKind::Every),
+            ("find", IteratorTerminalKind::Find),
+            ("forEach", IteratorTerminalKind::ForEach),
+            ("some", IteratorTerminalKind::Some),
+        ],
+    ) {
         define_value(
             context.heap(),
             prototype,

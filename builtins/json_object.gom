@@ -54,7 +54,7 @@ fn json_builtin_enumerable_keys(heap: runtime::Heap, object: runtime::ObjectId) 
         Some(value) => value,
         None => return Result::Err(function_vm_error("JSON object is invalid")),
     };
-    let keys: Vec[runtime::JsString] = Vec::[];
+    let keys: Vec[runtime::JsString] = Vec::new();
     for key in runtime::own_property_keys(heap, object) {
         match key {
             runtime::PropertyKey::String(name) => match value.own_property(key) {
@@ -69,8 +69,8 @@ fn json_builtin_enumerable_keys(heap: runtime::Heap, object: runtime::ObjectId) 
     Result::Ok(keys)
 }
 
-fn json_builtin_array_length(context: vm::Context, object: runtime::ObjectId, depth: int) -> Result[
-    int,
+fn json_builtin_array_length(context: vm::Context, object: runtime::ObjectId, depth: isize) -> Result[
+    isize,
     vm::VmError,
 ] {
     let value = context.read_property_at_depth(
@@ -80,7 +80,7 @@ fn json_builtin_array_length(context: vm::Context, object: runtime::ObjectId, de
     )?;
     match value {
         runtime::Value::Int(value) => if value >= 0 {
-            Result::Ok(value.to_int())
+            Result::Ok(value.to_isize())
         } else {
             Result::Err(function_vm_error("invalid JSON array length"))
         },
@@ -104,7 +104,7 @@ fn json_builtin_revive(
     holder: runtime::ObjectId,
     key: runtime::JsString,
     reviver: runtime::Value,
-    depth: int,
+    depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     let value = context.read_property_at_depth(
         runtime::Value::Object(holder),
@@ -197,13 +197,15 @@ fn json_builtin_revive(
     };
     context.invoke_with_this_at_depth(
         reviver,
-        Vec::[runtime::Value::String(key), value, runtime::Value::Object(reviver_context)],
+        Vec::from_array(
+            [runtime::Value::String(key), value, runtime::Value::Object(reviver_context)],
+        ),
         runtime::Value::Object(holder),
         depth,
     )
 }
 
-fn json_builtin_error_offset(error: json::JsonError) -> int {
+fn json_builtin_error_offset(error: json::JsonError) -> isize {
     if error.offset > 0
         && (error.message == "invalid string escape" || error.message == "invalid Unicode escape"
             || error.message == "unescaped control character in string") {
@@ -234,7 +236,7 @@ fn json_builtin_syntax_error(
     context: vm::Context,
     source: runtime::JsString,
     error: json::JsonError,
-    depth: int,
+    depth: isize,
 ) -> vm::VmError {
     let fallback = function_syntax_error(error.to_string());
     let global = match context.global_object() {
@@ -251,7 +253,7 @@ fn json_builtin_syntax_error(
     };
     let value = match context.invoke_with_this_at_depth(
         constructor,
-        Vec::[runtime::Value::String(js_string(error.to_string()))],
+        Vec::from_array([runtime::Value::String(js_string(error.to_string()))]),
         runtime::Value::Undefined,
         depth,
     ) {
@@ -283,7 +285,7 @@ fn json_builtin_parse(
     context: vm::Context,
     this_value: runtime::Value,
     arguments: Vec[runtime::Value],
-    depth: int,
+    depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     let _ = this_value;
     let source = match string_value_at_depth(context, argument(arguments, 0), depth)? {
@@ -307,16 +309,16 @@ fn json_builtin_parse(
     json_builtin_revive(context, sources, root, empty, reviver, depth)
 }
 
-fn json_builtin_append_ascii(output: Vec[uint16], value: string) -> unit {
+fn json_builtin_append_ascii(output: Vec[u16], value: string) -> unit {
     let bytes = value.to_bytes();
     let mut index = 0;
     while index < bytes.len() {
-        output.push(bytes[index].to_uint16());
+        output.push(bytes[index].to_u16());
         index += 1;
     }
 }
 
-fn json_builtin_append_string(output: Vec[uint16], value: runtime::JsString) -> unit {
+fn json_builtin_append_string(output: Vec[u16], value: runtime::JsString) -> unit {
     let mut index = 0;
     while index < value.len() {
         output.push(value.get(index));
@@ -324,7 +326,7 @@ fn json_builtin_append_string(output: Vec[uint16], value: runtime::JsString) -> 
     }
 }
 
-fn json_builtin_hex(value: uint16) -> uint16 {
+fn json_builtin_hex(value: u16) -> u16 {
     if value < 10 {
         48 + value
     } else {
@@ -332,7 +334,7 @@ fn json_builtin_hex(value: uint16) -> uint16 {
     }
 }
 
-fn json_builtin_append_escape(output: Vec[uint16], value: uint16) -> unit {
+fn json_builtin_append_escape(output: Vec[u16], value: u16) -> unit {
     output.push(92);
     output.push(117);
     output.push(json_builtin_hex((value >> 12) & 15));
@@ -341,7 +343,7 @@ fn json_builtin_append_escape(output: Vec[uint16], value: uint16) -> unit {
     output.push(json_builtin_hex(value & 15));
 }
 
-fn json_builtin_append_quoted(output: Vec[uint16], value: runtime::JsString) -> unit {
+fn json_builtin_append_quoted(output: Vec[u16], value: runtime::JsString) -> unit {
     output.push(34);
     let mut index = 0;
     while index < value.len() {
@@ -379,7 +381,7 @@ fn json_builtin_append_quoted(output: Vec[uint16], value: runtime::JsString) -> 
     output.push(34);
 }
 
-fn json_builtin_append_indent(output: Vec[uint16], gap: runtime::JsString, nesting: int) -> unit {
+fn json_builtin_append_indent(output: Vec[u16], gap: runtime::JsString, nesting: isize) -> unit {
     let mut current = 0;
     while current < nesting {
         json_builtin_append_string(output, gap);
@@ -396,7 +398,7 @@ fn json_builtin_stack_contains(stack: Vec[runtime::ObjectId], object: runtime::O
     false
 }
 
-fn json_builtin_raw_character(value: uint16) -> bool {
+fn json_builtin_raw_character(value: u16) -> bool {
     (value >= 97 && value <= 122) || (value >= 48 && value <= 57) || value == 45 || value == 34
 }
 
@@ -405,7 +407,7 @@ fn json_builtin_is_raw_json(
     raw_values: HashMap[runtime::ObjectId, runtime::JsString],
     this_value: runtime::Value,
     arguments: Vec[runtime::Value],
-    depth: int,
+    depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     let _ = this_value;
     let _ = depth;
@@ -423,7 +425,7 @@ fn json_builtin_raw_json(
     raw_values: HashMap[runtime::ObjectId, runtime::JsString],
     this_value: runtime::Value,
     arguments: Vec[runtime::Value],
-    depth: int,
+    depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     let _ = this_value;
     let source = match string_value_at_depth(context, argument(arguments, 0), depth)? {
@@ -490,10 +492,10 @@ fn json_builtin_write_array(
     replacer: Option[runtime::Value],
     property_list: Option[Vec[runtime::JsString]],
     gap: runtime::JsString,
-    nesting: int,
+    nesting: isize,
     stack: Vec[runtime::ObjectId],
-    output: Vec[uint16],
-    depth: int,
+    output: Vec[u16],
+    depth: isize,
 ) -> Result[unit, vm::VmError] {
     let length = json_builtin_array_length(context, object, depth)?;
     output.push(91);
@@ -506,7 +508,7 @@ fn json_builtin_write_array(
             output.push(10);
             json_builtin_append_indent(output, gap, nesting + 1)
         } else {};
-        let element: Vec[uint16] = Vec::[];
+        let element: Vec[u16] = Vec::new();
         if json_builtin_write_property(
             context,
             raw_values,
@@ -543,16 +545,16 @@ fn json_builtin_write_object(
     replacer: Option[runtime::Value],
     property_list: Option[Vec[runtime::JsString]],
     gap: runtime::JsString,
-    nesting: int,
+    nesting: isize,
     stack: Vec[runtime::ObjectId],
-    output: Vec[uint16],
-    depth: int,
+    output: Vec[u16],
+    depth: isize,
 ) -> Result[unit, vm::VmError] {
     output.push(123);
     let keys = json_builtin_object_keys(context.heap(), object, property_list)?;
     let mut count = 0;
     for key in keys {
-        let property: Vec[uint16] = Vec::[];
+        let property: Vec[u16] = Vec::new();
         if json_builtin_write_property(
             context,
             raw_values,
@@ -599,10 +601,10 @@ fn json_builtin_write_value(
     replacer: Option[runtime::Value],
     property_list: Option[Vec[runtime::JsString]],
     gap: runtime::JsString,
-    nesting: int,
+    nesting: isize,
     stack: Vec[runtime::ObjectId],
-    output: Vec[uint16],
-    depth: int,
+    output: Vec[u16],
+    depth: isize,
 ) -> Result[bool, vm::VmError] {
     match value {
         runtime::Value::Undefined | runtime::Value::Symbol(_) => Result::Ok(false),
@@ -705,10 +707,10 @@ fn json_builtin_write_property(
     replacer: Option[runtime::Value],
     property_list: Option[Vec[runtime::JsString]],
     gap: runtime::JsString,
-    nesting: int,
+    nesting: isize,
     stack: Vec[runtime::ObjectId],
-    output: Vec[uint16],
-    depth: int,
+    output: Vec[u16],
+    depth: isize,
 ) -> Result[bool, vm::VmError] {
     let key_value = runtime::Value::String(key);
     let mut value = context.read_property_at_depth(runtime::Value::Object(holder), key_value, depth)?;
@@ -720,7 +722,12 @@ fn json_builtin_write_property(
                 depth,
             )?;
             if json_builtin_callable(method) {
-                value = context.invoke_with_this_at_depth(method, Vec::[key_value], value, depth)?;
+                value = context.invoke_with_this_at_depth(
+                    method,
+                    Vec::from_array([key_value]),
+                    value,
+                    depth,
+                )?;
             } else {}
         },
         _ => (),
@@ -729,7 +736,7 @@ fn json_builtin_write_property(
         Some(callback) => {
             value = context.invoke_with_this_at_depth(
                 callback,
-                Vec::[key_value, value],
+                Vec::from_array([key_value, value]),
                 runtime::Value::Object(holder),
                 depth,
             )?;
@@ -750,7 +757,7 @@ fn json_builtin_write_property(
     )
 }
 
-fn json_builtin_property_list(context: vm::Context, value: runtime::Value, depth: int) -> Result[
+fn json_builtin_property_list(context: vm::Context, value: runtime::Value, depth: isize) -> Result[
     Option[Vec[runtime::JsString]],
     vm::VmError,
 ] {
@@ -769,7 +776,7 @@ fn json_builtin_property_list(context: vm::Context, value: runtime::Value, depth
         },
     };
     let length = json_builtin_array_length(context, object, depth)?;
-    let result: Vec[runtime::JsString] = Vec::[];
+    let result: Vec[runtime::JsString] = Vec::new();
     let mut index = 0;
     while index < length {
         let item = context.read_property_at_depth(
@@ -815,7 +822,7 @@ fn json_builtin_property_list(context: vm::Context, value: runtime::Value, depth
     Result::Ok(Option::Some(result))
 }
 
-fn json_builtin_space(context: vm::Context, value: runtime::Value, depth: int) -> Result[
+fn json_builtin_space(context: vm::Context, value: runtime::Value, depth: isize) -> Result[
     runtime::JsString,
     vm::VmError,
 ] {
@@ -854,7 +861,7 @@ fn json_builtin_space(context: vm::Context, value: runtime::Value, depth: int) -
             } else {
                 num::parse_int(dtoa::number_to_string(math::floor(value))).unwrap_or(0)
             };
-            let units: Vec[uint16] = Vec::with_capacity(count);
+            let units: Vec[u16] = Vec::with_capacity(count);
             let mut index = 0;
             while index < count {
                 units.push(32);
@@ -871,7 +878,7 @@ fn json_builtin_stringify(
     raw_values: HashMap[runtime::ObjectId, runtime::JsString],
     this_value: runtime::Value,
     arguments: Vec[runtime::Value],
-    depth: int,
+    depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     let _ = this_value;
     let replacer_value = argument(arguments, 1);
@@ -889,8 +896,8 @@ fn json_builtin_stringify(
     let root = json_builtin_allocate_object(context.heap())?;
     let empty = js_string("");
     json_builtin_define(context.heap(), root, empty, argument(arguments, 0))?;
-    let output: Vec[uint16] = Vec::[];
-    let stack: Vec[runtime::ObjectId] = Vec::[];
+    let output: Vec[u16] = Vec::new();
+    let stack: Vec[runtime::ObjectId] = Vec::new();
     if json_builtin_write_property(
         context,
         raw_values,
@@ -911,7 +918,7 @@ fn json_builtin_stringify(
 }
 
 fn install_json(context: vm::Context, object: runtime::ObjectId) -> Result[unit, BuiltinError] {
-    let raw_values: HashMap[runtime::ObjectId, runtime::JsString] = HashMap::{};
+    let raw_values: HashMap[runtime::ObjectId, runtime::JsString] = HashMap::new();
     define_value(
         context.heap(),
         object,

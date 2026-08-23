@@ -137,14 +137,14 @@ fn arraybuffer_receiver(value: runtime::Value, name: string) -> Result[
     }
 }
 
-fn arraybuffer_number(value: runtime::Value) -> Result[float64, vm::NativeError] {
+fn arraybuffer_number(value: runtime::Value) -> Result[f64, vm::NativeError] {
     match runtime::primitive_to_number(value) {
         Ok(value) => Result::Ok(value),
         Err(value) => Result::Err(native_error(value.message)),
     }
 }
 
-fn arraybuffer_integer(value: runtime::Value) -> Result[int, vm::NativeError] {
+fn arraybuffer_integer(value: runtime::Value) -> Result[isize, vm::NativeError] {
     let number = arraybuffer_number(value)?;
     if math::is_nan(number) || number == 0.0 {
         return Result::Ok(0)
@@ -159,7 +159,7 @@ fn arraybuffer_integer(value: runtime::Value) -> Result[int, vm::NativeError] {
     }
 }
 
-fn arraybuffer_index(value: runtime::Value) -> Result[int, vm::NativeError] {
+fn arraybuffer_index(value: runtime::Value) -> Result[isize, vm::NativeError] {
     let index = arraybuffer_integer(value)?;
     if index < 0 {
         Result::Err(native_error("RangeError: index must not be negative"))
@@ -168,8 +168,8 @@ fn arraybuffer_index(value: runtime::Value) -> Result[int, vm::NativeError] {
     }
 }
 
-fn arraybuffer_index_number_at_depth(context: vm::Context, value: runtime::Value, depth: int) -> Result[
-    float64,
+fn arraybuffer_index_number_at_depth(context: vm::Context, value: runtime::Value, depth: isize) -> Result[
+    f64,
     vm::VmError,
 ] {
     let primitive = context.to_primitive_number_at_depth(value, depth)?;
@@ -191,8 +191,8 @@ fn arraybuffer_index_number_at_depth(context: vm::Context, value: runtime::Value
     }
 }
 
-fn arraybuffer_index_at_depth(context: vm::Context, value: runtime::Value, depth: int) -> Result[
-    int,
+fn arraybuffer_index_at_depth(context: vm::Context, value: runtime::Value, depth: isize) -> Result[
+    isize,
     vm::VmError,
 ] {
     let number = arraybuffer_index_number_at_depth(context, value, depth)?;
@@ -206,9 +206,9 @@ fn arraybuffer_index_at_depth(context: vm::Context, value: runtime::Value, depth
 fn optional_index_at_depth(
     context: vm::Context,
     arguments: Vec[runtime::Value],
-    index: int,
-    depth: int,
-) -> Result[Option[int], vm::VmError] {
+    index: isize,
+    depth: isize,
+) -> Result[Option[isize], vm::VmError] {
     if index >= arguments.len() {
         Result::Ok(Option::None)
     } else {
@@ -219,8 +219,8 @@ fn optional_index_at_depth(
     }
 }
 
-fn optional_index(arguments: Vec[runtime::Value], index: int) -> Result[
-    Option[int],
+fn optional_index(arguments: Vec[runtime::Value], index: isize) -> Result[
+    Option[isize],
     vm::NativeError,
 ] {
     if index >= arguments.len() {
@@ -233,8 +233,8 @@ fn optional_index(arguments: Vec[runtime::Value], index: int) -> Result[
     }
 }
 
-fn relative_index(arguments: Vec[runtime::Value], index: int, default: int) -> Result[
-    int,
+fn relative_index(arguments: Vec[runtime::Value], index: isize, default: isize) -> Result[
+    isize,
     vm::NativeError,
 ] {
     if index >= arguments.len() {
@@ -247,23 +247,23 @@ fn relative_index(arguments: Vec[runtime::Value], index: int, default: int) -> R
     }
 }
 
-fn length_value(value: int) -> runtime::Value {
-    runtime::Value::Int(value.to_int32())
+fn length_value(value: isize) -> runtime::Value {
+    runtime::Value::Int(value.to_i32())
 }
 
-fn uint32_value(value: uint32) -> runtime::Value {
+fn uint32_value(value: u32) -> runtime::Value {
     if value <= 2147483647 {
-        runtime::Value::Int(value.to_int32())
+        runtime::Value::Int(value.to_i32())
     } else {
         runtime::Value::Float(num::parse_float64(value.to_string()).unwrap_or(0.0))
     }
 }
 
-fn float32_value(value: float32) -> runtime::Value {
+fn float32_value(value: f32) -> runtime::Value {
     runtime::Value::Float(arraybuffer::widen_float32(value))
 }
 
-fn float32_argument(arguments: Vec[runtime::Value], index: int) -> Result[float32, vm::NativeError] {
+fn float32_argument(arguments: Vec[runtime::Value], index: isize) -> Result[f32, vm::NativeError] {
     let number = arraybuffer_number(argument(arguments, index))?;
     match num::parse_float32(dtoa::number_to_string(number)) {
         Ok(value) => Result::Ok(value),
@@ -393,7 +393,7 @@ fn array_buffer_construct_vm(
     receiver: runtime::ObjectId,
     arguments: Vec[runtime::Value],
     selected_prototype: Option[runtime::ObjectId],
-    depth: int,
+    depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     let _ = depth;
     let length = match arguments[0] {
@@ -426,10 +426,11 @@ fn array_buffer_construct_vm(
     Result::Ok(runtime::Value::Object(receiver))
 }
 
-fn array_buffer_prepare_arguments(context: vm::Context, arguments: Vec[runtime::Value], depth: int) -> Result[
-    Vec[runtime::Value],
-    vm::VmError,
-] {
+fn array_buffer_prepare_arguments(
+    context: vm::Context,
+    arguments: Vec[runtime::Value],
+    depth: isize,
+) -> Result[Vec[runtime::Value], vm::VmError] {
     let length = if arguments.is_empty() {
         0.0
     } else {
@@ -467,7 +468,7 @@ fn array_buffer_prepare_arguments(context: vm::Context, arguments: Vec[runtime::
         },
         None => runtime::Value::Undefined,
     };
-    Result::Ok(Vec::[runtime::Value::Float(length), maximum])
+    Result::Ok(Vec::from_array([runtime::Value::Float(length), maximum]))
 }
 
 fn shared_array_buffer_construct_vm(
@@ -477,7 +478,7 @@ fn shared_array_buffer_construct_vm(
     receiver: runtime::ObjectId,
     arguments: Vec[runtime::Value],
     selected_prototype: Option[runtime::ObjectId],
-    depth: int,
+    depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     let _ = depth;
     let length = match arguments[0] {
@@ -580,7 +581,7 @@ fn array_buffer_resize(
     states: HashMap[runtime::ObjectId, arraybuffer::ArrayBuffer],
     this_value: runtime::Value,
     arguments: Vec[runtime::Value],
-    depth: int,
+    depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     let value = match array_buffer_state_kind(states, this_value, false) {
         Ok(value) => value.1,
@@ -600,7 +601,7 @@ fn array_buffer_slice_at_depth(
     this_value: runtime::Value,
     arguments: Vec[runtime::Value],
     shared: bool,
-    depth: int,
+    depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     let (source_object, source) = match array_buffer_state_kind(states, this_value, shared) {
         Ok(value) => value,
@@ -648,7 +649,7 @@ fn array_buffer_slice_at_depth(
     };
     let target_value = context.construct_with_new_target_at_depth(
         selected,
-        Vec::[runtime::Value::Int(count.to_int32())],
+        Vec::from_array([runtime::Value::Int(count.to_i32())]),
         selected,
         depth,
     )?;
@@ -690,7 +691,7 @@ fn array_buffer_transfer_at_depth(
     this_value: runtime::Value,
     arguments: Vec[runtime::Value],
     fixed_length: bool,
-    depth: int,
+    depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     let value = match array_buffer_state_kind(states, this_value, false) {
         Ok(value) => value.1,
@@ -716,7 +717,7 @@ fn shared_array_buffer_grow_at_depth(
     states: HashMap[runtime::ObjectId, arraybuffer::ArrayBuffer],
     this_value: runtime::Value,
     arguments: Vec[runtime::Value],
-    depth: int,
+    depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     let value = match array_buffer_state_kind(states, this_value, true) {
         Ok(value) => value.1,
@@ -738,7 +739,7 @@ fn install_array_buffer_constructor(context: vm::Context) -> Result[
         Ok(value) => value,
         Err(value) => return Result::Err(BuiltinError { message: value.message }),
     };
-    let states: HashMap[runtime::ObjectId, arraybuffer::ArrayBuffer] = HashMap::{};
+    let states: HashMap[runtime::ObjectId, arraybuffer::ArrayBuffer] = HashMap::new();
     let constructor = allocate_vm_function(
         context,
         "ArrayBuffer",
@@ -1091,7 +1092,7 @@ fn data_view_construct_vm(
     states: HashMap[runtime::ObjectId, DataViewInstance],
     receiver: runtime::ObjectId,
     arguments: Vec[runtime::Value],
-    depth: int,
+    depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     let (buffer_object, buffer) = match array_buffer_state(buffer_states, argument(arguments, 0)) {
         Ok(value) => value,
@@ -1118,7 +1119,7 @@ fn data_view_prepare_arguments(
     context: vm::Context,
     buffer_states: HashMap[runtime::ObjectId, arraybuffer::ArrayBuffer],
     arguments: Vec[runtime::Value],
-    depth: int,
+    depth: isize,
 ) -> Result[Vec[runtime::Value], vm::VmError] {
     let buffer_value = argument(arguments, 0);
     let buffer = match array_buffer_state(buffer_states, buffer_value) {
@@ -1143,11 +1144,13 @@ fn data_view_prepare_arguments(
             if value > buffer_length - byte_offset {
                 return Result::Err(function_range_error("DataView byteLength is out of range"))
             } else {};
-            runtime::Value::Int(value.to_int32())
+            runtime::Value::Int(value.to_i32())
         },
         None => runtime::Value::Undefined,
     };
-    Result::Ok(Vec::[buffer_value, runtime::Value::Int(byte_offset.to_int32()), prepared_length])
+    Result::Ok(
+        Vec::from_array([buffer_value, runtime::Value::Int(byte_offset.to_i32()), prepared_length]),
+    )
 }
 
 fn data_view_buffer(
@@ -1199,7 +1202,7 @@ fn data_view_get_int8(
     match data_view_state(states, this_value)?.value.get_int8(
         arraybuffer_index(argument(arguments, 0))?,
     ) {
-        Ok(value) => Result::Ok(runtime::Value::Int(value.to_int32())),
+        Ok(value) => Result::Ok(runtime::Value::Int(value.to_i32())),
         Err(value) => Result::Err(arraybuffer_native_error(value)),
     }
 }
@@ -1214,7 +1217,7 @@ fn data_view_get_uint8(
     match data_view_state(states, this_value)?.value.get_uint8(
         arraybuffer_index(argument(arguments, 0))?,
     ) {
-        Ok(value) => Result::Ok(runtime::Value::Int(value.to_int32())),
+        Ok(value) => Result::Ok(runtime::Value::Int(value.to_i32())),
         Err(value) => Result::Err(arraybuffer_native_error(value)),
     }
 }
@@ -1231,7 +1234,7 @@ fn data_view_get_int16(
         index,
         Option::Some(runtime::to_boolean(argument(arguments, 1))),
     ) {
-        Ok(value) => Result::Ok(runtime::Value::Int(value.to_int32())),
+        Ok(value) => Result::Ok(runtime::Value::Int(value.to_i32())),
         Err(value) => Result::Err(arraybuffer_native_error(value)),
     }
 }
@@ -1248,7 +1251,7 @@ fn data_view_get_uint16(
         index,
         Option::Some(runtime::to_boolean(argument(arguments, 1))),
     ) {
-        Ok(value) => Result::Ok(runtime::Value::Int(value.to_int32())),
+        Ok(value) => Result::Ok(runtime::Value::Int(value.to_i32())),
         Err(value) => Result::Err(arraybuffer_native_error(value)),
     }
 }
@@ -1293,7 +1296,7 @@ fn data_view_get_bigint_at_depth(
     this_value: runtime::Value,
     arguments: Vec[runtime::Value],
     signed: bool,
-    depth: int,
+    depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     let state = match data_view_state(states, this_value) {
         Ok(value) => value.value,
@@ -1366,7 +1369,7 @@ fn data_view_set_integer(
     states: HashMap[runtime::ObjectId, DataViewInstance],
     this_value: runtime::Value,
     arguments: Vec[runtime::Value],
-    kind: int,
+    kind: isize,
 ) -> Result[runtime::Value, vm::NativeError] {
     let state = data_view_state(states, this_value)?.value;
     let index = arraybuffer_index(argument(arguments, 0))?;
@@ -1392,7 +1395,7 @@ fn data_view_set_bigint_at_depth(
     this_value: runtime::Value,
     arguments: Vec[runtime::Value],
     signed: bool,
-    depth: int,
+    depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     let state = match data_view_state(states, this_value) {
         Ok(value) => value.value,
@@ -1477,7 +1480,7 @@ fn define_data_view_method(
     prototype: runtime::ObjectId,
     name: string,
     states: HashMap[runtime::ObjectId, DataViewInstance],
-    operation: int,
+    operation: isize,
 ) -> Result[unit, BuiltinError] {
     let function = allocate_function(
         context,
@@ -1499,7 +1502,7 @@ fn install_data_view_constructor(
         Ok(value) => value,
         Err(value) => return Result::Err(BuiltinError { message: value.message }),
     };
-    let states: HashMap[runtime::ObjectId, DataViewInstance] = HashMap::{};
+    let states: HashMap[runtime::ObjectId, DataViewInstance] = HashMap::new();
     define_to_string_tag(context, prototype, "DataView")?;
     define_arraybuffer_getter(
         heap,
@@ -1537,145 +1540,149 @@ fn install_data_view_constructor(
             },
         )?,
     )?;
-    for (name, function) in Vec::[
-        (
-            "getInt8",
-            allocate_function(
-                context,
-                "DataView.prototype.getInt8",
-                |heap, this_value, arguments| {
-                    data_view_get_int8(heap, states, this_value, arguments)
-                },
-            )?,
-        ),
-        (
-            "getUint8",
-            allocate_function(
-                context,
-                "DataView.prototype.getUint8",
-                |heap, this_value, arguments| {
-                    data_view_get_uint8(heap, states, this_value, arguments)
-                },
-            )?,
-        ),
-        (
-            "getInt16",
-            allocate_function(
-                context,
-                "DataView.prototype.getInt16",
-                |heap, this_value, arguments| {
-                    data_view_get_int16(heap, states, this_value, arguments)
-                },
-            )?,
-        ),
-        (
-            "getUint16",
-            allocate_function(
-                context,
-                "DataView.prototype.getUint16",
-                |heap, this_value, arguments| {
-                    data_view_get_uint16(heap, states, this_value, arguments)
-                },
-            )?,
-        ),
-        (
-            "getInt32",
-            allocate_function(
-                context,
-                "DataView.prototype.getInt32",
-                |heap, this_value, arguments| {
-                    data_view_get_int32(heap, states, this_value, arguments)
-                },
-            )?,
-        ),
-        (
-            "getUint32",
-            allocate_function(
-                context,
-                "DataView.prototype.getUint32",
-                |heap, this_value, arguments| {
-                    data_view_get_uint32(heap, states, this_value, arguments)
-                },
-            )?,
-        ),
-        (
-            "getBigInt64",
-            allocate_vm_function(
-                context,
-                "DataView.prototype.getBigInt64",
-                |this_value, arguments, depth| {
-                    data_view_get_bigint_at_depth(
-                        context,
-                        states,
-                        this_value,
-                        arguments,
-                        true,
-                        depth,
-                    )
-                },
-            )?,
-        ),
-        (
-            "getBigUint64",
-            allocate_vm_function(
-                context,
-                "DataView.prototype.getBigUint64",
-                |this_value, arguments, depth| {
-                    data_view_get_bigint_at_depth(
-                        context,
-                        states,
-                        this_value,
-                        arguments,
-                        false,
-                        depth,
-                    )
-                },
-            )?,
-        ),
-        (
-            "getFloat16",
-            allocate_function(
-                context,
-                "DataView.prototype.getFloat16",
-                |heap, this_value, arguments| {
-                    data_view_get_float16(heap, states, this_value, arguments)
-                },
-            )?,
-        ),
-        (
-            "getFloat32",
-            allocate_function(
-                context,
-                "DataView.prototype.getFloat32",
-                |heap, this_value, arguments| {
-                    data_view_get_float32(heap, states, this_value, arguments)
-                },
-            )?,
-        ),
-        (
-            "getFloat64",
-            allocate_function(
-                context,
-                "DataView.prototype.getFloat64",
-                |heap, this_value, arguments| {
-                    data_view_get_float64(heap, states, this_value, arguments)
-                },
-            )?,
-        ),
-    ] {
+    for (name, function) in Vec::from_array(
+        [
+            (
+                "getInt8",
+                allocate_function(
+                    context,
+                    "DataView.prototype.getInt8",
+                    |heap, this_value, arguments| {
+                        data_view_get_int8(heap, states, this_value, arguments)
+                    },
+                )?,
+            ),
+            (
+                "getUint8",
+                allocate_function(
+                    context,
+                    "DataView.prototype.getUint8",
+                    |heap, this_value, arguments| {
+                        data_view_get_uint8(heap, states, this_value, arguments)
+                    },
+                )?,
+            ),
+            (
+                "getInt16",
+                allocate_function(
+                    context,
+                    "DataView.prototype.getInt16",
+                    |heap, this_value, arguments| {
+                        data_view_get_int16(heap, states, this_value, arguments)
+                    },
+                )?,
+            ),
+            (
+                "getUint16",
+                allocate_function(
+                    context,
+                    "DataView.prototype.getUint16",
+                    |heap, this_value, arguments| {
+                        data_view_get_uint16(heap, states, this_value, arguments)
+                    },
+                )?,
+            ),
+            (
+                "getInt32",
+                allocate_function(
+                    context,
+                    "DataView.prototype.getInt32",
+                    |heap, this_value, arguments| {
+                        data_view_get_int32(heap, states, this_value, arguments)
+                    },
+                )?,
+            ),
+            (
+                "getUint32",
+                allocate_function(
+                    context,
+                    "DataView.prototype.getUint32",
+                    |heap, this_value, arguments| {
+                        data_view_get_uint32(heap, states, this_value, arguments)
+                    },
+                )?,
+            ),
+            (
+                "getBigInt64",
+                allocate_vm_function(
+                    context,
+                    "DataView.prototype.getBigInt64",
+                    |this_value, arguments, depth| {
+                        data_view_get_bigint_at_depth(
+                            context,
+                            states,
+                            this_value,
+                            arguments,
+                            true,
+                            depth,
+                        )
+                    },
+                )?,
+            ),
+            (
+                "getBigUint64",
+                allocate_vm_function(
+                    context,
+                    "DataView.prototype.getBigUint64",
+                    |this_value, arguments, depth| {
+                        data_view_get_bigint_at_depth(
+                            context,
+                            states,
+                            this_value,
+                            arguments,
+                            false,
+                            depth,
+                        )
+                    },
+                )?,
+            ),
+            (
+                "getFloat16",
+                allocate_function(
+                    context,
+                    "DataView.prototype.getFloat16",
+                    |heap, this_value, arguments| {
+                        data_view_get_float16(heap, states, this_value, arguments)
+                    },
+                )?,
+            ),
+            (
+                "getFloat32",
+                allocate_function(
+                    context,
+                    "DataView.prototype.getFloat32",
+                    |heap, this_value, arguments| {
+                        data_view_get_float32(heap, states, this_value, arguments)
+                    },
+                )?,
+            ),
+            (
+                "getFloat64",
+                allocate_function(
+                    context,
+                    "DataView.prototype.getFloat64",
+                    |heap, this_value, arguments| {
+                        data_view_get_float64(heap, states, this_value, arguments)
+                    },
+                )?,
+            ),
+        ],
+    ) {
         define_value(heap, prototype, name, function, true, true)?
     }
-    for (name, operation) in Vec::[
-        ("setInt8", 0),
-        ("setUint8", 1),
-        ("setInt16", 2),
-        ("setUint16", 3),
-        ("setInt32", 4),
-        ("setUint32", 5),
-    ] {
+    for (name, operation) in Vec::from_array(
+        [
+            ("setInt8", 0),
+            ("setUint8", 1),
+            ("setInt16", 2),
+            ("setUint16", 3),
+            ("setInt32", 4),
+            ("setUint32", 5),
+        ],
+    ) {
         define_data_view_method(context, prototype, name, states, operation)?
     }
-    for (name, signed) in Vec::[("setBigInt64", true), ("setBigUint64", false)] {
+    for (name, signed) in Vec::from_array([("setBigInt64", true), ("setBigUint64", false)]) {
         define_value(
             heap,
             prototype,
@@ -1698,38 +1705,40 @@ fn install_data_view_constructor(
             true,
         )?
     }
-    for (name, function) in Vec::[
-        (
-            "setFloat16",
-            allocate_function(
-                context,
-                "DataView.prototype.setFloat16",
-                |heap, this_value, arguments| {
-                    data_view_set_float16(heap, states, this_value, arguments)
-                },
-            )?,
-        ),
-        (
-            "setFloat32",
-            allocate_function(
-                context,
-                "DataView.prototype.setFloat32",
-                |heap, this_value, arguments| {
-                    data_view_set_float32(heap, states, this_value, arguments)
-                },
-            )?,
-        ),
-        (
-            "setFloat64",
-            allocate_function(
-                context,
-                "DataView.prototype.setFloat64",
-                |heap, this_value, arguments| {
-                    data_view_set_float64(heap, states, this_value, arguments)
-                },
-            )?,
-        ),
-    ] {
+    for (name, function) in Vec::from_array(
+        [
+            (
+                "setFloat16",
+                allocate_function(
+                    context,
+                    "DataView.prototype.setFloat16",
+                    |heap, this_value, arguments| {
+                        data_view_set_float16(heap, states, this_value, arguments)
+                    },
+                )?,
+            ),
+            (
+                "setFloat32",
+                allocate_function(
+                    context,
+                    "DataView.prototype.setFloat32",
+                    |heap, this_value, arguments| {
+                        data_view_set_float32(heap, states, this_value, arguments)
+                    },
+                )?,
+            ),
+            (
+                "setFloat64",
+                allocate_function(
+                    context,
+                    "DataView.prototype.setFloat64",
+                    |heap, this_value, arguments| {
+                        data_view_set_float64(heap, states, this_value, arguments)
+                    },
+                )?,
+            ),
+        ],
+    ) {
         define_value(heap, prototype, name, function, true, true)?
     }
     let constructor = allocate_vm_function(
@@ -1772,7 +1781,7 @@ fn install_data_view_constructor(
     Result::Ok((constructor, states))
 }
 
-fn typed_constructor_length(arguments: Vec[runtime::Value]) -> Result[int, vm::NativeError] {
+fn typed_constructor_length(arguments: Vec[runtime::Value]) -> Result[isize, vm::NativeError] {
     if arguments.is_empty() {
         Result::Ok(0)
     } else {
@@ -1783,7 +1792,7 @@ fn typed_constructor_length(arguments: Vec[runtime::Value]) -> Result[int, vm::N
     }
 }
 
-fn typed_array_collect_values(context: vm::Context, source: runtime::Value, depth: int) -> Result[
+fn typed_array_collect_values(context: vm::Context, source: runtime::Value, depth: isize) -> Result[
     Vec[runtime::Value],
     vm::VmError,
 ] {
@@ -1801,7 +1810,7 @@ fn typed_array_collect_mapped_values(
     source: runtime::Value,
     mapper: runtime::Value,
     this_argument: runtime::Value,
-    depth: int,
+    depth: isize,
 ) -> Result[Vec[runtime::Value], vm::VmError] {
     let global = match context.global_object() {
         Some(value) => runtime::Value::Object(value),
@@ -1819,7 +1828,7 @@ fn typed_array_collect_mapped_values(
     )?;
     let array = context.invoke_with_this_at_depth(
         from,
-        Vec::[source, mapper, this_argument],
+        Vec::from_array([source, mapper, this_argument]),
         constructor,
         depth,
     )?;
@@ -1829,7 +1838,7 @@ fn typed_array_collect_mapped_values(
         depth,
     )?;
     let length = match length_value {
-        runtime::Value::Int(value) => value.to_int(),
+        runtime::Value::Int(value) => value.to_isize(),
         runtime::Value::Float(value) => if math::is_finite(value) && value >= 0.0
             && value <= 2147483647.0 {
             num::parse_int(dtoa::number_to_string(math::trunc(value))).unwrap_or(0)
@@ -1842,15 +1851,15 @@ fn typed_array_collect_mapped_values(
     let mut index = 0;
     while index < length {
         values.push(
-            context.read_property_at_depth(array, runtime::Value::Int(index.to_int32()), depth)?,
+            context.read_property_at_depth(array, runtime::Value::Int(index.to_i32()), depth)?,
         );
         index += 1;
     }
     Result::Ok(values)
 }
 
-fn typed_array_number(context: vm::Context, value: runtime::Value, depth: int) -> Result[
-    float64,
+fn typed_array_number(context: vm::Context, value: runtime::Value, depth: isize) -> Result[
+    f64,
     vm::VmError,
 ] {
     let primitive = context.to_primitive_number_at_depth(value, depth)?;
@@ -1860,8 +1869,8 @@ fn typed_array_number(context: vm::Context, value: runtime::Value, depth: int) -
     }
 }
 
-fn typed_array_offset(context: vm::Context, value: runtime::Value, depth: int) -> Result[
-    int,
+fn typed_array_offset(context: vm::Context, value: runtime::Value, depth: isize) -> Result[
+    isize,
     vm::VmError,
 ] {
     let number = typed_array_number(context, value, depth)?;
@@ -1874,7 +1883,7 @@ fn typed_array_offset(context: vm::Context, value: runtime::Value, depth: int) -
     }
 }
 
-fn typed_array_view_length(view: runtime::TypedArrayView) -> int {
+fn typed_array_view_length(view: runtime::TypedArrayView) -> isize {
     match view {
         runtime::TypedArrayView::Uint8(value) => value.length(),
         runtime::TypedArrayView::Int32(value) => value.length(),
@@ -1894,7 +1903,7 @@ fn typed_array_view_detached(view: runtime::TypedArrayView) -> bool {
     }
 }
 
-fn typed_array_view_set(view: runtime::TypedArrayView, index: int, value: float64) -> Result[
+fn typed_array_view_set(view: runtime::TypedArrayView, index: isize, value: f64) -> Result[
     unit,
     vm::VmError,
 ] {
@@ -1922,7 +1931,7 @@ fn typed_array_set_values(
     context: vm::Context,
     view: runtime::TypedArrayView,
     arguments: Vec[runtime::Value],
-    depth: int,
+    depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     if typed_array_view_detached(view) {
         return Result::Err(function_vm_error("typed array buffer is detached"))
@@ -1960,9 +1969,9 @@ fn define_typed_array_bytes(
     heap: runtime::Heap,
     constructor: runtime::ObjectId,
     prototype: runtime::ObjectId,
-    size: int,
+    size: isize,
 ) -> Result[unit, BuiltinError] {
-    let value = runtime::Value::Int(size.to_int32());
+    let value = runtime::Value::Int(size.to_i32());
     define_value(heap, constructor, "BYTES_PER_ELEMENT", value, false, false)?;
     define_value(heap, prototype, "BYTES_PER_ELEMENT", value, false, false)
 }
@@ -2047,7 +2056,7 @@ fn uint8_array_from_values(
     states: HashMap[runtime::ObjectId, Uint8ArrayInstance],
     prototype: runtime::ObjectId,
     values: Vec[runtime::Value],
-    depth: int,
+    depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     let result = match uint8_array_construct(
         context.heap(),
@@ -2056,7 +2065,7 @@ fn uint8_array_from_values(
         states,
         prototype,
         runtime::Value::Undefined,
-        Vec::[runtime::Value::Int(values.len().to_int32())],
+        Vec::from_array([runtime::Value::Int(values.len().to_i32())]),
     ) {
         Ok(value) => value,
         Err(value) => return Result::Err(function_native_error(value)),
@@ -2086,7 +2095,7 @@ fn uint8_array_construct_vm(
     prototype: runtime::ObjectId,
     this_value: runtime::Value,
     arguments: Vec[runtime::Value],
-    depth: int,
+    depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     match argument(arguments, 0) {
         runtime::Value::Object(object) => match buffer_states.get(object) {
@@ -2181,7 +2190,7 @@ fn uint8_array_get(
     match uint8_array_state(states, this_value)?.value.get(
         arraybuffer_index(argument(arguments, 0))?,
     ) {
-        Ok(value) => Result::Ok(runtime::Value::Int(value.to_int32())),
+        Ok(value) => Result::Ok(runtime::Value::Int(value.to_i32())),
         Err(value) => Result::Err(arraybuffer_native_error(value)),
     }
 }
@@ -2239,7 +2248,7 @@ fn uint8_codec_string_option(
     context: vm::Context,
     options: runtime::Value,
     name: string,
-    depth: int,
+    depth: isize,
 ) -> Result[Option[runtime::JsString], vm::VmError] {
     let value = context.read_property_at_depth(
         options,
@@ -2256,7 +2265,7 @@ fn uint8_codec_string_option(
 fn uint8_codec_options(
     context: vm::Context,
     value: runtime::Value,
-    depth: int,
+    depth: isize,
     read_handling: bool,
     read_omit_padding: bool,
 ) -> Result[Uint8CodecOptions, vm::VmError] {
@@ -2332,7 +2341,7 @@ fn uint8_array_from_codec(
     states: HashMap[runtime::ObjectId, Uint8ArrayInstance],
     prototype: runtime::ObjectId,
     arguments: Vec[runtime::Value],
-    depth: int,
+    depth: isize,
     base64: bool,
 ) -> Result[runtime::Value, vm::VmError] {
     let input = uint8_codec_input(arguments)?;
@@ -2356,7 +2365,7 @@ fn uint8_array_from_codec(
     };
     let values: Vec[runtime::Value] = Vec::with_capacity(decoded.bytes.len());
     for value in decoded.bytes {
-        values.push(runtime::Value::Int(value.to_int32()))
+        values.push(runtime::Value::Int(value.to_i32()))
     }
     uint8_array_from_values(
         context,
@@ -2370,7 +2379,7 @@ fn uint8_array_from_codec(
 }
 
 fn uint8_array_codec_bytes(context: vm::Context, this_value: runtime::Value) -> Result[
-    (arraybuffer::Uint8Array, int),
+    (arraybuffer::Uint8Array, isize),
     vm::VmError,
 ] {
     let object = match this_value {
@@ -2387,7 +2396,7 @@ fn uint8_array_codec_encode(
     context: vm::Context,
     this_value: runtime::Value,
     arguments: Vec[runtime::Value],
-    depth: int,
+    depth: isize,
     base64: bool,
 ) -> Result[runtime::Value, vm::VmError] {
     let (view, length) = uint8_array_codec_bytes(context, this_value)?;
@@ -2409,7 +2418,7 @@ fn uint8_array_codec_encode(
     Result::Ok(runtime::Value::String(runtime::JsString::from_utf8(output.slice(0, output.len()))))
 }
 
-fn uint8_codec_result(heap: runtime::Heap, read: int, written: int) -> Result[
+fn uint8_codec_result(heap: runtime::Heap, read: isize, written: isize) -> Result[
     runtime::Value,
     vm::VmError,
 ] {
@@ -2417,12 +2426,12 @@ fn uint8_codec_result(heap: runtime::Heap, read: int, written: int) -> Result[
         Ok(value) => value,
         Err(value) => return Result::Err(function_native_error(value)),
     };
-    for (name, value) in Vec::[("read", read), ("written", written)] {
+    for (name, value) in Vec::from_array([("read", read), ("written", written)]) {
         if !runtime::define_own_property(
             heap,
             object,
             runtime::string_property_key(name),
-            runtime::data_descriptor(runtime::Value::Int(value.to_int32()), true, true, true),
+            runtime::data_descriptor(runtime::Value::Int(value.to_i32()), true, true, true),
         ) {
             return Result::Err(function_vm_error("cannot create codec result"))
         } else {}
@@ -2434,7 +2443,7 @@ fn uint8_array_set_from_codec(
     context: vm::Context,
     this_value: runtime::Value,
     arguments: Vec[runtime::Value],
-    depth: int,
+    depth: isize,
     base64: bool,
 ) -> Result[runtime::Value, vm::VmError] {
     let (view, length) = uint8_array_codec_bytes(context, this_value)?;
@@ -2460,7 +2469,7 @@ fn uint8_array_set_from_codec(
     };
     let mut index = 0;
     while index < decoded.bytes.len() {
-        match view.set(index, int_float(decoded.bytes[index].to_int())) {
+        match view.set(index, int_float(decoded.bytes[index].to_isize())) {
             Ok(()) => (),
             Err(value) => return Result::Err(function_native_error(arraybuffer_native_error(value))),
         };
@@ -2482,7 +2491,7 @@ fn install_uint8_array_constructor(
         Ok(value) => value,
         Err(value) => return Result::Err(BuiltinError { message: value.message }),
     };
-    let states: HashMap[runtime::ObjectId, Uint8ArrayInstance] = HashMap::{};
+    let states: HashMap[runtime::ObjectId, Uint8ArrayInstance] = HashMap::new();
     define_arraybuffer_getter(
         heap,
         prototype,
@@ -2531,32 +2540,34 @@ fn install_uint8_array_constructor(
             },
         )?,
     )?;
-    for (name, function) in Vec::[
-        (
-            "get",
-            allocate_function(
-                context,
-                "Uint8Array.prototype.get",
-                |heap, this_value, arguments| {
-                    uint8_array_get(heap, states, this_value, arguments)
-                },
-            )?,
-        ),
-        (
-            "subarray",
-            allocate_function(
-                context,
-                "Uint8Array.prototype.subarray",
-                |heap, this_value, arguments| {
-                    register_typed_array_tag(
-                        context,
-                        uint8_array_subarray(heap, states, prototype, this_value, arguments),
-                        "Uint8Array",
-                    )
-                },
-            )?,
-        ),
-    ] {
+    for (name, function) in Vec::from_array(
+        [
+            (
+                "get",
+                allocate_function(
+                    context,
+                    "Uint8Array.prototype.get",
+                    |heap, this_value, arguments| {
+                        uint8_array_get(heap, states, this_value, arguments)
+                    },
+                )?,
+            ),
+            (
+                "subarray",
+                allocate_function(
+                    context,
+                    "Uint8Array.prototype.subarray",
+                    |heap, this_value, arguments| {
+                        register_typed_array_tag(
+                            context,
+                            uint8_array_subarray(heap, states, prototype, this_value, arguments),
+                            "Uint8Array",
+                        )
+                    },
+                )?,
+            ),
+        ],
+    ) {
         define_value(heap, prototype, name, function, true, true)?
     }
     define_value(
@@ -2623,7 +2634,7 @@ fn install_uint8_array_constructor(
     };
     let object = function_object(constructor, "Uint8Array")?;
     define_typed_array_bytes(heap, object, prototype, 1)?;
-    for (name, base64) in Vec::[("fromBase64", true), ("fromHex", false)] {
+    for (name, base64) in Vec::from_array([("fromBase64", true), ("fromHex", false)]) {
         define_value(
             heap,
             object,
@@ -2650,12 +2661,9 @@ fn install_uint8_array_constructor(
             true,
         )?
     }
-    for (name, operation) in Vec::[
-        ("toBase64", 0),
-        ("toHex", 1),
-        ("setFromBase64", 2),
-        ("setFromHex", 3),
-    ] {
+    for (name, operation) in Vec::from_array(
+        [("toBase64", 0), ("toHex", 1), ("setFromBase64", 2), ("setFromHex", 3)],
+    ) {
         define_value(
             heap,
             prototype,
@@ -2813,7 +2821,7 @@ fn int32_array_from_values(
     states: HashMap[runtime::ObjectId, Int32ArrayInstance],
     prototype: runtime::ObjectId,
     values: Vec[runtime::Value],
-    depth: int,
+    depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     let result = match int32_array_construct(
         context.heap(),
@@ -2822,7 +2830,7 @@ fn int32_array_from_values(
         states,
         prototype,
         runtime::Value::Undefined,
-        Vec::[runtime::Value::Int(values.len().to_int32())],
+        Vec::from_array([runtime::Value::Int(values.len().to_i32())]),
     ) {
         Ok(value) => value,
         Err(value) => return Result::Err(function_native_error(value)),
@@ -2852,7 +2860,7 @@ fn int32_array_construct_vm(
     prototype: runtime::ObjectId,
     this_value: runtime::Value,
     arguments: Vec[runtime::Value],
-    depth: int,
+    depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     match argument(arguments, 0) {
         runtime::Value::Object(object) => match buffer_states.get(object) {
@@ -3005,7 +3013,7 @@ fn install_int32_array_constructor(
         Ok(value) => value,
         Err(value) => return Result::Err(BuiltinError { message: value.message }),
     };
-    let states: HashMap[runtime::ObjectId, Int32ArrayInstance] = HashMap::{};
+    let states: HashMap[runtime::ObjectId, Int32ArrayInstance] = HashMap::new();
     define_arraybuffer_getter(
         heap,
         prototype,
@@ -3054,32 +3062,34 @@ fn install_int32_array_constructor(
             },
         )?,
     )?;
-    for (name, function) in Vec::[
-        (
-            "get",
-            allocate_function(
-                context,
-                "Int32Array.prototype.get",
-                |heap, this_value, arguments| {
-                    int32_array_get(heap, states, this_value, arguments)
-                },
-            )?,
-        ),
-        (
-            "subarray",
-            allocate_function(
-                context,
-                "Int32Array.prototype.subarray",
-                |heap, this_value, arguments| {
-                    register_typed_array_tag(
-                        context,
-                        int32_array_subarray(heap, states, prototype, this_value, arguments),
-                        "Int32Array",
-                    )
-                },
-            )?,
-        ),
-    ] {
+    for (name, function) in Vec::from_array(
+        [
+            (
+                "get",
+                allocate_function(
+                    context,
+                    "Int32Array.prototype.get",
+                    |heap, this_value, arguments| {
+                        int32_array_get(heap, states, this_value, arguments)
+                    },
+                )?,
+            ),
+            (
+                "subarray",
+                allocate_function(
+                    context,
+                    "Int32Array.prototype.subarray",
+                    |heap, this_value, arguments| {
+                        register_typed_array_tag(
+                            context,
+                            int32_array_subarray(heap, states, prototype, this_value, arguments),
+                            "Int32Array",
+                        )
+                    },
+                )?,
+            ),
+        ],
+    ) {
         define_value(heap, prototype, name, function, true, true)?
     }
     define_value(
@@ -3269,7 +3279,7 @@ fn float64_array_from_values(
     states: HashMap[runtime::ObjectId, Float64ArrayInstance],
     prototype: runtime::ObjectId,
     values: Vec[runtime::Value],
-    depth: int,
+    depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     let result = match float64_array_construct(
         context.heap(),
@@ -3278,7 +3288,7 @@ fn float64_array_from_values(
         states,
         prototype,
         runtime::Value::Undefined,
-        Vec::[runtime::Value::Int(values.len().to_int32())],
+        Vec::from_array([runtime::Value::Int(values.len().to_i32())]),
     ) {
         Ok(value) => value,
         Err(value) => return Result::Err(function_native_error(value)),
@@ -3308,7 +3318,7 @@ fn float64_array_construct_vm(
     prototype: runtime::ObjectId,
     this_value: runtime::Value,
     arguments: Vec[runtime::Value],
-    depth: int,
+    depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     match argument(arguments, 0) {
         runtime::Value::Object(object) => match buffer_states.get(object) {
@@ -3461,7 +3471,7 @@ fn install_float64_array_constructor(
         Ok(value) => value,
         Err(value) => return Result::Err(BuiltinError { message: value.message }),
     };
-    let states: HashMap[runtime::ObjectId, Float64ArrayInstance] = HashMap::{};
+    let states: HashMap[runtime::ObjectId, Float64ArrayInstance] = HashMap::new();
     define_arraybuffer_getter(
         heap,
         prototype,
@@ -3510,32 +3520,34 @@ fn install_float64_array_constructor(
             },
         )?,
     )?;
-    for (name, function) in Vec::[
-        (
-            "get",
-            allocate_function(
-                context,
-                "Float64Array.prototype.get",
-                |heap, this_value, arguments| {
-                    float64_array_get(heap, states, this_value, arguments)
-                },
-            )?,
-        ),
-        (
-            "subarray",
-            allocate_function(
-                context,
-                "Float64Array.prototype.subarray",
-                |heap, this_value, arguments| {
-                    register_typed_array_tag(
-                        context,
-                        float64_array_subarray(heap, states, prototype, this_value, arguments),
-                        "Float64Array",
-                    )
-                },
-            )?,
-        ),
-    ] {
+    for (name, function) in Vec::from_array(
+        [
+            (
+                "get",
+                allocate_function(
+                    context,
+                    "Float64Array.prototype.get",
+                    |heap, this_value, arguments| {
+                        float64_array_get(heap, states, this_value, arguments)
+                    },
+                )?,
+            ),
+            (
+                "subarray",
+                allocate_function(
+                    context,
+                    "Float64Array.prototype.subarray",
+                    |heap, this_value, arguments| {
+                        register_typed_array_tag(
+                            context,
+                            float64_array_subarray(heap, states, prototype, this_value, arguments),
+                            "Float64Array",
+                        )
+                    },
+                )?,
+            ),
+        ],
+    ) {
         define_value(heap, prototype, name, function, true, true)?
     }
     define_value(
@@ -3741,7 +3753,7 @@ fn numeric_array_from_values(
     kind: arraybuffer::NumericArrayKind,
     name: string,
     values: Vec[runtime::Value],
-    depth: int,
+    depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     let result = match numeric_array_construct(
         context.heap(),
@@ -3751,7 +3763,7 @@ fn numeric_array_from_values(
         prototype,
         kind,
         name,
-        Vec::[runtime::Value::Int(values.len().to_int32())],
+        Vec::from_array([runtime::Value::Int(values.len().to_i32())]),
     ) {
         Ok(value) => value,
         Err(value) => return Result::Err(function_native_error(value)),
@@ -3780,7 +3792,7 @@ fn numeric_array_construct_vm(
     kind: arraybuffer::NumericArrayKind,
     name: string,
     arguments: Vec[runtime::Value],
-    depth: int,
+    depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     match argument(arguments, 0) {
         runtime::Value::Object(object) => match buffer_states.get(object) {
@@ -3829,7 +3841,7 @@ fn numeric_array_property(
     states: HashMap[runtime::ObjectId, NumericArrayInstance],
     this_value: runtime::Value,
     name: string,
-    property: int,
+    property: isize,
 ) -> Result[runtime::Value, vm::NativeError] {
     let state = numeric_array_state(states, this_value, name)?;
     match property {
@@ -3895,12 +3907,9 @@ fn install_numeric_array_constructor(
         Ok(value) => value,
         Err(value) => return Result::Err(BuiltinError { message: value.message }),
     };
-    for (property_name, property) in Vec::[
-        ("buffer", 0),
-        ("length", 1),
-        ("byteLength", 2),
-        ("byteOffset", 3),
-    ] {
+    for (property_name, property) in Vec::from_array(
+        [("buffer", 0), ("length", 1), ("byteLength", 2), ("byteOffset", 3)],
+    ) {
         define_arraybuffer_getter(
             heap,
             prototype,
@@ -4155,7 +4164,7 @@ fn bigint_array_set_values(
     context: vm::Context,
     state: BigIntArrayInstance,
     arguments: Vec[runtime::Value],
-    depth: int,
+    depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     if state.value.buffer().is_detached() {
         return Result::Err(function_vm_error("typed array buffer is detached"))
@@ -4190,7 +4199,7 @@ fn bigint_array_from_values(
     kind: arraybuffer::BigIntArrayKind,
     name: string,
     values: Vec[runtime::Value],
-    depth: int,
+    depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     let result = match bigint_array_construct(
         context.heap(),
@@ -4200,7 +4209,7 @@ fn bigint_array_from_values(
         prototype,
         kind,
         name,
-        Vec::[runtime::Value::Int(values.len().to_int32())],
+        Vec::from_array([runtime::Value::Int(values.len().to_i32())]),
     ) {
         Ok(value) => value,
         Err(value) => return Result::Err(function_native_error(value)),
@@ -4234,7 +4243,7 @@ fn bigint_array_construct_vm(
     kind: arraybuffer::BigIntArrayKind,
     name: string,
     arguments: Vec[runtime::Value],
-    depth: int,
+    depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     match argument(arguments, 0) {
         runtime::Value::Object(object) => match buffer_states.get(object) {
@@ -4283,7 +4292,7 @@ fn bigint_array_property(
     states: HashMap[runtime::ObjectId, BigIntArrayInstance],
     this_value: runtime::Value,
     name: string,
-    property: int,
+    property: isize,
 ) -> Result[runtime::Value, vm::NativeError] {
     let state = bigint_array_state(states, this_value, name)?;
     match property {
@@ -4349,12 +4358,9 @@ fn install_bigint_array_constructor(
         Ok(value) => value,
         Err(value) => return Result::Err(BuiltinError { message: value.message }),
     };
-    for (property_name, property) in Vec::[
-        ("buffer", 0),
-        ("length", 1),
-        ("byteLength", 2),
-        ("byteOffset", 3),
-    ] {
+    for (property_name, property) in Vec::from_array(
+        [("buffer", 0), ("length", 1), ("byteLength", 2), ("byteOffset", 3)],
+    ) {
         define_arraybuffer_getter(
             heap,
             prototype,
@@ -4523,7 +4529,7 @@ fn install_bigint_array_constructor(
 }
 
 fn typed_array_receiver(context: vm::Context, value: runtime::Value) -> Result[
-    (runtime::Value, int),
+    (runtime::Value, isize),
     vm::VmError,
 ] {
     let object = match value {
@@ -4599,7 +4605,7 @@ fn typed_array_default_constructor(
     }
 }
 
-fn typed_array_view_byte_length(view: runtime::TypedArrayView) -> int {
+fn typed_array_view_byte_length(view: runtime::TypedArrayView) -> isize {
     match view {
         runtime::TypedArrayView::Uint8(value) => value.byte_length(),
         runtime::TypedArrayView::Int32(value) => value.byte_length(),
@@ -4609,7 +4615,7 @@ fn typed_array_view_byte_length(view: runtime::TypedArrayView) -> int {
     }
 }
 
-fn typed_array_view_byte_offset(view: runtime::TypedArrayView) -> int {
+fn typed_array_view_byte_offset(view: runtime::TypedArrayView) -> isize {
     match view {
         runtime::TypedArrayView::Uint8(value) => value.byte_offset(),
         runtime::TypedArrayView::Int32(value) => value.byte_offset(),
@@ -4619,7 +4625,7 @@ fn typed_array_view_byte_offset(view: runtime::TypedArrayView) -> int {
     }
 }
 
-fn typed_array_view_element_size(view: runtime::TypedArrayView) -> int {
+fn typed_array_view_element_size(view: runtime::TypedArrayView) -> isize {
     match view {
         runtime::TypedArrayView::Uint8(_) => 1,
         runtime::TypedArrayView::Int32(_) => 4,
@@ -4633,7 +4639,7 @@ fn typed_array_view_element_size(view: runtime::TypedArrayView) -> int {
     }
 }
 
-fn typed_array_shared_property(heap: runtime::Heap, this_value: runtime::Value, property: int) -> Result[
+fn typed_array_shared_property(heap: runtime::Heap, this_value: runtime::Value, property: isize) -> Result[
     runtime::Value,
     vm::NativeError,
 ] {
@@ -4676,9 +4682,9 @@ fn typed_array_shared_tag(
 fn typed_array_write_value(
     context: vm::Context,
     target: runtime::Value,
-    index: int,
+    index: isize,
     value: runtime::Value,
-    depth: int,
+    depth: isize,
 ) -> Result[unit, vm::VmError] {
     let object = match target {
         runtime::Value::Object(value) => value,
@@ -4704,7 +4710,7 @@ fn typed_array_set_shared(
     context: vm::Context,
     this_value: runtime::Value,
     arguments: Vec[runtime::Value],
-    depth: int,
+    depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     let _ = typed_array_receiver(context, this_value)?;
     let object = match this_value {
@@ -4753,7 +4759,7 @@ fn typed_array_from_values_shared(
     context: vm::Context,
     constructor: runtime::Value,
     values: Vec[runtime::Value],
-    depth: int,
+    depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     let target = typed_array_intrinsic_create(context, constructor, values.len(), depth)?;
     let mut index = 0;
@@ -4768,7 +4774,7 @@ fn typed_array_at(
     context: vm::Context,
     this_value: runtime::Value,
     arguments: Vec[runtime::Value],
-    depth: int,
+    depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     let (object, length) = typed_array_receiver(context, this_value)?;
     let relative = array_copy_integer(context, argument(arguments, 0), 0, depth)?;
@@ -4788,7 +4794,7 @@ fn typed_array_join(
     context: vm::Context,
     this_value: runtime::Value,
     arguments: Vec[runtime::Value],
-    depth: int,
+    depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     let (object, length) = typed_array_receiver(context, this_value)?;
     let separator = match argument(arguments, 0) {
@@ -4827,8 +4833,8 @@ fn typed_array_search(
     context: vm::Context,
     this_value: runtime::Value,
     arguments: Vec[runtime::Value],
-    depth: int,
-    operation: int,
+    depth: isize,
+    operation: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     let (object, length) = typed_array_receiver(context, this_value)?;
     let needle = argument(arguments, 0);
@@ -4875,7 +4881,7 @@ fn typed_array_search(
             if includes {
                 return Result::Ok(runtime::Value::Bool(true))
             } else {
-                return Result::Ok(runtime::Value::Int(index.to_int32()))
+                return Result::Ok(runtime::Value::Int(index.to_i32()))
             }
         } else {};
         if reverse {
@@ -4891,7 +4897,7 @@ fn typed_array_search(
     }
 }
 
-fn typed_array_reverse(context: vm::Context, this_value: runtime::Value, depth: int) -> Result[
+fn typed_array_reverse(context: vm::Context, this_value: runtime::Value, depth: isize) -> Result[
     runtime::Value,
     vm::VmError,
 ] {
@@ -4912,7 +4918,7 @@ fn typed_array_mutation(
     context: vm::Context,
     this_value: runtime::Value,
     arguments: Vec[runtime::Value],
-    depth: int,
+    depth: isize,
     copy: bool,
 ) -> Result[runtime::Value, vm::VmError] {
     let _ = typed_array_receiver(context, this_value)?;
@@ -4927,7 +4933,7 @@ fn typed_array_iteration(
     context: vm::Context,
     this_value: runtime::Value,
     arguments: Vec[runtime::Value],
-    depth: int,
+    depth: isize,
     mode: ArrayIterationMode,
 ) -> Result[runtime::Value, vm::VmError] {
     let _ = typed_array_receiver(context, this_value)?;
@@ -4938,7 +4944,7 @@ fn typed_array_reduce(
     context: vm::Context,
     this_value: runtime::Value,
     arguments: Vec[runtime::Value],
-    depth: int,
+    depth: isize,
     reverse: bool,
 ) -> Result[runtime::Value, vm::VmError] {
     let _ = typed_array_receiver(context, this_value)?;
@@ -4949,7 +4955,7 @@ fn typed_array_species_constructor(
     context: vm::Context,
     original: runtime::Value,
     default_constructor: runtime::Value,
-    depth: int,
+    depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     let constructor = context.read_property_at_depth(
         original,
@@ -4978,13 +4984,13 @@ fn typed_array_species_create(
     context: vm::Context,
     original: runtime::Value,
     default_constructor: runtime::Value,
-    length: int,
-    depth: int,
+    length: isize,
+    depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     let selected = typed_array_species_constructor(context, original, default_constructor, depth)?;
     let result = context.construct_with_new_target_at_depth(
         selected,
-        Vec::[runtime::Value::Int(length.to_int32())],
+        Vec::from_array([runtime::Value::Int(length.to_i32())]),
         selected,
         depth,
     )?;
@@ -5009,7 +5015,7 @@ fn typed_array_subarray_shared(
     context: vm::Context,
     this_value: runtime::Value,
     arguments: Vec[runtime::Value],
-    depth: int,
+    depth: isize,
     constructors: TypedArrayConstructors,
 ) -> Result[runtime::Value, vm::VmError] {
     let (source, length) = typed_array_receiver(context, this_value)?;
@@ -5051,18 +5057,16 @@ fn typed_array_subarray_shared(
     if end_omitted && runtime::is_typed_array_length_tracking(context.heap(), object) {
         return context.construct_with_new_target_at_depth(
             selected,
-            Vec::[buffer, runtime::Value::Int(byte_offset.to_int32())],
+            Vec::from_array([buffer, runtime::Value::Int(byte_offset.to_i32())]),
             selected,
             depth,
         )
     } else {};
     context.construct_with_new_target_at_depth(
         selected,
-        Vec::[
-            buffer,
-            runtime::Value::Int(byte_offset.to_int32()),
-            runtime::Value::Int(count.to_int32()),
-        ],
+        Vec::from_array(
+            [buffer, runtime::Value::Int(byte_offset.to_i32()), runtime::Value::Int(count.to_i32())],
+        ),
         selected,
         depth,
     )
@@ -5072,7 +5076,7 @@ fn typed_array_map_filter(
     context: vm::Context,
     this_value: runtime::Value,
     arguments: Vec[runtime::Value],
-    depth: int,
+    depth: isize,
     constructor: runtime::Value,
     filter: bool,
 ) -> Result[runtime::Value, vm::VmError] {
@@ -5090,7 +5094,7 @@ fn typed_array_map_filter(
         let value = array_copy_read(context, source, index, depth)?;
         let mapped = context.invoke_with_this_at_depth(
             callback,
-            Vec::[value, runtime::Value::Int(index.to_int32()), source],
+            Vec::from_array([value, runtime::Value::Int(index.to_i32()), source]),
             callback_this,
             depth,
         )?;
@@ -5120,7 +5124,7 @@ fn typed_array_slice(
     context: vm::Context,
     this_value: runtime::Value,
     arguments: Vec[runtime::Value],
-    depth: int,
+    depth: isize,
     constructor: runtime::Value,
 ) -> Result[runtime::Value, vm::VmError] {
     let (source, length) = typed_array_receiver(context, this_value)?;
@@ -5160,12 +5164,12 @@ fn typed_array_slice(
 fn typed_array_intrinsic_create(
     context: vm::Context,
     constructor: runtime::Value,
-    length: int,
-    depth: int,
+    length: isize,
+    depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     let result = context.construct_with_new_target_at_depth(
         constructor,
-        Vec::[runtime::Value::Int(length.to_int32())],
+        Vec::from_array([runtime::Value::Int(length.to_i32())]),
         constructor,
         depth,
     )?;
@@ -5183,7 +5187,7 @@ fn typed_array_intrinsic_create(
     }
 }
 
-fn typed_array_number_compare(left: runtime::Value, right: runtime::Value) -> int {
+fn typed_array_number_compare(left: runtime::Value, right: runtime::Value) -> isize {
     match (left, right) {
         (runtime::Value::BigInt(left), runtime::Value::BigInt(right)) => left.compare(right),
         _ => {
@@ -5223,8 +5227,8 @@ fn typed_array_compare(
     callback: runtime::Value,
     left: runtime::Value,
     right: runtime::Value,
-    depth: int,
-) -> Result[int, vm::VmError] {
+    depth: isize,
+) -> Result[isize, vm::VmError] {
     match callback {
         runtime::Value::Undefined => Result::Ok(typed_array_number_compare(left, right)),
         _ => array_sort_compare_slots(
@@ -5241,7 +5245,7 @@ fn typed_array_sort_values(
     context: vm::Context,
     values: Vec[runtime::Value],
     callback: runtime::Value,
-    depth: int,
+    depth: isize,
 ) -> Result[unit, vm::VmError] {
     let mut index = 1;
     while index < values.len() {
@@ -5262,7 +5266,7 @@ fn typed_array_sort(
     context: vm::Context,
     this_value: runtime::Value,
     arguments: Vec[runtime::Value],
-    depth: int,
+    depth: isize,
     constructor: runtime::Value,
     copy: bool,
 ) -> Result[runtime::Value, vm::VmError] {
@@ -5299,7 +5303,7 @@ fn typed_array_copy_change(
     context: vm::Context,
     this_value: runtime::Value,
     arguments: Vec[runtime::Value],
-    depth: int,
+    depth: isize,
     constructor: runtime::Value,
     replace: bool,
 ) -> Result[runtime::Value, vm::VmError] {
@@ -5342,7 +5346,9 @@ fn install_typed_array_algorithms(
     prototype: runtime::ObjectId,
     constructors: TypedArrayConstructors,
 ) -> Result[unit, BuiltinError] {
-    for (method, operation) in Vec::[("indexOf", 0), ("lastIndexOf", 1), ("includes", 2)] {
+    for (method, operation) in Vec::from_array(
+        [("indexOf", 0), ("lastIndexOf", 1), ("includes", 2)],
+    ) {
         define_value(
             context.heap(),
             prototype,
@@ -5358,7 +5364,7 @@ fn install_typed_array_algorithms(
             true,
         )?
     }
-    for (method, copy) in Vec::[("fill", false), ("copyWithin", true)] {
+    for (method, copy) in Vec::from_array([("fill", false), ("copyWithin", true)]) {
         define_value(
             context.heap(),
             prototype,
@@ -5374,15 +5380,17 @@ fn install_typed_array_algorithms(
             true,
         )?
     }
-    for (method, mode) in Vec::[
-        ("forEach", ArrayIterationMode::ForEach),
-        ("every", ArrayIterationMode::Every),
-        ("some", ArrayIterationMode::Some),
-        ("find", ArrayIterationMode::Find),
-        ("findIndex", ArrayIterationMode::FindIndex),
-        ("findLast", ArrayIterationMode::FindLast),
-        ("findLastIndex", ArrayIterationMode::FindLastIndex),
-    ] {
+    for (method, mode) in Vec::from_array(
+        [
+            ("forEach", ArrayIterationMode::ForEach),
+            ("every", ArrayIterationMode::Every),
+            ("some", ArrayIterationMode::Some),
+            ("find", ArrayIterationMode::Find),
+            ("findIndex", ArrayIterationMode::FindIndex),
+            ("findLast", ArrayIterationMode::FindLast),
+            ("findLastIndex", ArrayIterationMode::FindLastIndex),
+        ],
+    ) {
         define_value(
             context.heap(),
             prototype,
@@ -5398,7 +5406,7 @@ fn install_typed_array_algorithms(
             true,
         )?
     }
-    for (method, reverse) in Vec::[("reduce", false), ("reduceRight", true)] {
+    for (method, reverse) in Vec::from_array([("reduce", false), ("reduceRight", true)]) {
         define_value(
             context.heap(),
             prototype,
@@ -5414,7 +5422,7 @@ fn install_typed_array_algorithms(
             true,
         )?
     }
-    for (method, filter) in Vec::[("map", false), ("filter", true)] {
+    for (method, filter) in Vec::from_array([("map", false), ("filter", true)]) {
         define_value(
             context.heap(),
             prototype,
@@ -5457,7 +5465,7 @@ fn install_typed_array_algorithms(
         true,
         true,
     )?;
-    for (method, replace) in Vec::[("toReversed", false), ("with", true)] {
+    for (method, replace) in Vec::from_array([("toReversed", false), ("with", true)]) {
         define_value(
             context.heap(),
             prototype,
@@ -5485,7 +5493,7 @@ fn install_typed_array_algorithms(
             true,
         )?
     }
-    for (method, copy) in Vec::[("sort", false), ("toSorted", true)] {
+    for (method, copy) in Vec::from_array([("sort", false), ("toSorted", true)]) {
         define_value(
             context.heap(),
             prototype,
@@ -5538,7 +5546,7 @@ fn install_typed_array_algorithms(
             "TypedArray.prototype.toLocaleString",
             |this_value, arguments, depth| {
                 let _ = arguments;
-                typed_array_join(context, this_value, Vec::[], depth)
+                typed_array_join(context, this_value, Vec::new(), depth)
             },
         )?,
         true,
@@ -5565,7 +5573,7 @@ fn define_shared_typed_array_method(
     context: vm::Context,
     prototype: runtime::ObjectId,
     name: string,
-    callback: (runtime::Value, Vec[runtime::Value], int) -> Result[runtime::Value, vm::VmError],
+    callback: (runtime::Value, Vec[runtime::Value], isize) -> Result[runtime::Value, vm::VmError],
 ) -> Result[runtime::Value, BuiltinError] {
     let function = allocate_vm_function(context, "TypedArray.prototype." + name, callback)?;
     define_value(context.heap(), prototype, name, function, true, true)?;
@@ -5599,7 +5607,7 @@ fn normalize_concrete_typed_array(
     } else if !runtime::set_prototype_of(heap, prototype, Option::Some(shared_prototype)) {
         return Result::Err(BuiltinError { message: "cannot inherit TypedArray prototype" })
     } else {};
-    for name in Vec::["from", "of"] {
+    for name in Vec::from_array(["from", "of"]) {
         if !runtime::delete_property(heap, constructor_object, runtime::string_property_key(name)) {
             return Result::Err(BuiltinError { message: "cannot remove concrete TypedArray static" })
         } else {}
@@ -5774,7 +5782,7 @@ fn install_shared_typed_array(context: vm::Context, install: ArrayBufferInstall)
             )
         },
     )?;
-    for (name, property) in Vec::[("buffer", 0), ("byteLength", 2), ("byteOffset", 3)] {
+    for (name, property) in Vec::from_array([("buffer", 0), ("byteLength", 2), ("byteOffset", 3)]) {
         define_arraybuffer_getter(
             heap,
             prototype,
@@ -5835,11 +5843,13 @@ fn install_shared_typed_array(context: vm::Context, install: ArrayBufferInstall)
             typed_array_mutation(context, this_value, arguments, depth, true)
         },
     )?;
-    for (name, mode) in Vec::[
-        ("every", ArrayIterationMode::Every),
-        ("some", ArrayIterationMode::Some),
-        ("forEach", ArrayIterationMode::ForEach),
-    ] {
+    for (name, mode) in Vec::from_array(
+        [
+            ("every", ArrayIterationMode::Every),
+            ("some", ArrayIterationMode::Some),
+            ("forEach", ArrayIterationMode::ForEach),
+        ],
+    ) {
         let _ = define_shared_typed_array_method(
             context,
             prototype,
@@ -5849,7 +5859,7 @@ fn install_shared_typed_array(context: vm::Context, install: ArrayBufferInstall)
             },
         )?;
     }
-    for (name, filter) in Vec::[("map", false), ("filter", true)] {
+    for (name, filter) in Vec::from_array([("map", false), ("filter", true)]) {
         let _ = define_shared_typed_array_method(
             context,
             prototype,
@@ -5871,7 +5881,7 @@ fn install_shared_typed_array(context: vm::Context, install: ArrayBufferInstall)
             },
         )?;
     }
-    for (name, reverse) in Vec::[("reduce", false), ("reduceRight", true)] {
+    for (name, reverse) in Vec::from_array([("reduce", false), ("reduceRight", true)]) {
         let _ = define_shared_typed_array_method(
             context,
             prototype,
@@ -5889,12 +5899,14 @@ fn install_shared_typed_array(context: vm::Context, install: ArrayBufferInstall)
             typed_array_mutation(context, this_value, arguments, depth, false)
         },
     )?;
-    for (name, mode) in Vec::[
-        ("find", ArrayIterationMode::Find),
-        ("findIndex", ArrayIterationMode::FindIndex),
-        ("findLast", ArrayIterationMode::FindLast),
-        ("findLastIndex", ArrayIterationMode::FindLastIndex),
-    ] {
+    for (name, mode) in Vec::from_array(
+        [
+            ("find", ArrayIterationMode::Find),
+            ("findIndex", ArrayIterationMode::FindIndex),
+            ("findLast", ArrayIterationMode::FindLast),
+            ("findLastIndex", ArrayIterationMode::FindLastIndex),
+        ],
+    ) {
         let _ = define_shared_typed_array_method(
             context,
             prototype,
@@ -5954,7 +5966,7 @@ fn install_shared_typed_array(context: vm::Context, install: ArrayBufferInstall)
             typed_array_subarray_shared(context, this_value, arguments, depth, constructors)
         },
     )?;
-    for (name, copy) in Vec::[("sort", false), ("toSorted", true)] {
+    for (name, copy) in Vec::from_array([("sort", false), ("toSorted", true)]) {
         let _ = define_shared_typed_array_method(
             context,
             prototype,
@@ -5983,10 +5995,10 @@ fn install_shared_typed_array(context: vm::Context, install: ArrayBufferInstall)
         "toLocaleString",
         |this_value, arguments, depth| {
             let _ = arguments;
-            typed_array_join(context, this_value, Vec::[], depth)
+            typed_array_join(context, this_value, Vec::new(), depth)
         },
     )?;
-    for (name, operation) in Vec::[("indexOf", 0), ("lastIndexOf", 1), ("includes", 2)] {
+    for (name, operation) in Vec::from_array([("indexOf", 0), ("lastIndexOf", 1), ("includes", 2)]) {
         let _ = define_shared_typed_array_method(
             context,
             prototype,
@@ -6042,20 +6054,22 @@ fn install_shared_typed_array(context: vm::Context, install: ArrayBufferInstall)
         None => (),
     };
     mark_constructor(context, constructor, "TypedArray")?;
-    for (concrete_constructor, concrete_prototype) in Vec::[
-        (install.uint8_array, install.uint8_array_prototype),
-        (install.int32_array, install.int32_array_prototype),
-        (install.float64_array, install.float64_array_prototype),
-        (install.uint8_clamped_array, install.uint8_clamped_array_prototype),
-        (install.int8_array, install.int8_array_prototype),
-        (install.int16_array, install.int16_array_prototype),
-        (install.uint16_array, install.uint16_array_prototype),
-        (install.uint32_array, install.uint32_array_prototype),
-        (install.float16_array, install.float16_array_prototype),
-        (install.float32_array, install.float32_array_prototype),
-        (install.bigint64_array, install.bigint64_array_prototype),
-        (install.biguint64_array, install.biguint64_array_prototype),
-    ] {
+    for (concrete_constructor, concrete_prototype) in Vec::from_array(
+        [
+            (install.uint8_array, install.uint8_array_prototype),
+            (install.int32_array, install.int32_array_prototype),
+            (install.float64_array, install.float64_array_prototype),
+            (install.uint8_clamped_array, install.uint8_clamped_array_prototype),
+            (install.int8_array, install.int8_array_prototype),
+            (install.int16_array, install.int16_array_prototype),
+            (install.uint16_array, install.uint16_array_prototype),
+            (install.uint32_array, install.uint32_array_prototype),
+            (install.float16_array, install.float16_array_prototype),
+            (install.float32_array, install.float32_array_prototype),
+            (install.bigint64_array, install.bigint64_array_prototype),
+            (install.biguint64_array, install.biguint64_array_prototype),
+        ],
+    ) {
         normalize_concrete_typed_array(
             context,
             concrete_constructor,
@@ -6164,7 +6178,7 @@ fn array_buffer_is_view(
 struct AtomicTarget {
     value: runtime::Value,
     view: runtime::TypedArrayView,
-    length: int,
+    length: isize,
 }
 
 #[derive(PartialEq, Eq)]
@@ -6211,8 +6225,8 @@ fn atomic_target(context: vm::Context, value: runtime::Value) -> Result[AtomicTa
     Result::Ok(AtomicTarget { value, view, length })
 }
 
-fn atomic_index(context: vm::Context, target: AtomicTarget, value: runtime::Value, depth: int) -> Result[
-    int,
+fn atomic_index(context: vm::Context, target: AtomicTarget, value: runtime::Value, depth: isize) -> Result[
+    isize,
     vm::VmError,
 ] {
     let index = arraybuffer_index_at_depth(context, value, depth)?;
@@ -6223,8 +6237,8 @@ fn atomic_index(context: vm::Context, target: AtomicTarget, value: runtime::Valu
     }
 }
 
-fn atomic_number(context: vm::Context, value: runtime::Value, depth: int) -> Result[
-    float64,
+fn atomic_number(context: vm::Context, value: runtime::Value, depth: isize) -> Result[
+    f64,
     vm::VmError,
 ] {
     let primitive = context.to_primitive_number_at_depth(value, depth)?;
@@ -6234,7 +6248,7 @@ fn atomic_number(context: vm::Context, value: runtime::Value, depth: int) -> Res
     }
 }
 
-fn atomic_bigint(context: vm::Context, value: runtime::Value, depth: int) -> Result[
+fn atomic_bigint(context: vm::Context, value: runtime::Value, depth: isize) -> Result[
     runtime::BigInt,
     vm::VmError,
 ] {
@@ -6268,26 +6282,26 @@ fn atomic_bigint64(value: runtime::BigInt, signed: bool) -> Result[runtime::BigI
     }
 }
 
-fn atomic_float(value: int64) -> float64 {
+fn atomic_float(value: i64) -> f64 {
     num::parse_float64(value.to_string()).unwrap_or(0.0)
 }
 
-fn atomic_normalize_number(view: runtime::TypedArrayView, value: float64) -> runtime::Value {
-    let converted = mathx::to_uint32(value);
+fn atomic_normalize_number(view: runtime::TypedArrayView, value: f64) -> runtime::Value {
+    let converted = mathx::to_u32(value);
     match view {
         runtime::TypedArrayView::Uint8(_) => {
-            runtime::Value::Int((converted & 0xff).to_int32())
+            runtime::Value::Int((converted & 0xff).to_i32())
         },
-        runtime::TypedArrayView::Int32(_) => runtime::Value::Int(converted.to_int32()),
+        runtime::TypedArrayView::Int32(_) => runtime::Value::Int(converted.to_i32()),
         runtime::TypedArrayView::Numeric(target) => match target.kind() {
             arraybuffer::NumericArrayKind::Int8 => runtime::Value::Float(
-                atomic_float((converted & 0xff).to_uint8().to_int8().to_int64()),
+                atomic_float((converted & 0xff).to_u8().to_i8().to_i64()),
             ),
             arraybuffer::NumericArrayKind::Int16 => runtime::Value::Float(
-                atomic_float((converted & 0xffff).to_uint16().to_int16().to_int64()),
+                atomic_float((converted & 0xffff).to_u16().to_i16().to_i64()),
             ),
             arraybuffer::NumericArrayKind::Uint16 => {
-                runtime::Value::Float(atomic_float((converted & 0xffff).to_int64()))
+                runtime::Value::Float(atomic_float((converted & 0xffff).to_i64()))
             },
             arraybuffer::NumericArrayKind::Uint32 => runtime::Value::Float(
                 num::parse_float64(converted.to_string()).unwrap_or(0.0),
@@ -6298,7 +6312,7 @@ fn atomic_normalize_number(view: runtime::TypedArrayView, value: float64) -> run
     }
 }
 
-fn atomic_normalize(context: vm::Context, target: AtomicTarget, value: runtime::Value, depth: int) -> Result[
+fn atomic_normalize(context: vm::Context, target: AtomicTarget, value: runtime::Value, depth: isize) -> Result[
     runtime::Value,
     vm::VmError,
 ] {
@@ -6317,23 +6331,23 @@ fn atomic_normalize(context: vm::Context, target: AtomicTarget, value: runtime::
     }
 }
 
-fn atomic_read(context: vm::Context, target: AtomicTarget, index: int, depth: int) -> Result[
+fn atomic_read(context: vm::Context, target: AtomicTarget, index: isize, depth: isize) -> Result[
     runtime::Value,
     vm::VmError,
 ] {
-    context.read_property_at_depth(target.value, runtime::Value::Int(index.to_int32()), depth)
+    context.read_property_at_depth(target.value, runtime::Value::Int(index.to_i32()), depth)
 }
 
 fn atomic_write(
     context: vm::Context,
     target: AtomicTarget,
-    index: int,
+    index: isize,
     value: runtime::Value,
-    depth: int,
+    depth: isize,
 ) -> Result[unit, vm::VmError] {
     if context.reflect_set_at_depth(
         target.value,
-        runtime::Value::Int(index.to_int32()),
+        runtime::Value::Int(index.to_i32()),
         value,
         target.value,
         depth,
@@ -6348,7 +6362,7 @@ fn atomic_load(
     context: vm::Context,
     this_value: runtime::Value,
     arguments: Vec[runtime::Value],
-    depth: int,
+    depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     let _ = this_value;
     let target = atomic_target(context, argument(arguments, 0))?;
@@ -6360,7 +6374,7 @@ fn atomic_store(
     context: vm::Context,
     this_value: runtime::Value,
     arguments: Vec[runtime::Value],
-    depth: int,
+    depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     let _ = this_value;
     let target = atomic_target(context, argument(arguments, 0))?;
@@ -6392,13 +6406,13 @@ fn atomic_binary_value(current: runtime::Value, input: runtime::Value, operation
                     AtomicOperation::Add => left_number + right_number,
                     AtomicOperation::Subtract => left_number - right_number,
                     AtomicOperation::And => atomic_float(
-                        (mathx::to_uint32(left_number) & mathx::to_uint32(right_number)).to_int64(),
+                        (mathx::to_u32(left_number) & mathx::to_u32(right_number)).to_i64(),
                     ),
                     AtomicOperation::Or => atomic_float(
-                        (mathx::to_uint32(left_number) | mathx::to_uint32(right_number)).to_int64(),
+                        (mathx::to_u32(left_number) | mathx::to_u32(right_number)).to_i64(),
                     ),
                     AtomicOperation::Xor => atomic_float(
-                        (mathx::to_uint32(left_number) ^ mathx::to_uint32(right_number)).to_int64(),
+                        (mathx::to_u32(left_number) ^ mathx::to_u32(right_number)).to_i64(),
                     ),
                     AtomicOperation::Exchange => right_number,
                 },
@@ -6411,7 +6425,7 @@ fn atomic_read_modify_write(
     context: vm::Context,
     this_value: runtime::Value,
     arguments: Vec[runtime::Value],
-    depth: int,
+    depth: isize,
     operation: AtomicOperation,
 ) -> Result[runtime::Value, vm::VmError] {
     let _ = this_value;
@@ -6428,7 +6442,7 @@ fn atomic_compare_exchange(
     context: vm::Context,
     this_value: runtime::Value,
     arguments: Vec[runtime::Value],
-    depth: int,
+    depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     let _ = this_value;
     let target = atomic_target(context, argument(arguments, 0))?;
@@ -6446,7 +6460,7 @@ fn atomic_is_lock_free(
     context: vm::Context,
     this_value: runtime::Value,
     arguments: Vec[runtime::Value],
-    depth: int,
+    depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     let _ = this_value;
     let size = arraybuffer_index_at_depth(context, argument(arguments, 0), depth)?;
@@ -6478,7 +6492,7 @@ fn atomic_notify(
     context: vm::Context,
     this_value: runtime::Value,
     arguments: Vec[runtime::Value],
-    depth: int,
+    depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     let _ = this_value;
     let target = atomic_wait_target(context, argument(arguments, 0))?;
@@ -6493,7 +6507,7 @@ fn atomic_wait(
     context: vm::Context,
     this_value: runtime::Value,
     arguments: Vec[runtime::Value],
-    depth: int,
+    depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     let _ = this_value;
     let target = atomic_wait_target(context, argument(arguments, 0))?;
@@ -6509,7 +6523,7 @@ fn atomic_pause(
     context: vm::Context,
     this_value: runtime::Value,
     arguments: Vec[runtime::Value],
-    depth: int,
+    depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     let _ = context;
     let _ = this_value;
@@ -6536,14 +6550,16 @@ fn install_atomics(context: vm::Context) -> Result[runtime::Value, BuiltinError]
         Err(value) => return Result::Err(BuiltinError { message: value.message }),
     };
     define_to_string_tag(context, object, "Atomics")?;
-    for (name, operation) in Vec::[
-        ("add", AtomicOperation::Add),
-        ("sub", AtomicOperation::Subtract),
-        ("and", AtomicOperation::And),
-        ("or", AtomicOperation::Or),
-        ("xor", AtomicOperation::Xor),
-        ("exchange", AtomicOperation::Exchange),
-    ] {
+    for (name, operation) in Vec::from_array(
+        [
+            ("add", AtomicOperation::Add),
+            ("sub", AtomicOperation::Subtract),
+            ("and", AtomicOperation::And),
+            ("or", AtomicOperation::Or),
+            ("xor", AtomicOperation::Xor),
+            ("exchange", AtomicOperation::Exchange),
+        ],
+    ) {
         define_value(
             context.heap(),
             object,
@@ -6559,7 +6575,7 @@ fn install_atomics(context: vm::Context) -> Result[runtime::Value, BuiltinError]
             true,
         )?
     }
-    for (name, callback) in Vec::[("load", atomic_load), ("store", atomic_store)] {
+    for (name, callback) in Vec::from_array([("load", atomic_load), ("store", atomic_store)]) {
         define_value(
             context.heap(),
             object,
@@ -6603,11 +6619,9 @@ fn install_atomics(context: vm::Context) -> Result[runtime::Value, BuiltinError]
         true,
         true,
     )?;
-    for (name, callback) in Vec::[
-        ("notify", atomic_notify),
-        ("wait", atomic_wait),
-        ("pause", atomic_pause),
-    ] {
+    for (name, callback) in Vec::from_array(
+        [("notify", atomic_notify), ("wait", atomic_wait), ("pause", atomic_pause)],
+    ) {
         define_value(
             context.heap(),
             object,
@@ -6634,7 +6648,7 @@ pub fn install_arraybuffer(context: vm::Context) -> Result[ArrayBufferInstall, B
     let uint8_array = install_uint8_array_constructor(context, buffer_states, buffer_prototype)?;
     let int32_array = install_int32_array_constructor(context, buffer_states, buffer_prototype)?;
     let float64_array = install_float64_array_constructor(context, buffer_states, buffer_prototype)?;
-    let numeric_states: HashMap[runtime::ObjectId, NumericArrayInstance] = HashMap::{};
+    let numeric_states: HashMap[runtime::ObjectId, NumericArrayInstance] = HashMap::new();
     let (uint8_clamped_array, uint8_clamped_array_prototype) = install_numeric_array_constructor(
         context,
         buffer_states,
@@ -6691,7 +6705,7 @@ pub fn install_arraybuffer(context: vm::Context) -> Result[ArrayBufferInstall, B
         arraybuffer::NumericArrayKind::Float32,
         "Float32Array",
     )?;
-    let bigint_states: HashMap[runtime::ObjectId, BigIntArrayInstance] = HashMap::{};
+    let bigint_states: HashMap[runtime::ObjectId, BigIntArrayInstance] = HashMap::new();
     let (bigint64_array, bigint64_array_prototype) = install_bigint_array_constructor(
         context,
         buffer_states,

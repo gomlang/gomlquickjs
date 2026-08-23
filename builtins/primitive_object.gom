@@ -10,7 +10,7 @@ fn primitive_number_receiver(
     heap: runtime::Heap,
     value: runtime::Value,
     prototype: runtime::ObjectId,
-) -> Result[float64, vm::NativeError] {
+) -> Result[f64, vm::NativeError] {
     match value {
         runtime::Value::Int(value) => {
             Result::Ok(num::parse_float64(value.to_string()).unwrap_or(0.0))
@@ -78,7 +78,7 @@ fn primitive_symbol_receiver(heap: runtime::Heap, value: runtime::Value) -> Resu
     }
 }
 
-fn primitive_radix(arguments: Vec[runtime::Value]) -> Result[int, vm::NativeError] {
+fn primitive_radix(arguments: Vec[runtime::Value]) -> Result[isize, vm::NativeError] {
     match argument(arguments, 0) {
         runtime::Value::Undefined => Result::Ok(10),
         value => {
@@ -96,15 +96,15 @@ fn primitive_radix(arguments: Vec[runtime::Value]) -> Result[int, vm::NativeErro
     }
 }
 
-fn primitive_number_text(value: float64, radix: int) -> Result[string, vm::NativeError] {
+fn primitive_number_text(value: f64, radix: isize) -> Result[string, vm::NativeError] {
     match dtoa::number_to_string_radix(value, radix) {
         Ok(value) => Result::Ok(value),
         Err(_) => Result::Err(native_error("RangeError: invalid number radix")),
     }
 }
 
-fn primitive_format_digits(arguments: Vec[runtime::Value], minimum: int, maximum: int) -> Result[
-    Option[int],
+fn primitive_format_digits(arguments: Vec[runtime::Value], minimum: isize, maximum: isize) -> Result[
+    Option[isize],
     vm::NativeError,
 ] {
     match argument(arguments, 0) {
@@ -182,7 +182,7 @@ fn primitive_number_to_locale_string(
     arguments: Vec[runtime::Value],
 ) -> Result[runtime::Value, vm::NativeError] {
     let _ = arguments;
-    primitive_number_to_string(heap, prototype, this_value, Vec::[])
+    primitive_number_to_string(heap, prototype, this_value, Vec::new())
 }
 
 fn primitive_boolean_value_of(
@@ -237,7 +237,7 @@ fn initialize_primitive_wrapper(
                 receiver,
                 runtime::string_property_key("length"),
                 runtime::data_descriptor(
-                    runtime::Value::Int(value.len().to_int32()),
+                    runtime::Value::Int(value.len().to_i32()),
                     false,
                     false,
                     false,
@@ -314,21 +314,25 @@ fn primitive_number_constructor_vm(
     context: vm::Context,
     receiver: runtime::ObjectId,
     arguments: Vec[runtime::Value],
-    depth: int,
+    depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     let _ = depth;
     let value = argument(arguments, 0);
     primitive_wrapper_vm_result(initialize_primitive_wrapper(context.heap(), receiver, value))
 }
 
-fn primitive_number_prepare(context: vm::Context, arguments: Vec[runtime::Value], depth: int) -> Result[
+fn primitive_number_prepare(context: vm::Context, arguments: Vec[runtime::Value], depth: isize) -> Result[
     Vec[runtime::Value],
     vm::VmError,
 ] {
-    Result::Ok(Vec::[number_constructor_vm(context, runtime::Value::Undefined, arguments, depth)?])
+    Result::Ok(
+        Vec::from_array(
+            [number_constructor_vm(context, runtime::Value::Undefined, arguments, depth)?],
+        ),
+    )
 }
 
-fn primitive_string_prepare(context: vm::Context, arguments: Vec[runtime::Value], depth: int) -> Result[
+fn primitive_string_prepare(context: vm::Context, arguments: Vec[runtime::Value], depth: isize) -> Result[
     Vec[runtime::Value],
     vm::VmError,
 ] {
@@ -343,21 +347,21 @@ fn primitive_string_prepare(context: vm::Context, arguments: Vec[runtime::Value]
             _ => match string_constructor(
                 context.heap(),
                 runtime::Value::Undefined,
-                Vec::[primitive],
+                Vec::from_array([primitive]),
             ) {
                 Ok(value) => value,
                 Err(value) => return Result::Err(function_vm_error(value.message)),
             },
         }
     };
-    Result::Ok(Vec::[value])
+    Result::Ok(Vec::from_array([value]))
 }
 
 fn primitive_string_constructor_vm(
     context: vm::Context,
     receiver: runtime::ObjectId,
     arguments: Vec[runtime::Value],
-    depth: int,
+    depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     let _ = depth;
     primitive_wrapper_vm_result(
@@ -627,12 +631,14 @@ fn install_primitive_prototypes(
         return Result::Err(BuiltinError { message: "cannot define Symbol.toPrimitive" })
     } else {};
     define_to_string_tag(context, symbol_prototype, "Symbol")?;
-    for (kind, prototype) in Vec::[
-        (vm::PrimitiveKind::Number, number_prototype),
-        (vm::PrimitiveKind::Boolean, boolean_prototype),
-        (vm::PrimitiveKind::BigInt, bigint_prototype),
-        (vm::PrimitiveKind::Symbol, symbol_prototype),
-    ] {
+    for (kind, prototype) in Vec::from_array(
+        [
+            (vm::PrimitiveKind::Number, number_prototype),
+            (vm::PrimitiveKind::Boolean, boolean_prototype),
+            (vm::PrimitiveKind::BigInt, bigint_prototype),
+            (vm::PrimitiveKind::Symbol, symbol_prototype),
+        ],
+    ) {
         match context.set_primitive_prototype(kind, prototype) {
             Ok(()) => (),
             Err(value) => return Result::Err(BuiltinError { message: value.kind.debug() }),
@@ -684,7 +690,9 @@ fn install_primitive_prototypes(
         boolean,
         |arguments, depth| {
             let _ = depth;
-            Result::Ok(Vec::[runtime::Value::Bool(runtime::to_boolean(argument(arguments, 0)))])
+            Result::Ok(
+                Vec::from_array([runtime::Value::Bool(runtime::to_boolean(argument(arguments, 0)))]),
+            )
         },
     ) {
         Ok(()) => (),

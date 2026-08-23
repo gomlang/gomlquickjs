@@ -5,23 +5,23 @@ use gomlang::quickjs::runtime;
 use std::math;
 use std::num;
 
-const MAX_ARRAY_LENGTH: int = 4294967295;
+const MAX_ARRAY_LENGTH: isize = 4294967295;
 
 pub enum ArrayError {
     InvalidObject,
     NotArray,
     InvalidLength,
     LengthNotWritable,
-    LengthOutOfRange(int),
+    LengthOutOfRange(isize),
     CannotRead {
-        index: int,
+        index: isize,
         message: string,
     },
-    CannotWrite(int),
-    CannotDelete(int),
+    CannotWrite(isize),
+    CannotDelete(isize),
     CannotAllocate(string),
     CannotStringify {
-        index: int,
+        index: isize,
         kind: string,
     },
 }
@@ -69,7 +69,7 @@ pub enum ConcatItem {
     Spread(runtime::ObjectId),
 }
 
-fn index_key(index: int) -> runtime::PropertyKey {
+fn index_key(index: isize) -> runtime::PropertyKey {
     runtime::string_property_key(index.to_string())
 }
 
@@ -97,10 +97,10 @@ fn length_descriptor(heap: runtime::Heap, array: runtime::ObjectId) -> Result[
     }
 }
 
-pub fn length(heap: runtime::Heap, array: runtime::ObjectId) -> Result[int, ArrayError] {
+pub fn length(heap: runtime::Heap, array: runtime::ObjectId) -> Result[isize, ArrayError] {
     match runtime::descriptor_value(length_descriptor(heap, array)?) {
         Some(runtime::Value::Int(value)) => if value >= 0 {
-            Result::Ok(value.to_int())
+            Result::Ok(value.to_isize())
         } else {
             Result::Err(ArrayError::InvalidLength)
         },
@@ -126,7 +126,10 @@ fn require_writable_length(heap: runtime::Heap, array: runtime::ObjectId) -> Res
     }
 }
 
-fn set_length(heap: runtime::Heap, array: runtime::ObjectId, value: int) -> Result[unit, ArrayError] {
+fn set_length(heap: runtime::Heap, array: runtime::ObjectId, value: isize) -> Result[
+    unit,
+    ArrayError,
+] {
     if value < 0 || value > MAX_ARRAY_LENGTH {
         Result::Err(ArrayError::LengthOutOfRange(value))
     } else if runtime::set_existing_data_property(
@@ -141,7 +144,7 @@ fn set_length(heap: runtime::Heap, array: runtime::ObjectId, value: int) -> Resu
     }
 }
 
-fn new_array(heap: runtime::Heap, value: int) -> Result[runtime::ObjectId, ArrayError] {
+fn new_array(heap: runtime::Heap, value: isize) -> Result[runtime::ObjectId, ArrayError] {
     if value < 0 || value > MAX_ARRAY_LENGTH {
         return Result::Err(ArrayError::LengthOutOfRange(value))
     } else {};
@@ -162,15 +165,15 @@ fn new_array(heap: runtime::Heap, value: int) -> Result[runtime::ObjectId, Array
     }
 }
 
-fn length_value(value: int) -> runtime::Value {
+fn length_value(value: isize) -> runtime::Value {
     if value <= 2147483647 {
-        runtime::Value::Int(value.to_int32())
+        runtime::Value::Int(value.to_i32())
     } else {
         runtime::Value::Float(num::parse_float64(value.to_string()).unwrap_or(0.0))
     }
 }
 
-fn read_index(heap: runtime::Heap, array: runtime::ObjectId, index: int) -> Result[
+fn read_index(heap: runtime::Heap, array: runtime::ObjectId, index: isize) -> Result[
     ArraySlot,
     ArrayError,
 ] {
@@ -181,7 +184,7 @@ fn read_index(heap: runtime::Heap, array: runtime::ObjectId, index: int) -> Resu
     }
 }
 
-fn write_index(heap: runtime::Heap, array: runtime::ObjectId, index: int, value: runtime::Value) -> Result[
+fn write_index(heap: runtime::Heap, array: runtime::ObjectId, index: isize, value: runtime::Value) -> Result[
     unit,
     ArrayError,
 ] {
@@ -205,7 +208,7 @@ fn write_index(heap: runtime::Heap, array: runtime::ObjectId, index: int, value:
     }
 }
 
-fn delete_index(heap: runtime::Heap, array: runtime::ObjectId, index: int) -> Result[
+fn delete_index(heap: runtime::Heap, array: runtime::ObjectId, index: isize) -> Result[
     unit,
     ArrayError,
 ] {
@@ -216,7 +219,7 @@ fn delete_index(heap: runtime::Heap, array: runtime::ObjectId, index: int) -> Re
     }
 }
 
-fn relative_index(value: int, size: int) -> int {
+fn relative_index(value: isize, size: isize) -> isize {
     if value < 0 {
         let offset = size + value;
         if offset < 0 {
@@ -231,7 +234,7 @@ fn relative_index(value: int, size: int) -> int {
     }
 }
 
-pub fn at(heap: runtime::Heap, array: runtime::ObjectId, index: int) -> Result[
+pub fn at(heap: runtime::Heap, array: runtime::ObjectId, index: isize) -> Result[
     ArraySlot,
     ArrayError,
 ] {
@@ -253,7 +256,7 @@ fn host_string(value: string) -> runtime::JsString {
     runtime::JsString::from_utf8(bytes.slice(0, bytes.len()))
 }
 
-fn join_value(value: runtime::Value, index: int) -> Result[runtime::JsString, ArrayError] {
+fn join_value(value: runtime::Value, index: isize) -> Result[runtime::JsString, ArrayError] {
     match value {
         runtime::Value::Undefined | runtime::Value::Null => Result::Ok(host_string("")),
         runtime::Value::Bool(value) => Result::Ok(host_string(value.to_string())),
@@ -320,7 +323,7 @@ pub fn reverse(heap: runtime::Heap, array: runtime::ObjectId) -> Result[unit, Ar
     Result::Ok(())
 }
 
-pub fn slice(heap: runtime::Heap, array: runtime::ObjectId, start: int, end: Option[int]) -> Result[
+pub fn slice(heap: runtime::Heap, array: runtime::ObjectId, start: isize, end: Option[isize]) -> Result[
     runtime::ObjectId,
     ArrayError,
 ] {
@@ -347,7 +350,7 @@ pub fn slice(heap: runtime::Heap, array: runtime::ObjectId, start: int, end: Opt
     Result::Ok(result)
 }
 
-fn checked_total(left: int, right: int) -> Result[int, ArrayError] {
+fn checked_total(left: isize, right: isize) -> Result[isize, ArrayError] {
     if right < 0 || left > MAX_ARRAY_LENGTH - right {
         Result::Err(ArrayError::LengthOutOfRange(MAX_ARRAY_LENGTH + 1))
     } else {
@@ -405,8 +408,8 @@ pub fn index_of(
     heap: runtime::Heap,
     array: runtime::ObjectId,
     search: runtime::Value,
-    from_index: int,
-) -> Result[int, ArrayError] {
+    from_index: isize,
+) -> Result[isize, ArrayError] {
     let size = length(heap, array)?;
     let mut index = if from_index >= 0 {
         if from_index > size {
@@ -438,8 +441,8 @@ pub fn last_index_of(
     heap: runtime::Heap,
     array: runtime::ObjectId,
     search: runtime::Value,
-    from_index: Option[int],
-) -> Result[int, ArrayError] {
+    from_index: Option[isize],
+) -> Result[isize, ArrayError] {
     let size = length(heap, array)?;
     if size == 0 {
         return Result::Ok(-1)
@@ -472,7 +475,7 @@ pub fn includes(
     heap: runtime::Heap,
     array: runtime::ObjectId,
     search: runtime::Value,
-    from_index: int,
+    from_index: isize,
 ) -> Result[bool, ArrayError] {
     let size = length(heap, array)?;
     let mut index = if from_index >= 0 {
@@ -503,7 +506,7 @@ pub fn includes(
 }
 
 pub fn push(heap: runtime::Heap, array: runtime::ObjectId, values: Vec[runtime::Value]) -> Result[
-    int,
+    isize,
     ArrayError,
 ] {
     let mut size = length(heap, array)?;
@@ -557,7 +560,7 @@ pub fn shift(heap: runtime::Heap, array: runtime::ObjectId) -> Result[ArraySlot,
 }
 
 pub fn unshift(heap: runtime::Heap, array: runtime::ObjectId, values: Vec[runtime::Value]) -> Result[
-    int,
+    isize,
     ArrayError,
 ] {
     let size = length(heap, array)?;
@@ -586,7 +589,7 @@ pub fn unshift(heap: runtime::Heap, array: runtime::ObjectId, values: Vec[runtim
     Result::Ok(new_length)
 }
 
-fn copy_removed(heap: runtime::Heap, array: runtime::ObjectId, start: int, count: int) -> Result[
+fn copy_removed(heap: runtime::Heap, array: runtime::ObjectId, start: isize, count: isize) -> Result[
     runtime::ObjectId,
     ArrayError,
 ] {
@@ -605,10 +608,10 @@ fn copy_removed(heap: runtime::Heap, array: runtime::ObjectId, start: int, count
 fn splice_shrink(
     heap: runtime::Heap,
     array: runtime::ObjectId,
-    size: int,
-    start: int,
-    delete_count: int,
-    item_count: int,
+    size: isize,
+    start: isize,
+    delete_count: isize,
+    item_count: isize,
 ) -> Result[unit, ArrayError] {
     let mut index = start;
     while index < size - delete_count {
@@ -632,10 +635,10 @@ fn splice_shrink(
 fn splice_grow(
     heap: runtime::Heap,
     array: runtime::ObjectId,
-    size: int,
-    start: int,
-    delete_count: int,
-    item_count: int,
+    size: isize,
+    start: isize,
+    delete_count: isize,
+    item_count: isize,
 ) -> Result[unit, ArrayError] {
     let mut index = size - delete_count;
     while index > start {
@@ -653,8 +656,8 @@ fn splice_grow(
 pub fn splice(
     heap: runtime::Heap,
     array: runtime::ObjectId,
-    start: int,
-    delete_count: int,
+    start: isize,
+    delete_count: isize,
     items: Vec[runtime::Value],
 ) -> Result[runtime::ObjectId, ArrayError] {
     let size = length(heap, array)?;

@@ -17,11 +17,11 @@ use std::text;
 
 struct StdFileState {
     contents: Ref[Vec[byte]],
-    position: Ref[int],
+    position: Ref[isize],
     path: Option[string],
     writable: bool,
     closed: Ref[bool],
-    stream: int,
+    stream: isize,
     loaded: Ref[bool],
 }
 
@@ -29,11 +29,11 @@ fn std_file_error(message: string) -> vm::VmError {
     function_vm_error("std file: " + message)
 }
 
-fn std_truncated_int(value: float64) -> int {
+fn std_truncated_int(value: f64) -> isize {
     num::parse_int(dtoa::number_to_string(math::trunc(value))).unwrap_or(0)
 }
 
-fn std_truncated_int64(value: float64) -> int64 {
+fn std_truncated_int64(value: f64) -> i64 {
     if !math::is_finite(value) || value == 0.0 {
         return 0
     } else {};
@@ -44,8 +44,8 @@ fn std_truncated_int64(value: float64) -> int64 {
         math::trunc(value)
     };
     let mut place = 4503599627370496.0;
-    let mut bit: int64 = 4503599627370496;
-    let mut result: int64 = 0;
+    let mut bit: i64 = 4503599627370496;
+    let mut result: i64 = 0;
     while bit != 0 {
         if remaining >= place {
             result += bit;
@@ -61,20 +61,20 @@ fn std_truncated_int64(value: float64) -> int64 {
     }
 }
 
-fn std_format_integer_value(context: vm::Context, value: runtime::Value, long: bool, depth: int) -> Result[
+fn std_format_integer_value(context: vm::Context, value: runtime::Value, long: bool, depth: isize) -> Result[
     bigint::BigInteger,
     vm::VmError,
 ] {
     match value {
         runtime::Value::BigInt(value) => Result::Ok(value.integer()),
-        runtime::Value::Int(value) => Result::Ok(bigint::BigInteger::from_int64(value.to_int64())),
+        runtime::Value::Int(value) => Result::Ok(bigint::BigInteger::from_int64(value.to_i64())),
         _ => match number_value_at_depth(context, value, depth)? {
             runtime::Value::Float(value) => Result::Ok(
                 bigint::BigInteger::from_int64(
                     if long {
                         std_truncated_int64(value)
                     } else {
-                        mathx::to_uint32(value).to_int32().to_int64()
+                        mathx::to_u32(value).to_i32().to_i64()
                     },
                 ),
             ),
@@ -95,7 +95,7 @@ fn std_unsigned_integer(value: bigint::BigInteger, long: bool) -> bigint::BigInt
     value.bit_and(mask)
 }
 
-fn std_format_padding(value: string, width: int, left: bool, zero: bool, prefix: string) -> string {
+fn std_format_padding(value: string, width: isize, left: bool, zero: bool, prefix: string) -> string {
     if width <= value.byte_len() {
         value
     } else {
@@ -126,8 +126,8 @@ fn std_format_integer(
     space: bool,
     left: bool,
     zero: bool,
-    width: int,
-    precision: Option[int],
+    width: isize,
+    precision: Option[isize],
 ) -> string {
     let signed = conversion == b'd' || conversion == b'i';
     let radix = if conversion == b'o' {
@@ -181,14 +181,14 @@ fn std_format_integer(
 }
 
 fn std_format_float(
-    value: float64,
+    value: f64,
     conversion: byte,
     plus: bool,
     space: bool,
     left: bool,
     zero: bool,
-    width: int,
-    precision: Option[int],
+    width: isize,
+    precision: Option[isize],
 ) -> string {
     let digits = precision.unwrap_or(6);
     let mut formatted = if conversion == b'f' || conversion == b'F' {
@@ -218,7 +218,7 @@ fn std_format_float(
 fn std_format_argument(
     context: vm::Context,
     arguments: Vec[runtime::Value],
-    argument_index: Ref[int],
+    argument_index: Ref[isize],
     conversion: byte,
     long: bool,
     alternate: bool,
@@ -226,9 +226,9 @@ fn std_format_argument(
     space: bool,
     left: bool,
     zero: bool,
-    width: int,
-    precision: Option[int],
-    depth: int,
+    width: isize,
+    precision: Option[isize],
+    depth: isize,
 ) -> Result[string, vm::VmError] {
     if argument_index.get() >= arguments.len() {
         return Result::Err(std_file_error("missing argument for conversion specifier"))
@@ -277,7 +277,7 @@ fn std_format_argument(
     Result::Err(std_file_error("invalid conversion specifier in format string"))
 }
 
-fn std_format(context: vm::Context, arguments: Vec[runtime::Value], depth: int) -> Result[
+fn std_format(context: vm::Context, arguments: Vec[runtime::Value], depth: isize) -> Result[
     string,
     vm::VmError,
 ] {
@@ -340,7 +340,7 @@ fn std_format(context: vm::Context, arguments: Vec[runtime::Value], depth: int) 
             let number = number_value_at_depth(context, arguments[argument_index.get()], depth)?;
             argument_index.set(argument_index.get() + 1);
             width = match number {
-                runtime::Value::Float(value) => mathx::to_uint32(value).to_int32().to_int(),
+                runtime::Value::Float(value) => mathx::to_u32(value).to_i32().to_isize(),
                 _ => 0,
             };
             if width < 0 {
@@ -351,11 +351,11 @@ fn std_format(context: vm::Context, arguments: Vec[runtime::Value], depth: int) 
         } else {
             while index < format.byte_len() && format.byte_get(index) >= b'0'
                 && format.byte_get(index) <= b'9' {
-                width = width * 10 + (format.byte_get(index) - b'0').to_int();
+                width = width * 10 + (format.byte_get(index) - b'0').to_isize();
                 index += 1;
             }
         };
-        let mut precision: Option[int] = Option::None;
+        let mut precision: Option[isize] = Option::None;
         if index < format.byte_len() && format.byte_get(index) == b'.' {
             index += 1;
             let mut digits = 0;
@@ -366,14 +366,14 @@ fn std_format(context: vm::Context, arguments: Vec[runtime::Value], depth: int) 
                 let number = number_value_at_depth(context, arguments[argument_index.get()], depth)?;
                 argument_index.set(argument_index.get() + 1);
                 digits = match number {
-                    runtime::Value::Float(value) => mathx::to_uint32(value).to_int32().to_int(),
+                    runtime::Value::Float(value) => mathx::to_u32(value).to_i32().to_isize(),
                     _ => 0,
                 };
                 index += 1;
             } else {
                 while index < format.byte_len() && format.byte_get(index) >= b'0'
                     && format.byte_get(index) <= b'9' {
-                    digits = digits * 10 + (format.byte_get(index) - b'0').to_int();
+                    digits = digits * 10 + (format.byte_get(index) - b'0').to_isize();
                     index += 1;
                 }
             };
@@ -445,8 +445,8 @@ fn std_file_flush(state: StdFileState) -> Result[unit, vm::VmError] {
     }
 }
 
-fn std_file_index(context: vm::Context, value: runtime::Value, depth: int) -> Result[
-    int,
+fn std_file_index(context: vm::Context, value: runtime::Value, depth: isize) -> Result[
+    isize,
     vm::VmError,
 ] {
     let number = match number_value_at_depth(context, value, depth)? {
@@ -516,8 +516,8 @@ fn std_file_define_method(
     context: vm::Context,
     object: runtime::ObjectId,
     name: string,
-    length: int,
-    callback: (runtime::Value, Vec[runtime::Value], int) -> Result[runtime::Value, vm::VmError],
+    length: isize,
+    callback: (runtime::Value, Vec[runtime::Value], isize) -> Result[runtime::Value, vm::VmError],
 ) -> Result[unit, vm::VmError] {
     let function = context.new_vm_function(callback)?;
     if !initialize_builtin_function(context.heap(), function, name, length)
@@ -609,7 +609,7 @@ fn std_file_object(
                 Err(value) => return Result::Err(std_file_error(value.to_string())),
             };
             state.position.set(position + count);
-            Result::Ok(runtime::Value::Int(count.to_int32()))
+            Result::Ok(runtime::Value::Int(count.to_i32()))
         },
     )?;
     std_file_define_method(
@@ -637,7 +637,7 @@ fn std_file_object(
                 index += 1;
             }
             std_file_write(state, copied)?;
-            Result::Ok(runtime::Value::Int(length.to_int32()))
+            Result::Ok(runtime::Value::Int(length.to_i32()))
         },
     )?;
     std_file_define_method(
@@ -679,11 +679,11 @@ fn std_file_object(
             let _ = this_value;
             let number = number_value_at_depth(context, argument(arguments, 0), depth)?;
             let value = match number {
-                runtime::Value::Float(value) => mathx::to_uint32(value) & 0xff,
+                runtime::Value::Float(value) => mathx::to_u32(value) & 0xff,
                 _ => 0,
             };
-            std_file_write(state, Vec::[value.to_uint8()])?;
-            Result::Ok(runtime::Value::Int(value.to_int32()))
+            std_file_write(state, Vec::from_array([value.to_u8()]))?;
+            Result::Ok(runtime::Value::Int(value.to_i32()))
         },
     )?;
     std_file_define_method(
@@ -701,7 +701,7 @@ fn std_file_object(
                 Result::Ok(runtime::Value::Int(-1))
             } else {
                 state.position.set(position + 1);
-                Result::Ok(runtime::Value::Int(values[position].to_int32()))
+                Result::Ok(runtime::Value::Int(values[position].to_i32()))
             }
         },
     )?;
@@ -719,7 +719,7 @@ fn std_file_object(
             if position >= values.len() {
                 return Result::Ok(runtime::Value::Null)
             } else {};
-            let output: Vec[byte] = Vec::[];
+            let output: Vec[byte] = Vec::new();
             while position < values.len() && values[position] != b'\n' {
                 output.push(values[position]);
                 position += 1;
@@ -777,7 +777,7 @@ fn std_file_object(
                     if state.stream >= 0 && state.stream <= 2 {
                         -1
                     } else {
-                        state.position.get().to_int32()
+                        state.position.get().to_i32()
                     },
                 ),
             )
@@ -799,7 +799,7 @@ fn std_file_object(
                         if state.stream >= 0 && state.stream <= 2 {
                             -1
                         } else {
-                            state.position.get().to_int64()
+                            state.position.get().to_i64()
                         },
                     ),
                 ),
@@ -816,7 +816,7 @@ fn std_file_object(
             let _ = arguments;
             let _ = depth;
             std_file_require_open(state)?;
-            Result::Ok(runtime::Value::Int(state.stream.to_int32()))
+            Result::Ok(runtime::Value::Int(state.stream.to_i32()))
         },
     )?;
     std_file_define_method(
@@ -912,18 +912,18 @@ fn std_open_file(
     } else {};
     let contents: Vec[byte] = match path {
         Some(value) => if mode == "w" || mode == "w+" {
-            Vec::[]
+            Vec::new()
         } else {
             match fs::read_bytes(value) {
                 Ok(value) => value.to_vec(),
                 Err(_) => if mode == "a" || mode == "a+" {
-                    Vec::[]
+                    Vec::new()
                 } else {
                     return Result::Ok(runtime::Value::Null)
                 },
             }
         },
-        None => Vec::[],
+        None => Vec::new(),
     };
     let position = if mode == "a" || mode == "a+" {
         contents.len()
@@ -945,7 +945,7 @@ fn std_open_file(
     )
 }
 
-fn std_value_host_string(context: vm::Context, value: runtime::Value, depth: int) -> Result[
+fn std_value_host_string(context: vm::Context, value: runtime::Value, depth: isize) -> Result[
     string,
     vm::VmError,
 ] {
@@ -999,24 +999,26 @@ fn std_error_constants(context: vm::Context) -> Result[runtime::Value, vm::VmErr
         Ok(value) => value,
         Err(value) => return Result::Err(std_file_error(value.message)),
     };
-    for (name, value) in Vec::[
-        ("EINVAL", 22),
-        ("EIO", 5),
-        ("EACCES", 13),
-        ("EEXIST", 17),
-        ("ENOSPC", 28),
-        ("ENOSYS", 38),
-        ("EBUSY", 16),
-        ("ENOENT", 2),
-        ("EPERM", 1),
-        ("EPIPE", 32),
-        ("EBADF", 9),
-    ] {
+    for (name, value) in Vec::from_array(
+        [
+            ("EINVAL", 22),
+            ("EIO", 5),
+            ("EACCES", 13),
+            ("EEXIST", 17),
+            ("ENOSPC", 28),
+            ("ENOSYS", 38),
+            ("EBUSY", 16),
+            ("ENOENT", 2),
+            ("EPERM", 1),
+            ("EPIPE", 32),
+            ("EBADF", 9),
+        ],
+    ) {
         if !runtime::define_own_property(
             context.heap(),
             object,
             runtime::string_property_key(name),
-            runtime::data_descriptor(runtime::Value::Int(value.to_int32()), true, false, false),
+            runtime::data_descriptor(runtime::Value::Int(value.to_i32()), true, false, false),
         ) {
             return Result::Err(std_file_error("cannot define error constant"))
         } else {}
@@ -1024,7 +1026,7 @@ fn std_error_constants(context: vm::Context) -> Result[runtime::Value, vm::VmErr
     Result::Ok(runtime::Value::Object(object))
 }
 
-fn std_error_message(value: int) -> string {
+fn std_error_message(value: isize) -> string {
     match value {
         1 => "Operation not permitted",
         2 => "No such file or directory",
@@ -1043,13 +1045,13 @@ fn std_error_message(value: int) -> string {
 
 fn std_stream_object(
     context: vm::Context,
-    stream: int,
+    stream: isize,
     buffer_states: HashMap[runtime::ObjectId, arraybuffer::ArrayBuffer],
 ) -> Result[runtime::Value, vm::VmError] {
     std_file_object(
         context,
         StdFileState {
-            contents: Ref::new(Vec::[]),
+            contents: Ref::new(Vec::new()),
             position: Ref::new(0),
             path: Option::None,
             writable: stream != 0,
@@ -1061,7 +1063,7 @@ fn std_stream_object(
     )
 }
 
-fn std_url_option(context: vm::Context, arguments: Vec[runtime::Value], name: string, depth: int) -> Result[
+fn std_url_option(context: vm::Context, arguments: Vec[runtime::Value], name: string, depth: isize) -> Result[
     bool,
     vm::VmError,
 ] {
@@ -1082,7 +1084,7 @@ fn std_url_option(context: vm::Context, arguments: Vec[runtime::Value], name: st
     }
 }
 
-fn std_url_line_end(values: Vec[byte], start: int) -> int {
+fn std_url_line_end(values: Vec[byte], start: isize) -> isize {
     let mut index = start;
     while index < values.len() {
         if values[index] == b'\n' {
@@ -1093,7 +1095,7 @@ fn std_url_line_end(values: Vec[byte], start: int) -> int {
     0 - 1
 }
 
-fn std_url_status(values: Vec[byte], end: int) -> int {
+fn std_url_status(values: Vec[byte], end: isize) -> isize {
     let mut index = 0;
     while index < end && values[index] != b' ' {
         index += 1;
@@ -1104,7 +1106,7 @@ fn std_url_status(values: Vec[byte], end: int) -> int {
     let mut status = 0;
     let mut digits = 0;
     while index < end && values[index] >= b'0' && values[index] <= b'9' {
-        status = status * 10 + (values[index] - b'0').to_int();
+        status = status * 10 + (values[index] - b'0').to_isize();
         digits += 1;
         index += 1;
     }
@@ -1120,11 +1122,11 @@ fn std_url_array_buffer(
     buffer_states: HashMap[runtime::ObjectId, arraybuffer::ArrayBuffer],
     constructor: runtime::Value,
     values: Vec[byte],
-    depth: int,
+    depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     let result = context.construct_with_new_target_at_depth(
         constructor,
-        Vec::[runtime::Value::Int(values.len().to_int32())],
+        Vec::from_array([runtime::Value::Int(values.len().to_i32())]),
         constructor,
         depth,
     )?;
@@ -1141,7 +1143,7 @@ fn std_url_response(
     array_buffer: runtime::Value,
     values: Vec[byte],
     binary: bool,
-    depth: int,
+    depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     if binary {
         std_url_array_buffer(context, buffer_states, array_buffer, values, depth)
@@ -1156,7 +1158,7 @@ fn std_url_full_response(
     context: vm::Context,
     response: runtime::Value,
     headers: Vec[byte],
-    status: int,
+    status: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     let object = match runtime::new_ordinary_object(
         context.heap(),
@@ -1193,12 +1195,7 @@ fn std_url_full_response(
                     context.heap(),
                     object,
                     runtime::string_property_key("status"),
-                    runtime::data_descriptor(
-                        runtime::Value::Int(status.to_int32()),
-                        true,
-                        true,
-                        true,
-                    ),
+                    runtime::data_descriptor(runtime::Value::Int(status.to_i32()), true, true, true),
                 ) {
                 return Result::Err(std_file_error("cannot define URL response metadata"))
             } else {}
@@ -1213,13 +1210,13 @@ fn std_url_get(
     buffer_states: HashMap[runtime::ObjectId, arraybuffer::ArrayBuffer],
     array_buffer: runtime::Value,
     arguments: Vec[runtime::Value],
-    depth: int,
+    depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     let url = std_value_host_string(context, argument(arguments, 0), depth)?;
     let binary = std_url_option(context, arguments, "binary", depth)?;
     let full = std_url_option(context, arguments, "full", depth)?;
     let output = match process::Command::new("/bin/sh").args(
-        Vec::["-c", "curl -s -i -- \"$1\"", "urlGet", url],
+        Vec::from_array(["-c", "curl -s -i -- \"$1\"", "urlGet", url]),
     ).current_dir(os_state.directory.get()).env_clear().envs(std_environment_entries(os_state)).output() {
         Ok(value) => value.stdout().to_vec(),
         Err(value) => return Result::Err(std_file_error("could not start curl: " + value)),
@@ -1230,8 +1227,8 @@ fn std_url_get(
     } else {
         std_url_status(output, status_end)
     };
-    let headers: Vec[byte] = Vec::[];
-    let body: Vec[byte] = Vec::[];
+    let headers: Vec[byte] = Vec::new();
+    let body: Vec[byte] = Vec::new();
     let mut valid = status_end >= 0;
     let mut index = status_end + 1;
     while valid && index < output.len() {
@@ -1271,7 +1268,7 @@ fn std_url_get(
     }
 }
 
-fn std_print_object_text(context: vm::Context, value: runtime::Value, depth: int) -> Result[
+fn std_print_object_text(context: vm::Context, value: runtime::Value, depth: isize) -> Result[
     string,
     vm::VmError,
 ] {
@@ -1288,7 +1285,7 @@ fn std_print_object_text(context: vm::Context, value: runtime::Value, depth: int
             ) {
                 Ok(stringify) => match context.invoke_with_this_at_depth(
                     stringify,
-                    Vec::[value],
+                    Vec::from_array([value]),
                     json,
                     depth,
                 ) {
@@ -1328,7 +1325,7 @@ pub fn install_std(
         Err(value) => return Result::Err(BuiltinError { message: value.kind.debug() }),
     };
     define_value(context.heap(), object, "Error", error_constants, true, true)?;
-    for (name, stream) in Vec::[("in", 0), ("out", 1), ("err", 2)] {
+    for (name, stream) in Vec::from_array([("in", 0), ("out", 1), ("err", 2)]) {
         let file = match std_stream_object(context, stream, buffer_states) {
             Ok(value) => value,
             Err(value) => return Result::Err(BuiltinError { message: value.kind.debug() }),
@@ -1515,7 +1512,7 @@ pub fn install_std(
                 let _ = this_value;
                 let converted = number_value_at_depth(context, argument(arguments, 0), depth)?;
                 let code = match converted {
-                    runtime::Value::Float(value) => mathx::to_uint32(value).to_int32().to_int(),
+                    runtime::Value::Float(value) => mathx::to_u32(value).to_i32().to_isize(),
                     _ => 0,
                 };
                 process::exit(code);
@@ -1580,9 +1577,11 @@ pub fn install_std(
                 if mode != "r" {
                     return Result::Err(std_file_error("only read popen mode is supported"))
                 } else {};
-                let output = match process::Command::new("/bin/sh").args(Vec::["-c", command]).current_dir(
-                    os_state.directory.get(),
-                ).env_clear().envs(std_environment_entries(os_state)).output() {
+                let output = match process::Command::new("/bin/sh").args(
+                    Vec::from_array(["-c", command]),
+                ).current_dir(os_state.directory.get()).env_clear().envs(
+                    std_environment_entries(os_state),
+                ).output() {
                     Ok(value) => value,
                     Err(value) => return Result::Err(std_file_error(value)),
                 };
@@ -1650,7 +1649,7 @@ pub fn install_std(
                 global_eval(
                     context,
                     this_value,
-                    Vec::[runtime::Value::String(js_string("return (" + source + ");"))],
+                    Vec::from_array([runtime::Value::String(js_string("return (" + source + ");"))]),
                     depth,
                 )
             },
@@ -1717,7 +1716,7 @@ pub fn install_std(
                 global_load_script(
                     context,
                     this_value,
-                    Vec::[runtime::Value::String(js_string(path))],
+                    Vec::from_array([runtime::Value::String(js_string(path))]),
                     depth,
                 )
             },

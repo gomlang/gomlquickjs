@@ -46,13 +46,13 @@ struct ModuleRecord {
     evaluation_error: Ref[runtime::Value],
     evaluation_error_set: Ref[bool],
     evaluation_error_path: Ref[string],
-    dfs_index: Ref[int],
-    dfs_ancestor_index: Ref[int],
-    pending_async_dependencies: Ref[int],
+    dfs_index: Ref[isize],
+    dfs_ancestor_index: Ref[isize],
+    pending_async_dependencies: Ref[isize],
     async_evaluation: Ref[bool],
     async_parents: Vec[Ref[ModuleRecord]],
     cycle_root: Ref[Option[Ref[ModuleRecord]]],
-    async_timestamp: Ref[int],
+    async_timestamp: Ref[isize],
     execution_started: Ref[bool],
     module_type: string,
 }
@@ -63,7 +63,7 @@ struct Loader {
     records: HashMap[string, Ref[ModuleRecord]],
     sources: HashMap[string, string],
     source_names: HashMap[string, string],
-    next_async_timestamp: Ref[int],
+    next_async_timestamp: Ref[isize],
 }
 
 fn module_error(module_path: string, message: string) -> ModuleError {
@@ -189,26 +189,28 @@ fn load_record_with_type(loader: Loader, module_path: string, requested_type: st
             ),
         };
         json_value = Option::Some(value);
-        let constants: Vec[bytecode::Constant] = Vec::[];
-        let code: Vec[bytecode::Instruction] = Vec::[bytecode::Instruction::ReturnUndef];
+        let constants: Vec[bytecode::Constant] = Vec::new();
+        let code: Vec[bytecode::Instruction] = Vec::from_array([bytecode::Instruction::ReturnUndef]);
         let function = bytecode::Function::new(constants, code, 3);
-        let mapped_arguments: Vec[int] = Vec::[];
+        let mapped_arguments: Vec[isize] = Vec::new();
         function.set_arguments_semantics(true, mapped_arguments);
-        let imports: Vec[compiler::ModuleImport] = Vec::[];
-        let attributes: Vec[compiler::ModuleAttribute] = Vec::[];
+        let imports: Vec[compiler::ModuleImport] = Vec::new();
+        let attributes: Vec[compiler::ModuleAttribute] = Vec::new();
         compiler::CompiledModule {
             function,
             imports,
-            exports: Vec::[
-                compiler::ModuleExport {
-                    exported: "default",
-                    source: Option::None,
-                    imported: "default",
-                    local_index: 0,
-                    attributes,
-                    span: ast::span(0, source.byte_len()),
-                },
-            ],
+            exports: Vec::from_array(
+                [
+                    compiler::ModuleExport {
+                        exported: "default",
+                        source: Option::None,
+                        imported: "default",
+                        local_index: 0,
+                        attributes,
+                        span: ast::span(0, source.byte_len()),
+                    },
+                ],
+            ),
             import_meta_index: 1,
             dynamic_import_referrer_index: 2,
         }
@@ -242,7 +244,7 @@ fn load_record_with_type(loader: Loader, module_path: string, requested_type: st
             path: canonical,
             compiled,
             locals,
-            dependencies: HashMap::{},
+            dependencies: HashMap::new(),
             namespace: Ref::new(Option::None),
             import_meta: Ref::new(Option::None),
             main: Ref::new(false),
@@ -254,7 +256,7 @@ fn load_record_with_type(loader: Loader, module_path: string, requested_type: st
             dfs_ancestor_index: Ref::new(-1),
             pending_async_dependencies: Ref::new(0),
             async_evaluation: Ref::new(false),
-            async_parents: Vec::[],
+            async_parents: Vec::new(),
             cycle_root: Ref::new(Option::None),
             async_timestamp: Ref::new(-1),
             execution_started: Ref::new(false),
@@ -341,12 +343,12 @@ fn dynamic_import_reject(
     context: vm::Context,
     capability: vm::HostPromiseCapability,
     error: vm::VmError,
-    depth: int,
+    depth: isize,
 ) -> Result[unit, vm::VmError] {
     let reason: runtime::Value = context.rejection_value(error);
     let _ = context.invoke_with_this_at_depth(
         capability.reject(),
-        Vec::[reason],
+        Vec::from_array([reason]),
         runtime::Value::Undefined,
         depth,
     )?;
@@ -356,7 +358,7 @@ fn dynamic_import_reject(
 fn dynamic_import_validate_attributes(
     context: vm::Context,
     attributes: runtime::ObjectId,
-    depth: int,
+    depth: isize,
 ) -> Result[string, vm::VmError] {
     let object: runtime::Object = match context.heap().get(attributes) {
         Some(value) => value,
@@ -410,7 +412,7 @@ fn dynamic_import_validate_attributes(
     Result::Ok(module_type)
 }
 
-fn dynamic_import_validate_options(context: vm::Context, options: runtime::Value, depth: int) -> Result[
+fn dynamic_import_validate_options(context: vm::Context, options: runtime::Value, depth: isize) -> Result[
     string,
     vm::VmError,
 ] {
@@ -466,13 +468,13 @@ fn dynamic_import_job(
     referrer: string,
     specifier: string,
     requested_type: string,
-    depth: int,
+    depth: isize,
 ) -> Result[unit, vm::VmError] {
     match dynamic_import_namespace(loader, referrer, specifier, requested_type) {
         Ok(namespace) => {
             let _ = loader.context.invoke_with_this_at_depth(
                 capability.resolve(),
-                Vec::[namespace],
+                Vec::from_array([namespace]),
                 runtime::Value::Undefined,
                 depth,
             )?;
@@ -490,7 +492,7 @@ fn dynamic_import_job(
                 Some(value) => {
                     let _ = loader.context.invoke_with_this_at_depth(
                         capability.reject(),
-                        Vec::[value],
+                        Vec::from_array([value]),
                         runtime::Value::Undefined,
                         depth,
                     )?;
@@ -512,7 +514,7 @@ fn dynamic_import(
     specifier_value: runtime::Value,
     options: runtime::Value,
     referrer_value: runtime::Value,
-    depth: int,
+    depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     let capability: vm::HostPromiseCapability = loader.context.new_host_promise_capability()?;
     let promise: runtime::Value = capability.promise();
@@ -571,12 +573,12 @@ fn dynamic_import(
             },
         },
     };
-    let callback: vm::HostTask = |job_depth: int| {
+    let callback: vm::HostTask = |job_depth: isize| {
         dynamic_import_job(loader, capability, referrer, specifier, requested_type, job_depth)
     };
     loader.context.enqueue_host_task(
         callback,
-        Vec::[promise, capability.resolve(), capability.reject()],
+        Vec::from_array([promise, capability.resolve(), capability.reject()]),
     );
     Result::Ok(promise)
 }
@@ -586,7 +588,7 @@ fn install_dynamic_module_loader(loader: Loader) -> unit {
         specifier: runtime::Value,
         options: runtime::Value,
         referrer: runtime::Value,
-        depth: int,
+        depth: isize,
     | dynamic_import(loader, specifier, options, referrer, depth);
     loader.context.set_dynamic_module_loader(callback)
 }
@@ -596,9 +598,9 @@ pub fn install_dynamic_import_loader(context: vm::Context, global: runtime::Obje
         Loader {
             context,
             global,
-            records: HashMap::{},
-            sources: HashMap::{},
-            source_names: HashMap::{},
+            records: HashMap::new(),
+            sources: HashMap::new(),
+            source_names: HashMap::new(),
             next_async_timestamp: Ref::new(0),
         },
     )
@@ -616,7 +618,7 @@ fn dependency_record(record: Ref[ModuleRecord], source: string) -> Result[
     }
 }
 
-fn local_import(record: Ref[ModuleRecord], index: int) -> Option[compiler::ModuleImport] {
+fn local_import(record: Ref[ModuleRecord], index: isize) -> Option[compiler::ModuleImport] {
     for binding in record.get().compiled.imports {
         if binding.local_index == index && binding.kind == compiler::ModuleImportKind::Named {
             return Option::Some(binding)
@@ -734,7 +736,7 @@ fn bind_named_imports(loader: Loader, record: Ref[ModuleRecord]) -> Result[unit,
             },
             None => {
                 let dependency = dependency_record(record, binding.source)?;
-                export_cell(dependency, binding.imported, Vec::[])?
+                export_cell(dependency, binding.imported, Vec::new())?
             },
         };
         if binding.local_index < 0 || binding.local_index >= record.get().locals.len() {
@@ -745,7 +747,7 @@ fn bind_named_imports(loader: Loader, record: Ref[ModuleRecord]) -> Result[unit,
     Result::Ok(())
 }
 
-fn string_compare(left: string, right: string) -> int {
+fn string_compare(left: string, right: string) -> isize {
     if left < right {
         -1
     } else if left > right {
@@ -765,7 +767,7 @@ fn collect_export_names(record: Ref[ModuleRecord], resolving: Vec[string], names
             match binding.source {
                 Some(source) => match dependency_record(record, source) {
                     Ok(dependency) => {
-                        let inherited: Vec[string] = Vec::[];
+                        let inherited: Vec[string] = Vec::new();
                         collect_export_names(dependency, resolving, inherited);
                         for name in inherited {
                             if name != "default" && !string_vector_contains(names, name) {
@@ -784,8 +786,8 @@ fn collect_export_names(record: Ref[ModuleRecord], resolving: Vec[string], names
 }
 
 fn export_names(record: Ref[ModuleRecord]) -> Vec[string] {
-    let names: Vec[string] = Vec::[];
-    collect_export_names(record, Vec::[], names);
+    let names: Vec[string] = Vec::new();
+    collect_export_names(record, Vec::new(), names);
     collections::sort_by(names, string_compare);
     names
 }
@@ -806,7 +808,7 @@ fn create_namespace(loader: Loader, record: Ref[ModuleRecord]) -> Result[
     let root = Ref::new(runtime::Value::Object(object));
     loader.context.add_external_root(root);
     for name in export_names(record) {
-        let cell = export_cell(record, name, Vec::[])?;
+        let cell = export_cell(record, name, Vec::new())?;
         let getter = match loader.context.new_native_function(|_, _, _| Result::Ok(cell.get())) {
             Ok(value) => value,
             Err(error) => return Result::Err(module_error(record.get().path, error.kind.debug())),
@@ -937,7 +939,7 @@ fn thrown_message(context: vm::Context, value: runtime::Value) -> string {
     match value {
         runtime::Value::String(value) => value.to_host_string().unwrap_or("<invalid string>"),
         runtime::Value::Object(object) => {
-            for name in Vec::["stack", "message", "name"] {
+            for name in Vec::from_array(["stack", "message", "name"]) {
                 match runtime::get_property(
                     context.heap(),
                     object,
@@ -1018,7 +1020,7 @@ fn push_requested_dependency(
 }
 
 fn requested_dependencies(record: Ref[ModuleRecord]) -> Vec[Ref[ModuleRecord]] {
-    let dependencies: Vec[Ref[ModuleRecord]] = Vec::[];
+    let dependencies: Vec[Ref[ModuleRecord]] = Vec::new();
     for binding in record.get().compiled.imports {
         push_requested_dependency(record, binding.source, dependencies)
     }
@@ -1222,7 +1224,12 @@ fn start_async_module(loader: Loader, record: Ref[ModuleRecord]) -> Result[unit,
         Ok(value) => value,
         Err(error) => return Result::Err(reject_vm_error(loader, record, error)),
     };
-    match loader.context.invoke_with_this_at_depth(then, Vec::[fulfilled, rejected], promise, 0) {
+    match loader.context.invoke_with_this_at_depth(
+        then,
+        Vec::from_array([fulfilled, rejected]),
+        promise,
+        0,
+    ) {
         Ok(_) => Result::Ok(()),
         Err(error) => Result::Err(reject_vm_error(loader, record, error)),
     }
@@ -1234,7 +1241,7 @@ fn async_module_fulfilled(loader: Loader, module: Ref[ModuleRecord]) -> unit {
     } else {};
     module.get().async_evaluation.set(false);
     module.get().state.set(ModuleState::Evaluated);
-    let records: Vec[Ref[ModuleRecord]] = Vec::[];
+    let records: Vec[Ref[ModuleRecord]] = Vec::new();
     gather_available_ancestors(module, records);
     for record in records {
         if record.get().state.get() == ModuleState::Errored
@@ -1261,7 +1268,7 @@ fn async_module_fulfilled(loader: Loader, module: Ref[ModuleRecord]) -> unit {
 fn inner_module_evaluation(
     loader: Loader,
     module: Ref[ModuleRecord],
-    next_index: Ref[int],
+    next_index: Ref[isize],
     stack: Vec[Ref[ModuleRecord]],
 ) -> Result[unit, ModuleError] {
     match module.get().state.get() {
@@ -1366,7 +1373,7 @@ fn evaluate_record(loader: Loader, record: Ref[ModuleRecord]) -> Result[unit, Mo
         ModuleState::Evaluating => return Result::Ok(()),
         ModuleState::Linked => (),
     };
-    let stack: Vec[Ref[ModuleRecord]] = Vec::[];
+    let stack: Vec[Ref[ModuleRecord]] = Vec::new();
     match inner_module_evaluation(loader, record, Ref::new(0), stack) {
         Ok(()) => await_graph_evaluation(loader, record),
         Err(error) => {
@@ -1406,9 +1413,9 @@ pub fn execute_file(context: vm::Context, global: runtime::ObjectId, module_path
     let loader = Loader {
         context,
         global,
-        records: HashMap::{},
-        sources: HashMap::{},
-        source_names: HashMap::{},
+        records: HashMap::new(),
+        sources: HashMap::new(),
+        source_names: HashMap::new(),
         next_async_timestamp: Ref::new(0),
     };
     install_dynamic_module_loader(loader);
@@ -1441,14 +1448,14 @@ pub fn execute_source_with_source_name(
 ) -> Result[runtime::Value, ModuleError] {
     install_worker_module_loader(context);
     let canonical = absolute_clean(module_path)?;
-    let sources: HashMap[string, string] = HashMap::{};
+    let sources: HashMap[string, string] = HashMap::new();
     sources[canonical] = source;
-    let source_names: HashMap[string, string] = HashMap::{};
+    let source_names: HashMap[string, string] = HashMap::new();
     source_names[canonical] = source_name;
     let loader = Loader {
         context,
         global,
-        records: HashMap::{},
+        records: HashMap::new(),
         sources,
         source_names,
         next_async_timestamp: Ref::new(0),

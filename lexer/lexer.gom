@@ -125,8 +125,8 @@ pub enum TokenKind {
 
 #[derive(PartialEq, Eq, Debug)]
 pub struct Span {
-    pub start: int,
-    pub end: int,
+    pub start: isize,
+    pub end: isize,
 }
 
 #[derive(PartialEq, Eq, Debug)]
@@ -155,12 +155,12 @@ pub struct LexResult {
 }
 
 struct StringScan {
-    end: int,
+    end: isize,
     value: string,
 }
 
 struct TemplateScan {
-    end: int,
+    end: isize,
     kind: TokenKind,
     value: string,
     opens_substitution: bool,
@@ -168,53 +168,53 @@ struct TemplateScan {
 }
 
 struct DigitScan {
-    end: int,
+    end: isize,
     valid: bool,
     any: bool,
 }
 
 struct NumberScan {
-    end: int,
+    end: isize,
     kind: TokenKind,
     valid: bool,
 }
 
 struct TriviaScan {
-    end: int,
+    end: isize,
     line_break: bool,
 }
 
 struct BlockCommentScan {
-    end: int,
+    end: isize,
     line_break: bool,
     closed: bool,
 }
 
 struct IdentifierEscapeScan {
-    end: int,
-    codepoint: uint32,
+    end: isize,
+    codepoint: u32,
     valid: bool,
 }
 
 struct IdentifierScan {
-    end: int,
+    end: isize,
     value: string,
     has_escape: bool,
     valid: bool,
 }
 
 struct RegExpScan {
-    end: int,
+    end: isize,
     pattern: string,
     flags: string,
     valid: bool,
 }
 
-fn span(start: int, end: int) -> Span {
+fn span(start: isize, end: isize) -> Span {
     Span { start, end }
 }
 
-fn push_error(errors: Vec[LexError], message: string, start: int, end: int) -> unit {
+fn push_error(errors: Vec[LexError], message: string, start: isize, end: isize) -> unit {
     errors.push(LexError { message, span: span(start, end) })
 }
 
@@ -223,8 +223,8 @@ fn push_token(
     source: string,
     kind: TokenKind,
     value: string,
-    start: int,
-    end: int,
+    start: isize,
+    end: isize,
     line_break_before: bool,
 ) -> unit {
     tokens.push(
@@ -237,7 +237,7 @@ fn push_token(
             line_break_before,
             has_escape: false,
             is_reserved: false,
-            template_errors: Vec::[],
+            template_errors: Vec::new(),
         },
     )
 }
@@ -247,8 +247,8 @@ fn push_identifier_token(
     source: string,
     kind: TokenKind,
     value: string,
-    start: int,
-    end: int,
+    start: isize,
+    end: isize,
     line_break_before: bool,
     has_escape: bool,
     is_reserved: bool,
@@ -263,7 +263,7 @@ fn push_identifier_token(
             line_break_before,
             has_escape,
             is_reserved,
-            template_errors: Vec::[],
+            template_errors: Vec::new(),
         },
     )
 }
@@ -289,7 +289,7 @@ fn is_non_ascii_whitespace(value: char) -> bool {
         || value == '\uFEFF'
 }
 
-fn line_terminator_width(source: string, index: int) -> int {
+fn line_terminator_width(source: string, index: isize) -> isize {
     if index >= source.byte_len() {
         0
     } else {
@@ -317,7 +317,7 @@ fn line_terminator_width(source: string, index: int) -> int {
     }
 }
 
-fn whitespace_width(source: string, index: int) -> int {
+fn whitespace_width(source: string, index: isize) -> isize {
     if index >= source.byte_len() {
         0
     } else {
@@ -350,16 +350,16 @@ fn is_ascii_identifier_continue(value: byte) -> bool {
     ascii::is_alphanumeric(value) || value == b'_' || value == b'$'
 }
 
-fn is_identifier_start_codepoint(tables: unicode::IdentifierTables, codepoint: uint32) -> bool {
+fn is_identifier_start_codepoint(tables: unicode::IdentifierTables, codepoint: u32) -> bool {
     codepoint == 36 || codepoint == 95 || tables.is_start(codepoint)
 }
 
-fn is_identifier_continue_codepoint(tables: unicode::IdentifierTables, codepoint: uint32) -> bool {
+fn is_identifier_continue_codepoint(tables: unicode::IdentifierTables, codepoint: u32) -> bool {
     codepoint == 36 || codepoint == 95 || codepoint == 8204 || codepoint == 8205
         || tables.is_continue(codepoint)
 }
 
-fn identifier_width(tables: unicode::IdentifierTables, source: string, index: int, first: bool) -> int {
+fn identifier_width(tables: unicode::IdentifierTables, source: string, index: isize, first: bool) -> isize {
     if index >= source.byte_len() {
         0
     } else {
@@ -377,9 +377,9 @@ fn identifier_width(tables: unicode::IdentifierTables, source: string, index: in
         } else {
             match source.decode_at(index) {
                 Some((character, width)) => if if first {
-                    is_identifier_start_codepoint(tables, character.to_uint32())
+                    is_identifier_start_codepoint(tables, character.to_u32())
                 } else {
-                    is_identifier_continue_codepoint(tables, character.to_uint32())
+                    is_identifier_continue_codepoint(tables, character.to_u32())
                 } {
                     width
                 } else {
@@ -391,12 +391,12 @@ fn identifier_width(tables: unicode::IdentifierTables, source: string, index: in
     }
 }
 
-fn scan_identifier_escape(source: string, slash: int) -> IdentifierEscapeScan {
+fn scan_identifier_escape(source: string, slash: isize) -> IdentifierEscapeScan {
     let digit_start = slash + 2;
     if digit_start < source.byte_len() && source.byte_get(digit_start) == b'{' {
         let mut index = digit_start + 1;
         let mut count = 0;
-        let mut codepoint = 0.to_uint32();
+        let mut codepoint = 0.to_u32();
         let mut valid = true;
         while index < source.byte_len() && source.byte_get(index) != b'}'
             && whitespace_width(source, index) == 0 {
@@ -429,7 +429,7 @@ fn scan_identifier_escape(source: string, slash: int) -> IdentifierEscapeScan {
     } else {
         let mut index = digit_start;
         let mut count = 0;
-        let mut codepoint = 0.to_uint32();
+        let mut codepoint = 0.to_u32();
         while count < 4 && index < source.byte_len() && hex_value(source.byte_get(index)).is_some() {
             match hex_value(source.byte_get(index)) {
                 Some(value) => {
@@ -448,16 +448,16 @@ fn scan_identifier_escape(source: string, slash: int) -> IdentifierEscapeScan {
     }
 }
 
-fn write_identifier_codepoint(builder: text::StringBuilder, codepoint: uint32) -> unit {
-    match char_from_uint32(codepoint) {
+fn write_identifier_codepoint(builder: text::StringBuilder, codepoint: u32) -> unit {
+    match char_from_u32(codepoint) {
         Some(character) => builder.write_char(character),
         None => (),
     }
 }
 
-fn write_identifier_source(builder: text::StringBuilder, source: string, index: int) -> unit {
+fn write_identifier_source(builder: text::StringBuilder, source: string, index: isize) -> unit {
     if source.byte_get(index) < 128 {
-        write_identifier_codepoint(builder, source.byte_get(index).to_uint32())
+        write_identifier_codepoint(builder, source.byte_get(index).to_u32())
     } else {
         match source.decode_at(index) {
             Some((character, _)) => builder.write_char(character),
@@ -469,7 +469,7 @@ fn write_identifier_source(builder: text::StringBuilder, source: string, index: 
 fn scan_identifier(
     tables: unicode::IdentifierTables,
     source: string,
-    start: int,
+    start: isize,
     errors: Vec[LexError],
 ) -> IdentifierScan {
     let builder = text::StringBuilder::new();
@@ -576,13 +576,13 @@ fn keyword_kind(value: string) -> TokenKind {
     }
 }
 
-fn hex_value(value: byte) -> Option[uint32] {
+fn hex_value(value: byte) -> Option[u32] {
     if value >= b'0' && value <= b'9' {
-        Option::Some((value - b'0').to_uint32())
+        Option::Some((value - b'0').to_u32())
     } else if value >= b'a' && value <= b'f' {
-        Option::Some((value - b'a' + 10).to_uint32())
+        Option::Some((value - b'a' + 10).to_u32())
     } else if value >= b'A' && value <= b'F' {
-        Option::Some((value - b'A' + 10).to_uint32())
+        Option::Some((value - b'A' + 10).to_u32())
     } else {
         Option::None
     }
@@ -591,12 +591,12 @@ fn hex_value(value: byte) -> Option[uint32] {
 fn write_codepoint(
     builder: text::StringBuilder,
     errors: Vec[LexError],
-    codepoint: uint32,
-    start: int,
-    end: int,
+    codepoint: u32,
+    start: isize,
+    end: isize,
 ) -> unit {
     if codepoint >= 0xd800 && codepoint <= 0xdfff {} else {
-        match char_from_uint32(codepoint) {
+        match char_from_u32(codepoint) {
             Some(character) => builder.write_char(character),
             None => push_error(errors, "invalid Unicode escape", start, end),
         }
@@ -607,17 +607,17 @@ fn write_byte(
     builder: text::StringBuilder,
     errors: Vec[LexError],
     value: byte,
-    start: int,
-    end: int,
+    start: isize,
+    end: isize,
 ) -> unit {
-    write_codepoint(builder, errors, value.to_uint32(), start, end)
+    write_codepoint(builder, errors, value.to_u32(), start, end)
 }
 
-fn scan_fixed_hex(source: string, start: int, count: int) -> Option[uint32] {
+fn scan_fixed_hex(source: string, start: isize, count: isize) -> Option[u32] {
     if start + count > source.byte_len() {
         Option::None
     } else {
-        let mut result = 0.to_uint32();
+        let mut result = 0.to_u32();
         for index in start..start + count {
             match hex_value(source.byte_get(index)) {
                 Some(value) => {
@@ -632,15 +632,15 @@ fn scan_fixed_hex(source: string, start: int, count: int) -> Option[uint32] {
 
 fn scan_unicode_escape(
     source: string,
-    slash: int,
+    slash: isize,
     builder: text::StringBuilder,
     errors: Vec[LexError],
-) -> int {
+) -> isize {
     let start = slash + 2;
     if start < source.byte_len() && source.byte_get(start) == b'{' {
         let mut index = start + 1;
         let mut count = 0;
-        let mut codepoint = 0.to_uint32();
+        let mut codepoint = 0.to_u32();
         let mut valid = true;
         while index < source.byte_len() && source.byte_get(index) != b'}' {
             match hex_value(source.byte_get(index)) {
@@ -693,7 +693,12 @@ fn scan_unicode_escape(
     }
 }
 
-fn scan_hex_escape(source: string, slash: int, builder: text::StringBuilder, errors: Vec[LexError]) -> int {
+fn scan_hex_escape(
+    source: string,
+    slash: isize,
+    builder: text::StringBuilder,
+    errors: Vec[LexError],
+) -> isize {
     let start = slash + 2;
     match scan_fixed_hex(source, start, 2) {
         Some(codepoint) => {
@@ -719,10 +724,10 @@ fn scan_hex_escape(source: string, slash: int, builder: text::StringBuilder, err
 
 fn scan_string_escape(
     source: string,
-    slash: int,
+    slash: isize,
     builder: text::StringBuilder,
     errors: Vec[LexError],
-) -> int {
+) -> isize {
     if slash + 1 >= source.byte_len() {
         push_error(errors, "unterminated string escape", slash, source.byte_len());
         source.byte_len()
@@ -783,7 +788,7 @@ fn scan_string_escape(
     }
 }
 
-fn scan_string(source: string, start: int, quote: byte, errors: Vec[LexError]) -> StringScan {
+fn scan_string(source: string, start: isize, quote: byte, errors: Vec[LexError]) -> StringScan {
     let builder = text::StringBuilder::new();
     let mut index = start + 1;
     while index < source.byte_len() {
@@ -815,9 +820,9 @@ fn scan_string(source: string, start: int, quote: byte, errors: Vec[LexError]) -
     StringScan { end: source.byte_len(), value: builder.finish() }
 }
 
-fn scan_template(source: string, start: int, initial: bool, errors: Vec[LexError]) -> TemplateScan {
+fn scan_template(source: string, start: isize, initial: bool, errors: Vec[LexError]) -> TemplateScan {
     let builder = text::StringBuilder::new();
-    let template_errors: Vec[LexError] = Vec::[];
+    let template_errors: Vec[LexError] = Vec::new();
     let mut index = start + 1;
     while index < source.byte_len() {
         let value = source.byte_get(index);
@@ -889,7 +894,7 @@ fn scan_template(source: string, start: int, initial: bool, errors: Vec[LexError
         kind: TokenKind::Error,
         value: builder.finish(),
         opens_substitution: false,
-        errors: Vec::[],
+        errors: Vec::new(),
     }
 }
 
@@ -897,7 +902,7 @@ fn push_template_token(
     tokens: Vec[Token],
     source: string,
     scanned: TemplateScan,
-    start: int,
+    start: isize,
     line_break_before: bool,
 ) -> unit {
     tokens.push(
@@ -915,7 +920,7 @@ fn push_template_token(
     )
 }
 
-fn radix_digit(value: byte, radix: int) -> bool {
+fn radix_digit(value: byte, radix: isize) -> bool {
     if radix == 2 {
         value == b'0' || value == b'1'
     } else if radix == 8 {
@@ -927,7 +932,7 @@ fn radix_digit(value: byte, radix: int) -> bool {
     }
 }
 
-fn scan_digits(source: string, start: int, radix: int) -> DigitScan {
+fn scan_digits(source: string, start: isize, radix: isize) -> DigitScan {
     let mut index = start;
     let mut any = false;
     let mut valid = true;
@@ -952,7 +957,12 @@ fn scan_digits(source: string, start: int, radix: int) -> DigitScan {
     DigitScan { end: index, valid: valid && previous_digit, any }
 }
 
-fn scan_prefixed_number(tables: unicode::IdentifierTables, source: string, start: int, radix: int) -> NumberScan {
+fn scan_prefixed_number(
+    tables: unicode::IdentifierTables,
+    source: string,
+    start: isize,
+    radix: isize,
+) -> NumberScan {
     let mut index = start + 2;
     let mut valid = true;
     let mut any = false;
@@ -996,7 +1006,7 @@ fn scan_prefixed_number(tables: unicode::IdentifierTables, source: string, start
     NumberScan { end: index, kind: TokenKind::Number, valid: valid && any && previous_digit }
 }
 
-fn scan_decimal_number(tables: unicode::IdentifierTables, source: string, start: int) -> NumberScan {
+fn scan_decimal_number(tables: unicode::IdentifierTables, source: string, start: isize) -> NumberScan {
     let mut index = start;
     let mut valid = true;
     let mut fractional = false;
@@ -1053,7 +1063,7 @@ fn scan_decimal_number(tables: unicode::IdentifierTables, source: string, start:
     NumberScan { end: index, kind, valid }
 }
 
-fn scan_legacy_octal_number(source: string, start: int) -> Option[NumberScan] {
+fn scan_legacy_octal_number(source: string, start: isize) -> Option[NumberScan] {
     let mut index = start;
     while index < source.byte_len() && source.byte_get(index) >= b'0'
         && source.byte_get(index) <= b'7' {
@@ -1069,7 +1079,7 @@ fn scan_legacy_octal_number(source: string, start: int) -> Option[NumberScan] {
     }
 }
 
-fn scan_number(tables: unicode::IdentifierTables, source: string, start: int) -> NumberScan {
+fn scan_number(tables: unicode::IdentifierTables, source: string, start: isize) -> NumberScan {
     if source.byte_get(start) == b'0' && start + 1 < source.byte_len() {
         let prefix = source.byte_get(start + 1);
         if prefix == b'b' || prefix == b'B' {
@@ -1089,7 +1099,7 @@ fn scan_number(tables: unicode::IdentifierTables, source: string, start: int) ->
     }
 }
 
-fn scan_symbol(source: string, start: int) -> Option[(TokenKind, int)] {
+fn scan_symbol(source: string, start: isize) -> Option[(TokenKind, isize)] {
     if text::starts_with_at(source, start, ">>>=") {
         Option::Some((TokenKind::ShiftRightUnsignedAssign, start + 4))
     } else if text::starts_with_at(source, start, "===") {
@@ -1192,14 +1202,14 @@ fn scan_symbol(source: string, start: int) -> Option[(TokenKind, int)] {
     }
 }
 
-fn advance_character(source: string, index: int) -> int {
+fn advance_character(source: string, index: isize) -> isize {
     match source.decode_at(index) {
         Some((_, width)) => index + width,
         None => index + 1,
     }
 }
 
-fn scan_line_comment_end(source: string, start: int) -> int {
+fn scan_line_comment_end(source: string, start: isize) -> isize {
     let mut index = start + 2;
     while index < source.byte_len() && line_terminator_width(source, index) == 0 {
         index = advance_character(source, index);
@@ -1207,7 +1217,7 @@ fn scan_line_comment_end(source: string, start: int) -> int {
     index
 }
 
-fn scan_block_comment(source: string, start: int) -> BlockCommentScan {
+fn scan_block_comment(source: string, start: isize) -> BlockCommentScan {
     let mut index = start + 2;
     let mut line_break = false;
     let mut closed = false;
@@ -1228,7 +1238,7 @@ fn scan_block_comment(source: string, start: int) -> BlockCommentScan {
     BlockCommentScan { end: index, line_break, closed }
 }
 
-fn scan_trivia(source: string, start: int, errors: Vec[LexError]) -> TriviaScan {
+fn scan_trivia(source: string, start: isize, errors: Vec[LexError]) -> TriviaScan {
     let mut index = start;
     let mut line_break = false;
     let mut scanning = true;
@@ -1256,7 +1266,7 @@ fn scan_trivia(source: string, start: int, errors: Vec[LexError]) -> TriviaScan 
     TriviaScan { end: index, line_break }
 }
 
-fn scan_regexp(tables: unicode::IdentifierTables, source: string, start: int) -> RegExpScan {
+fn scan_regexp(tables: unicode::IdentifierTables, source: string, start: isize) -> RegExpScan {
     let mut index = start + 1;
     let mut class = false;
     let mut escaped = false;
@@ -1332,7 +1342,7 @@ fn control_parenthesis(tokens: Vec[Token]) -> bool {
     }
 }
 
-fn declaration_prefix(tokens: Vec[Token], index: int) -> bool {
+fn declaration_prefix(tokens: Vec[Token], index: isize) -> bool {
     if index == 0 {
         true
     } else {
@@ -1343,7 +1353,7 @@ fn declaration_prefix(tokens: Vec[Token], index: int) -> bool {
     }
 }
 
-fn function_before_body(tokens: Vec[Token], brace: int) -> Option[int] {
+fn function_before_body(tokens: Vec[Token], brace: isize) -> Option[isize] {
     if brace == 0 || tokens[brace - 1].kind != TokenKind::RParen {
         return Option::None
     } else {};
@@ -1374,7 +1384,7 @@ fn function_before_body(tokens: Vec[Token], brace: int) -> Option[int] {
     }
 }
 
-fn class_before_body(tokens: Vec[Token], brace: int) -> Option[int] {
+fn class_before_body(tokens: Vec[Token], brace: isize) -> Option[isize] {
     if brace == 0 {
         return Option::None
     } else {};
@@ -1464,10 +1474,10 @@ fn scan_token(
     tokens: Vec[Token],
     errors: Vec[LexError],
     source: string,
-    start: int,
+    start: isize,
     line_break_before: bool,
     allow_regexp: bool,
-) -> int {
+) -> isize {
     let value = source.byte_get(start);
     if value == b'/' && allow_regexp {
         let scanned = scan_regexp(tables, source, start);
@@ -1485,7 +1495,7 @@ fn scan_token(
                     line_break_before,
                     has_escape: false,
                     is_reserved: false,
-                    template_errors: Vec::[],
+                    template_errors: Vec::new(),
                 },
             )
         };
@@ -1657,9 +1667,9 @@ fn scan_token(
 
 pub fn lex(source: string) -> LexResult {
     let tables = unicode::IdentifierTables::new();
-    let tokens: Vec[Token] = Vec::[];
-    let errors: Vec[LexError] = Vec::[];
-    let template_depths: Vec[int] = Vec::[];
+    let tokens: Vec[Token] = Vec::new();
+    let errors: Vec[LexError] = Vec::new();
+    let template_depths: Vec[isize] = Vec::new();
     let mut index = if text::starts_with_at(source, 0, "#!") {
         scan_line_comment_end(source, 0)
     } else {

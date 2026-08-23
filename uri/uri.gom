@@ -12,7 +12,7 @@ pub enum UriErrorKind {
 #[derive(PartialEq, Eq, Debug)]
 pub struct UriError {
     pub kind: UriErrorKind,
-    pub offset: int,
+    pub offset: isize,
 }
 
 impl ToString for UriError {
@@ -26,19 +26,19 @@ impl ToString for UriError {
     }
 }
 
-fn uri_error(kind: UriErrorKind, offset: int) -> UriError {
+fn uri_error(kind: UriErrorKind, offset: isize) -> UriError {
     UriError { kind, offset }
 }
 
-fn is_ascii_letter(value: uint16) -> bool {
+fn is_ascii_letter(value: u16) -> bool {
     (value >= 65 && value <= 90) || (value >= 97 && value <= 122)
 }
 
-fn is_ascii_digit(value: uint16) -> bool {
+fn is_ascii_digit(value: u16) -> bool {
     value >= 48 && value <= 57
 }
 
-fn is_uri_reserved(value: uint16) -> bool {
+fn is_uri_reserved(value: u16) -> bool {
     value == 59 || value == 47 || value == 63 || value == 58 || value == 64 || value == 38
         || value == 61
         || value == 43
@@ -47,7 +47,7 @@ fn is_uri_reserved(value: uint16) -> bool {
         || value == 35
 }
 
-fn is_component_unescaped(value: uint16) -> bool {
+fn is_component_unescaped(value: u16) -> bool {
     is_ascii_letter(value) || is_ascii_digit(value) || value == 45 || value == 95 || value == 46
         || value == 33
         || value == 126
@@ -57,44 +57,44 @@ fn is_component_unescaped(value: uint16) -> bool {
         || value == 41
 }
 
-fn is_uri_unescaped(value: uint16, component: bool) -> bool {
+fn is_uri_unescaped(value: u16, component: bool) -> bool {
     is_component_unescaped(value) || (!component && is_uri_reserved(value))
 }
 
-fn uppercase_hex(value: byte) -> uint16 {
+fn uppercase_hex(value: byte) -> u16 {
     if value < 10 {
-        48 + value.to_uint16()
+        48 + value.to_u16()
     } else {
-        65 + (value - 10).to_uint16()
+        65 + (value - 10).to_u16()
     }
 }
 
-fn append_percent_byte(output: Vec[uint16], value: byte) -> unit {
+fn append_percent_byte(output: Vec[u16], value: byte) -> unit {
     output.push(37);
     output.push(uppercase_hex(value >> 4));
     output.push(uppercase_hex(value & 15))
 }
 
-fn append_percent_code_point(output: Vec[uint16], code_point: uint32) -> unit {
+fn append_percent_code_point(output: Vec[u16], code_point: u32) -> unit {
     if code_point < 0x80 {
-        append_percent_byte(output, code_point.to_uint8())
+        append_percent_byte(output, code_point.to_u8())
     } else if code_point < 0x800 {
-        append_percent_byte(output, ((code_point >> 6) | 0xc0).to_uint8());
-        append_percent_byte(output, ((code_point & 0x3f) | 0x80).to_uint8())
+        append_percent_byte(output, ((code_point >> 6) | 0xc0).to_u8());
+        append_percent_byte(output, ((code_point & 0x3f) | 0x80).to_u8())
     } else if code_point < 0x10000 {
-        append_percent_byte(output, ((code_point >> 12) | 0xe0).to_uint8());
-        append_percent_byte(output, (((code_point >> 6) & 0x3f) | 0x80).to_uint8());
-        append_percent_byte(output, ((code_point & 0x3f) | 0x80).to_uint8())
+        append_percent_byte(output, ((code_point >> 12) | 0xe0).to_u8());
+        append_percent_byte(output, (((code_point >> 6) & 0x3f) | 0x80).to_u8());
+        append_percent_byte(output, ((code_point & 0x3f) | 0x80).to_u8())
     } else {
-        append_percent_byte(output, ((code_point >> 18) | 0xf0).to_uint8());
-        append_percent_byte(output, (((code_point >> 12) & 0x3f) | 0x80).to_uint8());
-        append_percent_byte(output, (((code_point >> 6) & 0x3f) | 0x80).to_uint8());
-        append_percent_byte(output, ((code_point & 0x3f) | 0x80).to_uint8())
+        append_percent_byte(output, ((code_point >> 18) | 0xf0).to_u8());
+        append_percent_byte(output, (((code_point >> 12) & 0x3f) | 0x80).to_u8());
+        append_percent_byte(output, (((code_point >> 6) & 0x3f) | 0x80).to_u8());
+        append_percent_byte(output, ((code_point & 0x3f) | 0x80).to_u8())
     }
 }
 
 fn encode(value: runtime::JsString, component: bool) -> Result[runtime::JsString, UriError] {
-    let output: Vec[uint16] = Vec::with_capacity(value.len() * 3);
+    let output: Vec[u16] = Vec::with_capacity(value.len() * 3);
     let mut index = 0;
     while index < value.len() {
         let first = value.get(index);
@@ -114,7 +114,7 @@ fn encode(value: runtime::JsString, component: bool) -> Result[runtime::JsString
             append_percent_code_point(output, code_point);
             index += 2;
         } else {
-            append_percent_code_point(output, first.to_uint32());
+            append_percent_code_point(output, first.to_u32());
             index += 1;
         }
     }
@@ -129,19 +129,19 @@ pub fn encode_uri_component(value: runtime::JsString) -> Result[runtime::JsStrin
     encode(value, true)
 }
 
-fn hex_value(value: uint16) -> Option[byte] {
+fn hex_value(value: u16) -> Option[byte] {
     if value >= 48 && value <= 57 {
-        Option::Some((value - 48).to_uint8())
+        Option::Some((value - 48).to_u8())
     } else if value >= 65 && value <= 70 {
-        Option::Some((value - 55).to_uint8())
+        Option::Some((value - 55).to_u8())
     } else if value >= 97 && value <= 102 {
-        Option::Some((value - 87).to_uint8())
+        Option::Some((value - 87).to_u8())
     } else {
         Option::None
     }
 }
 
-fn decode_percent_byte(value: runtime::JsString, offset: int) -> Result[byte, UriError] {
+fn decode_percent_byte(value: runtime::JsString, offset: isize) -> Result[byte, UriError] {
     if offset < 0 || offset + 2 >= value.len() || value.get(offset) != 37 {
         return Result::Err(uri_error(UriErrorKind::MalformedPercentEscape, offset))
     } else {};
@@ -156,9 +156,9 @@ fn decode_percent_byte(value: runtime::JsString, offset: int) -> Result[byte, Ur
     Result::Ok((high << 4) | low)
 }
 
-fn append_code_point(output: Vec[uint16], code_point: uint32, offset: int) -> Result[unit, UriError] {
+fn append_code_point(output: Vec[u16], code_point: u32, offset: isize) -> Result[unit, UriError] {
     if code_point <= 0xffff {
-        output.push(code_point.to_uint16());
+        output.push(code_point.to_u16());
         Result::Ok(())
     } else {
         match runtime::split_code_point(code_point) {
@@ -172,8 +172,8 @@ fn append_code_point(output: Vec[uint16], code_point: uint32, offset: int) -> Re
     }
 }
 
-fn utf8_shape(first: byte, offset: int) -> Result[(int, uint32, uint32), UriError] {
-    let value = first.to_uint32();
+fn utf8_shape(first: byte, offset: isize) -> Result[(isize, u32, u32), UriError] {
+    let value = first.to_u32();
     if first >= 0xc0 && first <= 0xdf {
         Result::Ok((2, value & 0x1f, 0x80))
     } else if first >= 0xe0 && first <= 0xef {
@@ -186,7 +186,7 @@ fn utf8_shape(first: byte, offset: int) -> Result[(int, uint32, uint32), UriErro
 }
 
 fn decode(value: runtime::JsString, component: bool) -> Result[runtime::JsString, UriError] {
-    let output: Vec[uint16] = Vec::with_capacity(value.len());
+    let output: Vec[u16] = Vec::with_capacity(value.len());
     let mut index = 0;
     while index < value.len() {
         let current = value.get(index);
@@ -196,12 +196,12 @@ fn decode(value: runtime::JsString, component: bool) -> Result[runtime::JsString
         } else {
             let first = decode_percent_byte(value, index)?;
             if first < 0x80 {
-                if !component && is_uri_reserved(first.to_uint16()) {
+                if !component && is_uri_reserved(first.to_u16()) {
                     output.push(value.get(index));
                     output.push(value.get(index + 1));
                     output.push(value.get(index + 2));
                 } else {
-                    output.push(first.to_uint16());
+                    output.push(first.to_u16());
                 };
                 index += 3;
             } else {
@@ -213,7 +213,7 @@ fn decode(value: runtime::JsString, component: bool) -> Result[runtime::JsString
                     if next < 0x80 || next >= 0xc0 {
                         return Result::Err(uri_error(UriErrorKind::InvalidUtf8, escape_offset))
                     } else {};
-                    code_point = (code_point << 6) | (next.to_uint32() & 0x3f);
+                    code_point = (code_point << 6) | (next.to_u32() & 0x3f);
                     byte_index += 1;
                 }
                 if code_point < minimum || code_point > 0x10ffff

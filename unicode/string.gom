@@ -1,27 +1,27 @@
 package unicode;
 
-const CASE_CODE_SHIFT: int = 15;
+const CASE_CODE_SHIFT: isize = 15;
 
-const CASE_LENGTH_SHIFT: int = 8;
+const CASE_LENGTH_SHIFT: isize = 8;
 
-const CASE_TYPE_SHIFT: int = 4;
+const CASE_TYPE_SHIFT: isize = 4;
 
-const INDEX_BLOCK_LENGTH: int = 32;
+const INDEX_BLOCK_LENGTH: isize = 32;
 
 struct StringUnicodeData {
-    case_table1: Vec[uint32],
-    case_table2: Vec[uint8],
-    case_extension: Vec[uint16],
-    cased_table: Vec[uint8],
-    cased_index: Vec[uint8],
-    case_ignorable_table: Vec[uint8],
-    case_ignorable_index: Vec[uint8],
-    combining_class_table: Vec[uint8],
-    combining_class_index: Vec[uint8],
-    decomposition_table1: Vec[uint32],
-    decomposition_table2: Vec[uint16],
-    decomposition_data: Vec[uint8],
-    composition_table: Vec[uint16],
+    case_table1: Vec[u32],
+    case_table2: Vec[u8],
+    case_extension: Vec[u16],
+    cased_table: Vec[u8],
+    cased_index: Vec[u8],
+    case_ignorable_table: Vec[u8],
+    case_ignorable_index: Vec[u8],
+    combining_class_table: Vec[u8],
+    combining_class_index: Vec[u8],
+    decomposition_table1: Vec[u32],
+    decomposition_table2: Vec[u16],
+    decomposition_data: Vec[u8],
+    composition_table: Vec[u16],
 }
 
 pub enum NormalizationForm {
@@ -35,21 +35,21 @@ pub struct StringUnicode {
     data: StringUnicodeData,
 }
 
-fn string_code_point_at(input: Slice[uint16], index: int) -> (uint32, int) {
+fn string_code_point_at(input: Slice[u16], index: isize) -> (u32, isize) {
     let first = input.get(index);
     if first >= 0xd800 && first <= 0xdbff && index + 1 < input.len() {
         let second = input.get(index + 1);
         if second >= 0xdc00 && second <= 0xdfff {
-            (0x10000 + (first.to_uint32() - 0xd800) * 0x400 + second.to_uint32() - 0xdc00, 2)
+            (0x10000 + (first.to_u32() - 0xd800) * 0x400 + second.to_u32() - 0xdc00, 2)
         } else {
-            (first.to_uint32(), 1)
+            (first.to_u32(), 1)
         }
     } else {
-        (first.to_uint32(), 1)
+        (first.to_u32(), 1)
     }
 }
 
-fn string_previous_code_point(input: Slice[uint16], end: int) -> Option[(uint32, int)] {
+fn string_previous_code_point(input: Slice[u16], end: isize) -> Option[(u32, isize)] {
     if end <= 0 {
         return Option::None
     } else {};
@@ -59,35 +59,32 @@ fn string_previous_code_point(input: Slice[uint16], end: int) -> Option[(uint32,
         let first = input.get(index - 1);
         if first >= 0xd800 && first <= 0xdbff {
             Option::Some(
-                (
-                    0x10000 + (first.to_uint32() - 0xd800) * 0x400 + last.to_uint32() - 0xdc00,
-                    index - 1,
-                ),
+                (0x10000 + (first.to_u32() - 0xd800) * 0x400 + last.to_u32() - 0xdc00, index - 1),
             )
         } else {
-            Option::Some((last.to_uint32(), index))
+            Option::Some((last.to_u32(), index))
         }
     } else {
-        Option::Some((last.to_uint32(), index))
+        Option::Some((last.to_u32(), index))
     }
 }
 
-fn string_append_code_point(output: Vec[uint16], value: uint32) -> unit {
+fn string_append_code_point(output: Vec[u16], value: u32) -> unit {
     if value <= 0xffff {
-        output.push(value.to_uint16())
+        output.push(value.to_u16())
     } else {
         let adjusted = value - 0x10000;
-        output.push((0xd800 + (adjusted >> 10)).to_uint16());
-        output.push((0xdc00 + (adjusted & 0x3ff)).to_uint16());
+        output.push((0xd800 + (adjusted >> 10)).to_u16());
+        output.push((0xdc00 + (adjusted & 0x3ff)).to_u16());
     }
 }
 
-fn string_get_le24(table: Vec[uint8], index: int) -> uint32 {
-    table.get(index).to_uint32() | (table.get(index + 1).to_uint32() << 8)
-        | (table.get(index + 2).to_uint32() << 16)
+fn string_get_le24(table: Vec[u8], index: isize) -> u32 {
+    table.get(index).to_u32() | (table.get(index + 1).to_u32() << 8)
+        | (table.get(index + 2).to_u32() << 16)
 }
 
-fn string_index_position(index_table: Vec[uint8], value: uint32) -> Option[(uint32, int)] {
+fn string_index_position(index_table: Vec[u8], value: u32) -> Option[(u32, isize)] {
     let block_count = index_table.len() / 3;
     let first_value = string_get_le24(index_table, 0);
     let first_code = first_value & 0x1fffff;
@@ -110,17 +107,17 @@ fn string_index_position(index_table: Vec[uint8], value: uint32) -> Option[(uint
         }
     }
     let entry = string_get_le24(index_table, first * 3);
-    Option::Some((entry & 0x1fffff, (first + 1) * INDEX_BLOCK_LENGTH + (entry >> 21).to_int()))
+    Option::Some((entry & 0x1fffff, (first + 1) * INDEX_BLOCK_LENGTH + (entry >> 21).to_isize()))
 }
 
-fn string_is_in_table(table: Vec[uint8], index_table: Vec[uint8], value: uint32) -> bool {
+fn string_is_in_table(table: Vec[u8], index_table: Vec[u8], value: u32) -> bool {
     let (mut code, mut position) = match string_index_position(index_table, value) {
         Some(value) => value,
         None => return false,
     };
     let mut included = false;
     while position < table.len() {
-        let byte = table.get(position).to_uint32();
+        let byte = table.get(position).to_u32();
         position += 1;
         if byte < 64 {
             code += (byte >> 3) + 1;
@@ -132,12 +129,12 @@ fn string_is_in_table(table: Vec[uint8], index_table: Vec[uint8], value: uint32)
         } else if byte >= 0x80 {
             code += byte - 0x80 + 1;
         } else if byte < 0x60 {
-            code += ((byte - 0x40) << 8) | table.get(position).to_uint32();
+            code += ((byte - 0x40) << 8) | table.get(position).to_u32();
             code += 1;
             position += 1;
         } else {
-            code += ((byte - 0x60) << 16) | (table.get(position).to_uint32() << 8)
-                | table.get(position + 1).to_uint32();
+            code += ((byte - 0x60) << 16) | (table.get(position).to_u32() << 8)
+                | table.get(position + 1).to_u32();
             code += 1;
             position += 2;
         }
@@ -150,17 +147,17 @@ fn string_is_in_table(table: Vec[uint8], index_table: Vec[uint8], value: uint32)
     false
 }
 
-fn string_case_entry(data: StringUnicodeData, value: uint32, index: int, entry: uint32, lower: bool) -> Vec[
-    uint32,
+fn string_case_entry(data: StringUnicodeData, value: u32, index: isize, entry: u32, lower: bool) -> Vec[
+    u32,
 ] {
-    let output: Vec[uint32] = Vec::with_capacity(3);
+    let output: Vec[u32] = Vec::with_capacity(3);
     let code = entry >> CASE_CODE_SHIFT;
     let type_ = (entry >> CASE_TYPE_SHIFT) & 0xf;
-    let table_data = ((entry & 0xf) << 8) | data.case_table2.get(index).to_uint32();
+    let table_data = ((entry & 0xf) << 8) | data.case_table2.get(index).to_u32();
     let mut result = value;
     if type_ <= 3 {
         if lower == ((type_ & 1) == 1) {
-            result = value - code + (data.case_table1.get(table_data.to_int()) >> CASE_CODE_SHIFT);
+            result = value - code + (data.case_table1.get(table_data.to_isize()) >> CASE_CODE_SHIFT);
         } else {};
     } else if type_ == 4 {
         let offset = value - code;
@@ -194,11 +191,10 @@ fn string_case_entry(data: StringUnicodeData, value: uint32, index: int, entry: 
         } else {};
     } else if type_ == 6 {
         if lower {
-            result = value - code
-                + data.case_extension.get((table_data & 0x3f).to_int()).to_uint32();
+            result = value - code + data.case_extension.get((table_data & 0x3f).to_isize()).to_u32();
         } else {
             output.push(
-                value - code + data.case_extension.get((table_data >> 6).to_int()).to_uint32(),
+                value - code + data.case_extension.get((table_data >> 6).to_isize()).to_u32(),
             );
             output.push(0x399);
             return output
@@ -209,40 +205,40 @@ fn string_case_entry(data: StringUnicodeData, value: uint32, index: int, entry: 
         } else {};
     } else if type_ == 8 {
         if !lower {
-            result = data.case_extension.get(table_data.to_int()).to_uint32();
+            result = data.case_extension.get(table_data.to_isize()).to_u32();
         } else {};
     } else if type_ == 9 || type_ == 10 {
         if lower == (type_ == 10) {
-            result = data.case_extension.get(table_data.to_int()).to_uint32();
+            result = data.case_extension.get(table_data.to_isize()).to_u32();
         } else {};
     } else if type_ == 12 {
         if lower {
             output.push(
-                value - code + data.case_extension.get((table_data >> 6).to_int()).to_uint32(),
+                value - code + data.case_extension.get((table_data >> 6).to_isize()).to_u32(),
             );
-            output.push(data.case_extension.get((table_data & 0x3f).to_int()).to_uint32());
+            output.push(data.case_extension.get((table_data & 0x3f).to_isize()).to_u32());
             return output
         } else {};
     } else if type_ == 11 {
         if !lower {
             output.push(
-                value - code + data.case_extension.get((table_data >> 6).to_int()).to_uint32(),
+                value - code + data.case_extension.get((table_data >> 6).to_isize()).to_u32(),
             );
-            output.push(data.case_extension.get((table_data & 0x3f).to_int()).to_uint32());
+            output.push(data.case_extension.get((table_data & 0x3f).to_isize()).to_u32());
             return output
         } else {};
     } else if !lower {
-        output.push(data.case_extension.get((table_data >> 8).to_int()).to_uint32());
-        output.push(data.case_extension.get(((table_data >> 4) & 0xf).to_int()).to_uint32());
-        output.push(data.case_extension.get((table_data & 0xf).to_int()).to_uint32());
+        output.push(data.case_extension.get((table_data >> 8).to_isize()).to_u32());
+        output.push(data.case_extension.get(((table_data >> 4) & 0xf).to_isize()).to_u32());
+        output.push(data.case_extension.get((table_data & 0xf).to_isize()).to_u32());
         return output
     } else {};
     output.push(result);
     output
 }
 
-fn string_case_convert(data: StringUnicodeData, value: uint32, lower: bool) -> Vec[uint32] {
-    let output: Vec[uint32] = Vec::with_capacity(1);
+fn string_case_convert(data: StringUnicodeData, value: u32, lower: bool) -> Vec[u32] {
+    let output: Vec[u32] = Vec::with_capacity(1);
     if value < 128 {
         if lower && value >= 65 && value <= 90 {
             output.push(value + 32);
@@ -272,7 +268,7 @@ fn string_case_convert(data: StringUnicodeData, value: uint32, lower: bool) -> V
     output
 }
 
-fn string_is_cased(data: StringUnicodeData, value: uint32) -> bool {
+fn string_is_cased(data: StringUnicodeData, value: u32) -> bool {
     let mut first = 0;
     let mut last = data.case_table1.len() - 1;
     while first <= last {
@@ -291,11 +287,11 @@ fn string_is_cased(data: StringUnicodeData, value: uint32) -> bool {
     string_is_in_table(data.cased_table, data.cased_index, value)
 }
 
-fn string_is_case_ignorable(data: StringUnicodeData, value: uint32) -> bool {
+fn string_is_case_ignorable(data: StringUnicodeData, value: u32) -> bool {
     string_is_in_table(data.case_ignorable_table, data.case_ignorable_index, value)
 }
 
-fn string_is_final_sigma(data: StringUnicodeData, input: Slice[uint16], start: int, end: int) -> bool {
+fn string_is_final_sigma(data: StringUnicodeData, input: Slice[u16], start: isize, end: isize) -> bool {
     let mut before = start;
     let mut previous = Option::None;
     loop {
@@ -327,8 +323,8 @@ fn string_is_final_sigma(data: StringUnicodeData, input: Slice[uint16], start: i
     true
 }
 
-fn string_change_case(data: StringUnicodeData, input: Slice[uint16], lower: bool) -> Vec[uint16] {
-    let output: Vec[uint16] = Vec::with_capacity(input.len());
+fn string_change_case(data: StringUnicodeData, input: Slice[u16], lower: bool) -> Vec[u16] {
+    let output: Vec[u16] = Vec::with_capacity(input.len());
     let mut index = 0;
     while index < input.len() {
         let start = index;
@@ -336,7 +332,7 @@ fn string_change_case(data: StringUnicodeData, input: Slice[uint16], lower: bool
         index += width;
         let converted = if lower && value == 0x3a3
             && string_is_final_sigma(data, input, start, index) {
-            Vec::[0x3c2]
+            Vec::from_array([0x3c2])
         } else {
             string_case_convert(data, value, lower)
         };
@@ -347,7 +343,7 @@ fn string_change_case(data: StringUnicodeData, input: Slice[uint16], lower: bool
     output
 }
 
-fn string_short_code(value: uint32) -> uint32 {
+fn string_short_code(value: u32) -> u32 {
     if value < 0x80 {
         value
     } else if value < 0xd0 {
@@ -359,7 +355,7 @@ fn string_short_code(value: uint32) -> uint32 {
     }
 }
 
-fn string_simple_lower(value: uint32) -> uint32 {
+fn string_simple_lower(value: u32) -> u32 {
     if value < 0x100 || (value >= 0x410 && value <= 0x42f) {
         value + 0x20
     } else {
@@ -367,50 +363,50 @@ fn string_simple_lower(value: uint32) -> uint32 {
     }
 }
 
-fn string_get16(table: Vec[uint8], position: int) -> uint32 {
-    table.get(position).to_uint32() | (table.get(position + 1).to_uint32() << 8)
+fn string_get16(table: Vec[u8], position: isize) -> u32 {
+    table.get(position).to_u32() | (table.get(position + 1).to_u32() << 8)
 }
 
 fn string_decomposition_entry(
     data: StringUnicodeData,
-    value: uint32,
-    index: int,
-    code: uint32,
-    length: uint32,
-    type_: uint32,
-) -> Vec[uint32] {
-    let output: Vec[uint32] = Vec::with_capacity(18);
+    value: u32,
+    index: isize,
+    code: u32,
+    length: u32,
+    type_: u32,
+) -> Vec[u32] {
+    let output: Vec[u32] = Vec::with_capacity(18);
     if type_ == 0 {
-        output.push(data.decomposition_table2.get(index).to_uint32());
+        output.push(data.decomposition_table2.get(index).to_u32());
         return output
     } else {};
-    let mut position = data.decomposition_table2.get(index).to_int();
+    let mut position = data.decomposition_table2.get(index).to_isize();
     if type_ >= 1 && type_ <= 7 {
-        let result_length = type_.to_int();
-        position += (value - code).to_int() * result_length * 2;
+        let result_length = type_.to_isize();
+        position += (value - code).to_isize() * result_length * 2;
         let mut result_index = 0;
         while result_index < result_length {
             let result = string_get16(data.decomposition_data, position + result_index * 2);
             if result == 0 {
-                return Vec::[]
+                return Vec::new()
             } else {
                 output.push(result);
             };
             result_index += 1;
         }
     } else if type_ == 8 || type_ == 9 {
-        let result_length = (type_ - 7).to_int();
+        let result_length = (type_ - 7).to_isize();
         let mut result_index = 0;
-        let mut offset = (value - code).to_int() * result_length;
-        let high_position = length.to_int() * result_length * 2;
+        let mut offset = (value - code).to_isize() * result_length;
+        let high_position = length.to_isize() * result_length * 2;
         while result_index < result_length {
             let result = string_get16(data.decomposition_data, position + offset * 2)
-                | (((data.decomposition_data.get(position + high_position + offset / 4).to_uint32()
+                | (((data.decomposition_data.get(position + high_position + offset / 4).to_u32()
                     >> ((offset % 4) * 2))
                     & 3)
                     << 16);
             if result == 0 {
-                return Vec::[]
+                return Vec::new()
             } else {
                 output.push(result);
             };
@@ -418,15 +414,15 @@ fn string_decomposition_entry(
             result_index += 1;
         }
     } else if type_ >= 10 && type_ <= 14 {
-        let result_length = (type_ - 9).to_int();
-        position += (value - code).to_int() * result_length;
+        let result_length = (type_ - 9).to_isize();
+        position += (value - code).to_isize() * result_length;
         let mut result_index = 0;
         while result_index < result_length {
             let result = string_short_code(
-                data.decomposition_data.get(position + result_index).to_uint32(),
+                data.decomposition_data.get(position + result_index).to_u32(),
             );
             if result == 0 {
-                return Vec::[]
+                return Vec::new()
             } else {
                 output.push(result);
             };
@@ -436,12 +432,12 @@ fn string_decomposition_entry(
         let result_length = if type_ == 15 {
             1
         } else {
-            2 + ((type_ - 16) >> 1).to_int()
+            2 + ((type_ - 16) >> 1).to_isize()
         };
         let increment_index = if type_ == 15 {
             0
         } else {
-            ((type_ - 16) & 1).to_int()
+            ((type_ - 16) & 1).to_isize()
                 + if result_length > 2 {
                     1
                 } else {
@@ -461,13 +457,13 @@ fn string_decomposition_entry(
         let result_length = if type_ == 30 {
             18
         } else {
-            (type_ - 21).to_int()
+            (type_ - 21).to_isize()
         };
         let minimum = string_get16(data.decomposition_data, position);
-        position += 2 + (value - code).to_int() * result_length;
+        position += 2 + (value - code).to_isize() * result_length;
         let mut result_index = 0;
         while result_index < result_length {
-            let byte = data.decomposition_data.get(position + result_index).to_uint32();
+            let byte = data.decomposition_data.get(position + result_index).to_u32();
             output.push(
                 if byte == 0xff {
                     0x20
@@ -478,29 +474,29 @@ fn string_decomposition_entry(
             result_index += 1;
         }
     } else if type_ == 31 {
-        position += (value - code).to_int() * 3;
+        position += (value - code).to_isize() * 3;
         let first = string_get16(data.decomposition_data, position);
         if first == 0 {
-            return Vec::[]
+            return Vec::new()
         } else {
             output.push(first);
-            output.push(string_short_code(data.decomposition_data.get(position + 2).to_uint32()));
+            output.push(string_short_code(data.decomposition_data.get(position + 2).to_u32()));
         }
     } else if type_ == 32 {
         output.push(string_get16(data.decomposition_data, position));
         let last = string_get16(data.decomposition_data, position + 2);
-        position += 4 + (value - code).to_int() * 2;
+        position += 4 + (value - code).to_isize() * 2;
         output.push(string_get16(data.decomposition_data, position));
         output.push(last);
     } else if type_ == 33 || type_ == 34 {
         let offset = value - code;
         let mut first = 0;
         if type_ == 33 {
-            position += (offset & 0xfffffffe).to_int();
-            first = string_short_code(data.decomposition_data.get(position).to_uint32());
+            position += (offset & 0xfffffffe).to_isize();
+            first = string_short_code(data.decomposition_data.get(position).to_u32());
             position += 1;
         } else {
-            position += (offset >> 1).to_int() * 3;
+            position += (offset >> 1).to_isize() * 3;
             first = string_get16(data.decomposition_data, position);
             position += 2;
         };
@@ -508,12 +504,12 @@ fn string_decomposition_entry(
             first = string_simple_lower(first);
         } else {};
         output.push(first);
-        output.push(string_short_code(data.decomposition_data.get(position).to_uint32()));
+        output.push(string_short_code(data.decomposition_data.get(position).to_u32()));
     } else {};
     output
 }
 
-fn string_decomposition(data: StringUnicodeData, value: uint32, compatibility: bool) -> Vec[uint32] {
+fn string_decomposition(data: StringUnicodeData, value: u32, compatibility: bool) -> Vec[u32] {
     let mut first = 0;
     let mut last = data.decomposition_table1.len() - 1;
     while first <= last {
@@ -526,18 +522,18 @@ fn string_decomposition(data: StringUnicodeData, value: uint32, compatibility: b
         } else if value >= code + length {
             first = index + 1;
         } else if !compatibility && (entry & 1) == 1 {
-            return Vec::[]
+            return Vec::new()
         } else {
             return string_decomposition_entry(data, value, index, code, length, (entry >> 1) & 0x3f)
         }
     }
-    Vec::[]
+    Vec::new()
 }
 
 fn string_append_decomposed(
     data: StringUnicodeData,
-    output: Vec[uint32],
-    value: uint32,
+    output: Vec[u32],
+    value: u32,
     compatibility: bool,
 ) -> unit {
     if value >= 0xac00 && value < 0xd7a4 {
@@ -560,24 +556,24 @@ fn string_append_decomposed(
     }
 }
 
-fn string_combining_class(data: StringUnicodeData, value: uint32) -> int {
+fn string_combining_class(data: StringUnicodeData, value: u32) -> isize {
     let (mut code, mut position) = match string_index_position(data.combining_class_index, value) {
         Some(value) => value,
         None => return 0,
     };
     while position < data.combining_class_table.len() {
-        let byte = data.combining_class_table.get(position).to_uint32();
+        let byte = data.combining_class_table.get(position).to_u32();
         position += 1;
         let type_ = byte >> 6;
         let mut length = byte & 0x3f;
         if length < 48 {} else if length < 56 {
-            length = ((length - 48) << 8) | data.combining_class_table.get(position).to_uint32();
+            length = ((length - 48) << 8) | data.combining_class_table.get(position).to_u32();
             length += 48;
             position += 1;
         } else {
             length = ((length - 56) << 16)
-                | (data.combining_class_table.get(position).to_uint32() << 8)
-                | data.combining_class_table.get(position + 1).to_uint32();
+                | (data.combining_class_table.get(position).to_u32() << 8)
+                | data.combining_class_table.get(position + 1).to_u32();
             length += 2096;
             position += 2;
         };
@@ -587,8 +583,9 @@ fn string_combining_class(data: StringUnicodeData, value: uint32) -> int {
         let end = code + length + 1;
         if value < end {
             return match type_ {
-                0 => data.combining_class_table.get(position - 1).to_int(),
-                1 => data.combining_class_table.get(position - 1).to_int() + (value - code).to_int(),
+                0 => data.combining_class_table.get(position - 1).to_isize(),
+                1 => data.combining_class_table.get(position - 1).to_isize()
+                    + (value - code).to_isize(),
                 2 => 0,
                 _ => 230,
             }
@@ -599,7 +596,7 @@ fn string_combining_class(data: StringUnicodeData, value: uint32) -> int {
     0
 }
 
-fn string_sort_combining_classes(data: StringUnicodeData, values: Vec[uint32]) -> unit {
+fn string_sort_combining_classes(data: StringUnicodeData, values: Vec[u32]) -> unit {
     let mut index = 0;
     while index < values.len() {
         if string_combining_class(data, values[index]) == 0 {
@@ -623,8 +620,8 @@ fn string_sort_combining_classes(data: StringUnicodeData, values: Vec[uint32]) -
     }
 }
 
-fn string_composition_pair(data: StringUnicodeData, first_value: uint32, second_value: uint32) -> Option[
-    uint32,
+fn string_composition_pair(data: StringUnicodeData, first_value: u32, second_value: u32) -> Option[
+    u32,
 ] {
     if first_value >= 0x1100 && first_value < 0x1113 && second_value >= 0x1161
         && second_value < 0x1176 {
@@ -638,8 +635,8 @@ fn string_composition_pair(data: StringUnicodeData, first_value: uint32, second_
     let mut last = data.composition_table.len() - 1;
     while first <= last {
         let index = first + (last - first) / 2;
-        let decomposition_index = data.composition_table.get(index).to_uint32();
-        let table_index = (decomposition_index >> 6).to_int();
+        let decomposition_index = data.composition_table.get(index).to_u32();
+        let table_index = (decomposition_index >> 6).to_isize();
         let offset = decomposition_index & 0x3f;
         let entry = data.decomposition_table1.get(table_index);
         let code = entry >> 14;
@@ -675,11 +672,11 @@ fn string_composition_pair(data: StringUnicodeData, first_value: uint32, second_
     Option::None
 }
 
-fn string_compose(data: StringUnicodeData, values: Vec[uint32]) -> Vec[uint32] {
+fn string_compose(data: StringUnicodeData, values: Vec[u32]) -> Vec[u32] {
     if values.len() <= 1 {
         return values
     } else {};
-    let output: Vec[uint32] = Vec::with_capacity(values.len());
+    let output: Vec[u32] = Vec::with_capacity(values.len());
     output.push(values[0]);
     let mut index = 1;
     while index < values.len() {
@@ -716,9 +713,7 @@ fn string_compose(data: StringUnicodeData, values: Vec[uint32]) -> Vec[uint32] {
     output
 }
 
-fn string_normalize(data: StringUnicodeData, input: Slice[uint16], form: NormalizationForm) -> Vec[
-    uint16,
-] {
+fn string_normalize(data: StringUnicodeData, input: Slice[u16], form: NormalizationForm) -> Vec[u16] {
     let compatibility = match form {
         NormalizationForm::Nfkc | NormalizationForm::Nfkd => true,
         _ => false,
@@ -727,7 +722,7 @@ fn string_normalize(data: StringUnicodeData, input: Slice[uint16], form: Normali
         NormalizationForm::Nfc | NormalizationForm::Nfkc => true,
         _ => false,
     };
-    let decomposed: Vec[uint32] = Vec::with_capacity(input.len());
+    let decomposed: Vec[u32] = Vec::with_capacity(input.len());
     let mut index = 0;
     while index < input.len() {
         let (value, width) = string_code_point_at(input, index);
@@ -740,15 +735,15 @@ fn string_normalize(data: StringUnicodeData, input: Slice[uint16], form: Normali
     } else {
         decomposed
     };
-    let output: Vec[uint16] = Vec::with_capacity(normalized.len());
+    let output: Vec[u16] = Vec::with_capacity(normalized.len());
     for value in normalized {
         string_append_code_point(output, value)
     }
     output
 }
 
-fn string_code_points(input: Slice[uint16]) -> Vec[uint32] {
-    let output: Vec[uint32] = Vec::with_capacity(input.len());
+fn string_code_points(input: Slice[u16]) -> Vec[u32] {
+    let output: Vec[u32] = Vec::with_capacity(input.len());
     let mut index = 0;
     while index < input.len() {
         let (value, width) = string_code_point_at(input, index);
@@ -763,21 +758,19 @@ impl StringUnicode {
         StringUnicode { data: string_unicode_data() }
     }
 
-    pub fn lowercase(self: StringUnicode, input: Slice[uint16]) -> Vec[uint16] {
+    pub fn lowercase(self: StringUnicode, input: Slice[u16]) -> Vec[u16] {
         string_change_case(self.data, input, true)
     }
 
-    pub fn uppercase(self: StringUnicode, input: Slice[uint16]) -> Vec[uint16] {
+    pub fn uppercase(self: StringUnicode, input: Slice[u16]) -> Vec[u16] {
         string_change_case(self.data, input, false)
     }
 
-    pub fn normalize(self: StringUnicode, input: Slice[uint16], form: NormalizationForm) -> Vec[
-        uint16,
-    ] {
+    pub fn normalize(self: StringUnicode, input: Slice[u16], form: NormalizationForm) -> Vec[u16] {
         string_normalize(self.data, input, form)
     }
 
-    pub fn locale_compare(self: StringUnicode, left: Slice[uint16], right: Slice[uint16]) -> int {
+    pub fn locale_compare(self: StringUnicode, left: Slice[u16], right: Slice[u16]) -> isize {
         let left_units = string_normalize(self.data, left, NormalizationForm::Nfc);
         let right_units = string_normalize(self.data, right, NormalizationForm::Nfc);
         let left_points = string_code_points(left_units.slice(0, left_units.len()));
@@ -790,7 +783,7 @@ impl StringUnicode {
         let mut index = 0;
         while index < length {
             if left_points[index] != right_points[index] {
-                return left_points[index].to_int() - right_points[index].to_int()
+                return left_points[index].to_isize() - right_points[index].to_isize()
             } else {
                 index += 1;
             }

@@ -2,20 +2,20 @@ package bigint;
 
 use std::text;
 
-const MAX_SHIFT: int = 100000000;
+const MAX_SHIFT: isize = 100000000;
 
 #[derive(PartialEq, Eq, Debug)]
 pub enum BigIntError {
-    InvalidRadix(int),
+    InvalidRadix(isize),
     EmptyInput,
     InvalidDigit {
-        offset: int,
+        offset: isize,
         value: byte,
-        radix: int,
+        radix: isize,
     },
     DivisionByZero,
-    NegativeExponent(int),
-    ShiftTooLarge(int),
+    NegativeExponent(isize),
+    ShiftTooLarge(isize),
 }
 
 impl ToString for BigIntError {
@@ -41,10 +41,10 @@ impl ToString for BigIntError {
 
 pub struct BigInteger {
     negative_value: bool,
-    limbs_value: Vec[uint32],
+    limbs_value: Vec[u32],
 }
 
-fn clone_limbs(value: Vec[uint32]) -> Vec[uint32] {
+fn clone_limbs(value: Vec[u32]) -> Vec[u32] {
     let result = Vec::with_capacity(value.len());
     let mut index = 0;
     while index < value.len() {
@@ -54,7 +54,7 @@ fn clone_limbs(value: Vec[uint32]) -> Vec[uint32] {
     result
 }
 
-fn normalize_limbs(value: Vec[uint32]) -> unit {
+fn normalize_limbs(value: Vec[u32]) -> unit {
     let mut length = value.len();
     while length > 1 && value[length - 1] == 0 {
         length -= 1;
@@ -66,16 +66,16 @@ fn normalize_limbs(value: Vec[uint32]) -> unit {
     }
 }
 
-fn limbs_are_zero(value: Vec[uint32]) -> bool {
+fn limbs_are_zero(value: Vec[u32]) -> bool {
     value.len() == 1 && value[0] == 0
 }
 
-fn make_owned(negative: bool, limbs: Vec[uint32]) -> BigInteger {
+fn make_owned(negative: bool, limbs: Vec[u32]) -> BigInteger {
     normalize_limbs(limbs);
     BigInteger { negative_value: negative && !limbs_are_zero(limbs), limbs_value: limbs }
 }
 
-fn make_copy(negative: bool, limbs: Vec[uint32]) -> BigInteger {
+fn make_copy(negative: bool, limbs: Vec[u32]) -> BigInteger {
     make_owned(negative, clone_limbs(limbs))
 }
 
@@ -83,7 +83,7 @@ fn copy_big(value: BigInteger) -> BigInteger {
     make_copy(value.negative_value, value.limbs_value)
 }
 
-fn magnitude_compare(left: Vec[uint32], right: Vec[uint32]) -> int {
+fn magnitude_compare(left: Vec[u32], right: Vec[u32]) -> isize {
     if left.len() < right.len() {
         return -1
     } else if left.len() > right.len() {
@@ -102,55 +102,55 @@ fn magnitude_compare(left: Vec[uint32], right: Vec[uint32]) -> int {
     0
 }
 
-fn magnitude_add(left: Vec[uint32], right: Vec[uint32]) -> Vec[uint32] {
+fn magnitude_add(left: Vec[u32], right: Vec[u32]) -> Vec[u32] {
     let length = if left.len() > right.len() {
         left.len()
     } else {
         right.len()
     };
     let result = Vec::with_capacity(length + 1);
-    let mut carry = 0.to_uint64();
+    let mut carry = 0.to_u64();
     let mut index = 0;
     while index < length {
         let left_limb = if index < left.len() {
-            left[index].to_uint64()
+            left[index].to_u64()
         } else {
-            0.to_uint64()
+            0.to_u64()
         };
         let right_limb = if index < right.len() {
-            right[index].to_uint64()
+            right[index].to_u64()
         } else {
-            0.to_uint64()
+            0.to_u64()
         };
         let sum = left_limb + right_limb + carry;
-        result.push((sum & 0xffffffff).to_uint32());
+        result.push((sum & 0xffffffff).to_u32());
         carry = sum >> 32;
         index += 1;
     }
     if carry != 0 {
-        result.push(carry.to_uint32());
+        result.push(carry.to_u32());
     } else {};
     result
 }
 
-fn magnitude_subtract(left: Vec[uint32], right: Vec[uint32]) -> Vec[uint32] {
+fn magnitude_subtract(left: Vec[u32], right: Vec[u32]) -> Vec[u32] {
     let result = Vec::with_capacity(left.len());
-    let base = 1.to_uint64() << 32;
-    let mut borrow = 0.to_uint64();
+    let base = 1.to_u64() << 32;
+    let mut borrow = 0.to_u64();
     let mut index = 0;
     while index < left.len() {
-        let left_limb = left[index].to_uint64();
+        let left_limb = left[index].to_u64();
         let right_limb = if index < right.len() {
-            right[index].to_uint64()
+            right[index].to_u64()
         } else {
-            0.to_uint64()
+            0.to_u64()
         };
         let subtrahend = right_limb + borrow;
         if left_limb >= subtrahend {
-            result.push((left_limb - subtrahend).to_uint32());
+            result.push((left_limb - subtrahend).to_u32());
             borrow = 0;
         } else {
-            result.push((base + left_limb - subtrahend).to_uint32());
+            result.push((base + left_limb - subtrahend).to_u32());
             borrow = 1;
         };
         index += 1;
@@ -159,11 +159,11 @@ fn magnitude_subtract(left: Vec[uint32], right: Vec[uint32]) -> Vec[uint32] {
     result
 }
 
-fn magnitude_multiply(left: Vec[uint32], right: Vec[uint32]) -> Vec[uint32] {
+fn magnitude_multiply(left: Vec[u32], right: Vec[u32]) -> Vec[u32] {
     if limbs_are_zero(left) || limbs_are_zero(right) {
-        return Vec::[0]
+        return Vec::from_array([0])
     } else {};
-    let result: Vec[uint32] = Vec::with_capacity(left.len() + right.len());
+    let result: Vec[u32] = Vec::with_capacity(left.len() + right.len());
     let mut fill = 0;
     while fill < left.len() + right.len() {
         result.push(0);
@@ -171,74 +171,74 @@ fn magnitude_multiply(left: Vec[uint32], right: Vec[uint32]) -> Vec[uint32] {
     }
     let mut left_index = 0;
     while left_index < left.len() {
-        let mut carry = 0.to_uint64();
+        let mut carry = 0.to_u64();
         let mut right_index = 0;
         while right_index < right.len() {
             let offset = left_index + right_index;
-            let product = left[left_index].to_uint64() * right[right_index].to_uint64()
-                + result[offset].to_uint64()
+            let product = left[left_index].to_u64() * right[right_index].to_u64()
+                + result[offset].to_u64()
                 + carry;
-            result[offset] = (product & 0xffffffff).to_uint32();
+            result[offset] = (product & 0xffffffff).to_u32();
             carry = product >> 32;
             right_index += 1;
         }
-        result[left_index + right.len()] = carry.to_uint32();
+        result[left_index + right.len()] = carry.to_u32();
         left_index += 1;
     }
     normalize_limbs(result);
     result
 }
 
-fn magnitude_multiply_small(value: Vec[uint32], factor: uint32) -> unit {
+fn magnitude_multiply_small(value: Vec[u32], factor: u32) -> unit {
     if factor == 0 {
         value.truncate(1);
         value[0] = 0;
         return
     } else {};
-    let mut carry = 0.to_uint64();
+    let mut carry = 0.to_u64();
     let mut index = 0;
     while index < value.len() {
-        let product = value[index].to_uint64() * factor.to_uint64() + carry;
-        value[index] = (product & 0xffffffff).to_uint32();
+        let product = value[index].to_u64() * factor.to_u64() + carry;
+        value[index] = (product & 0xffffffff).to_u32();
         carry = product >> 32;
         index += 1;
     }
     if carry != 0 {
-        value.push(carry.to_uint32());
+        value.push(carry.to_u32());
     } else {}
 }
 
-fn magnitude_add_small(value: Vec[uint32], addend: uint32) -> unit {
-    let mut carry = addend.to_uint64();
+fn magnitude_add_small(value: Vec[u32], addend: u32) -> unit {
+    let mut carry = addend.to_u64();
     let mut index = 0;
     while carry != 0 {
         if index == value.len() {
-            value.push(carry.to_uint32());
+            value.push(carry.to_u32());
             carry = 0;
         } else {
-            let sum = value[index].to_uint64() + carry;
-            value[index] = (sum & 0xffffffff).to_uint32();
+            let sum = value[index].to_u64() + carry;
+            value[index] = (sum & 0xffffffff).to_u32();
             carry = sum >> 32;
             index += 1;
         }
     }
 }
 
-fn magnitude_divide_small(value: Vec[uint32], divisor: uint32) -> uint32 {
-    let mut remainder = 0.to_uint64();
+fn magnitude_divide_small(value: Vec[u32], divisor: u32) -> u32 {
+    let mut remainder = 0.to_u64();
     let mut index = value.len();
     while index > 0 {
         let offset = index - 1;
-        let current = (remainder << 32) | value[offset].to_uint64();
-        value[offset] = (current / divisor.to_uint64()).to_uint32();
-        remainder = current % divisor.to_uint64();
+        let current = (remainder << 32) | value[offset].to_u64();
+        value[offset] = (current / divisor.to_u64()).to_u32();
+        remainder = current % divisor.to_u64();
         index -= 1;
     }
     normalize_limbs(value);
-    remainder.to_uint32()
+    remainder.to_u32()
 }
 
-fn uint32_bit_length(value: uint32) -> int {
+fn uint32_bit_length(value: u32) -> isize {
     let mut remaining = value;
     let mut result = 0;
     while remaining != 0 {
@@ -248,7 +248,7 @@ fn uint32_bit_length(value: uint32) -> int {
     result
 }
 
-fn magnitude_bit_length(value: Vec[uint32]) -> int {
+fn magnitude_bit_length(value: Vec[u32]) -> isize {
     if limbs_are_zero(value) {
         0
     } else {
@@ -256,7 +256,7 @@ fn magnitude_bit_length(value: Vec[uint32]) -> int {
     }
 }
 
-fn magnitude_shift_left(value: Vec[uint32], count: int) -> Vec[uint32] {
+fn magnitude_shift_left(value: Vec[u32], count: isize) -> Vec[u32] {
     if count == 0 || limbs_are_zero(value) {
         return clone_limbs(value)
     } else {};
@@ -268,28 +268,28 @@ fn magnitude_shift_left(value: Vec[uint32], count: int) -> Vec[uint32] {
         result.push(0);
         index += 1;
     }
-    let mut carry = 0.to_uint64();
+    let mut carry = 0.to_u64();
     index = 0;
     while index < value.len() {
-        let shifted = (value[index].to_uint64() << bit_count) | carry;
-        result.push((shifted & 0xffffffff).to_uint32());
+        let shifted = (value[index].to_u64() << bit_count) | carry;
+        result.push((shifted & 0xffffffff).to_u32());
         carry = shifted >> 32;
         index += 1;
     }
     if carry != 0 {
-        result.push(carry.to_uint32());
+        result.push(carry.to_u32());
     } else {};
     result
 }
 
-fn magnitude_shift_right(value: Vec[uint32], count: int) -> Vec[uint32] {
+fn magnitude_shift_right(value: Vec[u32], count: isize) -> Vec[u32] {
     if count == 0 {
         return clone_limbs(value)
     } else {};
     let word_count = count / 32;
     let bit_count = count % 32;
     if word_count >= value.len() {
-        return Vec::[0]
+        return Vec::from_array([0])
     } else {};
     let result = Vec::with_capacity(value.len() - word_count);
     let mut index = word_count;
@@ -305,7 +305,7 @@ fn magnitude_shift_right(value: Vec[uint32], count: int) -> Vec[uint32] {
     result
 }
 
-fn magnitude_has_discarded_bits(value: Vec[uint32], count: int) -> bool {
+fn magnitude_has_discarded_bits(value: Vec[u32], count: isize) -> bool {
     let word_count = count / 32;
     let bit_count = count % 32;
     if word_count >= value.len() {
@@ -318,23 +318,23 @@ fn magnitude_has_discarded_bits(value: Vec[uint32], count: int) -> bool {
         } else {};
         index += 1;
     }
-    bit_count != 0 && value[word_count] & ((1.to_uint32() << bit_count) - 1) != 0
+    bit_count != 0 && value[word_count] & ((1.to_u32() << bit_count) - 1) != 0
 }
 
-fn magnitude_set_bit(value: Vec[uint32], bit: int) -> unit {
+fn magnitude_set_bit(value: Vec[u32], bit: isize) -> unit {
     let word = bit / 32;
     while value.len() <= word {
         value.push(0);
     }
-    value[word] |= 1.to_uint32() << (bit % 32);
+    value[word] |= 1.to_u32() << (bit % 32);
 }
 
-fn magnitude_div_rem(numerator: Vec[uint32], denominator: Vec[uint32]) -> (Vec[uint32], Vec[uint32]) {
+fn magnitude_div_rem(numerator: Vec[u32], denominator: Vec[u32]) -> (Vec[u32], Vec[u32]) {
     if magnitude_compare(numerator, denominator) < 0 {
-        return (Vec::[0], clone_limbs(numerator))
+        return (Vec::from_array([0]), clone_limbs(numerator))
     } else {};
     let mut remainder = clone_limbs(numerator);
-    let quotient = Vec::[0];
+    let quotient = Vec::from_array([0]);
     let mut shift = magnitude_bit_length(numerator) - magnitude_bit_length(denominator);
     let mut shifted = magnitude_shift_left(denominator, shift);
     while shift >= 0 {
@@ -351,34 +351,34 @@ fn magnitude_div_rem(numerator: Vec[uint32], denominator: Vec[uint32]) -> (Vec[u
     (quotient, remainder)
 }
 
-fn digit_value(value: byte) -> Option[int] {
+fn digit_value(value: byte) -> Option[isize] {
     if value >= b'0' && value <= b'9' {
-        Option::Some((value - b'0').to_int())
+        Option::Some((value - b'0').to_isize())
     } else if value >= b'a' && value <= b'z' {
-        Option::Some((value - b'a' + 10).to_int())
+        Option::Some((value - b'a' + 10).to_isize())
     } else if value >= b'A' && value <= b'Z' {
-        Option::Some((value - b'A' + 10).to_int())
+        Option::Some((value - b'A' + 10).to_isize())
     } else {
         Option::None
     }
 }
 
-fn digit_byte(value: uint32) -> byte {
+fn digit_byte(value: u32) -> byte {
     if value < 10 {
-        (value + 48).to_uint8()
+        (value + 48).to_u8()
     } else {
-        (value + 87).to_uint8()
+        (value + 87).to_u8()
     }
 }
 
-fn unsigned_to_string(value: Vec[uint32], radix: int) -> string {
+fn unsigned_to_string(value: Vec[u32], radix: isize) -> string {
     if limbs_are_zero(value) {
         return "0"
     } else {};
     let remaining = clone_limbs(value);
-    let reversed: Vec[byte] = Vec::[];
+    let reversed: Vec[byte] = Vec::new();
     while !limbs_are_zero(remaining) {
-        reversed.push(digit_byte(magnitude_divide_small(remaining, radix.to_uint32())));
+        reversed.push(digit_byte(magnitude_divide_small(remaining, radix.to_u32())));
     }
     let builder = text::StringBuilder::with_capacity(reversed.len());
     let mut index = reversed.len();
@@ -389,7 +389,7 @@ fn unsigned_to_string(value: Vec[uint32], radix: int) -> string {
     builder.finish()
 }
 
-fn twos_complement(value: BigInteger, width: int) -> Vec[uint32] {
+fn twos_complement(value: BigInteger, width: isize) -> Vec[u32] {
     let result = Vec::with_capacity(width);
     let mut index = 0;
     while index < width {
@@ -403,11 +403,11 @@ fn twos_complement(value: BigInteger, width: int) -> Vec[uint32] {
         index += 1;
     }
     if value.negative_value {
-        let mut carry = 1.to_uint64();
+        let mut carry = 1.to_u64();
         index = 0;
         while index < result.len() {
-            let converted = (~result[index]).to_uint64() + carry;
-            result[index] = (converted & 0xffffffff).to_uint32();
+            let converted = (~result[index]).to_u64() + carry;
+            result[index] = (converted & 0xffffffff).to_u32();
             carry = converted >> 32;
             index += 1;
         }
@@ -415,17 +415,17 @@ fn twos_complement(value: BigInteger, width: int) -> Vec[uint32] {
     result
 }
 
-fn from_twos_complement(value: Vec[uint32]) -> BigInteger {
+fn from_twos_complement(value: Vec[u32]) -> BigInteger {
     let negative = value[value.len() - 1] & 0x80000000 != 0;
     if !negative {
         make_owned(false, value)
     } else {
         let magnitude = Vec::with_capacity(value.len());
-        let mut carry = 1.to_uint64();
+        let mut carry = 1.to_u64();
         let mut index = 0;
         while index < value.len() {
-            let converted = (~value[index]).to_uint64() + carry;
-            magnitude.push((converted & 0xffffffff).to_uint32());
+            let converted = (~value[index]).to_u64() + carry;
+            magnitude.push((converted & 0xffffffff).to_u32());
             carry = converted >> 32;
             index += 1;
         }
@@ -433,7 +433,7 @@ fn from_twos_complement(value: Vec[uint32]) -> BigInteger {
     }
 }
 
-fn bitwise_width(left: BigInteger, right: BigInteger) -> int {
+fn bitwise_width(left: BigInteger, right: BigInteger) -> isize {
     let maximum = if left.limbs_value.len() > right.limbs_value.len() {
         left.limbs_value.len()
     } else {
@@ -442,7 +442,7 @@ fn bitwise_width(left: BigInteger, right: BigInteger) -> int {
     maximum + 1
 }
 
-fn validate_shift(count: int) -> Result[int, BigIntError] {
+fn validate_shift(count: isize) -> Result[isize, BigIntError] {
     if count < -MAX_SHIFT || count > MAX_SHIFT {
         Result::Err(BigIntError::ShiftTooLarge(count))
     } else if count < 0 {
@@ -452,7 +452,7 @@ fn validate_shift(count: int) -> Result[int, BigIntError] {
     }
 }
 
-pub fn parse_radix(value: string, radix: int) -> Result[BigInteger, BigIntError] {
+pub fn parse_radix(value: string, radix: isize) -> Result[BigInteger, BigIntError] {
     if radix < 2 || radix > 36 {
         return Result::Err(BigIntError::InvalidRadix(radix))
     } else {};
@@ -465,7 +465,7 @@ pub fn parse_radix(value: string, radix: int) -> Result[BigInteger, BigIntError]
     if index == value.byte_len() {
         return Result::Err(BigIntError::EmptyInput)
     } else {};
-    let limbs = Vec::[0];
+    let limbs = Vec::from_array([0]);
     while index < value.byte_len() {
         let current = value.byte_get(index);
         let digit = match digit_value(current) {
@@ -479,8 +479,8 @@ pub fn parse_radix(value: string, radix: int) -> Result[BigInteger, BigIntError]
         if digit >= radix {
             return Result::Err(BigIntError::InvalidDigit { offset: index, value: current, radix })
         } else {};
-        magnitude_multiply_small(limbs, radix.to_uint32());
-        magnitude_add_small(limbs, digit.to_uint32());
+        magnitude_multiply_small(limbs, radix.to_u32());
+        magnitude_add_small(limbs, digit.to_u32());
         index += 1;
     }
     Result::Ok(make_owned(negative, limbs))
@@ -492,34 +492,34 @@ pub fn parse(value: string) -> Result[BigInteger, BigIntError] {
 
 impl BigInteger {
     pub fn zero() -> BigInteger {
-        make_owned(false, Vec::[0])
+        make_owned(false, Vec::from_array([0]))
     }
 
     pub fn one() -> BigInteger {
-        make_owned(false, Vec::[1])
+        make_owned(false, Vec::from_array([1]))
     }
 
-    pub fn from_uint64(value: uint64) -> BigInteger {
-        let limbs = Vec::[(value & 0xffffffff).to_uint32()];
-        let high = (value >> 32).to_uint32();
+    pub fn from_uint64(value: u64) -> BigInteger {
+        let limbs = Vec::from_array([(value & 0xffffffff).to_u32()]);
+        let high = (value >> 32).to_u32();
         if high != 0 {
             limbs.push(high);
         } else {};
         make_owned(false, limbs)
     }
 
-    pub fn from_int64(value: int64) -> BigInteger {
+    pub fn from_int64(value: i64) -> BigInteger {
         let negative = value < 0;
         let magnitude = if negative {
-            (-(value + 1)).to_uint64() + 1
+            (-(value + 1)).to_u64() + 1
         } else {
-            value.to_uint64()
+            value.to_u64()
         };
         let result = BigInteger::from_uint64(magnitude);
         make_copy(negative, result.limbs_value)
     }
 
-    pub fn from_parts(negative: bool, limbs: Vec[uint32]) -> BigInteger {
+    pub fn from_parts(negative: bool, limbs: Vec[u32]) -> BigInteger {
         make_copy(negative, limbs)
     }
 
@@ -527,7 +527,7 @@ impl BigInteger {
         parse(value)
     }
 
-    pub fn parse_radix(value: string, radix: int) -> Result[BigInteger, BigIntError] {
+    pub fn parse_radix(value: string, radix: isize) -> Result[BigInteger, BigIntError] {
         parse_radix(value, radix)
     }
 
@@ -539,7 +539,7 @@ impl BigInteger {
         self.negative_value
     }
 
-    pub fn signum(self: BigInteger) -> int {
+    pub fn signum(self: BigInteger) -> isize {
         if self.is_zero() {
             0
         } else if self.negative_value {
@@ -549,15 +549,15 @@ impl BigInteger {
         }
     }
 
-    pub fn limbs(self: BigInteger) -> Vec[uint32] {
+    pub fn limbs(self: BigInteger) -> Vec[u32] {
         clone_limbs(self.limbs_value)
     }
 
-    pub fn limb_count(self: BigInteger) -> int {
+    pub fn limb_count(self: BigInteger) -> isize {
         self.limbs_value.len()
     }
 
-    pub fn bit_length(self: BigInteger) -> int {
+    pub fn bit_length(self: BigInteger) -> isize {
         magnitude_bit_length(self.limbs_value)
     }
 
@@ -573,7 +573,7 @@ impl BigInteger {
         make_copy(!self.negative_value, self.limbs_value)
     }
 
-    pub fn compare(self: BigInteger, other: BigInteger) -> int {
+    pub fn compare(self: BigInteger, other: BigInteger) -> isize {
         if self.negative_value && !other.negative_value {
             -1
         } else if !self.negative_value && other.negative_value {
@@ -646,7 +646,7 @@ impl BigInteger {
         Result::Ok(remainder)
     }
 
-    pub fn pow(self: BigInteger, exponent: int) -> Result[BigInteger, BigIntError] {
+    pub fn pow(self: BigInteger, exponent: isize) -> Result[BigInteger, BigIntError] {
         if exponent < 0 {
             return Result::Err(BigIntError::NegativeExponent(exponent))
         } else {};
@@ -716,7 +716,7 @@ impl BigInteger {
         from_twos_complement(result)
     }
 
-    pub fn shift_left(self: BigInteger, count: int) -> Result[BigInteger, BigIntError] {
+    pub fn shift_left(self: BigInteger, count: isize) -> Result[BigInteger, BigIntError] {
         let magnitude = validate_shift(count)?;
         if count < 0 {
             self.shift_right(magnitude)
@@ -727,7 +727,7 @@ impl BigInteger {
         }
     }
 
-    pub fn shift_right(self: BigInteger, count: int) -> Result[BigInteger, BigIntError] {
+    pub fn shift_right(self: BigInteger, count: isize) -> Result[BigInteger, BigIntError] {
         let magnitude = validate_shift(count)?;
         if count < 0 {
             self.shift_left(magnitude)
@@ -743,7 +743,7 @@ impl BigInteger {
         }
     }
 
-    pub fn to_string_radix(self: BigInteger, radix: int) -> Result[string, BigIntError] {
+    pub fn to_string_radix(self: BigInteger, radix: isize) -> Result[string, BigIntError] {
         if radix < 2 || radix > 36 {
             return Result::Err(BigIntError::InvalidRadix(radix))
         } else {};
