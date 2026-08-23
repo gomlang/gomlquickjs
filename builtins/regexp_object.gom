@@ -35,6 +35,38 @@ struct RegExpInstall {
     states: HashMap[runtime::ObjectId, RegExpState],
 }
 
+struct RegExpConstructorInput {
+    pattern: runtime::JsString,
+    flags: runtime::Value,
+}
+
+fn regexp_with_root[T](
+    context: vm::Context,
+    value: runtime::Value,
+    callback: () -> Result[T, vm::VmError],
+) -> Result[T, vm::VmError] {
+    let root = Ref::new(value);
+    context.add_external_root(root);
+    let result = callback();
+    let _ = context.remove_external_root(root);
+    result
+}
+
+fn regexp_gc_edges(heap: runtime::Heap, states: HashMap[runtime::ObjectId, RegExpState]) -> Vec[
+    runtime::GcEdge,
+] {
+    let stale: Vec[runtime::ObjectId] = Vec::new();
+    for (object, _) in states.entries() {
+        if !heap.contains(object) {
+            stale.push(object)
+        } else {}
+    }
+    for object in stale {
+        let _ = states.remove(object);
+    }
+    Vec::new()
+}
+
 fn regexp_compile_error(value: regexp::RegexError) -> vm::NativeError {
     native_error(
         "SyntaxError: invalid regular expression at UTF-16 offset " + value.offset.to_string()
@@ -190,87 +222,270 @@ fn define_regexp_instance(heap: runtime::Heap, object: runtime::ObjectId, state:
     )
 }
 
-fn regexp_argument_pattern(
-    heap: runtime::Heap,
+fn regexp_is_regexp_at_depth(
+    context: vm::Context,
     states: HashMap[runtime::ObjectId, RegExpState],
     value: runtime::Value,
-) -> Result[(runtime::JsString, Option[runtime::ObjectId]), vm::NativeError] {
-    match value {
-        runtime::Value::Undefined => Result::Ok((js_string(""), Option::None)),
-        runtime::Value::Object(object) => match states.get(object) {
-            Some(state) => Result::Ok((state.pattern, Option::Some(object))),
-            None => Result::Ok((value_string(heap, value)?, Option::None)),
+    depth: isize,
+) -> Result[bool, vm::VmError] {
+    let object = match value {
+        runtime::Value::Object(value) => value,
+        _ => return Result::Ok(false),
+    };
+    match context.well_known_symbol(vm::WellKnownSymbolKind::Match) {
+        Some(symbol) => match context.read_property_at_depth(
+            value,
+            runtime::Value::Symbol(symbol),
+            depth,
+        )? {
+            runtime::Value::Undefined => (),
+            result => return Result::Ok(runtime::to_boolean(result)),
         },
-        _ => Result::Ok((value_string(heap, value)?, Option::None)),
-    }
+        None => (),
+    };
+    Result::Ok(states.get(object).is_some())
 }
 
-fn regexp_argument_flags(
-    heap: runtime::Heap,
+fn regexp_constructor_input_at_depth(
+    context: vm::Context,
     states: HashMap[runtime::ObjectId, RegExpState],
-    source_object: Option[runtime::ObjectId],
     arguments: Vec[runtime::Value],
-) -> Result[runtime::JsString, vm::NativeError] {
-    match argument(arguments, 1) {
-        runtime::Value::Undefined => match source_object {
-            Some(object) => match states.get(object) {
-                Some(state) => Result::Ok(state.flags),
-                None => Result::Ok(js_string("")),
+    is_regexp: bool,
+    depth: isize,
+) -> Result[RegExpConstructorInput, vm::VmError] {
+    let value = argument(arguments, 0);
+    let requested_flags = argument(arguments, 1);
+    let state = match value {
+        runtime::Value::Object(object) => states.get(object),
+        _ => Option::None,
+    };
+    let (pattern_value, flags_value) = match state {
+        Some(state) => (
+            runtime::Value::String(state.pattern),
+            match requested_flags {
+                runtime::Value::Undefined => runtime::Value::String(state.flags),
+                value => value,
             },
-            None => Result::Ok(js_string("")),
+        ),
+        None => if is_regexp {
+            let pattern_value = context.read_property_at_depth(
+                value,
+                runtime::Value::String(js_string("source")),
+                depth,
+            )?;
+            let flags_value = regexp_with_root(
+                context,
+                pattern_value,
+                || match requested_flags {
+                    runtime::Value::Undefined => context.read_property_at_depth(
+                        value,
+                        runtime::Value::String(js_string("flags")),
+                        depth,
+                    ),
+                    value => Result::Ok(value),
+                },
+            )?;
+            (pattern_value, flags_value)
+        } else {
+            (
+                match value {
+                    runtime::Value::Undefined => runtime::Value::String(js_string("")),
+                    value => value,
+                },
+                requested_flags,
+            )
         },
-        value => value_string(heap, value),
+    };
+    let pattern_value = match pattern_value {
+        runtime::Value::Undefined => runtime::Value::String(js_string("")),
+        value => value,
+    };
+    let converted_pattern = regexp_with_root(
+        context,
+        flags_value,
+        || string_value_at_depth(context, pattern_value, depth),
+    )?;
+    let pattern = match converted_pattern {
+        runtime::Value::String(value) => value,
+        _ => return Result::Err(function_vm_error("RegExp pattern is not a string")),
+    };
+    Result::Ok(RegExpConstructorInput { pattern, flags: flags_value })
+}
+
+fn regexp_constructor_prepare_at_depth(
+    context: vm::Context,
+    states: HashMap[runtime::ObjectId, RegExpState],
+    arguments: Vec[runtime::Value],
+    depth: isize,
+) -> Result[Vec[runtime::Value], vm::VmError] {
+    let is_regexp = regexp_is_regexp_at_depth(context, states, argument(arguments, 0), depth)?;
+    let input = regexp_constructor_input_at_depth(context, states, arguments, is_regexp, depth)?;
+    Result::Ok(Vec::from_array([runtime::Value::String(input.pattern), input.flags]))
+}
+
+fn regexp_flags_at_constructor_depth(context: vm::Context, value: runtime::Value, depth: isize) -> Result[
+    runtime::JsString,
+    vm::VmError,
+] {
+    match value {
+        runtime::Value::Undefined => Result::Ok(js_string("")),
+        value => match string_value_at_depth(context, value, depth)? {
+            runtime::Value::String(value) => Result::Ok(value),
+            _ => Result::Err(function_vm_error("RegExp flags are not a string")),
+        },
     }
 }
 
-fn regexp_construct(
-    heap: runtime::Heap,
+fn regexp_prepared_state_at_depth(
+    context: vm::Context,
+    arguments: Vec[runtime::Value],
+    depth: isize,
+) -> Result[RegExpState, vm::VmError] {
+    let pattern = match argument(arguments, 0) {
+        runtime::Value::String(value) => value,
+        _ => return Result::Err(function_vm_error("RegExp pattern is not prepared")),
+    };
+    let flags = regexp_flags_at_constructor_depth(context, argument(arguments, 1), depth)?;
+    match new_regexp_state(pattern, flags) {
+        Ok(value) => Result::Ok(value),
+        Err(value) => Result::Err(function_native_error(value)),
+    }
+}
+
+fn regexp_initialize_instance_at_depth(
+    context: vm::Context,
+    states: HashMap[runtime::ObjectId, RegExpState],
+    object: runtime::ObjectId,
+    arguments: Vec[runtime::Value],
+    depth: isize,
+) -> Result[runtime::Value, vm::VmError] {
+    regexp_with_root(
+        context,
+        runtime::Value::Object(object),
+        || regexp_initialize_rooted_instance_at_depth(context, states, object, arguments, depth),
+    )
+}
+
+fn regexp_initialize_rooted_instance_at_depth(
+    context: vm::Context,
+    states: HashMap[runtime::ObjectId, RegExpState],
+    object: runtime::ObjectId,
+    arguments: Vec[runtime::Value],
+    depth: isize,
+) -> Result[runtime::Value, vm::VmError] {
+    let state = regexp_prepared_state_at_depth(context, arguments, depth)?;
+    match define_regexp_instance(context.heap(), object, state) {
+        Ok(()) => (),
+        Err(value) => return Result::Err(function_native_error(value)),
+    };
+    states[object] = state;
+    if context.set_object_builtin_tag(object, js_string("RegExp")) {
+        Result::Ok(runtime::Value::Object(object))
+    } else {
+        Result::Err(function_vm_error("cannot register RegExp instance"))
+    }
+}
+
+fn regexp_allocate_instance_at_depth(
+    context: vm::Context,
     states: HashMap[runtime::ObjectId, RegExpState],
     prototype: runtime::ObjectId,
-    this_value: runtime::Value,
     arguments: Vec[runtime::Value],
-) -> Result[runtime::Value, vm::NativeError] {
-    let _ = this_value;
-    let (pattern, source_object) = regexp_argument_pattern(heap, states, argument(arguments, 0))?;
-    if source_object.is_some()
+    depth: isize,
+) -> Result[runtime::Value, vm::VmError] {
+    let object = match allocate_ordinary(context.heap(), Option::Some(prototype)) {
+        Ok(value) => value,
+        Err(value) => return Result::Err(function_native_error(value)),
+    };
+    regexp_initialize_instance_at_depth(context, states, object, arguments, depth)
+}
+
+fn regexp_constructor_call_at_depth(
+    context: vm::Context,
+    states: HashMap[runtime::ObjectId, RegExpState],
+    prototype: runtime::ObjectId,
+    constructor: runtime::Value,
+    arguments: Vec[runtime::Value],
+    depth: isize,
+) -> Result[runtime::Value, vm::VmError] {
+    let value = argument(arguments, 0);
+    let is_regexp = regexp_is_regexp_at_depth(context, states, value, depth)?;
+    if is_regexp
         && match argument(arguments, 1) {
             runtime::Value::Undefined => true,
             _ => false,
         } {
-        return Result::Ok(runtime::Value::Object(source_object.unwrap_or(prototype)))
+        let pattern_constructor = context.read_property_at_depth(
+            value,
+            runtime::Value::String(js_string("constructor")),
+            depth,
+        )?;
+        if runtime::same_value(pattern_constructor, constructor) {
+            return Result::Ok(value)
+        } else {}
     } else {};
-    let flags = regexp_argument_flags(heap, states, source_object, arguments)?;
-    let state = new_regexp_state(pattern, flags)?;
-    let object = allocate_ordinary(heap, Option::Some(prototype))?;
-    define_regexp_instance(heap, object, state)?;
-    states[object] = state;
-    Result::Ok(runtime::Value::Object(object))
+    let input = regexp_constructor_input_at_depth(context, states, arguments, is_regexp, depth)?;
+    regexp_allocate_instance_at_depth(
+        context,
+        states,
+        prototype,
+        Vec::from_array([runtime::Value::String(input.pattern), input.flags]),
+        depth,
+    )
 }
 
-fn regexp_compile_instance(
-    heap: runtime::Heap,
+fn regexp_compile_instance_at_depth(
+    context: vm::Context,
     states: HashMap[runtime::ObjectId, RegExpState],
     this_value: runtime::Value,
     arguments: Vec[runtime::Value],
-) -> Result[runtime::Value, vm::NativeError] {
-    let (object, _) = regexp_state(states, this_value)?;
-    let (pattern, source_object) = regexp_argument_pattern(heap, states, argument(arguments, 0))?;
-    if source_object.is_some()
-        && match argument(arguments, 1) {
-            runtime::Value::Undefined => false,
-            _ => true,
-        } {
-        return Result::Err(native_error("TypeError: flags must be undefined"))
-    } else {};
-    let flags = regexp_argument_flags(heap, states, source_object, arguments)?;
-    let state = new_regexp_state(pattern, flags)?;
-    define_regexp_instance(heap, object, state)?;
+    depth: isize,
+) -> Result[runtime::Value, vm::VmError] {
+    let object = match regexp_state(states, this_value) {
+        Ok((object, _)) => object,
+        Err(value) => return Result::Err(function_native_error(value)),
+    };
+    let pattern_value = argument(arguments, 0);
+    let requested_flags = argument(arguments, 1);
+    let replacement = match pattern_value {
+        runtime::Value::Object(object) => states.get(object),
+        _ => Option::None,
+    };
+    let state = match replacement {
+        Some(state) => {
+            match requested_flags {
+                runtime::Value::Undefined => (),
+                _ => return Result::Err(function_vm_error("flags must be undefined")),
+            };
+            state
+        },
+        None => {
+            let source = match pattern_value {
+                runtime::Value::Undefined => runtime::Value::String(js_string("")),
+                value => value,
+            };
+            let pattern = match string_value_at_depth(context, source, depth)? {
+                runtime::Value::String(value) => value,
+                _ => return Result::Err(function_vm_error("RegExp pattern is not a string")),
+            };
+            let flags = regexp_flags_at_constructor_depth(context, requested_flags, depth)?;
+            match new_regexp_state(pattern, flags) {
+                Ok(value) => value,
+                Err(value) => return Result::Err(function_native_error(value)),
+            }
+        },
+    };
     states[object] = state;
+    match set_regexp_last_index(context.heap(), object, 0) {
+        Ok(()) => (),
+        Err(value) => return Result::Err(function_native_error(value)),
+    };
     Result::Ok(runtime::Value::Object(object))
 }
 
 fn regexp_state_property(
     states: HashMap[runtime::ObjectId, RegExpState],
+    prototype: runtime::ObjectId,
     property: string,
     heap: runtime::Heap,
     this_value: runtime::Value,
@@ -278,7 +493,18 @@ fn regexp_state_property(
 ) -> Result[runtime::Value, vm::NativeError] {
     let _ = heap;
     let _ = arguments;
-    let (_, state) = regexp_state(states, this_value)?;
+    let object = regexp_object(this_value)?;
+    if object == prototype {
+        if property == "source" {
+            return Result::Ok(runtime::Value::String(js_string("(?:)")))
+        } else {
+            return Result::Ok(runtime::Value::Undefined)
+        }
+    } else {};
+    let state = match states.get(object) {
+        Some(value) => value,
+        None => return Result::Err(native_error("RegExp method called on incompatible receiver")),
+    };
     if property == "source" {
         Result::Ok(runtime::Value::String(state.source))
     } else if property == "hasIndices" {
@@ -392,6 +618,31 @@ fn define_regexp_getter(
         Result::Ok(())
     } else {
         Result::Err(regexp_builtin_error("cannot define RegExp getter " + name))
+    }
+}
+
+fn regexp_last_index_at_depth(
+    context: vm::Context,
+    object: runtime::ObjectId,
+    input_length: isize,
+    depth: isize,
+) -> Result[isize, vm::VmError] {
+    let value = context.read_property_at_depth(
+        runtime::Value::Object(object),
+        runtime::Value::String(js_string("lastIndex")),
+        depth,
+    )?;
+    let number = match number_value_at_depth(context, value, depth)? {
+        runtime::Value::Float(value) => value,
+        _ => return Result::Err(function_vm_error("RegExp lastIndex is not numeric")),
+    };
+    if math::is_nan(number) || number <= 0.0 {
+        Result::Ok(0)
+    } else if math::is_infinite(number)
+        || number > num::parse_float64(input_length.to_string()).unwrap_or(0.0) {
+        Result::Ok(input_length + 1)
+    } else {
+        Result::Ok(num::parse_int(dtoa::number_to_string(math::floor(number))).unwrap_or(0))
     }
 }
 
@@ -670,46 +921,87 @@ fn regexp_match_array(
     Result::Ok(runtime::Value::Object(object))
 }
 
-fn regexp_execute(
-    heap: runtime::Heap,
+fn regexp_execute_at_depth(
+    context: vm::Context,
     states: HashMap[runtime::ObjectId, RegExpState],
     this_value: runtime::Value,
     arguments: Vec[runtime::Value],
-) -> Result[runtime::Value, vm::NativeError] {
-    let (object, state) = regexp_state(states, this_value)?;
-    let input = value_string(heap, argument(arguments, 0))?;
+    depth: isize,
+) -> Result[runtime::Value, vm::VmError] {
+    let (object, state) = match regexp_state(states, this_value) {
+        Ok(value) => value,
+        Err(value) => return Result::Err(function_native_error(value)),
+    };
+    let input = match string_value_at_depth(context, argument(arguments, 0), depth)? {
+        runtime::Value::String(value) => value,
+        _ => return Result::Err(function_vm_error("RegExp input is not a string")),
+    };
     let indexed = state.global || state.sticky;
+    let converted_last_index = regexp_last_index_at_depth(context, object, input.len(), depth)?;
     let last_index = if indexed {
-        regexp_last_index(heap, object, input.len())?
+        converted_last_index
     } else {
         0
     };
     let last_index = regexp_unicode_start(state, input, last_index);
-    match find_regexp_match(state, input, last_index)? {
+    let found = match find_regexp_match(state, input, last_index) {
+        Ok(value) => value,
+        Err(value) => return Result::Err(function_native_error(value)),
+    };
+    match found {
         Some(found) => {
             if indexed {
-                set_regexp_last_index(heap, object, found.end)?
+                match set_regexp_last_index(context.heap(), object, found.end) {
+                    Ok(()) => (),
+                    Err(value) => return Result::Err(function_native_error(value)),
+                }
             } else {};
-            regexp_match_array(heap, input, found, state.has_indices)
+            match regexp_match_array(context.heap(), input, found, state.has_indices) {
+                Ok(value) => Result::Ok(value),
+                Err(value) => Result::Err(function_native_error(value)),
+            }
         },
         None => {
             if indexed {
-                set_regexp_last_index(heap, object, 0)?
+                match set_regexp_last_index(context.heap(), object, 0) {
+                    Ok(()) => (),
+                    Err(value) => return Result::Err(function_native_error(value)),
+                }
             } else {};
             Result::Ok(runtime::Value::Null)
         },
     }
 }
 
-fn regexp_test(
-    heap: runtime::Heap,
+fn regexp_test_at_depth(
+    context: vm::Context,
     states: HashMap[runtime::ObjectId, RegExpState],
     this_value: runtime::Value,
     arguments: Vec[runtime::Value],
-) -> Result[runtime::Value, vm::NativeError] {
-    match regexp_execute(heap, states, this_value, arguments)? {
+    depth: isize,
+) -> Result[runtime::Value, vm::VmError] {
+    let exec = context.read_property_at_depth(
+        this_value,
+        runtime::Value::String(js_string("exec")),
+        depth,
+    )?;
+    let result = match exec {
+        runtime::Value::Object(object) => if object.is_callable() {
+            context.invoke_with_this_at_depth(
+                exec,
+                Vec::from_array([argument(arguments, 0)]),
+                this_value,
+                depth,
+            )?
+        } else {
+            regexp_execute_at_depth(context, states, this_value, arguments, depth)?
+        },
+        _ => regexp_execute_at_depth(context, states, this_value, arguments, depth)?,
+    };
+    match result {
         runtime::Value::Null => Result::Ok(runtime::Value::Bool(false)),
-        _ => Result::Ok(runtime::Value::Bool(true)),
+        runtime::Value::Object(_) => Result::Ok(runtime::Value::Bool(true)),
+        _ => Result::Err(function_vm_error("RegExp exec method must return an object or null")),
     }
 }
 
@@ -832,11 +1124,7 @@ fn install_regexp_runtime(context: vm::Context) -> Result[RegExpInstall, Builtin
         Err(value) => return Result::Err(regexp_builtin_error(value.message)),
     };
     let states: HashMap[runtime::ObjectId, RegExpState] = HashMap::new();
-    let prototype_state = match new_regexp_state(js_string(""), js_string("")) {
-        Ok(value) => value,
-        Err(value) => return Result::Err(regexp_builtin_error(value.message)),
-    };
-    states[prototype] = prototype_state;
+    context.add_external_edge_provider(|| regexp_gc_edges(context.heap(), states));
     let flags_getter = allocate_vm_function(
         context,
         "get RegExp.prototype.flags",
@@ -863,26 +1151,30 @@ fn install_regexp_runtime(context: vm::Context) -> Result[RegExpInstall, Builtin
             context,
             "get RegExp.prototype." + property,
             |heap, this_value, arguments| {
-                regexp_state_property(states, property, heap, this_value, arguments)
+                regexp_state_property(states, prototype, property, heap, this_value, arguments)
             },
         )?;
         define_regexp_getter(heap, prototype, property, getter)?
     }
-    let exec = allocate_function(
+    let exec = allocate_vm_function(
         context,
         "RegExp.prototype.exec",
-        |heap, this_value, arguments| regexp_execute(heap, states, this_value, arguments),
+        |this_value, arguments, depth| {
+            regexp_execute_at_depth(context, states, this_value, arguments, depth)
+        },
     )?;
-    let test = allocate_function(
+    let test = allocate_vm_function(
         context,
         "RegExp.prototype.test",
-        |heap, this_value, arguments| regexp_test(heap, states, this_value, arguments),
+        |this_value, arguments, depth| {
+            regexp_test_at_depth(context, states, this_value, arguments, depth)
+        },
     )?;
-    let compile_method = allocate_function(
+    let compile_method = allocate_vm_function(
         context,
         "RegExp.prototype.compile",
-        |heap, this_value, arguments| {
-            regexp_compile_instance(heap, states, this_value, arguments)
+        |this_value, arguments, depth| {
+            regexp_compile_instance_at_depth(context, states, this_value, arguments, depth)
         },
     )?;
     let to_string = allocate_vm_function(
@@ -896,27 +1188,41 @@ fn install_regexp_runtime(context: vm::Context) -> Result[RegExpInstall, Builtin
     define_value(heap, prototype, "test", test, true, true)?;
     define_value(heap, prototype, "compile", compile_method, true, true)?;
     define_value(heap, prototype, "toString", to_string, true, true)?;
-    let constructor = allocate_function(
+    let constructor_value = Ref::new(runtime::Value::Undefined);
+    let constructor = allocate_vm_function(
         context,
         "RegExp",
-        |heap, this_value, arguments| {
-            let result = regexp_construct(heap, states, prototype, this_value, arguments)?;
-            match result {
-                runtime::Value::Object(object) => if context.set_object_builtin_tag(
-                    object,
-                    js_string("RegExp"),
-                ) {
-                    Result::Ok(result)
-                } else {
-                    Result::Err(native_error("cannot register RegExp instance"))
-                },
-                _ => Result::Ok(result),
-            }
+        |this_value, arguments, depth| {
+            let _ = this_value;
+            regexp_constructor_call_at_depth(
+                context,
+                states,
+                prototype,
+                constructor_value.get(),
+                arguments,
+                depth,
+            )
         },
     )?;
-    if !context.set_object_builtin_tag(prototype, js_string("RegExp")) {
-        return Result::Err(regexp_builtin_error("cannot register RegExp prototype"))
-    } else {};
+    constructor_value.set(constructor);
+    match context.set_vm_constructor_callback(
+        constructor,
+        |receiver, arguments, selected_prototype, new_target, depth| {
+            let _ = new_target;
+            constructor_receiver_prototype(context.heap(), receiver, selected_prototype, prototype)?;
+            regexp_initialize_instance_at_depth(context, states, receiver, arguments, depth)
+        },
+    ) {
+        Ok(()) => (),
+        Err(value) => return Result::Err(regexp_builtin_error(value.kind.debug())),
+    };
+    match context.set_vm_constructor_prepare_callback(
+        constructor,
+        |arguments, depth| regexp_constructor_prepare_at_depth(context, states, arguments, depth),
+    ) {
+        Ok(()) => (),
+        Err(value) => return Result::Err(regexp_builtin_error(value.kind.debug())),
+    };
     let constructor_object = function_object(constructor, "RegExp")?;
     define_value(
         heap,

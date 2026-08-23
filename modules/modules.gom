@@ -18,11 +18,26 @@ pub enum ModuleErrorKind {
     Type,
 }
 
-#[derive(PartialEq, Eq, Debug)]
+#[derive(PartialEq, Eq)]
 pub struct ModuleError {
     pub kind: ModuleErrorKind,
     pub path: string,
     pub message: string,
+    pub runtime_type: Option[string],
+}
+
+impl Debug for ModuleError {
+    fn debug(self: ModuleError) -> string {
+        let runtime_type = match self.runtime_type {
+            Some(value) => "Some(\"" + value + "\")",
+            None => "None",
+        };
+        "ModuleError { kind: " + self.kind.debug() + ", path: \"" + self.path + "\", message: \""
+            + self.message
+            + "\", runtime_type: "
+            + runtime_type
+            + " }"
+    }
 }
 
 #[derive(PartialEq, Eq)]
@@ -46,6 +61,7 @@ struct ModuleRecord {
     evaluation_error: Ref[runtime::Value],
     evaluation_error_set: Ref[bool],
     evaluation_error_path: Ref[string],
+    evaluation_module_error: Ref[Option[ModuleError]],
     dfs_index: Ref[isize],
     dfs_ancestor_index: Ref[isize],
     pending_async_dependencies: Ref[isize],
@@ -67,15 +83,41 @@ struct Loader {
 }
 
 fn module_error(module_path: string, message: string) -> ModuleError {
-    ModuleError { kind: ModuleErrorKind::Reference, path: module_path, message }
+    ModuleError {
+        kind: ModuleErrorKind::Reference,
+        path: module_path,
+        message,
+        runtime_type: Option::None,
+    }
 }
 
 fn module_syntax_error(module_path: string, message: string) -> ModuleError {
-    ModuleError { kind: ModuleErrorKind::Syntax, path: module_path, message }
+    ModuleError {
+        kind: ModuleErrorKind::Syntax,
+        path: module_path,
+        message,
+        runtime_type: Option::None,
+    }
 }
 
 fn module_type_error(module_path: string, message: string) -> ModuleError {
-    ModuleError { kind: ModuleErrorKind::Type, path: module_path, message }
+    ModuleError {
+        kind: ModuleErrorKind::Type,
+        path: module_path,
+        message,
+        runtime_type: Option::None,
+    }
+}
+
+fn module_runtime_error(module_path: string, message: string, type_name: string) -> ModuleError {
+    let kind = if type_name == "TypeError" {
+        ModuleErrorKind::Type
+    } else if type_name == "SyntaxError" {
+        ModuleErrorKind::Syntax
+    } else {
+        ModuleErrorKind::Reference
+    };
+    ModuleError { kind, path: module_path, message, runtime_type: Option::Some(type_name) }
 }
 
 fn compile_messages(errors: Vec[compiler::CompileError]) -> string {
@@ -252,6 +294,7 @@ fn load_record_with_type(loader: Loader, module_path: string, requested_type: st
             evaluation_error,
             evaluation_error_set: Ref::new(false),
             evaluation_error_path: Ref::new(""),
+            evaluation_module_error: Ref::new(Option::None),
             dfs_index: Ref::new(-1),
             dfs_ancestor_index: Ref::new(-1),
             pending_async_dependencies: Ref::new(0),
@@ -331,10 +374,27 @@ fn dynamic_import_vm_error(message: string) -> vm::VmError {
 
 fn dynamic_import_module_error(error: ModuleError) -> vm::VmError {
     let message = error.path + ": " + error.message;
-    let kind = match error.kind {
-        ModuleErrorKind::Reference => vm::VmErrorKind::ReferenceError(message),
-        ModuleErrorKind::Syntax => vm::VmErrorKind::SyntaxError(message),
-        ModuleErrorKind::Type => vm::VmErrorKind::TypeError(message),
+    let kind = match error.runtime_type {
+        Some(type_name) => if type_name == "TypeError" {
+            vm::VmErrorKind::TypeError(message)
+        } else if type_name == "RangeError" {
+            vm::VmErrorKind::RangeError(message)
+        } else if type_name == "ReferenceError" {
+            vm::VmErrorKind::ReferenceError(message)
+        } else if type_name == "SyntaxError" {
+            vm::VmErrorKind::SyntaxError(message)
+        } else if type_name == "URIError" {
+            vm::VmErrorKind::UriError(message)
+        } else if type_name == "InternalError" {
+            vm::VmErrorKind::CallDepthExceeded
+        } else {
+            vm::VmErrorKind::ReferenceError(message)
+        },
+        None => match error.kind {
+            ModuleErrorKind::Reference => vm::VmErrorKind::ReferenceError(message),
+            ModuleErrorKind::Syntax => vm::VmErrorKind::SyntaxError(message),
+            ModuleErrorKind::Type => vm::VmErrorKind::TypeError(message),
+        },
     };
     vm::VmError { offset: -1, kind }
 }
@@ -676,7 +736,10 @@ fn try_export_cell(record: Ref[ModuleRecord], name: string, resolving: Vec[strin
                 Some(value) => match candidate {
                     Some(previous) => if previous != value {
                         return Result::Err(
-                            module_error(record.get().path, "ambiguous star export `" + name + "`"),
+                            module_syntax_error(
+                                record.get().path,
+                                "ambiguous star export `" + name + "`",
+                            ),
                         )
                     } else {},
                     None => {
@@ -698,7 +761,7 @@ fn export_cell(record: Ref[ModuleRecord], name: string, resolving: Vec[string]) 
     match try_export_cell(record, name, resolving)? {
         Some(value) => Result::Ok(value),
         None => Result::Err(
-            module_error(record.get().path, "module has no export named `" + name + "`"),
+            module_syntax_error(record.get().path, "module has no export named `" + name + "`"),
         ),
     }
 }
@@ -723,7 +786,7 @@ fn bind_named_imports(loader: Loader, record: Ref[ModuleRecord]) -> Result[unit,
                 ) {
                     Ok(Some(value)) => value,
                     Ok(None) => return Result::Err(
-                        module_error(
+                        module_syntax_error(
                             binding.source,
                             "module has no export named `" + binding.imported + "`",
                         ),
@@ -935,23 +998,77 @@ fn instantiate_graph(loader: Loader) -> Result[unit, ModuleError] {
     Result::Ok(())
 }
 
+fn thrown_string_property(context: vm::Context, object: runtime::ObjectId, name: string) -> Option[
+    string,
+] {
+    match runtime::get_property(context.heap(), object, runtime::string_property_key(name)) {
+        Ok(Some(runtime::Value::String(value))) => match value.to_host_string() {
+            Ok(value) => Option::Some(value),
+            Err(_) => Option::None,
+        },
+        _ => Option::None,
+    }
+}
+
+fn thrown_error_message(context: vm::Context, object: runtime::ObjectId) -> string {
+    let name = thrown_string_property(context, object, "name").unwrap_or("Error");
+    let message = thrown_string_property(context, object, "message").unwrap_or("");
+    let header = if message.byte_len() == 0 {
+        name
+    } else {
+        name + ": " + message
+    };
+    match thrown_string_property(context, object, "stack") {
+        Some(stack) => if stack.byte_len() == 0 {
+            header
+        } else if stack.contains(header) {
+            stack
+        } else {
+            header + "\n" + stack
+        },
+        None => header,
+    }
+}
+
+fn thrown_type(context: vm::Context, value: runtime::Value) -> string {
+    match value {
+        runtime::Value::Object(object) => match context.error_object_type(object) {
+            Some(value) => value.to_host_string().unwrap_or("Thrown"),
+            None => "Thrown",
+        },
+        _ => "Thrown",
+    }
+}
+
+fn vm_error_type(context: vm::Context, kind: vm::VmErrorKind) -> string {
+    match kind {
+        vm::VmErrorKind::TypeError(_) => "TypeError",
+        vm::VmErrorKind::RangeError(_) => "RangeError",
+        vm::VmErrorKind::ReferenceError(_) => "ReferenceError",
+        vm::VmErrorKind::SyntaxError(_) | vm::VmErrorKind::SyntaxErrorAt(_, _) => "SyntaxError",
+        vm::VmErrorKind::UriError(_) => "URIError",
+        vm::VmErrorKind::Thrown(value) => thrown_type(context, value),
+        vm::VmErrorKind::CallDepthExceeded => "InternalError",
+        _ => "RuntimeError",
+    }
+}
+
 fn thrown_message(context: vm::Context, value: runtime::Value) -> string {
     match value {
         runtime::Value::String(value) => value.to_host_string().unwrap_or("<invalid string>"),
         runtime::Value::Object(object) => {
+            match context.error_object_type(object) {
+                Some(_) => {
+                    return thrown_error_message(context, object)
+                },
+                None => (),
+            };
             for name in Vec::from_array(["stack", "message", "name"]) {
-                match runtime::get_property(
-                    context.heap(),
-                    object,
-                    runtime::string_property_key(name),
-                ) {
-                    Ok(Some(runtime::Value::String(value))) => match value.to_host_string() {
-                        Ok(value) => if value.byte_len() > 0 {
-                            return value
-                        } else {},
-                        Err(_) => (),
-                    },
-                    _ => (),
+                match thrown_string_property(context, object, name) {
+                    Some(value) => if value.byte_len() > 0 {
+                        return value
+                    } else {},
+                    None => (),
                 }
             }
             "<object>"
@@ -968,25 +1085,14 @@ fn runtime_message(context: vm::Context, error: vm::VmError) -> string {
     "runtime error at bytecode " + error.offset.to_string() + ": " + detail
 }
 
+fn module_vm_error(context: vm::Context, module_path: string, error: vm::VmError) -> ModuleError {
+    let type_name = vm_error_type(context, error.kind);
+    let message = runtime_message(context, error);
+    module_runtime_error(module_path, message, type_name)
+}
+
 fn rejection_message(context: vm::Context, value: runtime::Value) -> string {
-    match value {
-        runtime::Value::Object(object) => match runtime::get_property(
-            context.heap(),
-            object,
-            runtime::string_property_key("message"),
-        ) {
-            Ok(Some(runtime::Value::String(value))) => match value.to_host_string() {
-                Ok(value) => if value.byte_len() > 0 {
-                    value
-                } else {
-                    thrown_message(context, runtime::Value::Object(object))
-                },
-                Err(_) => thrown_message(context, runtime::Value::Object(object)),
-            },
-            _ => thrown_message(context, runtime::Value::Object(object)),
-        },
-        _ => thrown_message(context, value),
-    }
+    thrown_message(context, value)
 }
 
 fn async_module_argument(arguments: Vec[runtime::Value]) -> runtime::Value {
@@ -1038,45 +1144,60 @@ fn cycle_root(record: Ref[ModuleRecord]) -> Ref[ModuleRecord] {
 }
 
 fn rejection_error(loader: Loader, record: Ref[ModuleRecord]) -> ModuleError {
+    match record.get().evaluation_module_error.get() {
+        Some(error) => return error,
+        None => (),
+    };
     let path = if record.get().evaluation_error_path.get() == "" {
         record.get().path
     } else {
         record.get().evaluation_error_path.get()
     };
-    module_error(
-        path,
-        "module evaluation rejected: "
-            + rejection_message(loader.context, record.get().evaluation_error.get()),
-    )
+    let reason = record.get().evaluation_error.get();
+    let type_name = thrown_type(loader.context, reason);
+    let message = "module evaluation rejected: " + rejection_message(loader.context, reason);
+    module_runtime_error(path, message, type_name)
 }
 
-fn reject_module(record: Ref[ModuleRecord], reason: runtime::Value, origin: string) -> unit {
+fn reject_module(
+    record: Ref[ModuleRecord],
+    reason: runtime::Value,
+    origin: string,
+    module_error: Option[ModuleError],
+) -> unit {
     if record.get().state.get() == ModuleState::Errored {
         return
     } else {};
     record.get().evaluation_error.set(reason);
     record.get().evaluation_error_set.set(true);
     record.get().evaluation_error_path.set(origin);
+    record.get().evaluation_module_error.set(module_error);
     record.get().async_evaluation.set(false);
     record.get().state.set(ModuleState::Errored);
     for parent in record.get().async_parents {
-        reject_module(parent, reason, origin)
+        reject_module(parent, reason, origin, module_error)
     }
 }
 
-fn reject_module_error(loader: Loader, record: Ref[ModuleRecord], error: ModuleError) -> unit {
+fn reject_module_error(record: Ref[ModuleRecord], error: ModuleError) -> unit {
     let message = error.path + ": " + error.message;
     let bytes = message.to_bytes();
     reject_module(
         record,
         runtime::Value::String(runtime::JsString::from_utf8(bytes.slice(0, bytes.len()))),
         error.path,
+        Option::Some(error),
     )
 }
 
 fn reject_vm_error(loader: Loader, record: Ref[ModuleRecord], error: vm::VmError) -> ModuleError {
-    let result = module_error(record.get().path, runtime_message(loader.context, error));
-    reject_module(record, loader.context.rejection_value(error), record.get().path);
+    let result = module_vm_error(loader.context, record.get().path, error);
+    reject_module(
+        record,
+        loader.context.rejection_value(error),
+        record.get().path,
+        Option::Some(result),
+    );
     result
 }
 
@@ -1087,7 +1208,12 @@ fn copy_module_rejection(target: Ref[ModuleRecord], source: Ref[ModuleRecord]) -
         } else {
             source.get().evaluation_error_path.get()
         };
-        reject_module(target, source.get().evaluation_error.get(), origin)
+        reject_module(
+            target,
+            source.get().evaluation_error.get(),
+            origin,
+            source.get().evaluation_module_error.get(),
+        )
     } else {}
 }
 
@@ -1129,7 +1255,7 @@ fn execute_module_body(loader: Loader, record: Ref[ModuleRecord], asynchronous: 
     let previous_path = match initialize_module_execution(loader, record) {
         Ok(value) => value,
         Err(error) => {
-            reject_module_error(loader, record, error);
+            reject_module_error(record, error);
             return Result::Err(error)
         },
     };
@@ -1190,7 +1316,7 @@ fn gather_available_ancestors(module: Ref[ModuleRecord], records: Vec[Ref[Module
 }
 
 fn async_module_rejected(record: Ref[ModuleRecord], arguments: Vec[runtime::Value]) -> unit {
-    reject_module(record, async_module_argument(arguments), record.get().path)
+    reject_module(record, async_module_argument(arguments), record.get().path, Option::None)
 }
 
 fn start_async_module(loader: Loader, record: Ref[ModuleRecord]) -> Result[unit, ModuleError] {
@@ -1360,7 +1486,11 @@ fn await_graph_evaluation(loader: Loader, record: Ref[ModuleRecord]) -> Result[u
         ModuleState::Evaluated => Result::Ok(()),
         ModuleState::Errored => Result::Err(rejection_error(loader, root)),
         _ => Result::Err(
-            module_error(root.get().path, "top-level await remained pending without host jobs"),
+            module_runtime_error(
+                root.get().path,
+                "top-level await remained pending without host jobs",
+                "RuntimeError",
+            ),
         ),
     }
 }
@@ -1382,7 +1512,7 @@ fn evaluate_record(loader: Loader, record: Ref[ModuleRecord]) -> Result[unit, Mo
                     if record.get().evaluation_error_set.get() {
                         copy_module_rejection(active, record)
                     } else {
-                        reject_module_error(loader, active, error)
+                        reject_module_error(active, error)
                     }
                 } else {}
             }
@@ -1426,7 +1556,7 @@ pub fn execute_file(context: vm::Context, global: runtime::ObjectId, module_path
     let namespace = create_namespace(loader, entry)?;
     match context.run_pending_jobs() {
         Ok(_) => Result::Ok(runtime::Value::Object(namespace)),
-        Err(error) => Result::Err(module_error(entry.get().path, runtime_message(context, error))),
+        Err(error) => Result::Err(module_vm_error(context, entry.get().path, error)),
     }
 }
 
@@ -1468,6 +1598,6 @@ pub fn execute_source_with_source_name(
     let namespace = create_namespace(loader, entry)?;
     match context.run_pending_jobs() {
         Ok(_) => Result::Ok(runtime::Value::Object(namespace)),
-        Err(error) => Result::Err(module_error(entry.get().path, runtime_message(context, error))),
+        Err(error) => Result::Err(module_vm_error(context, entry.get().path, error)),
     }
 }

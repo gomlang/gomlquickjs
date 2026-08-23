@@ -146,6 +146,7 @@ struct Compiler {
     parameter_count: isize,
     function_length: isize,
     strict: bool,
+    strict_context: Ref[bool],
     arguments_available: bool,
     lexical_this: bool,
     lexical_arguments: bool,
@@ -216,6 +217,16 @@ enum ExcludedBindingKey {
 
 fn compile_error(compiler: Compiler, message: string, span: ast::Span) -> unit {
     compiler.errors.push(CompileError { message, span })
+}
+
+fn compiler_is_strict(compiler: Compiler) -> bool {
+    compiler.strict || compiler.strict_context.get()
+}
+
+fn validate_strict_identifier(compiler: Compiler, name: string, span: ast::Span) -> unit {
+    if compiler_is_strict(compiler) && name == "yield" {
+        compile_error(compiler, "yield cannot be used as an identifier in strict mode", span)
+    } else {}
 }
 
 fn emit(compiler: Compiler, instruction: bytecode::Instruction) -> isize {
@@ -362,6 +373,7 @@ fn declare_in_scope(
     kind: BindingKind,
     span: ast::Span,
 ) -> Option[Binding] {
+    validate_strict_identifier(compiler, name, span);
     let scope = compiler.scopes[scope_index];
     match scope.bindings.get(name) {
         Some(previous) => {
@@ -609,7 +621,7 @@ fn current_eval_bindings(compiler: Compiler) -> Vec[bytecode::EvalBinding] {
             },
         )
     }
-    if compiler.strict {
+    if compiler_is_strict(compiler) {
         result.push(
             bytecode::EvalBinding {
                 name: "$strict",
@@ -652,7 +664,7 @@ fn add_eval_site(compiler: Compiler, bindings: Vec[bytecode::EvalBinding]) -> is
 }
 
 fn predeclare_static_eval_vars(compiler: Compiler, arguments: Vec[ast::Expr]) -> unit {
-    if compiler.strict || arguments.is_empty() {
+    if compiler_is_strict(compiler) || arguments.is_empty() {
         return
     } else {};
     match arguments[0] {
@@ -684,7 +696,7 @@ fn add_dynamic_eval_var(compiler: Compiler, name: string) -> unit {
 }
 
 fn dynamic_eval_var_conflicts_current_scope(compiler: Compiler, name: string) -> bool {
-    compiler.direct_eval.get() && !compiler.strict
+    compiler.direct_eval.get() && !compiler_is_strict(compiler)
         && compiler.scopes.len() - 1 == compiler.var_scope_index.get()
         && has_dynamic_eval_var(compiler, name)
 }
@@ -699,7 +711,9 @@ fn declare_var_pattern(compiler: Compiler, pattern: ast::BindingPattern) -> unit
     let names: Vec[(string, ast::Span)] = Vec::new();
     collect_parameter_names(pattern, names);
     for (name, span) in names {
-        if compiler.direct_eval.get() && compiler.strict && (name == "arguments" || name == "eval") {
+        validate_strict_identifier(compiler, name, span);
+        if compiler.direct_eval.get() && compiler_is_strict(compiler)
+            && (name == "arguments" || name == "eval") {
             compile_error(compiler, "invalid strict eval var binding `" + name + "`", span);
             continue
         } else {};
@@ -710,7 +724,7 @@ fn declare_var_pattern(compiler: Compiler, pattern: ast::BindingPattern) -> unit
                     compile_error(compiler, "duplicate declaration of `" + name + "`", span)
                 } else {}
             } else {},
-            None => if compiler.direct_eval.get() && !compiler.strict {
+            None => if compiler.direct_eval.get() && !compiler_is_strict(compiler) {
                 match lookup_outer_binding(compiler, name) {
                     Some(binding) => if binding.kind != BindingKind::Var {
                         compile_error(compiler, "duplicate declaration of `" + name + "`", span)
@@ -868,10 +882,13 @@ fn declare_lexical_statement(compiler: Compiler, statement: ast::Stmt) -> unit {
                 compile_error(compiler, "function declaration requires a name", span)
             } else {
                 match compiler.scopes[compiler.scopes.len() - 1].bindings.get(name) {
-                    Some(binding) => if binding.kind == BindingKind::Var {} else {
-                        compile_error(compiler, "duplicate declaration of `" + name + "`", span)
+                    Some(binding) => {
+                        validate_strict_identifier(compiler, name, span);
+                        if binding.kind == BindingKind::Var {} else {
+                            compile_error(compiler, "duplicate declaration of `" + name + "`", span)
+                        }
                     },
-                    None => if compiler.direct_eval.get() && !compiler.strict {
+                    None => if compiler.direct_eval.get() && !compiler_is_strict(compiler) {
                         match lookup_outer_binding(compiler, name) {
                             Some(binding) => if binding.kind != BindingKind::Var {
                                 compile_error(
@@ -1015,6 +1032,10 @@ fn patch_loop_jumps(
 }
 
 fn compile_loop_jump(compiler: Compiler, is_continue: bool, label: Option[string], span: ast::Span) -> unit {
+    match label {
+        Some(value) => validate_strict_identifier(compiler, value, span),
+        None => (),
+    };
     if is_continue {
         let mut selected = Option::None;
         let mut index = compiler.loops.len();
@@ -1562,6 +1583,7 @@ fn compile_with_binding_value(compiler: Compiler, name: string, span: ast::Span)
 }
 
 fn compile_identifier(compiler: Compiler, name: string, span: ast::Span) -> unit {
+    validate_strict_identifier(compiler, name, span);
     if compiler.with_bindings.is_empty() {
         compile_plain_identifier(compiler, name, span);
         return
@@ -2556,7 +2578,7 @@ fn compile_delete(compiler: Compiler, argument: ast::Expr) -> unit {
         ast::Expr::Parenthesized { expression, .. } => {
             compile_delete(compiler, expression.get())
         },
-        ast::Expr::Identifier { name, span } => if compiler.strict {
+        ast::Expr::Identifier { name, span } => if compiler_is_strict(compiler) {
             compile_error(compiler, "identifier deletion is not allowed in strict mode", span);
             let _ = emit(compiler, bytecode::Instruction::PushFalse);
         } else if compiler.with_bindings.is_empty() {
@@ -2618,6 +2640,7 @@ fn compile_unary(
             ast::Expr::Identifier { name, span } => if !compiler.with_bindings.is_empty() {
                 compile_identifier(compiler, name, span)
             } else {
+                validate_strict_identifier(compiler, name, span);
                 match lookup_binding(compiler, name) {
                     Some(binding) => {
                         let _ = emit(compiler, bytecode::Instruction::GetLoc(binding.index));
@@ -2785,7 +2808,8 @@ fn local_assignment_target(
             AssignmentStorage::Local(index)
         },
         writable,
-        throws_on_write: kind == BindingKind::Const || named_function && compiler.strict,
+        throws_on_write: kind == BindingKind::Const
+            || named_function && compiler_is_strict(compiler),
         source_offset: span.start,
     }
 }
@@ -2863,10 +2887,13 @@ fn with_identifier_assignment_target(compiler: Compiler, name: string, span: ast
 
 fn prepare_assignment_target(compiler: Compiler, expression: ast::Expr, fallback_span: ast::Span) -> AssignmentTarget {
     match expression {
-        ast::Expr::Identifier { name, span } => if compiler.with_bindings.is_empty() {
-            plain_identifier_assignment_target(compiler, name, span)
-        } else {
-            with_identifier_assignment_target(compiler, name, span)
+        ast::Expr::Identifier { name, span } => {
+            validate_strict_identifier(compiler, name, span);
+            if compiler.with_bindings.is_empty() {
+                plain_identifier_assignment_target(compiler, name, span)
+            } else {
+                with_identifier_assignment_target(compiler, name, span)
+            }
         },
         ast::Expr::Parenthesized { expression, .. } => {
             prepare_assignment_target(compiler, expression.get(), fallback_span)
@@ -3073,14 +3100,14 @@ fn store_assignment_target(compiler: Compiler, target: AssignmentTarget) -> unit
             let _ = emit(compiler, bytecode::Instruction::SetUpvalue(index));
         },
         AssignmentStorage::Global(index) => {
-            if compiler.strict && compiler.allow_unknown_globals.get() {
+            if compiler_is_strict(compiler) && compiler.allow_unknown_globals.get() {
                 let _ = emit(compiler, bytecode::Instruction::GetGlobal(index));
                 let _ = emit(compiler, bytecode::Instruction::Drop);
             } else {};
             let _ = emit(compiler, bytecode::Instruction::SetGlobal(index));
         },
         AssignmentStorage::Eval(index) => {
-            if compiler.strict {
+            if compiler_is_strict(compiler) {
                 let _ = emit(compiler, bytecode::Instruction::GetEval(index));
                 let _ = emit(compiler, bytecode::Instruction::Drop);
             } else {};
@@ -3427,7 +3454,7 @@ fn compile_nested_function(
 ) -> bytecode::Function {
     let function_inherit_home_object = inherit_home_object || arrow && parent.super_property_allowed;
     let strict_directive = function_body_is_strict(body);
-    let strict = force_strict || strict_directive || parent.strict;
+    let strict = force_strict || strict_directive || compiler_is_strict(parent);
     let child = compiler_new(
         parameters,
         if arrow {
@@ -3453,6 +3480,10 @@ fn compile_nested_function(
         generator,
         asynchronous,
     );
+    match name {
+        Some(value) => validate_strict_identifier(child, value, span),
+        None => (),
+    };
     child.source.set(parent.source.get());
     child.source_name.set(parent.source_name.get());
     child.allow_unknown_globals.set(parent.allow_unknown_globals.get());
@@ -3986,7 +4017,7 @@ fn compile_function_declaration(
     let binding = match scope.bindings.get(name) {
         Some(value) => Option::Some(value),
         None => if has_dynamic_eval_var(compiler, name)
-            || compiler.direct_eval.get() && !compiler.strict
+            || compiler.direct_eval.get() && !compiler_is_strict(compiler)
                 && match lookup_outer_binding(compiler, name) {
                     Some(value) => value.kind == BindingKind::Var,
                     None => false,
@@ -4398,6 +4429,13 @@ fn compile_class_private_method_initializer(
     }
 }
 
+fn compile_class_strict_expression(compiler: Compiler, expression: ast::Expr) -> unit {
+    let previous = compiler.strict_context.get();
+    compiler.strict_context.set(true);
+    compile_expression(compiler, expression);
+    compiler.strict_context.set(previous)
+}
+
 fn compile_class_value(
     compiler: Compiler,
     name: Option[string],
@@ -4458,7 +4496,7 @@ fn compile_class_value(
     let _ = emit(compiler, bytecode::Instruction::PutLoc(class_index));
     let _ = emit(compiler, bytecode::Instruction::GetLoc(class_index));
     match heritage {
-        Some(value) => compile_expression(compiler, value.get()),
+        Some(value) => compile_class_strict_expression(compiler, value.get()),
         None => {
             let _ = emit(compiler, bytecode::Instruction::Undefined);
         },
@@ -4473,7 +4511,7 @@ fn compile_class_value(
     for element in elements {
         match element.computed_name {
             Some(value) => {
-                compile_expression(compiler, value.get());
+                compile_class_strict_expression(compiler, value.get());
                 let local = new_local(compiler);
                 let _ = emit(compiler, bytecode::Instruction::PutLoc(local));
                 computed_key_locals.push(local);
@@ -5264,7 +5302,8 @@ fn iteration_statement(statement: ast::Stmt) -> bool {
     }
 }
 
-fn compile_labelled_statement(compiler: Compiler, label: string, body: ast::Stmt) -> unit {
+fn compile_labelled_statement(compiler: Compiler, label: string, body: ast::Stmt, span: ast::Span) -> unit {
+    validate_strict_identifier(compiler, label, span);
     push_label_breakable(compiler, label);
     if iteration_statement(body) {
         compiler.pending_loop_label.set(Option::Some(label))
@@ -5279,7 +5318,7 @@ fn compile_labelled_statement(compiler: Compiler, label: string, body: ast::Stmt
 }
 
 fn compile_with_statement(compiler: Compiler, object: ast::Expr, body: ast::Stmt, span: ast::Span) -> unit {
-    if compiler.strict {
+    if compiler_is_strict(compiler) {
         compile_error(compiler, "with statement is not allowed in strict mode", span)
     } else {};
     compile_expression(compiler, object);
@@ -5460,8 +5499,8 @@ fn compile_statement(compiler: Compiler, statement: ast::Stmt) -> unit {
         ast::Stmt::Continue { label, span } => {
             compile_loop_jump(compiler, true, label, span)
         },
-        ast::Stmt::Labelled { label, body, .. } => {
-            compile_labelled_statement(compiler, label, body.get())
+        ast::Stmt::Labelled { label, body, span } => {
+            compile_labelled_statement(compiler, label, body.get(), span)
         },
         ast::Stmt::Return { argument, .. } => match argument {
             Some(value) => {
@@ -5575,6 +5614,7 @@ fn declare_parameter_bindings(compiler: Compiler, parameters: Vec[ast::FunctionP
         collect_parameter_names(parameter.pattern.get(), names)
     }
     for (name, span) in names {
+        validate_strict_identifier(compiler, name, span);
         match compiler.scopes[0].bindings.get(name) {
             Some(_) => if !allow_duplicates {
                 compile_error(compiler, "duplicate parameter `" + name + "`", span)
@@ -6150,6 +6190,7 @@ fn compiler_new(
         parameter_count,
         function_length,
         strict,
+        strict_context: Ref::new(false),
         arguments_available,
         lexical_this,
         lexical_arguments,
@@ -6613,7 +6654,7 @@ pub fn compile_module_with_source_name(source: string, source_name: string) -> R
     CompiledModule,
     Vec[CompileError],
 ] {
-    let parsed = parser::parse(source);
+    let parsed = parser::parse_module(source);
     let errors: Vec[CompileError] = Vec::new();
     for error in parsed.errors {
         errors.push(CompileError { message: error.message, span: error.span })

@@ -1663,7 +1663,29 @@ impl Context {
     }
 
     pub fn object_builtin_tag(self: Context, object: runtime::ObjectId) -> Option[runtime::JsString] {
-        self.object_builtin_tags_value.get(object)
+        match self.object_builtin_tags_value.get(object) {
+            Some(tag) => if error_type_from_builtin_tag(tag).is_some() {
+                Option::Some(js_string("Error"))
+            } else {
+                Option::Some(tag)
+            },
+            None => Option::None,
+        }
+    }
+
+    pub fn set_error_object_type(
+        self: Context,
+        object: runtime::ObjectId,
+        type_name: runtime::JsString,
+    ) -> bool {
+        self.set_object_builtin_tag(object, error_builtin_tag(type_name))
+    }
+
+    pub fn error_object_type(self: Context, object: runtime::ObjectId) -> Option[runtime::JsString] {
+        match self.object_builtin_tags_value.get(object) {
+            Some(tag) => error_type_from_builtin_tag(tag),
+            None => Option::None,
+        }
     }
 
     pub fn set_regexp_constructor(self: Context, value: runtime::Value) -> Result[unit, VmError] {
@@ -1900,7 +1922,7 @@ fn materialize_error_value_with_runtime(
         Ok(value) => value,
         Err(_) => return fallback_error_value(name, message),
     };
-    object_builtin_tags[object] = js_string("Error");
+    object_builtin_tags[object] = error_builtin_tag(js_string(name));
     if own_name
         && !runtime::define_own_property(
             heap,
@@ -1979,7 +2001,7 @@ fn ensure_error_stack(machine: Machine, value: runtime::Value, offset: isize) ->
         _ => return value,
     };
     match machine.object_builtin_tags.get(object) {
-        Some(tag) => if tag != js_string("Error") {
+        Some(tag) => if error_type_from_builtin_tag(tag).is_none() {
             return value
         } else {},
         None => return value,
@@ -2265,6 +2287,21 @@ fn bigint_value(machine: Machine, offset: isize, value: runtime::Value) -> Resul
 fn js_string(value: string) -> runtime::JsString {
     let bytes = value.to_bytes();
     runtime::JsString::from_utf8(bytes.slice(0, bytes.len()))
+}
+
+fn error_builtin_tag(type_name: runtime::JsString) -> runtime::JsString {
+    js_string("Error:").concat(type_name)
+}
+
+fn error_type_from_builtin_tag(tag: runtime::JsString) -> Option[runtime::JsString] {
+    let prefix = js_string("Error:");
+    if tag.len() > prefix.len() && tag.slice(0, prefix.len()) == prefix {
+        Option::Some(tag.slice(prefix.len(), tag.len()))
+    } else if tag == js_string("Error") {
+        Option::Some(js_string("Error"))
+    } else {
+        Option::None
+    }
 }
 
 fn host_string(value: runtime::JsString) -> string {
@@ -6730,7 +6767,55 @@ fn proxy_argument_array(machine: Machine, offset: isize, arguments: Vec[runtime:
     Result::Ok(runtime::Value::Object(array))
 }
 
+fn with_machine_roots[T](
+    machine: Machine,
+    values: Vec[runtime::Value],
+    callback: () -> Result[T, VmError],
+) -> Result[T, VmError] {
+    let stack_start = machine.stack.len();
+    for value in values {
+        machine.stack.push(value)
+    }
+    let result = callback();
+    machine.stack.truncate(stack_start);
+    result
+}
+
 fn call_value_with_mode(
+    machine: Machine,
+    offset: isize,
+    callee: runtime::Value,
+    arguments: Vec[runtime::Value],
+    this_value: runtime::Value,
+    constructing: bool,
+    new_target: Option[runtime::Value],
+) -> Result[runtime::Value, VmError] {
+    let roots: Vec[runtime::Value] = Vec::with_capacity(arguments.len() + 3);
+    roots.push(callee);
+    roots.push(this_value);
+    for value in arguments {
+        roots.push(value)
+    }
+    match new_target {
+        Some(value) => roots.push(value),
+        None => (),
+    };
+    with_machine_roots(
+        machine,
+        roots,
+        || call_value_with_mode_rooted(
+            machine,
+            offset,
+            callee,
+            arguments,
+            this_value,
+            constructing,
+            new_target,
+        ),
+    )
+}
+
+fn call_value_with_mode_rooted(
     machine: Machine,
     offset: isize,
     callee: runtime::Value,
@@ -6983,7 +7068,136 @@ fn call_value(
     call_value_with_mode(machine, offset, callee, arguments, this_value, false, Option::None)
 }
 
+fn finish_construct_value_with_new_target(
+    machine: Machine,
+    offset: isize,
+    callee: runtime::Value,
+    object: runtime::ObjectId,
+    arguments: Vec[runtime::Value],
+    new_target: runtime::Value,
+    prototype: Option[runtime::ObjectId],
+    receiver: runtime::Value,
+) -> Result[runtime::Value, VmError] {
+    match (receiver, machine.native_constructor_functions.get(object)) {
+        (runtime::Value::Object(receiver_object), Some(callback)) => {
+            return match callback(machine.heap, receiver_object, arguments) {
+                Ok(runtime::Value::Object(value)) => Result::Ok(runtime::Value::Object(value)),
+                Ok(_) => Result::Ok(receiver),
+                Err(value) => Result::Err(error(offset, native_error_kind(value.message))),
+            }
+        },
+        _ => (),
+    };
+    match (receiver, machine.vm_constructor_functions.get(object)) {
+        (runtime::Value::Object(receiver_object), Some(callbacks)) => {
+            return match callbacks.callback {
+                Some(callback) => match callback(
+                    receiver_object,
+                    arguments,
+                    prototype,
+                    new_target,
+                    machine.depth,
+                ) {
+                    Ok(runtime::Value::Object(value)) => Result::Ok(runtime::Value::Object(value)),
+                    Ok(_) => Result::Ok(receiver),
+                    Err(value) => Result::Err(value),
+                },
+                None => Result::Err(
+                    error(offset, VmErrorKind::TypeError("constructor callback is unavailable")),
+                ),
+            }
+        },
+        _ => (),
+    };
+    match call_value_with_mode(
+        machine,
+        offset,
+        callee,
+        arguments,
+        receiver,
+        true,
+        Option::Some(new_target),
+    )? {
+        runtime::Value::Object(value) => Result::Ok(runtime::Value::Object(value)),
+        _ => Result::Ok(receiver),
+    }
+}
+
+fn construct_prepared_value_with_new_target(
+    machine: Machine,
+    offset: isize,
+    callee: runtime::Value,
+    object: runtime::ObjectId,
+    arguments: Vec[runtime::Value],
+    new_target: runtime::Value,
+    new_target_object: runtime::ObjectId,
+) -> Result[runtime::Value, VmError] {
+    match machine.vm_constructor_functions.get(object) {
+        Some(callbacks) => match callbacks.self_allocating {
+            Some(callback) => return callback(arguments, machine.depth),
+            None => (),
+        },
+        None => (),
+    };
+    let prototype = match read_object_property(
+        machine,
+        offset,
+        new_target_object,
+        new_target,
+        runtime::string_property_key("prototype"),
+    )? {
+        runtime::Value::Object(value) => Option::Some(value),
+        _ => Option::None,
+    };
+    let derived = match machine.functions.get(object) {
+        Some(closure) => closure.function.get().derived_constructor(),
+        None => false,
+    };
+    let receiver = if derived {
+        runtime::Value::Undefined
+    } else {
+        match runtime::new_ordinary_object(machine.heap, prototype) {
+            Ok(value) => runtime::Value::Object(value),
+            Err(value) => return Result::Err(error(offset, VmErrorKind::TypeError(value.message))),
+        }
+    };
+    with_machine_roots(
+        machine,
+        Vec::from_array([receiver]),
+        || finish_construct_value_with_new_target(
+            machine,
+            offset,
+            callee,
+            object,
+            arguments,
+            new_target,
+            prototype,
+            receiver,
+        ),
+    )
+}
+
 fn construct_value_with_new_target(
+    machine: Machine,
+    offset: isize,
+    callee: runtime::Value,
+    arguments: Vec[runtime::Value],
+    new_target: runtime::Value,
+) -> Result[runtime::Value, VmError] {
+    let roots: Vec[runtime::Value] = Vec::with_capacity(arguments.len() + 2);
+    roots.push(callee);
+    roots.push(new_target);
+    for value in arguments {
+        roots.push(value)
+    }
+    with_machine_roots(
+        machine,
+        roots,
+        || construct_value_with_new_target_rooted(machine, offset, callee, arguments, new_target),
+    )
+}
+
+fn construct_value_with_new_target_rooted(
     machine: Machine,
     offset: isize,
     callee: runtime::Value,
@@ -7077,78 +7291,19 @@ fn construct_value_with_new_target(
         },
         None => arguments,
     };
-    match machine.vm_constructor_functions.get(object) {
-        Some(callbacks) => match callbacks.self_allocating {
-            Some(callback) => return callback(arguments, machine.depth),
-            None => (),
-        },
-        None => (),
-    };
-    let prototype = match read_object_property(
+    with_machine_roots(
         machine,
-        offset,
-        new_target_object,
-        new_target,
-        runtime::string_property_key("prototype"),
-    )? {
-        runtime::Value::Object(value) => Option::Some(value),
-        _ => Option::None,
-    };
-    let derived = match source_function {
-        Some(closure) => closure.function.get().derived_constructor(),
-        None => false,
-    };
-    let receiver = if derived {
-        runtime::Value::Undefined
-    } else {
-        match runtime::new_ordinary_object(machine.heap, prototype) {
-            Ok(value) => runtime::Value::Object(value),
-            Err(value) => return Result::Err(error(offset, VmErrorKind::TypeError(value.message))),
-        }
-    };
-    match (receiver, machine.native_constructor_functions.get(object)) {
-        (runtime::Value::Object(receiver_object), Some(callback)) => {
-            return match callback(machine.heap, receiver_object, arguments) {
-                Ok(runtime::Value::Object(value)) => Result::Ok(runtime::Value::Object(value)),
-                Ok(_) => Result::Ok(receiver),
-                Err(value) => Result::Err(error(offset, native_error_kind(value.message))),
-            }
-        },
-        _ => (),
-    };
-    match (receiver, machine.vm_constructor_functions.get(object)) {
-        (runtime::Value::Object(receiver_object), Some(callbacks)) => {
-            return match callbacks.callback {
-                Some(callback) => match callback(
-                    receiver_object,
-                    arguments,
-                    prototype,
-                    new_target,
-                    machine.depth,
-                ) {
-                    Ok(runtime::Value::Object(value)) => Result::Ok(runtime::Value::Object(value)),
-                    Ok(_) => Result::Ok(receiver),
-                    Err(value) => Result::Err(value),
-                },
-                None => Result::Err(
-                    error(offset, VmErrorKind::TypeError("constructor callback is unavailable")),
-                ),
-            }
-        },
-        _ => (),
-    };
-    match call_value_with_mode(
-        machine,
-        offset,
-        callee,
         arguments,
-        receiver,
-        true,
-        Option::Some(new_target),
-    )? {
-        runtime::Value::Object(value) => Result::Ok(runtime::Value::Object(value)),
-        _ => Result::Ok(receiver),
-    }
+        || construct_prepared_value_with_new_target(
+            machine,
+            offset,
+            callee,
+            object,
+            arguments,
+            new_target,
+            new_target_object,
+        ),
+    )
 }
 
 fn construct_value(

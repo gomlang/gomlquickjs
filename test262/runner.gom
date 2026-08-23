@@ -48,8 +48,8 @@ fn harness_names(metadata: Metadata, variant: SourceVariant) -> Vec[string] {
     if variant == SourceVariant::Raw {
         return names
     } else {};
-    push_unique(names, "sta.js");
     push_unique(names, "assert.js");
+    push_unique(names, "sta.js");
     for name in metadata.includes {
         push_unique(names, name)
     }
@@ -60,18 +60,71 @@ pub fn prepare_source(case: TestCase, variant: SourceVariant, loader: HarnessLoa
     string,
     string,
 ] {
+    let _ = loader;
+    Result::Ok(variant_source(case, variant))
+}
+
+fn prepare_harness(metadata: Metadata, variant: SourceVariant, loader: HarnessLoader) -> Result[
+    string,
+    string,
+] {
     let builder = text::StringBuilder::new();
-    for name in harness_names(case.metadata, variant) {
+    for name in harness_names(metadata, variant) {
         match loader(name) {
             Ok(source) => append_source(builder, source),
             Err(message) => return Result::Err("cannot load harness `" + name + "`: " + message),
         }
     }
+    Result::Ok(builder.finish())
+}
+
+fn variant_source(case: TestCase, variant: SourceVariant) -> string {
+    if variant == SourceVariant::Raw {
+        return case.source
+    } else {};
+    let builder = text::StringBuilder::new();
     if variant == SourceVariant::Strict {
         append_source(builder, "\"use strict\";")
     } else {};
     append_source(builder, case.source);
-    Result::Ok(builder.finish())
+    builder.finish()
+}
+
+fn unsupported_feature(feature: string) -> bool {
+    feature == "Array.fromAsync" || feature == "Atomics.waitAsync" || feature == "IsHTMLDDA"
+        || feature == "ShadowRealm"
+        || feature == "WebAssembly"
+        || feature == "await-dictionary"
+        || feature == "cross-realm"
+        || feature == "decorators"
+        || feature == "decorator-metadata"
+        || feature == "error-stack-accessor"
+        || feature == "explicit-resource-management"
+        || feature == "export-defer"
+        || feature == "host-gc-required"
+        || feature == "immutable-arraybuffer"
+        || feature == "import-bytes"
+        || feature == "import-defer"
+        || feature == "import-text"
+        || feature == "nonextensible-applies-to-private"
+        || feature == "source-phase-imports"
+        || feature == "source-phase-imports-module-source"
+        || feature == "tail-call-optimization"
+        || feature == "intl-normative-optional"
+        || feature.starts_with("Intl")
+        || feature.starts_with("Temporal")
+}
+
+fn skip_reason(metadata: Metadata) -> Option[string] {
+    if has_flag(metadata, "CanBlockIsTrue") {
+        return Option::Some("host cannot block")
+    } else {};
+    for feature in metadata.features {
+        if unsupported_feature(feature) {
+            return Option::Some("unsupported feature `" + feature + "`")
+        } else {}
+    }
+    Option::None
 }
 
 fn compile_messages(errors: Vec[compiler::CompileError]) -> string {
@@ -91,14 +144,24 @@ fn compile_messages(errors: Vec[compiler::CompileError]) -> string {
     builder.finish()
 }
 
-fn runtime_type(error: vm::VmErrorKind) -> string {
+fn thrown_type(context: vm::Context, value: runtime::Value) -> string {
+    match value {
+        runtime::Value::Object(object) => match context.error_object_type(object) {
+            Some(value) => value.to_host_string().unwrap_or("Thrown"),
+            None => "Thrown",
+        },
+        _ => "Thrown",
+    }
+}
+
+fn runtime_type(context: vm::Context, error: vm::VmErrorKind) -> string {
     match error {
         vm::VmErrorKind::TypeError(_) => "TypeError",
         vm::VmErrorKind::RangeError(_) => "RangeError",
         vm::VmErrorKind::ReferenceError(_) => "ReferenceError",
-        vm::VmErrorKind::SyntaxError(_) => "SyntaxError",
+        vm::VmErrorKind::SyntaxError(_) | vm::VmErrorKind::SyntaxErrorAt(_, _) => "SyntaxError",
         vm::VmErrorKind::UriError(_) => "URIError",
-        vm::VmErrorKind::Thrown(_) => "Thrown",
+        vm::VmErrorKind::Thrown(value) => thrown_type(context, value),
         vm::VmErrorKind::CallDepthExceeded => "InternalError",
         _ => "RuntimeError",
     }
@@ -107,16 +170,29 @@ fn runtime_type(error: vm::VmErrorKind) -> string {
 fn compile_failure(variant: SourceVariant, metadata: Metadata, errors: Vec[compiler::CompileError]) -> RunResult {
     let message = compile_messages(errors);
     match metadata.negative {
-        Some(NegativeExpectation { phase: NegativePhase::Parse, .. }) | Some(NegativeExpectation {
-            phase: NegativePhase::Resolution,
-            ..,
-        }) => {
+        Some(NegativeExpectation { phase: NegativePhase::Parse, type_name }) => if type_name
+            == "SyntaxError" {
             result(variant, RunStatus::Passed, message)
+        } else {
+            result(
+                variant,
+                RunStatus::Failed,
+                "expected parse " + type_name + " but got parse SyntaxError: " + message,
+            )
         },
-        Some(_) => result(
+        Some(NegativeExpectation { phase, type_name }) => result(
             variant,
             RunStatus::Failed,
-            "expected a runtime failure but compilation failed: " + message,
+            "expected "
+                + match phase {
+                    NegativePhase::Parse => "parse",
+                    NegativePhase::Resolution => "resolution",
+                    NegativePhase::Runtime => "runtime",
+                }
+                + " "
+                + type_name
+                + " but got parse SyntaxError: "
+                + message,
         ),
         None => result(variant, RunStatus::Failed, "unexpected compile failure: " + message),
     }
@@ -141,8 +217,14 @@ fn runtime_success(variant: SourceVariant, metadata: Metadata) -> RunResult {
     }
 }
 
-fn runtime_failure(variant: SourceVariant, metadata: Metadata, offset: isize, kind: vm::VmErrorKind) -> RunResult {
-    let actual_type = runtime_type(kind);
+fn runtime_failure(
+    context: vm::Context,
+    variant: SourceVariant,
+    metadata: Metadata,
+    offset: isize,
+    kind: vm::VmErrorKind,
+) -> RunResult {
+    let actual_type = runtime_type(context, kind);
     let detail = "runtime " + actual_type + " at bytecode " + offset.to_string();
     match metadata.negative {
         Some(NegativeExpectation { phase: NegativePhase::Runtime, type_name }) => if type_name
@@ -171,6 +253,20 @@ fn runtime_failure(variant: SourceVariant, metadata: Metadata, offset: isize, ki
         ),
         None => result(variant, RunStatus::Failed, "unexpected " + detail),
     }
+}
+
+fn harness_runtime_failure(
+    context: vm::Context,
+    variant: SourceVariant,
+    offset: isize,
+    kind: vm::VmErrorKind,
+) -> RunResult {
+    result(
+        variant,
+        RunStatus::Failed,
+        "unexpected harness runtime " + runtime_type(context, kind) + " at bytecode "
+            + offset.to_string(),
+    )
 }
 
 fn async_argument(arguments: Vec[runtime::Value]) -> runtime::Value {
@@ -237,7 +333,7 @@ fn async_success(
 ) -> RunResult {
     match context.run_pending_jobs() {
         Ok(_) => (),
-        Err(error) => return runtime_failure(variant, metadata, error.offset, error.kind),
+        Err(error) => return runtime_failure(context, variant, metadata, error.offset, error.kind),
     };
     match completion.get() {
         AsyncCompletion::Passed => runtime_success(variant, metadata),
@@ -260,13 +356,18 @@ fn async_success(
 }
 
 pub fn run_variant(case: TestCase, variant: SourceVariant, loader: HarnessLoader) -> RunResult {
+    match skip_reason(case.metadata) {
+        Some(message) => return result(variant, RunStatus::Skipped, message),
+        None => (),
+    };
     if variant == SourceVariant::Module {
         return result(variant, RunStatus::Skipped, "modules are not implemented")
     } else {};
-    let source = match prepare_source(case, variant, loader) {
+    let harness = match prepare_harness(case.metadata, variant, loader) {
         Ok(value) => value,
         Err(message) => return result(variant, RunStatus::Failed, message),
     };
+    let source = variant_source(case, variant);
     let function = match compiler::compile(source) {
         Ok(value) => value,
         Err(errors) => return compile_failure(variant, case.metadata, errors),
@@ -287,13 +388,42 @@ pub fn run_variant(case: TestCase, variant: SourceVariant, loader: HarnessLoader
                     Err(message) => return result(variant, RunStatus::Failed, message),
                 }
             } else {};
+            if harness.byte_len() > 0 {
+                let harness_function = match context.compile_dynamic_eval_source(
+                    harness,
+                    Vec::new(),
+                ) {
+                    Ok(value) => value,
+                    Err(error) => return harness_runtime_failure(
+                        context,
+                        variant,
+                        error.offset,
+                        error.kind,
+                    ),
+                };
+                match context.execute(harness_function) {
+                    Ok(_) => (),
+                    Err(error) => return harness_runtime_failure(
+                        context,
+                        variant,
+                        error.offset,
+                        error.kind,
+                    ),
+                }
+            } else {};
             match context.execute(function) {
                 Ok(_) => if case.metadata.asynchronous {
                     async_success(context, variant, case.metadata, completion)
                 } else {
                     runtime_success(variant, case.metadata)
                 },
-                Err(error) => runtime_failure(variant, case.metadata, error.offset, error.kind),
+                Err(error) => runtime_failure(
+                    context,
+                    variant,
+                    case.metadata,
+                    error.offset,
+                    error.kind,
+                ),
             }
         },
     }
@@ -308,37 +438,69 @@ pub fn run(case: TestCase, loader: HarnessLoader) -> Vec[RunResult] {
 }
 
 fn prepare_module_harness(metadata: Metadata, loader: HarnessLoader) -> Result[string, string] {
-    let builder = text::StringBuilder::new();
-    for name in harness_names(metadata, SourceVariant::Module) {
-        match loader(name) {
-            Ok(source) => append_source(builder, source),
-            Err(message) => return Result::Err("cannot load harness `" + name + "`: " + message),
-        }
+    prepare_harness(metadata, SourceVariant::Module, loader)
+}
+
+fn module_error_phase(error: modules::ModuleError) -> NegativePhase {
+    match error.runtime_type {
+        Some(_) => NegativePhase::Runtime,
+        None => NegativePhase::Resolution,
     }
-    Result::Ok(builder.finish())
+}
+
+fn module_error_type(error: modules::ModuleError) -> string {
+    match error.runtime_type {
+        Some(value) => return value,
+        None => (),
+    };
+    match error.kind {
+        modules::ModuleErrorKind::Reference => "ReferenceError",
+        modules::ModuleErrorKind::Syntax => "SyntaxError",
+        modules::ModuleErrorKind::Type => "TypeError",
+    }
 }
 
 fn module_failure(metadata: Metadata, error: modules::ModuleError) -> RunResult {
+    let actual_phase = module_error_phase(error);
+    let actual_type = module_error_type(error);
     let detail = error.path + ": " + error.message;
     match metadata.negative {
-        Some(NegativeExpectation { phase: NegativePhase::Resolution, .. }) => {
+        Some(NegativeExpectation { phase, type_name }) => if phase == actual_phase
+            && type_name == actual_type {
             result(SourceVariant::Module, RunStatus::Passed, detail)
+        } else {
+            result(
+                SourceVariant::Module,
+                RunStatus::Failed,
+                "expected "
+                    + match phase {
+                        NegativePhase::Parse => "parse",
+                        NegativePhase::Resolution => "resolution",
+                        NegativePhase::Runtime => "runtime",
+                    }
+                    + " "
+                    + type_name
+                    + " but got "
+                    + match actual_phase {
+                        NegativePhase::Parse => "parse",
+                        NegativePhase::Resolution => "resolution",
+                        NegativePhase::Runtime => "runtime",
+                    }
+                    + " "
+                    + actual_type
+                    + ": "
+                    + detail,
+            )
         },
-        Some(NegativeExpectation { phase: NegativePhase::Runtime, type_name }) => result(
-            SourceVariant::Module,
-            RunStatus::Failed,
-            "expected runtime " + type_name + " but got " + detail,
-        ),
-        Some(NegativeExpectation { phase: NegativePhase::Parse, type_name }) => result(
-            SourceVariant::Module,
-            RunStatus::Failed,
-            "expected parse " + type_name + " but got " + detail,
-        ),
         None => result(SourceVariant::Module, RunStatus::Failed, "unexpected " + detail),
     }
 }
 
 fn run_module_file(case: TestCase, file: string, loader: HarnessLoader) -> RunResult {
+    match skip_reason(case.metadata) {
+        Some(message) => return result(SourceVariant::Module, RunStatus::Skipped, message),
+        None => (),
+    };
     match compiler::compile_module(case.source) {
         Err(errors) => return compile_failure(SourceVariant::Module, case.metadata, errors),
         Ok(_) => (),
@@ -346,14 +508,6 @@ fn run_module_file(case: TestCase, file: string, loader: HarnessLoader) -> RunRe
     let harness = match prepare_module_harness(case.metadata, loader) {
         Ok(value) => value,
         Err(message) => return result(SourceVariant::Module, RunStatus::Failed, message),
-    };
-    let harness_function = match compiler::compile(harness) {
-        Ok(value) => value,
-        Err(errors) => return result(
-            SourceVariant::Module,
-            RunStatus::Failed,
-            "cannot compile module harness: " + compile_messages(errors),
-        ),
     };
     let context = vm::Context::new(runtime::Heap::new());
     compiler::install_dynamic_function_compiler(context);
@@ -372,15 +526,26 @@ fn run_module_file(case: TestCase, file: string, loader: HarnessLoader) -> RunRe
             Err(message) => return result(SourceVariant::Module, RunStatus::Failed, message),
         }
     } else {};
-    match context.execute(harness_function) {
-        Err(error) => return runtime_failure(
-            SourceVariant::Module,
-            case.metadata,
-            error.offset,
-            error.kind,
-        ),
-        Ok(_) => (),
-    };
+    if harness.byte_len() > 0 {
+        let harness_function = match context.compile_dynamic_eval_source(harness, Vec::new()) {
+            Ok(value) => value,
+            Err(error) => return harness_runtime_failure(
+                context,
+                SourceVariant::Module,
+                error.offset,
+                error.kind,
+            ),
+        };
+        match context.execute(harness_function) {
+            Err(error) => return harness_runtime_failure(
+                context,
+                SourceVariant::Module,
+                error.offset,
+                error.kind,
+            ),
+            Ok(_) => (),
+        }
+    } else {};
     match modules::execute_source(context, realm.global_object(), file, case.source) {
         Ok(_) => if case.metadata.asynchronous {
             async_success(context, SourceVariant::Module, case.metadata, completion)
@@ -392,6 +557,28 @@ fn run_module_file(case: TestCase, file: string, loader: HarnessLoader) -> RunRe
 }
 
 pub fn run_file(file: string, harness_directory: string) -> Result[Vec[RunResult], string] {
+    if file.starts_with("test/intl402/") || file.starts_with("test/staging/intl402/")
+        || file.contains("/test/intl402/")
+        || file.contains("/test/staging/intl402/") {
+        return Result::Ok(
+            Vec::from_array(
+                [result(SourceVariant::Raw, RunStatus::Skipped, "Intl402 tests are not supported")],
+            ),
+        )
+    } else {};
+    if path::file_name(file).unwrap_or(file).contains("_FIXTURE") {
+        return Result::Ok(
+            Vec::from_array(
+                [
+                    result(
+                        SourceVariant::Raw,
+                        RunStatus::Skipped,
+                        "fixture files are dependencies, not standalone tests",
+                    ),
+                ],
+            ),
+        )
+    } else {};
     let source = match fs::read_file(file) {
         Ok(value) => value,
         Err(message) => return Result::Err("cannot read test `" + file + "`: " + message),

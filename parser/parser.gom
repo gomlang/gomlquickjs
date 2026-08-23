@@ -2,6 +2,7 @@ package parser;
 
 use gomlang::quickjs::ast;
 use gomlang::quickjs::lexer;
+use std::collections;
 use std::text;
 
 #[derive(PartialEq, Eq, Debug)]
@@ -15,10 +16,28 @@ pub struct ParseResult {
     pub errors: Vec[ParseError],
 }
 
+struct ParsePass {
+    result: ParseResult,
+    contextual_divisions: Vec[isize],
+}
+
 struct Parser {
     tokens: Vec[lexer::Token],
     index: Ref[isize],
     errors: Vec[ParseError],
+    module_goal: bool,
+    contexts: Vec[ParseContext],
+    contextual_divisions: Vec[isize],
+    contextual_division_offsets: collections::HashSet[isize],
+}
+
+struct ParseContext {
+    generator: bool,
+    asynchronous: bool,
+    function_body: bool,
+    module_top_level: bool,
+    strict: bool,
+    await_reserved: bool,
 }
 
 enum InfixKind {
@@ -75,6 +94,93 @@ fn lookahead_token(parser: Parser, offset: isize) -> lexer::Token {
 
 fn current_kind(parser: Parser) -> lexer::TokenKind {
     current_token(parser).kind
+}
+
+fn current_context(parser: Parser) -> ParseContext {
+    parser.contexts[parser.contexts.len() - 1]
+}
+
+fn push_context(
+    parser: Parser,
+    generator: bool,
+    asynchronous: bool,
+    function_body: bool,
+    module_top_level: bool,
+    strict: bool,
+    await_reserved: bool,
+) -> unit {
+    parser.contexts.push(
+        ParseContext {
+            generator,
+            asynchronous,
+            function_body,
+            module_top_level,
+            strict,
+            await_reserved,
+        },
+    )
+}
+
+fn pop_context(parser: Parser) -> unit {
+    let _ = parser.contexts.pop();
+}
+
+fn await_expression_allowed(parser: Parser) -> bool {
+    let context = current_context(parser);
+    context.asynchronous || parser.module_goal && context.module_top_level
+}
+
+fn yield_expression_allowed(parser: Parser) -> bool {
+    current_context(parser).generator
+}
+
+fn identifier_allowed_with_context(
+    parser: Parser,
+    token: lexer::Token,
+    generator: bool,
+    asynchronous: bool,
+    strict: bool,
+    await_reserved: bool,
+) -> bool {
+    if token.kind == lexer::TokenKind::Identifier && !token.is_reserved {
+        true
+    } else if token.value == "await"
+        && (token.kind == lexer::TokenKind::AwaitKeyword || token.is_reserved) {
+        !parser.module_goal && !asynchronous && !await_reserved
+    } else if token.value == "yield"
+        && (token.kind == lexer::TokenKind::YieldKeyword || token.is_reserved) {
+        !generator && !strict
+    } else {
+        false
+    }
+}
+
+fn identifier_allowed(parser: Parser, token: lexer::Token) -> bool {
+    let context = current_context(parser);
+    identifier_allowed_with_context(
+        parser,
+        token,
+        context.generator,
+        context.asynchronous,
+        context.strict,
+        context.await_reserved,
+    )
+}
+
+fn request_contextual_division(parser: Parser) -> unit {
+    let token = current_token(parser);
+    if token.kind == lexer::TokenKind::RegExp
+        || token.kind == lexer::TokenKind::Error && text::starts_with_at(token.lexeme, 0, "/") {
+        if parser.contextual_division_offsets.insert(token.span.start) {
+            parser.contextual_divisions.push(token.span.start)
+        } else {}
+    } else {}
+}
+
+fn request_contextual_property_division(parser: Parser, token: lexer::Token) -> unit {
+    if token.kind == lexer::TokenKind::AwaitKeyword || token.kind == lexer::TokenKind::YieldKeyword {
+        request_contextual_division(parser)
+    } else {}
 }
 
 fn at(parser: Parser, kind: lexer::TokenKind) -> bool {
@@ -613,7 +719,7 @@ fn invalid_binding_pattern(parser: Parser, message: string) -> ast::BindingPatte
 
 fn parse_binding_identifier(parser: Parser) -> ast::BindingPattern {
     let token = current_token(parser);
-    if token.kind == lexer::TokenKind::Identifier && !token.is_reserved {
+    if identifier_allowed(parser, token) {
         bump(parser);
         ast::BindingPattern::Identifier { name: token.value, span: convert_span(token.span) }
     } else {
@@ -725,7 +831,7 @@ fn parse_binding_property_key(parser: Parser) -> Option[ParsedBindingPropertyKey
             Option::Some(
                 ParsedBindingPropertyKey {
                     key: ast::ObjectPropertyKey::Identifier(token.value),
-                    shorthand: if token.kind == lexer::TokenKind::Identifier && !token.is_reserved {
+                    shorthand: if identifier_allowed(parser, token) {
                         Option::Some(token.value)
                     } else {
                         Option::None
@@ -879,11 +985,13 @@ fn parse_binding_pattern(parser: Parser) -> ast::BindingPattern {
 
 fn parse_variable_binding_pattern(parser: Parser) -> ast::BindingPattern {
     let token = current_token(parser);
-    if token.kind == lexer::TokenKind::Identifier && token.is_reserved {
-        invalid_binding_pattern(parser, "reserved word cannot be used as a variable name")
-    } else if token.kind == lexer::TokenKind::Identifier || token.kind == lexer::TokenKind::LBracket
+    if identifier_allowed(parser, token) || token.kind == lexer::TokenKind::LBracket
         || token.kind == lexer::TokenKind::LBrace {
         parse_binding_pattern(parser)
+    } else if token.kind == lexer::TokenKind::Identifier
+        || token.kind == lexer::TokenKind::AwaitKeyword
+        || token.kind == lexer::TokenKind::YieldKeyword {
+        invalid_binding_pattern(parser, "reserved word cannot be used as a variable name")
     } else {
         invalid_binding_pattern(parser, "expected variable name")
     }
@@ -891,11 +999,13 @@ fn parse_variable_binding_pattern(parser: Parser) -> ast::BindingPattern {
 
 fn parse_catch_binding_pattern(parser: Parser) -> ast::BindingPattern {
     let token = current_token(parser);
-    if token.kind == lexer::TokenKind::Identifier && token.is_reserved {
-        invalid_binding_pattern(parser, "reserved word cannot be used as a catch binding")
-    } else if token.kind == lexer::TokenKind::Identifier || token.kind == lexer::TokenKind::LBracket
+    if identifier_allowed(parser, token) || token.kind == lexer::TokenKind::LBracket
         || token.kind == lexer::TokenKind::LBrace {
         parse_binding_pattern(parser)
+    } else if token.kind == lexer::TokenKind::Identifier
+        || token.kind == lexer::TokenKind::AwaitKeyword
+        || token.kind == lexer::TokenKind::YieldKeyword {
+        invalid_binding_pattern(parser, "reserved word cannot be used as a catch binding")
     } else {
         invalid_binding_pattern(parser, "expected catch binding")
     }
@@ -922,8 +1032,7 @@ fn parse_function_parameters(parser: Parser) -> Vec[ast::FunctionParameter] {
                 false
             };
             let token = current_token(parser);
-            if token.kind == lexer::TokenKind::Identifier && !token.is_reserved
-                || token.kind == lexer::TokenKind::LBracket
+            if identifier_allowed(parser, token) || token.kind == lexer::TokenKind::LBracket
                 || token.kind == lexer::TokenKind::LBrace {
                 let pattern = parse_binding_pattern(parser);
                 let name = match pattern {
@@ -1007,6 +1116,8 @@ fn parse_arrow_function(
     } else {
         report(parser, "expected `=>`", missing_span(parser))
     };
+    let context = current_context(parser);
+    push_context(parser, false, asynchronous, true, false, context.strict, false);
     let body: Vec[ast::Stmt] = Vec::new();
     let expression_body = !at(parser, lexer::TokenKind::LBrace);
     let end = if !expression_body {
@@ -1029,6 +1140,7 @@ fn parse_arrow_function(
         body.push(ast::Stmt::Return { argument: Option::Some(Ref::new(expression)), span });
         span.end
     };
+    pop_context(parser);
     ast::Expr::Arrow {
         parameters,
         body,
@@ -1048,7 +1160,18 @@ fn block_arrow(expression: ast::Expr) -> bool {
 fn parse_parenthesized_or_arrow(parser: Parser) -> ast::Expr {
     if parenthesized_arrow_start(parser) {
         let start = current_token(parser).span.start;
+        let context = current_context(parser);
+        push_context(
+            parser,
+            context.generator,
+            context.asynchronous,
+            false,
+            context.module_top_level,
+            context.strict,
+            context.await_reserved,
+        );
         let parameters = parse_function_parameters(parser);
+        pop_context(parser);
         parse_arrow_function(parser, start, parameters, false)
     } else {
         parse_parenthesized(parser)
@@ -1064,25 +1187,48 @@ fn parse_function_parts(parser: Parser, declaration: bool, asynchronous: bool) -
         false
     };
     let token = current_token(parser);
-    let name = if token.kind == lexer::TokenKind::Identifier {
+    let outer_context = current_context(parser);
+    let name_allowed = if declaration {
+        identifier_allowed(parser, token)
+    } else {
+        identifier_allowed_with_context(
+            parser,
+            token,
+            generator,
+            asynchronous,
+            outer_context.strict,
+            false,
+        )
+    };
+    let name = if name_allowed {
         bump(parser);
-        if token.is_reserved {
+        Option::Some(token.value)
+    } else {
+        if declaration {
+            report(parser, "expected function name", missing_span(parser));
+            if token.kind == lexer::TokenKind::Identifier
+                || token.kind == lexer::TokenKind::AwaitKeyword
+                || token.kind == lexer::TokenKind::YieldKeyword {
+                bump(parser);
+            } else {}
+        } else if token.kind == lexer::TokenKind::Identifier
+            || token.kind == lexer::TokenKind::AwaitKeyword
+            || token.kind == lexer::TokenKind::YieldKeyword {
             report(
                 parser,
                 "reserved word cannot be used as a function name",
                 convert_span(token.span),
-            )
-        } else {};
-        Option::Some(token.value)
-    } else {
-        if declaration {
-            report(parser, "expected function name", missing_span(parser))
+            );
+            bump(parser);
         } else {};
         Option::None
     };
+    push_context(parser, generator, asynchronous, false, false, outer_context.strict, false);
     let parameters = parse_function_parameters(parser);
+    pop_context(parser);
     let mut body: Vec[ast::Stmt] = Vec::new();
     let mut end = current_token(parser).span.start;
+    push_context(parser, generator, asynchronous, true, false, outer_context.strict, false);
     if at(parser, lexer::TokenKind::LBrace) {
         let block = parse_block_statement(parser);
         match block {
@@ -1095,6 +1241,7 @@ fn parse_function_parts(parser: Parser, declaration: bool, asynchronous: bool) -
     } else {
         report(parser, "expected function body", missing_span(parser))
     };
+    pop_context(parser);
     ParsedFunction {
         start: keyword.span.start,
         name,
@@ -1191,9 +1338,13 @@ fn synchronize_object_property(parser: Parser) -> unit {
 }
 
 fn parse_object_method(parser: Parser, start: isize, generator: bool, asynchronous: bool) -> ast::Expr {
+    let outer_context = current_context(parser);
+    push_context(parser, generator, asynchronous, false, false, outer_context.strict, false);
     let parameters = parse_function_parameters(parser);
+    pop_context(parser);
     let mut body: Vec[ast::Stmt] = Vec::new();
     let mut end = current_token(parser).span.start;
+    push_context(parser, generator, asynchronous, true, false, outer_context.strict, false);
     if at(parser, lexer::TokenKind::LBrace) {
         match parse_block_statement(parser) {
             ast::Stmt::Block { body: value, span } => {
@@ -1205,6 +1356,7 @@ fn parse_object_method(parser: Parser, start: isize, generator: bool, asynchrono
     } else {
         report(parser, "expected object method body", missing_span(parser))
     };
+    pop_context(parser);
     ast::Expr::Function {
         name: Option::None,
         parameters,
@@ -1467,7 +1619,7 @@ fn parse_object_property(parser: Parser) -> Option[ast::ObjectProperty] {
                 }
             } else if at(parser, lexer::TokenKind::LParen) {
                 parse_object_method(parser, token.span.start, false, false)
-            } else if token.kind == lexer::TokenKind::Identifier && !token.is_reserved
+            } else if identifier_allowed(parser, token)
                 && (at(parser, lexer::TokenKind::Comma) || at(parser, lexer::TokenKind::RBrace)) {
                 ast::Expr::Identifier { name: token.value, span: convert_span(token.span) }
             } else {
@@ -1758,20 +1910,24 @@ fn parse_primary(parser: Parser) -> ast::Expr {
             ast::Expr::Super { span: convert_span(token.span) }
         },
         ImportKeyword => parse_import_expression(parser),
-        Identifier => {
+        Identifier | AwaitKeyword | YieldKeyword => {
             if token.value == "async" && !token.has_escape
                 && !lookahead_token(parser, 1).line_break_before
                 && lookahead_token(parser, 1).kind == lexer::TokenKind::FunctionKeyword {
                 bump(parser);
                 return parse_function_expression(parser, true)
             } else {};
+            let allowed = identifier_allowed(parser, token);
             bump(parser);
-            if token.is_reserved {
+            if !allowed {
                 report(
                     parser,
                     "reserved word cannot be used as an identifier",
                     convert_span(token.span),
                 )
+            } else if token.kind == lexer::TokenKind::AwaitKeyword
+                || token.kind == lexer::TokenKind::YieldKeyword {
+                request_contextual_division(parser)
             } else {};
             ast::Expr::Identifier { name: token.value, span: convert_span(token.span) }
         },
@@ -1906,6 +2062,7 @@ fn parse_postfix(parser: Parser, initial: ast::Expr) -> ast::Expr {
                 }
             } else if is_identifier_name(property_token.kind) {
                 bump(parser);
+                request_contextual_property_division(parser, property_token);
                 ast::Expr::Identifier {
                     name: property_token.value,
                     span: convert_span(property_token.span),
@@ -1969,6 +2126,7 @@ fn parse_postfix(parser: Parser, initial: ast::Expr) -> ast::Expr {
                     }
                 } else if is_identifier_name(property_token.kind) {
                     bump(parser);
+                    request_contextual_property_division(parser, property_token);
                     ast::Expr::Identifier {
                         name: property_token.value,
                         span: convert_span(property_token.span),
@@ -2047,6 +2205,7 @@ fn parse_new_expression(parser: Parser) -> ast::Expr {
                 }
             } else if is_identifier_name(property_token.kind) {
                 bump(parser);
+                request_contextual_property_division(parser, property_token);
                 ast::Expr::Identifier {
                     name: property_token.value,
                     span: convert_span(property_token.span),
@@ -2107,8 +2266,15 @@ fn parse_new_expression(parser: Parser) -> ast::Expr {
 }
 
 fn parse_prefix(parser: Parser) -> ast::Expr {
-    if at(parser, lexer::TokenKind::AwaitKeyword) {
+    if at(parser, lexer::TokenKind::AwaitKeyword) && await_expression_allowed(parser) {
         let token = bump(parser);
+        if !current_context(parser).function_body {
+            report(
+                parser,
+                "await is not allowed in a parameter initializer",
+                convert_span(token.span),
+            )
+        } else {};
         let argument = parse_precedence(parser, 14);
         return ast::Expr::Await {
             argument: Ref::new(argument),
@@ -2184,7 +2350,7 @@ fn parse_precedence(parser: Parser, minimum: isize) -> ast::Expr {
                         InfixKind::Binary(operator) => {
                             if operator == ast::BinaryOperator::Power
                                 && match left {
-                                    ast::Expr::Unary { .. } => true,
+                                    ast::Expr::Unary { .. } | ast::Expr::Await { .. } => true,
                                     _ => false,
                                 } {
                                 report(
@@ -2537,11 +2703,24 @@ fn parse_assignment_expression(parser: Parser) -> ast::Expr {
         && !current_token(parser).has_escape
         && !lookahead_token(parser, 1).line_break_before {
         let start = current_token(parser).span.start;
-        if lookahead_token(parser, 1).kind == lexer::TokenKind::Identifier
+        let parameter_token = lookahead_token(parser, 1);
+        if (parameter_token.kind == lexer::TokenKind::Identifier
+            || parameter_token.kind == lexer::TokenKind::AwaitKeyword
+            || parameter_token.kind == lexer::TokenKind::YieldKeyword)
             && lookahead_token(parser, 2).kind == lexer::TokenKind::Arrow {
             bump(parser);
             let parameter = bump(parser);
             let span = convert_span(parameter.span);
+            if !identifier_allowed_with_context(
+                parser,
+                parameter,
+                current_context(parser).generator,
+                true,
+                current_context(parser).strict,
+                false,
+            ) {
+                report(parser, "reserved word cannot be used as a parameter name", span)
+            } else {};
             return parse_arrow_function(
                 parser,
                 start,
@@ -2564,14 +2743,32 @@ fn parse_assignment_expression(parser: Parser) -> ast::Expr {
             let saved = parser.index.get();
             bump(parser);
             if parenthesized_arrow_start(parser) {
+                let context = current_context(parser);
+                push_context(
+                    parser,
+                    context.generator,
+                    true,
+                    false,
+                    context.module_top_level,
+                    context.strict,
+                    false,
+                );
                 let parameters = parse_function_parameters(parser);
+                pop_context(parser);
                 return parse_arrow_function(parser, start, parameters, true)
             } else {
                 parser.index.set(saved)
             }
         } else {}
     } else {};
-    if at(parser, lexer::TokenKind::YieldKeyword) {
+    if at(parser, lexer::TokenKind::YieldKeyword) && yield_expression_allowed(parser) {
+        if !current_context(parser).function_body {
+            report(
+                parser,
+                "yield is not allowed in a parameter initializer",
+                convert_span(current_token(parser).span),
+            )
+        } else {};
         return parse_yield_expression(parser)
     } else {};
     if destructuring_assignment_start(parser) {
@@ -2833,7 +3030,9 @@ fn parse_class_element(parser: Parser) -> Option[ast::ClassElement] {
     if at(parser, lexer::TokenKind::StaticKeyword)
         && lookahead_token(parser, 1).kind == lexer::TokenKind::LBrace {
         bump(parser);
+        push_context(parser, false, false, true, false, true, true);
         let block = parse_block_statement(parser);
+        pop_context(parser);
         return match block {
             ast::Stmt::Block { body, span } => {
                 for statement in body {
@@ -2931,7 +3130,10 @@ fn parse_class_element(parser: Parser) -> Option[ast::ClassElement] {
             if at(parser, lexer::TokenKind::Semicolon) || at(parser, lexer::TokenKind::RBrace) {
                 Option::Some(Ref::new(error_expr(parser, "expected class field initializer")))
             } else {
-                Option::Some(Ref::new(parse_assignment_expression(parser)))
+                push_context(parser, false, false, true, false, true, false);
+                let value = parse_assignment_expression(parser);
+                pop_context(parser);
+                Option::Some(Ref::new(value))
             }
         } else {
             Option::None
@@ -2975,13 +3177,16 @@ fn parse_class_element(parser: Parser) -> Option[ast::ClassElement] {
             ast::span(start, name_end),
         )
     } else {};
+    push_context(parser, generator, asynchronous, false, false, true, false);
     let parameters = parse_function_parameters(parser);
+    pop_context(parser);
     if kind == ast::ClassElementKind::Getter && !parameters.is_empty() {
         report(parser, "getter must not have parameters", ast::span(start, name_end))
     } else if kind == ast::ClassElementKind::Setter && parameters.len() != 1 {
         report(parser, "setter must have exactly one parameter", ast::span(start, name_end))
     } else {};
     let body: Vec[ast::Stmt] = Vec::new();
+    push_context(parser, generator, asynchronous, true, false, true, false);
     let end = if at(parser, lexer::TokenKind::LBrace) {
         match parse_block_statement(parser) {
             ast::Stmt::Block { body: statements, span } => {
@@ -2996,6 +3201,7 @@ fn parse_class_element(parser: Parser) -> Option[ast::ClassElement] {
         report(parser, "expected class method body", missing_span(parser));
         name_end
     };
+    pop_context(parser);
     Option::Some(
         ast::ClassElement {
             name,
@@ -3039,22 +3245,39 @@ fn validate_private_class_element(
 fn parse_class_parts(parser: Parser, declaration: bool) -> ParsedClass {
     let keyword = bump(parser);
     let name_token = current_token(parser);
-    let name = if name_token.kind == lexer::TokenKind::Identifier {
+    let name = if identifier_allowed(parser, name_token) && name_token.value != "yield" {
         bump(parser);
-        if name_token.is_reserved {
+        Option::Some(name_token.value)
+    } else {
+        if declaration {
+            report(parser, "expected class name", convert_span(name_token.span));
+            if name_token.kind == lexer::TokenKind::Identifier
+                || name_token.kind == lexer::TokenKind::AwaitKeyword
+                || name_token.kind == lexer::TokenKind::YieldKeyword {
+                bump(parser);
+            } else {}
+        } else if name_token.kind == lexer::TokenKind::Identifier
+            || name_token.kind == lexer::TokenKind::AwaitKeyword
+            || name_token.kind == lexer::TokenKind::YieldKeyword {
             report(
                 parser,
                 "reserved word cannot be used as a class name",
                 convert_span(name_token.span),
-            )
-        } else {};
-        Option::Some(name_token.value)
-    } else {
-        if declaration {
-            report(parser, "expected class name", convert_span(name_token.span))
+            );
+            bump(parser);
         } else {};
         Option::None
     };
+    let outer_context = current_context(parser);
+    push_context(
+        parser,
+        outer_context.generator,
+        outer_context.asynchronous,
+        outer_context.function_body,
+        outer_context.module_top_level,
+        true,
+        outer_context.await_reserved,
+    );
     let heritage = if at(parser, lexer::TokenKind::ExtendsKeyword) {
         bump(parser);
         if at(parser, lexer::TokenKind::LBrace) || at_eof(parser) {
@@ -3103,7 +3326,9 @@ fn parse_class_parts(parser: Parser, declaration: bool) -> ParsedClass {
     } else {
         report(parser, "expected `{` after class header", missing_span(parser))
     };
-    ParsedClass { start: keyword.span.start, name, heritage, elements, end }
+    let parsed = ParsedClass { start: keyword.span.start, name, heritage, elements, end };
+    pop_context(parser);
+    parsed
 }
 
 fn parse_class_declaration(parser: Parser) -> ast::Stmt {
@@ -3576,7 +3801,7 @@ fn parse_switch_statement(parser: Parser) -> ast::Stmt {
 fn parse_break_statement(parser: Parser) -> ast::Stmt {
     let keyword = bump(parser);
     let label = if !current_token(parser).line_break_before
-        && at(parser, lexer::TokenKind::Identifier) {
+        && identifier_allowed(parser, current_token(parser)) {
         Option::Some(bump(parser).value)
     } else {
         Option::None
@@ -3593,7 +3818,7 @@ fn parse_break_statement(parser: Parser) -> ast::Stmt {
 fn parse_continue_statement(parser: Parser) -> ast::Stmt {
     let keyword = bump(parser);
     let label = if !current_token(parser).line_break_before
-        && at(parser, lexer::TokenKind::Identifier) {
+        && identifier_allowed(parser, current_token(parser)) {
         Option::Some(bump(parser).value)
     } else {
         Option::None
@@ -3756,7 +3981,7 @@ fn parse_debugger_statement(parser: Parser) -> ast::Stmt {
 
 fn parse_module_binding_name(parser: Parser, message: string) -> (string, isize) {
     let token = current_token(parser);
-    if is_identifier_name(token.kind) {
+    if identifier_allowed(parser, token) {
         bump(parser);
         (token.value, token.span.end)
     } else {
@@ -3872,6 +4097,7 @@ fn parse_named_import_specifiers(parser: Parser, specifiers: Vec[ast::ImportSpec
     let mut end = bump(parser).span.end;
     while !at_eof(parser) && !at(parser, lexer::TokenKind::RBrace) {
         let start = current_token(parser).span.start;
+        let imported_token = current_token(parser);
         let (imported, imported_end, string_name) = parse_module_export_name(
             parser,
             "expected imported name",
@@ -3888,6 +4114,13 @@ fn parse_named_import_specifiers(parser: Parser, specifiers: Vec[ast::ImportSpec
                 parser,
                 "string import name requires a local binding",
                 ast::span(start, imported_end),
+            );
+            local = "";
+        } else if !identifier_allowed(parser, imported_token) {
+            report(
+                parser,
+                "reserved word cannot be used as an import binding",
+                convert_span(imported_token.span),
             );
             local = "";
         } else {};
@@ -3959,7 +4192,7 @@ fn parse_import_statement(parser: Parser) -> ast::Stmt {
         let specifiers: Vec[ast::ImportSpecifier] = Vec::new();
         let _ = parse_named_import_specifiers(parser, specifiers);
         return finish_named_import(parser, keyword.span.start, specifiers)
-    } else if at(parser, lexer::TokenKind::Identifier) && !current_token(parser).is_reserved {
+    } else if identifier_allowed(parser, current_token(parser)) {
         let binding_start = current_token(parser).span.start;
         let (local, local_end) = parse_module_binding_name(
             parser,
@@ -4029,7 +4262,8 @@ fn parse_export_specifiers(parser: Parser) -> (Vec[ast::ExportSpecifier], isize)
             bump(parser);
             (local_token.value, local_token.span.end)
         } else {
-            parse_module_binding_name(parser, "expected exported name")
+            let (value, value_end, _) = parse_module_export_name(parser, "expected exported name");
+            (value, value_end)
         };
         let mut exported = local;
         let mut specifier_end = local_end;
@@ -4104,7 +4338,10 @@ fn parse_export_statement(parser: Parser) -> ast::Stmt {
         let star = bump(parser);
         if at(parser, lexer::TokenKind::Identifier) && current_token(parser).value == "as" {
             bump(parser);
-            let (exported, _) = parse_module_binding_name(parser, "expected namespace export name");
+            let (exported, _, _) = parse_module_export_name(
+                parser,
+                "expected namespace export name",
+            );
             consume_from(parser, "expected `from` after namespace export");
             let (source, source_end) = parse_module_source(parser, "expected export module string");
             let (attributes, attributes_end) = parse_import_attributes(parser, source_end);
@@ -4205,7 +4442,7 @@ fn parse_statement(parser: Parser) -> ast::Stmt {
         bump(parser);
         return parse_function_declaration(parser, true)
     } else {};
-    if at(parser, lexer::TokenKind::Identifier)
+    if identifier_allowed(parser, current_token(parser))
         && lookahead_token(parser, 1).kind == lexer::TokenKind::Colon {
         return parse_labelled_statement(parser)
     } else {};
@@ -4247,16 +4484,35 @@ fn parse_statement(parser: Parser) -> ast::Stmt {
     }
 }
 
-fn parser_from_lexed(value: lexer::LexResult) -> Parser {
+fn parser_from_lexed(value: lexer::LexResult, module_goal: bool) -> Parser {
     let errors: Vec[ParseError] = Vec::new();
     for error in value.errors {
         errors.push(ParseError { message: error.message, span: convert_span(error.span) })
     }
-    Parser { tokens: value.tokens, index: Ref::new(0), errors }
+    Parser {
+        tokens: value.tokens,
+        index: Ref::new(0),
+        errors,
+        module_goal,
+        contextual_divisions: Vec::new(),
+        contextual_division_offsets: collections::HashSet::new(),
+        contexts: Vec::from_array(
+            [
+                ParseContext {
+                    generator: false,
+                    asynchronous: false,
+                    function_body: true,
+                    module_top_level: module_goal,
+                    strict: module_goal,
+                    await_reserved: false,
+                },
+            ],
+        ),
+    }
 }
 
-pub fn parse(source: string) -> ParseResult {
-    let parser = parser_from_lexed(lexer::lex(source));
+fn parse_pass(value: lexer::LexResult, module_goal: bool) -> ParsePass {
+    let parser = parser_from_lexed(value, module_goal);
     let body: Vec[ast::Stmt] = Vec::new();
     while !at_eof(parser) {
         let before = parser.index.get();
@@ -4267,5 +4523,38 @@ pub fn parse(source: string) -> ParseResult {
         } else {}
     }
     let end = current_token(parser).span.end;
-    ParseResult { program: ast::Program { body, span: ast::span(0, end) }, errors: parser.errors }
+    ParsePass {
+        result: ParseResult {
+            program: ast::Program { body, span: ast::span(0, end) },
+            errors: parser.errors,
+        },
+        contextual_divisions: parser.contextual_divisions,
+    }
+}
+
+fn parse_with_goal(source: string, module_goal: bool) -> ParseResult {
+    let forced_divisions: collections::HashSet[isize] = collections::HashSet::new();
+    loop {
+        let parsed = parse_pass(
+            lexer::lex_with_forced_divisions(source, forced_divisions),
+            module_goal,
+        );
+        let mut retry = false;
+        for offset in parsed.contextual_divisions {
+            if forced_divisions.insert(offset) {
+                retry = true;
+            } else {}
+        }
+        if !retry {
+            return parsed.result
+        } else {}
+    }
+}
+
+pub fn parse(source: string) -> ParseResult {
+    parse_with_goal(source, false)
+}
+
+pub fn parse_module(source: string) -> ParseResult {
+    parse_with_goal(source, true)
 }
