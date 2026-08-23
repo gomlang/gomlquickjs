@@ -15,12 +15,12 @@ fn expect_regex(value: Result[Regex, RegexError]) -> Regex {
         Result::Err(error) => {
             testing::fail(error.message + " at " + error.offset.to_string());
             Regex {
-                nodes: Vec::[Node::Empty],
+                nodes: Vec::from_array([Node::Empty]),
                 root: 0,
                 flags: RegexFlags::new(),
                 canonicalizer: unicode::CaseCanonicalizer::new(false),
                 capture_count: 0,
-                capture_names: Vec::[Option::None],
+                capture_names: Vec::from_array([Option::None]),
             }
         },
     }
@@ -34,13 +34,13 @@ fn expect_match(value: Option[RegexMatch]) -> RegexMatch {
             RegexMatch {
                 start: 0,
                 end: 0,
-                captures: Vec::[Option::Some(RegexCapture { start: 0, end: 0 })],
+                captures: Vec::from_array([Option::Some(RegexCapture { start: 0, end: 0 })]),
             }
         },
     }
 }
 
-fn assert_match_range(value: Option[RegexMatch], start: int, end: int) -> RegexMatch {
+fn assert_match_range(value: Option[RegexMatch], start: isize, end: isize) -> RegexMatch {
     let found = expect_match(value);
     testing::assert_eq(found.start, start);
     testing::assert_eq(found.end, end);
@@ -100,8 +100,10 @@ fn counted_quantifiers_handle_exact_open_and_bounded_forms() -> unit {
 
 #[test]
 fn matching_operates_on_utf16_code_units() -> unit {
-    let face = runtime::JsString::from_code_units(Vec::[0xd83d, 0xde00]);
-    let literal = expect_regex(compile(runtime::JsString::from_code_units(Vec::[0xd83d, 0xde00])));
+    let face = runtime::JsString::from_code_units(Vec::from_array([0xd83d, 0xde00]));
+    let literal = expect_regex(
+        compile(runtime::JsString::from_code_units(Vec::from_array([0xd83d, 0xde00]))),
+    );
     assert_match_range(literal.search(face), 0, 2);
     let dot = expect_regex(compile_utf8("."));
     let _ = assert_match_range(dot.search(face), 0, 1);
@@ -132,6 +134,13 @@ fn empty_match_quantifiers_terminate() -> unit {
 }
 
 #[test]
+fn greedy_quantifiers_backtrack_through_empty_alternatives() -> unit {
+    let regex = expect_regex(compile_utf8("(?:|[\\w])+([0-9])"));
+    let found = assert_match_range(regex.search(js_string("123a23")), 0, 6);
+    testing::assert(found.capture(1) == Option::Some(RegexCapture { start: 5, end: 6 }))
+}
+
+#[test]
 fn character_class_escapes_and_character_escapes_match() -> unit {
     testing::assert(expect_regex(compile_utf8("^\\d\\w\\s$")).is_match(js_string("4a ")));
     testing::assert(!expect_regex(compile_utf8("^\\D$")).is_match(js_string("7")));
@@ -140,7 +149,9 @@ fn character_class_escapes_and_character_escapes_match() -> unit {
         expect_regex(compile_utf8("^\\x41\\u0042\\cC$")).is_match(js_string("AB\u0003")),
     );
     testing::assert(
-        expect_regex(compile_utf8("^[\\b]$")).is_match(runtime::JsString::from_code_units(Vec::[8])),
+        expect_regex(compile_utf8("^[\\b]$")).is_match(
+            runtime::JsString::from_code_units(Vec::from_array([8])),
+        ),
     )
 }
 
@@ -231,22 +242,24 @@ fn unicode_string_properties_match_sequences_and_set_operations() -> unit {
     let flag = expect_regex(compile_utf8_with_flags("\\p{RGI_Emoji_Flag_Sequence}", "v"));
     assert_match_range(flag.search(js_string("x🇨🇳y")), 1, 5);
     let england = runtime::JsString::from_code_units(
-        Vec::[
-            0xd83c,
-            0xdff4,
-            0xdb40,
-            0xdc67,
-            0xdb40,
-            0xdc62,
-            0xdb40,
-            0xdc65,
-            0xdb40,
-            0xdc6e,
-            0xdb40,
-            0xdc67,
-            0xdb40,
-            0xdc7f,
-        ],
+        Vec::from_array(
+            [
+                0xd83c,
+                0xdff4,
+                0xdb40,
+                0xdc67,
+                0xdb40,
+                0xdc62,
+                0xdb40,
+                0xdc65,
+                0xdb40,
+                0xdc6e,
+                0xdb40,
+                0xdc67,
+                0xdb40,
+                0xdc7f,
+            ],
+        ),
     );
     testing::assert(
         expect_regex(compile_utf8_with_flags("^\\p{RGI_Emoji_Tag_Sequence}$", "v")).is_match(
@@ -590,7 +603,7 @@ fn ignore_case_uses_quickjs_unicode_canonicalization() -> unit {
 
 #[test]
 fn invalid_inline_modifiers_report_the_group_offset() -> unit {
-    for pattern in Vec::["(?i-i:a)", "(?d:a)", "(?-:a)"] {
+    for pattern in Vec::from_array(["(?i-i:a)", "(?d:a)", "(?-:a)"]) {
         match compile_utf8(pattern) {
             Result::Err(error) => testing::assert_eq(error.offset, 0),
             Result::Ok(_) => testing::fail("expected invalid inline modifier error"),
@@ -618,7 +631,7 @@ fn unicode_mode_consumes_supplementary_code_points_as_single_atoms() -> unit {
 
 #[test]
 fn unicode_mode_preserves_lone_surrogates_and_rejects_out_of_range_escapes() -> unit {
-    let lone = runtime::JsString::from_code_units(Vec::[0xd800.to_uint16()]);
+    let lone = runtime::JsString::from_code_units(Vec::from_array([0xd800.to_u16()]));
     testing::assert(expect_regex(compile_utf8_with_flags("^.$", "u")).is_match(lone));
     testing::assert(expect_regex(compile_utf8_with_flags("^\\uD800$", "u")).is_match(lone));
     match compile_utf8_with_flags("\\u{110000}", "u") {
@@ -634,29 +647,29 @@ fn unicode_mode_preserves_lone_surrogates_and_rejects_out_of_range_escapes() -> 
 fn annex_b_decimal_escapes_fall_back_to_octal_or_identity() -> unit {
     testing::assert(
         expect_regex(compile_utf8("^\\1$")).is_match(
-            runtime::JsString::from_code_units(Vec::[1.to_uint16()]),
+            runtime::JsString::from_code_units(Vec::from_array([1.to_u16()])),
         ),
     );
     testing::assert(
         expect_regex(compile_utf8("^(a)\\11$")).is_match(
-            runtime::JsString::from_code_units(Vec::[97.to_uint16(), 9.to_uint16()]),
+            runtime::JsString::from_code_units(Vec::from_array([97.to_u16(), 9.to_u16()])),
         ),
     );
     testing::assert(
         expect_regex(compile_utf8("^\\377$")).is_match(
-            runtime::JsString::from_code_units(Vec::[255.to_uint16()]),
+            runtime::JsString::from_code_units(Vec::from_array([255.to_u16()])),
         ),
     );
     testing::assert(expect_regex(compile_utf8("^\\400$")).is_match(js_string(" 0")));
     testing::assert(expect_regex(compile_utf8("^\\8\\9$")).is_match(js_string("89")));
     testing::assert(
         expect_regex(compile_utf8("^\\08$")).is_match(
-            runtime::JsString::from_code_units(Vec::[0.to_uint16(), 56.to_uint16()]),
+            runtime::JsString::from_code_units(Vec::from_array([0.to_u16(), 56.to_u16()])),
         ),
     );
     testing::assert(
         expect_regex(compile_utf8("^[\\11]$")).is_match(
-            runtime::JsString::from_code_units(Vec::[9.to_uint16()]),
+            runtime::JsString::from_code_units(Vec::from_array([9.to_u16()])),
         ),
     );
     testing::assert(expect_regex(compile_utf8("^(a)\\1$")).is_match(js_string("aa")))
@@ -666,25 +679,25 @@ fn annex_b_decimal_escapes_fall_back_to_octal_or_identity() -> unit {
 fn annex_b_control_and_counted_quantifier_fallbacks_are_literals() -> unit {
     testing::assert(
         expect_regex(compile_utf8("^\\ca$")).is_match(
-            runtime::JsString::from_code_units(Vec::[1.to_uint16()]),
+            runtime::JsString::from_code_units(Vec::from_array([1.to_u16()])),
         ),
     );
     testing::assert(expect_regex(compile_utf8("^\\c0$")).is_match(js_string("\\c0")));
     testing::assert(
         expect_regex(compile_utf8("^[\\c0]$")).is_match(
-            runtime::JsString::from_code_units(Vec::[16.to_uint16()]),
+            runtime::JsString::from_code_units(Vec::from_array([16.to_u16()])),
         ),
     );
     testing::assert(expect_regex(compile_utf8("^{1a}$")).is_match(js_string("{1a}")));
     testing::assert(expect_regex(compile_utf8("^a{1+$")).is_match(js_string("a{11")));
-    for pattern in Vec::["\\c0", "{1a}", "a{1+", "{value}", "value}"] {
+    for pattern in Vec::from_array(["\\c0", "{1a}", "a{1+", "{value}", "value}"]) {
         testing::assert(compile_utf8_with_flags(pattern, "u").is_err())
     }
 }
 
 #[test]
 fn unicode_mode_rejects_legacy_decimal_escapes() -> unit {
-    for pattern in Vec::["\\1", "\\8", "\\08", "[\\1]"] {
+    for pattern in Vec::from_array(["\\1", "\\8", "\\08", "[\\1]"]) {
         match compile_utf8_with_flags(pattern, "u") {
             Result::Err(_) => (),
             Result::Ok(_) => testing::fail("expected Unicode decimal escape error"),
@@ -740,7 +753,7 @@ fn unicode_property_alias_batch_matches_quickjs_ranges() -> unit {
     );
     testing::assert(
         expect_regex(compile_utf8_with_flags("^\\p{Deprecated}$", "u")).is_match(
-            runtime::JsString::from_code_units(Vec::[0x149.to_uint16()]),
+            runtime::JsString::from_code_units(Vec::from_array([0x149.to_u16()])),
         ),
     );
     testing::assert(
@@ -790,7 +803,7 @@ fn unicode_binary_property_batch_matches_quickjs() -> unit {
             js_string("A0́"),
         ),
     );
-    for name in Vec::["ID_Compat_Math_Start", "ID_Compat_Math_Continue", "InCB"] {
+    for name in Vec::from_array(["ID_Compat_Math_Start", "ID_Compat_Math_Continue", "InCB"]) {
         testing::assert(compile_utf8_with_flags("\\p{" + name + "}", "u").is_err())
     }
 }
@@ -817,7 +830,7 @@ fn unicode_general_category_batch_matches_letters_marks_symbols_and_other() -> u
     );
     testing::assert(
         expect_regex(compile_utf8_with_flags("^\\p{General_Category=Other}+$", "u")).is_match(
-            runtime::JsString::from_code_units(Vec::[0.to_uint16(), 0xd800.to_uint16()]),
+            runtime::JsString::from_code_units(Vec::from_array([0.to_u16(), 0xd800.to_u16()])),
         ),
     )
 }
