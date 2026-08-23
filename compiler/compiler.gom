@@ -797,7 +797,9 @@ fn collect_var_statement(compiler: Compiler, statement: ast::Stmt) -> unit {
             ..,
         } | ast::Stmt::ExportNamed { .. } | ast::Stmt::ExportDefault { .. } | ast::Stmt::ExportAll {
             ..,
-        } | ast::Stmt::FunctionDeclaration { .. } | ast::Stmt::ClassDeclaration { .. } => (),
+        } | ast::Stmt::ExportNamespace { .. } | ast::Stmt::FunctionDeclaration { .. } | ast::Stmt::ClassDeclaration {
+            ..,
+        } => (),
         ast::Stmt::Labelled { body, .. } => collect_var_statement(compiler, body.get()),
         ast::Stmt::Empty { .. } | ast::Stmt::Debugger { .. } | ast::Stmt::Expression { .. } | ast::Stmt::Break {
             ..,
@@ -894,7 +896,18 @@ fn declare_lexical_statement(compiler: Compiler, statement: ast::Stmt) -> unit {
                 let _ = declare_current(compiler, name, BindingKind::Let, span);
             }
         },
-        ast::Stmt::ImportNamespace { local, span, .. } => {
+        ast::Stmt::ImportNamespace { default_specifier, local, span, .. } => {
+            match default_specifier {
+                Some(specifier) => {
+                    let _ = declare_current(
+                        compiler,
+                        specifier.local,
+                        BindingKind::Const,
+                        specifier.span,
+                    );
+                },
+                None => (),
+            };
             let _ = declare_current(compiler, local, BindingKind::Const, span);
         },
         ast::Stmt::ImportNamed { specifiers, .. } => {
@@ -910,8 +923,22 @@ fn declare_lexical_statement(compiler: Compiler, statement: ast::Stmt) -> unit {
         ast::Stmt::ImportSideEffect { .. } | ast::Stmt::ExportNamed { .. } | ast::Stmt::ExportAll {
             ..,
         } => (),
-        ast::Stmt::ExportDefault { local, span, .. } => {
+        ast::Stmt::ExportNamespace { local, span, .. } => {
             let _ = declare_current(compiler, local, BindingKind::Const, span);
+        },
+        ast::Stmt::ExportDefault { local, hoisted, declaration, named, span, .. } => {
+            let _ = declare_current(
+                compiler,
+                local,
+                if hoisted {
+                    BindingKind::Var
+                } else if declaration && named {
+                    BindingKind::Let
+                } else {
+                    BindingKind::Const
+                },
+                span,
+            );
         },
         ast::Stmt::ExportDeclaration { declaration, .. } => {
             declare_lexical_statement(compiler, declaration.get())
@@ -4620,6 +4647,44 @@ fn compile_class_expression(
     }
 }
 
+fn compile_export_default(compiler: Compiler, expression: ast::Expr, local: string, span: ast::Span) -> unit {
+    match expression {
+        ast::Expr::Function { name: Some(_), parameters, body, generator, asynchronous, span } => if !local.starts_with(
+            "$module_default@",
+        ) {
+            compile_function_declaration(
+                compiler,
+                local,
+                parameters,
+                body,
+                generator,
+                asynchronous,
+                span,
+            );
+            return
+        } else {},
+        _ => (),
+    };
+    compile_expression_with_inferred_name(
+        compiler,
+        expression,
+        if local.starts_with("$module_default@") {
+            "default"
+        } else {
+            local
+        },
+    );
+    match lookup_binding(compiler, local) {
+        Some(binding) => {
+            let _ = emit(compiler, bytecode::Instruction::PutLoc(binding.index));
+        },
+        None => {
+            compile_error(compiler, "missing default export binding", span);
+            let _ = emit(compiler, bytecode::Instruction::Drop);
+        },
+    }
+}
+
 fn initialize_function_declarations(compiler: Compiler, body: Vec[ast::Stmt]) -> unit {
     for statement in body {
         match statement {
@@ -4633,6 +4698,28 @@ fn initialize_function_declarations(compiler: Compiler, body: Vec[ast::Stmt]) ->
                     asynchronous,
                     span,
                 )
+            },
+            ast::Stmt::ExportDeclaration { declaration, .. } => match declaration.get() {
+                ast::Stmt::FunctionDeclaration {
+                    name,
+                    parameters,
+                    body,
+                    generator,
+                    asynchronous,
+                    span,
+                } => compile_function_declaration(
+                    compiler,
+                    name,
+                    parameters,
+                    body,
+                    generator,
+                    asynchronous,
+                    span,
+                ),
+                _ => (),
+            },
+            ast::Stmt::ExportDefault { expression, local, hoisted: true, span, .. } => {
+                compile_export_default(compiler, expression.get(), local, span)
             },
             _ => (),
         }
@@ -5130,8 +5217,15 @@ fn compile_statement(compiler: Compiler, statement: ast::Stmt) -> unit {
         ast::Stmt::VariableDeclaration { kind, declarations, .. } => {
             compile_variable_declaration(compiler, kind, declarations)
         },
-        ast::Stmt::ImportNamespace { local, source, span, .. } => {
+        ast::Stmt::ImportNamespace { default_specifier, local, source, span, .. } => {
             if !compiler.module_mode.get() {
+                if default_specifier.is_some() {
+                    compile_error(
+                        compiler,
+                        "module import is only supported by module compilation",
+                        span,
+                    )
+                } else {};
                 if source == "std" || source == "os" {
                     let source_index = string_constant(compiler, source);
                     let _ = emit(compiler, bytecode::Instruction::GetGlobal(source_index));
@@ -5161,25 +5255,21 @@ fn compile_statement(compiler: Compiler, statement: ast::Stmt) -> unit {
         ast::Stmt::ExportNamed { span, .. } => if !compiler.module_mode.get() {
             compile_error(compiler, "export is only supported by module compilation", span)
         } else {},
-        ast::Stmt::ExportDefault { expression, local, span } => if compiler.module_mode.get() {
-            compile_expression(compiler, expression.get());
-            match lookup_binding(compiler, local) {
-                Some(binding) => {
-                    let _ = emit(compiler, bytecode::Instruction::PutLoc(binding.index));
-                },
-                None => {
-                    compile_error(compiler, "missing default export binding", span);
-                    let _ = emit(compiler, bytecode::Instruction::Drop);
-                },
-            }
+        ast::Stmt::ExportDefault { expression, local, hoisted, span, .. } => if compiler.module_mode.get() {
+            if !hoisted {
+                compile_export_default(compiler, expression.get(), local, span)
+            } else {}
         } else {
             compile_error(compiler, "export is only supported by module compilation", span)
         },
-        ast::Stmt::ExportAll { span, .. } => if !compiler.module_mode.get() {
+        ast::Stmt::ExportAll { span, .. } | ast::Stmt::ExportNamespace { span, .. } => if !compiler.module_mode.get() {
             compile_error(compiler, "export is only supported by module compilation", span)
         } else {},
         ast::Stmt::ExportDeclaration { declaration, span } => if compiler.module_mode.get() {
-            compile_statement(compiler, declaration.get())
+            match declaration.get() {
+                ast::Stmt::FunctionDeclaration { .. } => (),
+                value => compile_statement(compiler, value),
+            }
         } else {
             compile_error(compiler, "export is only supported by module compilation", span)
         },
@@ -6091,17 +6181,37 @@ fn collect_module_metadata(compiler: Compiler, body: Vec[ast::Stmt]) -> (
     };
     for statement in body {
         match statement {
-            ast::Stmt::ImportNamespace { local, source, attributes, span } => imports.push(
-                ModuleImport {
-                    kind: ModuleImportKind::Namespace,
-                    source,
-                    imported: "*",
-                    local,
-                    local_index: module_binding_index(compiler, local, span),
-                    attributes: convert_attributes(attributes),
-                    span,
-                },
-            ),
+            ast::Stmt::ImportNamespace { default_specifier, local, source, attributes, span } => {
+                match default_specifier {
+                    Some(specifier) => imports.push(
+                        ModuleImport {
+                            kind: ModuleImportKind::Named,
+                            source,
+                            imported: "default",
+                            local: specifier.local,
+                            local_index: module_binding_index(
+                                compiler,
+                                specifier.local,
+                                specifier.span,
+                            ),
+                            attributes: convert_attributes(attributes),
+                            span: specifier.span,
+                        },
+                    ),
+                    None => (),
+                };
+                imports.push(
+                    ModuleImport {
+                        kind: ModuleImportKind::Namespace,
+                        source,
+                        imported: "*",
+                        local,
+                        local_index: module_binding_index(compiler, local, span),
+                        attributes: convert_attributes(attributes),
+                        span,
+                    },
+                )
+            },
             ast::Stmt::ImportNamed { specifiers, source, attributes, .. } => {
                 for specifier in specifiers {
                     imports.push(
@@ -6182,6 +6292,31 @@ fn collect_module_metadata(compiler: Compiler, body: Vec[ast::Stmt]) -> (
                     span,
                 },
             ),
+            ast::Stmt::ExportNamespace { exported, local, source, attributes, span } => {
+                imports.push(
+                    ModuleImport {
+                        kind: ModuleImportKind::Namespace,
+                        source,
+                        imported: "*",
+                        local,
+                        local_index: module_binding_index(compiler, local, span),
+                        attributes: convert_attributes(attributes),
+                        span,
+                    },
+                );
+                push_module_export(
+                    compiler,
+                    exports,
+                    ModuleExport {
+                        exported,
+                        source: Option::None,
+                        imported: local,
+                        local_index: module_binding_index(compiler, local, span),
+                        attributes: Vec::new(),
+                        span,
+                    },
+                )
+            },
             _ => (),
         }
     };
@@ -6383,7 +6518,7 @@ pub fn source_is_module(source: string) -> bool {
                 ..,
             } | ast::Stmt::ExportNamed { .. } | ast::Stmt::ExportDeclaration { .. } | ast::Stmt::ExportDefault {
                 ..,
-            } | ast::Stmt::ExportAll { .. } => return true,
+            } | ast::Stmt::ExportAll { .. } | ast::Stmt::ExportNamespace { .. } => return true,
             _ => (),
         }
     }

@@ -3700,6 +3700,17 @@ fn parse_module_binding_name(parser: Parser, message: string) -> (string, isize)
     }
 }
 
+fn parse_module_export_name(parser: Parser, message: string) -> (string, isize, bool) {
+    let token = current_token(parser);
+    if token.kind == lexer::TokenKind::String || is_identifier_name(token.kind) {
+        bump(parser);
+        (token.value, token.span.end, token.kind == lexer::TokenKind::String)
+    } else {
+        report(parser, message, missing_span(parser));
+        ("", token.span.start, false)
+    }
+}
+
 fn parse_module_source(parser: Parser, message: string) -> (string, isize) {
     if at(parser, lexer::TokenKind::String) {
         let token = bump(parser);
@@ -3792,13 +3803,85 @@ fn parse_import_attributes(parser: Parser, initial_end: isize) -> (Vec[ast::Impo
     (attributes, end)
 }
 
+fn parse_named_import_specifiers(parser: Parser, specifiers: Vec[ast::ImportSpecifier]) -> isize {
+    let mut end = bump(parser).span.end;
+    while !at_eof(parser) && !at(parser, lexer::TokenKind::RBrace) {
+        let start = current_token(parser).span.start;
+        let (imported, imported_end, string_name) = parse_module_export_name(
+            parser,
+            "expected imported name",
+        );
+        let mut local = imported;
+        let mut specifier_end = imported_end;
+        if at(parser, lexer::TokenKind::Identifier) && current_token(parser).value == "as" {
+            bump(parser);
+            let (value, value_end) = parse_module_binding_name(parser, "expected local import name");
+            local = value;
+            specifier_end = value_end;
+        } else if string_name {
+            report(
+                parser,
+                "string import name requires a local binding",
+                ast::span(start, imported_end),
+            );
+            local = "";
+        } else {};
+        specifiers.push(
+            ast::ImportSpecifier { imported, local, span: ast::span(start, specifier_end) },
+        );
+        if at(parser, lexer::TokenKind::Comma) {
+            bump(parser);
+        } else {
+            break
+        }
+    }
+    if at(parser, lexer::TokenKind::RBrace) {
+        end = bump(parser).span.end;
+    } else {
+        report(parser, "expected `}` after import specifiers", missing_span(parser))
+    };
+    end
+}
+
+fn finish_named_import(parser: Parser, start: isize, specifiers: Vec[ast::ImportSpecifier]) -> ast::Stmt {
+    consume_from(parser, "expected `from` after import specifiers");
+    let (source, source_end) = parse_module_source(parser, "expected import module string");
+    let (attributes, attributes_end) = parse_import_attributes(parser, source_end);
+    let end = consume_statement_terminator(parser, attributes_end);
+    ast::Stmt::ImportNamed { specifiers, source, attributes, span: ast::span(start, end) }
+}
+
+fn finish_namespace_import(
+    parser: Parser,
+    start: isize,
+    default_specifier: Option[ast::ImportSpecifier],
+) -> ast::Stmt {
+    bump(parser);
+    if at(parser, lexer::TokenKind::Identifier) && current_token(parser).value == "as" {
+        bump(parser);
+    } else {
+        report(parser, "expected `as` after import namespace", missing_span(parser))
+    };
+    let (local, _) = parse_module_binding_name(parser, "expected import binding name");
+    consume_from(parser, "expected `from` after import binding");
+    let (source, source_end) = parse_module_source(parser, "expected import module string");
+    let (attributes, attributes_end) = parse_import_attributes(parser, source_end);
+    let end = consume_statement_terminator(parser, attributes_end);
+    ast::Stmt::ImportNamespace {
+        default_specifier,
+        local,
+        source,
+        attributes,
+        span: ast::span(start, end),
+    }
+}
+
 fn parse_import_statement(parser: Parser) -> ast::Stmt {
     let keyword = bump(parser);
-    let mut end = keyword.span.end;
     if at(parser, lexer::TokenKind::String) {
         let (source, source_end) = parse_module_source(parser, "expected import module string");
         let (attributes, attributes_end) = parse_import_attributes(parser, source_end);
-        end = consume_statement_terminator(parser, attributes_end);
+        let end = consume_statement_terminator(parser, attributes_end);
         return ast::Stmt::ImportSideEffect {
             source,
             attributes,
@@ -3806,96 +3889,59 @@ fn parse_import_statement(parser: Parser) -> ast::Stmt {
         }
     } else {};
     if at(parser, lexer::TokenKind::Star) {
-        end = bump(parser).span.end;
-        if at(parser, lexer::TokenKind::Identifier) && current_token(parser).value == "as" {
-            end = bump(parser).span.end;
-        } else {
-            report(parser, "expected `as` after import namespace", missing_span(parser))
-        };
-        let (local, local_end) = parse_module_binding_name(parser, "expected import binding name");
-        end = local_end;
-        consume_from(parser, "expected `from` after import binding");
-        let (source, source_end) = parse_module_source(parser, "expected import module string");
-        let (attributes, attributes_end) = parse_import_attributes(parser, source_end);
-        end = consume_statement_terminator(parser, attributes_end);
-        return ast::Stmt::ImportNamespace {
-            local,
-            source,
-            attributes,
-            span: ast::span(keyword.span.start, end),
-        }
+        return finish_namespace_import(parser, keyword.span.start, Option::None)
     } else if at(parser, lexer::TokenKind::LBrace) {
-        bump(parser);
         let specifiers: Vec[ast::ImportSpecifier] = Vec::new();
-        while !at_eof(parser) && !at(parser, lexer::TokenKind::RBrace) {
-            let start = current_token(parser).span.start;
-            let (imported, imported_end) = parse_module_binding_name(
-                parser,
-                "expected imported name",
-            );
-            let mut local = imported;
-            let mut specifier_end = imported_end;
-            if at(parser, lexer::TokenKind::Identifier) && current_token(parser).value == "as" {
-                bump(parser);
-                let (value, value_end) = parse_module_binding_name(
-                    parser,
-                    "expected local import name",
-                );
-                local = value;
-                specifier_end = value_end;
-            } else {};
-            specifiers.push(
-                ast::ImportSpecifier { imported, local, span: ast::span(start, specifier_end) },
-            );
-            if at(parser, lexer::TokenKind::Comma) {
-                bump(parser);
-            } else {
-                break
-            }
-        }
-        if at(parser, lexer::TokenKind::RBrace) {
-            end = bump(parser).span.end;
-        } else {
-            report(parser, "expected `}` after import specifiers", missing_span(parser))
-        };
-        consume_from(parser, "expected `from` after import specifiers");
-        let (source, source_end) = parse_module_source(parser, "expected import module string");
-        let (attributes, attributes_end) = parse_import_attributes(parser, source_end);
-        end = consume_statement_terminator(parser, attributes_end);
-        return ast::Stmt::ImportNamed {
-            specifiers,
-            source,
-            attributes,
-            span: ast::span(keyword.span.start, end),
-        }
+        let _ = parse_named_import_specifiers(parser, specifiers);
+        return finish_named_import(parser, keyword.span.start, specifiers)
     } else if at(parser, lexer::TokenKind::Identifier) && !current_token(parser).is_reserved {
-        let start = current_token(parser).span.start;
+        let binding_start = current_token(parser).span.start;
         let (local, local_end) = parse_module_binding_name(
             parser,
             "expected default import binding",
         );
-        consume_from(parser, "expected `from` after default import");
-        let (source, source_end) = parse_module_source(parser, "expected import module string");
-        let (attributes, attributes_end) = parse_import_attributes(parser, source_end);
-        end = consume_statement_terminator(parser, attributes_end);
-        return ast::Stmt::ImportNamed {
-            specifiers: Vec::from_array(
-                [
-                    ast::ImportSpecifier {
-                        imported: "default",
-                        local,
-                        span: ast::span(start, local_end),
-                    },
-                ],
-            ),
-            source,
-            attributes,
-            span: ast::span(keyword.span.start, end),
+        let default_specifier = ast::ImportSpecifier {
+            imported: "default",
+            local,
+            span: ast::span(binding_start, local_end),
+        };
+        if at(parser, lexer::TokenKind::Comma) {
+            bump(parser);
+            if at(parser, lexer::TokenKind::Star) {
+                return finish_namespace_import(
+                    parser,
+                    keyword.span.start,
+                    Option::Some(default_specifier),
+                )
+            } else if at(parser, lexer::TokenKind::LBrace) {
+                let specifiers = Vec::from_array([default_specifier]);
+                let _ = parse_named_import_specifiers(parser, specifiers);
+                return finish_named_import(parser, keyword.span.start, specifiers)
+            } else if at(parser, lexer::TokenKind::Identifier)
+                && current_token(parser).value == "from" {
+                return finish_named_import(
+                    parser,
+                    keyword.span.start,
+                    Vec::from_array([default_specifier]),
+                )
+            } else {
+                report(
+                    parser,
+                    "expected namespace or named imports after default import",
+                    missing_span(parser),
+                )
+            }
+        } else {
+            return finish_named_import(
+                parser,
+                keyword.span.start,
+                Vec::from_array([default_specifier]),
+            )
         }
     } else {
         report(parser, "expected import clause", missing_span(parser))
     };
-    end = synchronize_statement(parser);
+    let end = synchronize_statement(parser);
     ast::Stmt::ImportSideEffect {
         source: "",
         attributes: Vec::new(),
@@ -3908,12 +3954,23 @@ fn parse_export_specifiers(parser: Parser) -> (Vec[ast::ExportSpecifier], isize)
     let mut end = bump(parser).span.end;
     while !at_eof(parser) && !at(parser, lexer::TokenKind::RBrace) {
         let start = current_token(parser).span.start;
-        let (local, local_end) = parse_module_binding_name(parser, "expected exported name");
+        let local_token = current_token(parser);
+        let (local, local_end) = if local_token.kind == lexer::TokenKind::String {
+            report(
+                parser,
+                "reexport source name must be an identifier",
+                convert_span(local_token.span),
+            );
+            bump(parser);
+            (local_token.value, local_token.span.end)
+        } else {
+            parse_module_binding_name(parser, "expected exported name")
+        };
         let mut exported = local;
         let mut specifier_end = local_end;
         if at(parser, lexer::TokenKind::Identifier) && current_token(parser).value == "as" {
             bump(parser);
-            let (value, value_end) = parse_module_binding_name(parser, "expected export alias");
+            let (value, value_end, _) = parse_module_export_name(parser, "expected export alias");
             exported = value;
             specifier_end = value_end;
         } else {};
@@ -3943,19 +4000,64 @@ fn parse_export_statement(parser: Parser) -> ast::Stmt {
         } else {
             parse_assignment_expression(parser)
         };
-        let end = consume_statement_terminator(parser, expr_end(expression));
+        let hidden = "$module_default@" + default_token.span.start.to_string();
+        let (local, hoisted, declaration, named) = match expression {
+            ast::Expr::Function { name, .. } => (
+                match name {
+                    Some(value) => value,
+                    None => hidden,
+                },
+                true,
+                true,
+                name.is_some(),
+            ),
+            ast::Expr::Class { name, .. } => (
+                match name {
+                    Some(value) => value,
+                    None => hidden,
+                },
+                false,
+                true,
+                name.is_some(),
+            ),
+            _ => (hidden, false, false, false),
+        };
+        let end = if declaration {
+            expr_end(expression)
+        } else {
+            consume_statement_terminator(parser, expr_end(expression))
+        };
         ast::Stmt::ExportDefault {
             expression: Ref::new(expression),
-            local: "$module_default@" + default_token.span.start.to_string(),
+            local,
+            hoisted,
+            declaration,
+            named,
             span: ast::span(keyword.span.start, end),
         }
     } else if at(parser, lexer::TokenKind::Star) {
-        bump(parser);
-        consume_from(parser, "expected `from` after export star");
-        let (source, source_end) = parse_module_source(parser, "expected export module string");
-        let (attributes, attributes_end) = parse_import_attributes(parser, source_end);
-        let end = consume_statement_terminator(parser, attributes_end);
-        ast::Stmt::ExportAll { source, attributes, span: ast::span(keyword.span.start, end) }
+        let star = bump(parser);
+        if at(parser, lexer::TokenKind::Identifier) && current_token(parser).value == "as" {
+            bump(parser);
+            let (exported, _) = parse_module_binding_name(parser, "expected namespace export name");
+            consume_from(parser, "expected `from` after namespace export");
+            let (source, source_end) = parse_module_source(parser, "expected export module string");
+            let (attributes, attributes_end) = parse_import_attributes(parser, source_end);
+            let end = consume_statement_terminator(parser, attributes_end);
+            ast::Stmt::ExportNamespace {
+                exported,
+                local: "$module_namespace@" + star.span.start.to_string(),
+                source,
+                attributes,
+                span: ast::span(keyword.span.start, end),
+            }
+        } else {
+            consume_from(parser, "expected `from` after export star");
+            let (source, source_end) = parse_module_source(parser, "expected export module string");
+            let (attributes, attributes_end) = parse_import_attributes(parser, source_end);
+            let end = consume_statement_terminator(parser, attributes_end);
+            ast::Stmt::ExportAll { source, attributes, span: ast::span(keyword.span.start, end) }
+        }
     } else if at(parser, lexer::TokenKind::FunctionKeyword) {
         let declaration = parse_function_declaration(parser, false);
         let end = ast::stmt_span(declaration).end;
