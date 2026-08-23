@@ -2856,12 +2856,72 @@ fn deleting_super_property_throws_reference_error_at_runtime() -> unit {
 }
 
 #[test]
-fn optional_member_chains_short_circuit_delete_and_preserve_method_this() -> unit {
+fn optional_chains_share_short_circuit_state_until_a_grouping_boundary() -> unit {
     match execute_source_with_builtins(
-        "let missing = null; let value = {nested: {field: 2}, method() { return this.nested; }}; let deletedMissing = delete missing?.nested.field; let deletedValue = delete value?.nested.field; let called = (value?.method)(); let skipped = missing?.method(); return deletedMissing && deletedValue && value.nested.field === undefined && called === value.nested && skipped === undefined;",
+        "let keyHits = 0; let argumentHits = 0; let fallbackHits = 0; function key() { keyHits++; return 'field'; } function argument() { argumentHits++; return 1; } let missing = null; let named = missing?.nested.field; let computed = missing?.nested[key()].field; let called = missing?.method(argument()).field; let optionalCalled = missing?.method?.(argument()).field; let fallback = missing?.nested ?? ++fallbackHits; let retained = ({nested: 0})?.nested ?? ++fallbackHits; let groupedTarget = {nested: {field: 1}}; ((groupedTarget?.nested).field) = 2; let liveNullThrows = false; try { ({nested: null})?.nested.field; } catch (error) { liveNullThrows = error instanceof TypeError; } let groupedThrows = false; try { (missing?.nested).field; } catch (error) { groupedThrows = error instanceof TypeError; } return named === undefined && computed === undefined && called === undefined && optionalCalled === undefined && fallback === 1 && retained === 0 && fallbackHits === 1 && groupedTarget.nested.field === 2 && keyHits === 0 && argumentHits === 0 && liveNullThrows && groupedThrows;",
     ) {
         runtime::Value::Bool(value) => testing::assert(value),
-        _ => testing::fail("expected optional member result"),
+        _ => testing::fail("expected continuous optional chain result"),
+    }
+}
+
+#[test]
+fn optional_calls_skip_arguments_and_preserve_method_receivers() -> unit {
+    match execute_source_with_builtins(
+        "let hits = 0; function argument() { hits++; return 1; } function bare() { 'use strict'; return this === undefined; } let object = {value: 4, method(value) { return this.value + value; }, missing: null}; let first = object?.method(argument()); let second = object.method?.(argument()); let third = object?.['method']?.(...[argument()]); let skipped = object.missing?.(argument()); let bareThis = bare?.(); let grouped = (object?.method)(argument()); let absent = null; let groupedSkipped = (absent?.method)?.(argument()); let ordinaryCallThrows = false; try { object?.missing(argument()); } catch (error) { ordinaryCallThrows = error instanceof TypeError; } class Base { method() { return this.value; } } class Derived extends Base { constructor() { super(); this.value = 6; } named() { return (() => super.method?.())(); } computed() { return (() => super['method']?.())(); } } let derived = new Derived(); return first === 5 && second === 5 && third === 5 && skipped === undefined && bareThis && grouped === 5 && groupedSkipped === undefined && ordinaryCallThrows && derived.named() === 6 && derived.computed() === 6 && hits === 5;",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected optional call result"),
+    }
+}
+
+#[test]
+fn optional_delete_skips_the_remaining_chain_and_respects_parentheses() -> unit {
+    match execute_source_with_builtins(
+        "let hits = 0; function key() { hits++; return 'field'; } let missing = null; let first = delete missing?.[key()].field; let second = delete missing?.nested[key()]; let third = delete missing?.nested.field; let live = {nested: {field: 1}}; let deleted = delete live?.nested.field; let groupedObject = {field: 1}; let groupedDeleted = delete (groupedObject?.field); let plainObject = {field: 1}; let plainDeleted = delete ((plainObject.field)); let liveNullThrows = false; try { delete ({nested: null})?.nested.field; } catch (error) { liveNullThrows = error instanceof TypeError; } let groupedThrows = false; try { delete (missing?.nested).field; } catch (error) { groupedThrows = error instanceof TypeError; } return first && second && third && deleted && live.nested.field === undefined && groupedDeleted && !('field' in groupedObject) && plainDeleted && !('field' in plainObject) && hits === 0 && liveNullThrows && groupedThrows;",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected optional delete result"),
+    }
+}
+
+#[test]
+fn optional_private_members_and_new_target_postfix_execute_end_to_end() -> unit {
+    match execute_source_with_builtins(
+        "class Box { #value = 4; #read() { return this.#value; } read(other) { return other?.#value; } call(other) { return other?.#read?.(); } discard(other) { return delete other?.#value; } } let box = new Box(); let brandThrows = false; try { box.read({}); } catch (error) { brandThrows = error instanceof TypeError; } let deleteBrandThrows = false; try { box.discard({}); } catch (error) { deleteBrandThrows = error instanceof TypeError; } function Meta() { this.optionalName = new.target?.name; this.directName = new.target.name; } function plain() { return new.target?.name; } let meta = new Meta(); return box.read(box) === 4 && box.read(null) === undefined && box.call(box) === 4 && box.call(null) === undefined && box.discard(box) && box.discard(null) && box.read(box) === 4 && brandThrows && deleteBrandThrows && meta.optionalName === 'Meta' && meta.directName === 'Meta' && plain() === undefined;",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected optional private and new target result"),
+    }
+}
+
+#[test]
+fn grouped_optional_tags_constructs_and_eval_follow_reference_rules() -> unit {
+    match execute_source_with_builtins(
+        "let object = {value: 2, tag(parts) { return this.value + parts[0].length; }}; let tagged = (object?.tag)`abc`; let missingTagThrows = false; try { (null?.tag)`x`; } catch (error) { missingTagThrows = error instanceof TypeError; } function Item() { this.value = 7; } let holder = {Item}; let item = new (holder?.Item)(); let missingConstructThrows = false; try { new (null?.Item)(); } catch (error) { missingConstructThrows = error instanceof TypeError; } function indirect() { let local = 1; return eval?.('typeof local'); } return tagged === 5 && missingTagThrows && item.value === 7 && missingConstructThrows && indirect() === 'undefined';",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected grouped optional reference result"),
+    }
+}
+
+#[test]
+fn rejects_invalid_optional_chain_targets_tags_and_constructors() -> unit {
+    let sources = Vec::from_array(
+        [
+            "target?.field.value = 1;",
+            "target?.field.value++;",
+            "new target?.Ctor();",
+            "new target.Ctor?.();",
+            "target?.tag`value`;",
+            "target.tag?.`value`;",
+        ],
+    );
+    for source in sources {
+        match compile(source) {
+            Err(errors) => testing::assert(!errors.is_empty()),
+            Ok(_) => testing::fail("expected optional chain compile error"),
+        }
     }
 }
 

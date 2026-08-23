@@ -258,8 +258,10 @@ fn parses_call_and_member_chains() -> unit {
 }
 
 #[test]
-fn parses_optional_named_and_computed_member_chains() -> unit {
-    let result = parse("value?.field; value?.['field']; value?.field();");
+fn parses_optional_member_and_call_chain_segments() -> unit {
+    let result = parse(
+        "value?.field; value?.['field']; value?.field(); callable?.(); value.method?.(); value?.method?.();",
+    );
     testing::assert_eq(result.errors.len(), 0);
     match expression_statement(result.program.body[0]) {
         ast::Expr::Member { optional, computed, .. } => {
@@ -274,7 +276,74 @@ fn parses_optional_named_and_computed_member_chains() -> unit {
             testing::assert(computed)
         },
         _ => testing::fail("expected optional computed member"),
+    };
+    match expression_statement(result.program.body[2]) {
+        ast::Expr::Call { callee, optional, .. } => {
+            testing::assert(!optional);
+            match callee.get() {
+                ast::Expr::Member { optional, .. } => testing::assert(optional),
+                _ => testing::fail("expected optional member callee"),
+            }
+        },
+        _ => testing::fail("expected member call"),
+    };
+    match expression_statement(result.program.body[3]) {
+        ast::Expr::Call { callee, optional, .. } => {
+            testing::assert(optional);
+            assert_identifier(callee.get(), "callable")
+        },
+        _ => testing::fail("expected optional function call"),
+    };
+    match expression_statement(result.program.body[4]) {
+        ast::Expr::Call { callee, optional, .. } => {
+            testing::assert(optional);
+            match callee.get() {
+                ast::Expr::Member { optional, .. } => testing::assert(!optional),
+                _ => testing::fail("expected ordinary member callee"),
+            }
+        },
+        _ => testing::fail("expected optional method call"),
+    };
+    match expression_statement(result.program.body[5]) {
+        ast::Expr::Call { callee, optional, .. } => {
+            testing::assert(optional);
+            match callee.get() {
+                ast::Expr::Member { optional, .. } => testing::assert(optional),
+                _ => testing::fail("expected optional member callee"),
+            }
+        },
+        _ => testing::fail("expected fully optional method call"),
     }
+}
+
+#[test]
+fn enforces_optional_chain_boundaries_and_early_errors() -> unit {
+    let assignment = parse("target?.field.value = 1;");
+    testing::assert(!assignment.errors.is_empty());
+    let update = parse("target?.field.value++;");
+    testing::assert(!update.errors.is_empty());
+    let construct_member = parse("new target?.Ctor();");
+    testing::assert(!construct_member.errors.is_empty());
+    let construct_call = parse("new target.Ctor?.();");
+    testing::assert(!construct_call.errors.is_empty());
+    let tagged_member = parse("target?.tag`value`;");
+    testing::assert(!tagged_member.errors.is_empty());
+    let tagged_call = parse("target.tag?.`value`;");
+    testing::assert(!tagged_call.errors.is_empty());
+    let optional_super = parse("class Child extends Base { read() { return super?.value; } }");
+    testing::assert(!optional_super.errors.is_empty());
+    let grouped_super = parse("class Child extends Base { read() { return (super)?.value; } }");
+    testing::assert(!grouped_super.errors.is_empty());
+    let mixed_nullish = parse("target?.field ?? fallback || other;");
+    testing::assert(!mixed_nullish.errors.is_empty());
+    let grouped = parse(
+        "new (target?.Ctor)(); new C()?.field; (new C)?.field; (target?.tag)`value`; (target?.field).value = 1; ((target?.field).value) = 2;",
+    );
+    testing::assert_eq(grouped.errors.len(), 0);
+    let private_member = parse("class Box { #value; read(other) { return other?.#value; } }");
+    testing::assert_eq(private_member.errors.len(), 0);
+    let new_target = parse("function Meta() { return new.target?.name; }");
+    testing::assert_eq(new_target.errors.len(), 0)
 }
 
 #[test]
