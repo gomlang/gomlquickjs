@@ -686,6 +686,99 @@ fn parses_namespace_imports() -> unit {
 }
 
 #[test]
+fn parses_combined_imports_string_names_and_namespace_reexports() -> unit {
+    let result = parse(
+        "import primary, {named as alias, 'string-name' as stringName} from './source.js' with {type: 'javascript'}; import fallback, * as namespace from './source.js'; import loose, from './source.js'; export * as forwarded from './source.js' with {type: 'javascript'}; export {named as 'string-name'} from './source.js';",
+    );
+    testing::assert(result.errors.is_empty());
+    testing::assert_eq(result.program.body.len(), 5);
+    match result.program.body[0] {
+        ast::Stmt::ImportNamed { specifiers, attributes, .. } => {
+            testing::assert_eq(specifiers.len(), 3);
+            testing::assert_eq(specifiers[0].imported, "default");
+            testing::assert_eq(specifiers[0].local, "primary");
+            testing::assert_eq(specifiers[1].imported, "named");
+            testing::assert_eq(specifiers[1].local, "alias");
+            testing::assert_eq(specifiers[2].imported, "string-name");
+            testing::assert_eq(specifiers[2].local, "stringName");
+            testing::assert_eq(attributes.len(), 1)
+        },
+        _ => testing::fail("expected combined named import"),
+    };
+    match result.program.body[1] {
+        ast::Stmt::ImportNamespace { default_specifier, local, .. } => {
+            match default_specifier {
+                Some(specifier) => {
+                    testing::assert_eq(specifier.imported, "default");
+                    testing::assert_eq(specifier.local, "fallback")
+                },
+                None => testing::fail("expected default import specifier"),
+            };
+            testing::assert_eq(local, "namespace")
+        },
+        _ => testing::fail("expected combined namespace import"),
+    };
+    match result.program.body[2] {
+        ast::Stmt::ImportNamed { specifiers, .. } => {
+            testing::assert_eq(specifiers.len(), 1);
+            testing::assert_eq(specifiers[0].local, "loose")
+        },
+        _ => testing::fail("expected trailing-comma default import"),
+    };
+    match result.program.body[3] {
+        ast::Stmt::ExportNamespace { exported, attributes, .. } => {
+            testing::assert_eq(exported, "forwarded");
+            testing::assert_eq(attributes.len(), 1)
+        },
+        _ => testing::fail("expected namespace reexport"),
+    };
+    match result.program.body[4] {
+        ast::Stmt::ExportNamed { specifiers, .. } => {
+            testing::assert_eq(specifiers[0].exported, "string-name")
+        },
+        _ => testing::fail("expected string-named reexport"),
+    }
+}
+
+#[test]
+fn rejects_unbound_string_imports_and_string_reexport_sources() -> unit {
+    let result = parse(
+        "import {'string-name'} from './source.js'; export {'string-name' as alias} from './source.js';",
+    );
+    testing::assert_eq(result.errors.len(), 2);
+    testing::assert_eq(result.errors[0].message, "string import name requires a local binding");
+    testing::assert_eq(result.errors[1].message, "reexport source name must be an identifier")
+}
+
+#[test]
+fn parses_default_declarations_with_module_bindings() -> unit {
+    let functions = parse("export default function named() {} named();");
+    testing::assert(functions.errors.is_empty());
+    testing::assert_eq(functions.program.body.len(), 2);
+    match functions.program.body[0] {
+        ast::Stmt::ExportDefault { local, hoisted, declaration, named, .. } => {
+            testing::assert_eq(local, "named");
+            testing::assert(hoisted);
+            testing::assert(declaration);
+            testing::assert(named)
+        },
+        _ => testing::fail("expected named default function"),
+    };
+    let classes = parse("export default class Visible {} new Visible();");
+    testing::assert(classes.errors.is_empty());
+    testing::assert_eq(classes.program.body.len(), 2);
+    match classes.program.body[0] {
+        ast::Stmt::ExportDefault { local, hoisted, declaration, named, .. } => {
+            testing::assert_eq(local, "Visible");
+            testing::assert(!hoisted);
+            testing::assert(declaration);
+            testing::assert(named)
+        },
+        _ => testing::fail("expected named default class"),
+    }
+}
+
+#[test]
 fn parses_dynamic_import_with_options_and_trailing_comma() -> unit {
     let result = parse("let loaded = import('./module.js', {with: {type: 'json'}},);");
     testing::assert(result.errors.is_empty());

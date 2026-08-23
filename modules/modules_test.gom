@@ -207,6 +207,56 @@ fn default_exports_and_star_exports_link() -> unit {
 }
 
 #[test]
+fn combined_imports_namespace_reexports_and_default_declarations_link() -> unit {
+    let directory = "__gomlquickjs_modules_combined_89c4__";
+    let _ = fs::remove_dir_all(directory);
+    let _ = fs::create_dir_all(directory);
+    module_write(
+        directory + "/source.js",
+        "export let named = 20; export const extra = 2; const stringValue = 5; export {stringValue as 'string-name'}; export const before = call(19); export default function call(value) { return value + 1; } export const after = call(20); export const regularBefore = regular(); export function regular() { return 3; }",
+    );
+    module_write(
+        directory + "/middle.js",
+        "import {'string-name' as importedString} from './source.js'; export * as source from './source.js' with {type: 'javascript'}; export {default} from './source.js'; export {importedString as renamed};",
+    );
+    module_write(
+        directory + "/function.js",
+        "export default function mutable() { return mutable; } export const old = mutable; mutable = 1; export const rebound = old() === 1;",
+    );
+    module_write(
+        directory + "/class.js",
+        "export default class Mutable {} Mutable = 7; export const rebound = Mutable;",
+    );
+    module_write(
+        directory + "/entry.js",
+        "import call, {named, extra, before, after, regularBefore, regular, 'string-name' as stringName} from './source.js'; import fallback, * as source from './source.js' with {type: 'javascript'}; import middleDefault, * as middle from './middle.js'; import functionValue, {rebound as functionRebound} from './function.js'; import classValue, {rebound as classRebound} from './class.js'; export const result = call(named) + extra + fallback(0) + middleDefault(1) + stringName + middle.renamed + before + after; export const identity = source === middle.source && source.default === call && source['string-name'] === stringName; export const names = call.name + '|' + fallback.name + '|' + middleDefault.name; export const hoisted = regularBefore === 3 && regular() === 3; export const declarations = functionValue === 1 && functionRebound && classValue === 7 && classRebound === 7;",
+    );
+    let (context, global) = module_test_context();
+    let namespace = match execute_file(context, global, directory + "/entry.js") {
+        Ok(value) => value,
+        Err(error) => {
+            testing::fail(error.path + ": " + error.message);
+            runtime::Value::Undefined
+        },
+    };
+    module_expect_number(module_read(context, namespace, "result"), 77);
+    match module_read(context, namespace, "identity") {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected namespace identity result"),
+    };
+    match module_read(context, namespace, "hoisted") {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected exported function hoisting result"),
+    };
+    match module_read(context, namespace, "declarations") {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected default declaration binding result"),
+    };
+    module_expect_string(module_read(context, namespace, "names"), "call|call|call");
+    let _ = fs::remove_dir_all(directory);
+}
+
+#[test]
 fn exported_async_functions_resume_in_their_module_realm() -> unit {
     let directory = "__gomlquickjs_modules_async_5f29__";
     let _ = fs::remove_dir_all(directory);
