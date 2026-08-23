@@ -61,7 +61,8 @@ instance and static methods, getters and setters, and public instance and static
 fields, including computed public element names, private fields, methods and accessors with
 lexical brands and private-name checks, plus static initialization blocks. The source compiler supports its implemented
 declarations, expressions, classic, property-enumeration, and iterable loops, switch, throw, try/catch/finally, and
-function subset, including labelled break and continue, optional property chains,
+function subset, including labelled break and continue, continuous optional property,
+computed, and call chains with grouped reference and delete semantics,
 `new.target`, object-method home objects, and direct-eval inheritance of `this`,
 `new.target`, and `super`, including static and runtime-computed eval var propagation into parameter and
 function environments, plus nested `with` identifier reads, writes, updates, deletion, lexical shadowing,
