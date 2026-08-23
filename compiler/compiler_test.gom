@@ -3121,6 +3121,16 @@ fn await_context_and_async_constructors_report_compile_errors() -> unit {
             has_message(errors, "await is only valid in async functions"),
         ),
     };
+    match compile("for await (let value of []) {}") {
+        Ok(_) => testing::fail("expected for-await context error"),
+        Err(errors) => testing::assert(
+            has_message(errors, "await is only valid in async functions"),
+        ),
+    };
+    match compile_module("for await (let value of []) {}") {
+        Ok(_) => (),
+        Err(_) => testing::fail("expected module top-level for-await"),
+    };
     match compile("class Invalid { async constructor() {} }") {
         Ok(_) => testing::fail("expected async constructor error"),
         Err(errors) => testing::assert(has_message(errors, "class constructor cannot be async")),
@@ -3174,6 +3184,86 @@ fn async_yield_delegation_awaits_return_before_missing_throw_rejection() -> unit
     ) {
         runtime::Value::Bool(value) => testing::assert(value),
         _ => testing::fail("expected awaited iterator close result"),
+    }
+}
+
+#[test]
+fn async_from_sync_iterator_assimilates_values_and_caches_next() -> unit {
+    match execute_source_with_builtins(
+        "let reads = 0; let calls = 0; let argumentCounts = []; let iterator = {}; Object.defineProperty(iterator, 'next', {get() { reads += 1; return function(value) { argumentCounts.push(arguments.length); calls += 1; if (calls === 1) return {value: Promise.resolve(3), done: false}; if (calls === 2) return {value: {then(resolve) { resolve(4); }}, done: false}; return {value: Promise.resolve(5), done: true}; }; }}); let source = {[Symbol.iterator]() { return iterator; }}; async function* delegated() { return yield *source; } let results = []; let values = delegated(); values.next().then(value => results.push(value)); values.next().then(value => results.push(value)); values.next().then(value => results.push(value)); Promise.drainJobs(); return reads === 1 && argumentCounts.join(',') === '0,1,1' && results.length === 3 && results[0].value === 3 && !results[0].done && results[1].value === 4 && !results[1].done && results[2].value === 5 && results[2].done;",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected async-from-sync value assimilation"),
+    }
+}
+
+#[test]
+fn async_from_sync_rejection_closes_and_preserves_the_original_reason() -> unit {
+    match execute_source_with_builtins(
+        "let marker = {}; let closeFailure = {}; let closeCalls = 0; let closeArguments = -1; let source = {[Symbol.iterator]() { return this; }, next() { return {value: Promise.reject(marker), done: false}; }, return() { closeCalls += 1; closeArguments = arguments.length; throw closeFailure; }}; let doneMarker = {}; let doneCloseCalls = 0; let doneSource = {[Symbol.iterator]() { return this; }, next() { return {value: Promise.reject(doneMarker), done: true}; }, return() { doneCloseCalls += 1; return {}; }}; async function* delegated(value) { return yield *value; } let rejected = false; let doneRejected = false; delegated(source).next().catch(error => rejected = error === marker); delegated(doneSource).next().catch(error => doneRejected = error === doneMarker); Promise.drainJobs(); return rejected && closeCalls === 1 && closeArguments === 0 && doneRejected && doneCloseCalls === 0;",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected async-from-sync rejection closing"),
+    }
+}
+
+#[test]
+fn async_generators_inherit_the_async_iterator_identity_prototype() -> unit {
+    match execute_source_with_builtins(
+        "async function* values() {} let iterator = values(); let functionPrototype = values.prototype; let generatorPrototype = Object.getPrototypeOf(functionPrototype); let asyncIteratorPrototype = Object.getPrototypeOf(generatorPrototype); let descriptor = Object.getOwnPropertyDescriptor(asyncIteratorPrototype, Symbol.asyncIterator); return Object.getPrototypeOf(iterator) === functionPrototype && iterator[Symbol.asyncIterator]() === iterator && !Object.hasOwn(functionPrototype, Symbol.asyncIterator) && !Object.hasOwn(generatorPrototype, Symbol.asyncIterator) && descriptor.value.call(iterator) === iterator && descriptor.writable && !descriptor.enumerable && descriptor.configurable && Object.getPrototypeOf(asyncIteratorPrototype) === Object.prototype;",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected inherited async iterator identity"),
+    }
+}
+
+#[test]
+fn special_function_and_generator_prototypes_match_quickjs_topology() -> unit {
+    match execute_source_with_builtins(
+        "async function asyncValue() {} function* values() {} async function* asyncValues() {} let AF = Object.getPrototypeOf(asyncValue).constructor; let GF = Object.getPrototypeOf(values).constructor; let AGF = Object.getPrototypeOf(asyncValues).constructor; let generatorPrototype = GF.prototype.prototype; let asyncGeneratorPrototype = AGF.prototype.prototype; let iterator = values(); let asyncIterator = asyncValues(); return AF.name === 'AsyncFunction' && GF.name === 'GeneratorFunction' && AGF.name === 'AsyncGeneratorFunction' && Object.getPrototypeOf(AF) === Function && Object.getPrototypeOf(GF) === Function && Object.getPrototypeOf(AGF) === Function && Object.getPrototypeOf(asyncValue) === AF.prototype && Object.getPrototypeOf(values) === GF.prototype && Object.getPrototypeOf(asyncValues) === AGF.prototype && !Object.hasOwn(asyncValue, 'prototype') && Object.hasOwn(values, 'prototype') && Object.hasOwn(asyncValues, 'prototype') && Object.getPrototypeOf(values.prototype) === generatorPrototype && Object.getPrototypeOf(asyncValues.prototype) === asyncGeneratorPrototype && Object.getPrototypeOf(iterator) === values.prototype && Object.getPrototypeOf(asyncIterator) === asyncValues.prototype && typeof iterator.map === 'function' && Object.prototype.toString.call(asyncValue) === '[object AsyncFunction]' && Object.prototype.toString.call(values) === '[object GeneratorFunction]' && Object.prototype.toString.call(asyncValues) === '[object AsyncGeneratorFunction]' && !Object.hasOwn(values, 'lineNumber') && values.lineNumber !== undefined;",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected special function prototype topology"),
+    }
+}
+
+#[test]
+fn dynamic_special_function_constructors_execute_and_honor_new_target() -> unit {
+    match execute_source_with_builtins(
+        "let AF = Object.getPrototypeOf(async function() {}).constructor; let GF = Object.getPrototypeOf(function*() {}).constructor; let AGF = Object.getPrototypeOf(async function*() {}).constructor; let generated = GF('yield 2'); let generatedResult = generated().next(); let asyncResult = 0; let asyncGeneratorResult = 0; AF('return await 3')().then(value => asyncResult = value); AGF('yield await 4')().next().then(result => asyncGeneratorResult = result.value); function NewTarget() {} let customFunctionPrototype = {}; NewTarget.prototype = customFunctionPrototype; let reflected = Reflect.construct(GF, ['yield 5'], NewTarget); let customInstancePrototype = {}; generated.prototype = customInstancePrototype; let customInstance = generated(); generated.prototype = null; let fallbackInstance = generated(); let generatorParameterError = false; let asyncParameterError = false; try { GF('yield', ''); } catch (error) { generatorParameterError = error instanceof SyntaxError; } try { AF('await', ''); } catch (error) { asyncParameterError = error instanceof SyntaxError; } Promise.drainJobs(); return generatedResult.value === 2 && !generatedResult.done && asyncResult === 3 && asyncGeneratorResult === 4 && Object.getPrototypeOf(reflected) === customFunctionPrototype && Object.getPrototypeOf(customInstance) === customInstancePrototype && Object.getPrototypeOf(fallbackInstance) === GF.prototype.prototype && generatorParameterError && asyncParameterError;",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected dynamic special function constructors"),
+    }
+}
+
+#[test]
+fn for_await_iterates_async_sources_and_assimilates_sync_values() -> unit {
+    match execute_source_with_builtins(
+        "let asyncIndex = 0; let asyncReceiver = true; let asyncSource = {[Symbol.asyncIterator]() { return this; }, next() { asyncReceiver = asyncReceiver && this === asyncSource; asyncIndex += 1; return Promise.resolve({value: asyncIndex, done: asyncIndex > 2}); }}; let result = ''; let syncLeft = 0; let syncRight = 0; for ([syncLeft, syncRight] of [[7, 8]]) {} async function collect() { let values = []; let left = 0; let right = 0; for await (let value of asyncSource) values.push(value); for await (let value of [Promise.resolve(3), {then(resolve) { resolve(4); }}]) values.push(value); for await ([left, right] of [[5, 6]]) {} return values.join(',') + ':' + left + ',' + right; } collect().then(value => result = value); Promise.drainJobs(); return asyncReceiver && asyncIndex === 3 && result === '1,2,3,4:5,6' && syncLeft === 7 && syncRight === 8;",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected async and sync for-await iteration"),
+    }
+}
+
+#[test]
+fn for_await_awaits_iterator_close_on_break() -> unit {
+    match execute_source_with_builtins(
+        "let events = []; let release; let gate = new Promise(resolve => release = resolve); let source = {[Symbol.asyncIterator]() { return this; }, next() { events.push('next'); return {value: 1, done: false}; }, return() { events.push('return' + arguments.length); return gate.then(() => { events.push('closed'); return {done: true}; }); }}; let completed = false; async function stop() { for await (let value of source) { events.push('body' + value); break; } events.push('after'); } stop().then(() => { completed = true; events.push('complete'); }); Promise.drainJobs(); let pending = !completed && events.join(',') === 'next,body1,return0'; release(); Promise.drainJobs(); return pending && completed && events.join(',') === 'next,body1,return0,closed,after,complete';",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected awaited for-await break close"),
+    }
+}
+
+#[test]
+fn for_await_preserves_body_throw_when_iterator_close_rejects() -> unit {
+    match execute_source_with_builtins(
+        "let marker = {}; let closeFailure = {}; let events = []; let rejectClose; let gate = new Promise((resolve, reject) => rejectClose = reject); let source = {[Symbol.asyncIterator]() { return this; }, next() { return {value: 1, done: false}; }, return() { events.push('return' + arguments.length); return gate; }}; let reason; async function fail() { for await (let value of source) { events.push('body' + value); throw marker; }} fail().catch(error => { reason = error; events.push('rejected'); }); Promise.drainJobs(); let pending = reason === undefined && events.join(',') === 'body1,return0'; rejectClose(closeFailure); Promise.drainJobs(); return pending && reason === marker && events.join(',') === 'body1,return0,rejected';",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected original for-await throw after close rejection"),
     }
 }
 

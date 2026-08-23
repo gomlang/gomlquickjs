@@ -557,9 +557,10 @@ fn parses_for_of_variable_declarations() -> unit {
     testing::assert_eq(result.errors.len(), 0);
     testing::assert_eq(result.program.body.len(), 3);
     match result.program.body[0] {
-        ast::Stmt::ForOf { kind, name, iterable, .. } => {
+        ast::Stmt::ForOf { kind, name, iterable, asynchronous, .. } => {
             testing::assert_eq(kind, ast::VariableKind::Let);
             testing::assert_eq(name, "value");
+            testing::assert(!asynchronous);
             assert_identifier(iterable.get(), "values")
         },
         _ => testing::fail("expected let for-of statement"),
@@ -578,6 +579,82 @@ fn parses_for_of_variable_declarations() -> unit {
         },
         _ => testing::fail("expected var for-of statement"),
     }
+}
+
+#[test]
+fn parses_for_await_of_declarations_targets_and_patterns() -> unit {
+    let result = parse(
+        "for await (let value of values) {} for\nawait (const [key, item] of entries) {} for await (target[index()] of values) {} for await ([first, ...rest] of values) {} for await ({value: renamed, other} of values) {}",
+    );
+    testing::assert_eq(result.errors.len(), 0);
+    testing::assert_eq(result.program.body.len(), 5);
+    match result.program.body[0] {
+        ast::Stmt::ForOf { kind, name, target, assignment_pattern, asynchronous, .. } => {
+            testing::assert_eq(kind, ast::VariableKind::Let);
+            testing::assert_eq(name, "value");
+            testing::assert(target.is_none());
+            testing::assert(assignment_pattern.is_none());
+            testing::assert(asynchronous)
+        },
+        _ => testing::fail("expected async declaration for-of statement"),
+    };
+    match result.program.body[1] {
+        ast::Stmt::ForOf { pattern, asynchronous, .. } => {
+            testing::assert(asynchronous);
+            match pattern.get() {
+                ast::BindingPattern::Array { elements, .. } => {
+                    testing::assert_eq(elements.len(), 2)
+                },
+                _ => testing::fail("expected async declaration array pattern"),
+            }
+        },
+        _ => testing::fail("expected async destructuring declaration for-of statement"),
+    };
+    match result.program.body[2] {
+        ast::Stmt::ForOf { target: Some(target), assignment_pattern, asynchronous, .. } => {
+            testing::assert(assignment_pattern.is_none());
+            testing::assert(asynchronous);
+            match target.get() {
+                ast::Expr::Member { computed: true, .. } => (),
+                _ => testing::fail("expected async computed assignment target"),
+            }
+        },
+        _ => testing::fail("expected async assignment-target for-of statement"),
+    };
+    match result.program.body[3] {
+        ast::Stmt::ForOf { target, assignment_pattern: Some(pattern), asynchronous, .. } => {
+            testing::assert(target.is_none());
+            testing::assert(asynchronous);
+            match pattern.get() {
+                ast::AssignmentPattern::Array { elements, .. } => {
+                    testing::assert_eq(elements.len(), 2)
+                },
+                _ => testing::fail("expected async array assignment pattern"),
+            }
+        },
+        _ => testing::fail("expected async array-assignment for-of statement"),
+    };
+    match result.program.body[4] {
+        ast::Stmt::ForOf { assignment_pattern: Some(pattern), asynchronous, .. } => {
+            testing::assert(asynchronous);
+            match pattern.get() {
+                ast::AssignmentPattern::Object { properties, .. } => {
+                    testing::assert_eq(properties.len(), 2)
+                },
+                _ => testing::fail("expected async object assignment pattern"),
+            }
+        },
+        _ => testing::fail("expected async object-assignment for-of statement"),
+    }
+}
+
+#[test]
+fn diagnoses_non_of_for_await_forms() -> unit {
+    let result = parse(
+        "for await (let key in object) {} for await (key in object) {} for await (;;) {}",
+    );
+    testing::assert_eq(result.errors.len(), 3);
+    testing::assert_eq(result.program.body.len(), 3)
 }
 
 #[test]
