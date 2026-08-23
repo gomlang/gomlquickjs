@@ -116,6 +116,7 @@ struct SwitchJump {
 enum FinalizerKind {
     Statements(Vec[ast::Stmt]),
     Iterator(isize),
+    AsyncIterator(isize),
 }
 
 struct FinallyContext {
@@ -1128,6 +1129,73 @@ fn compile_finalizer_kind(compiler: Compiler, kind: FinalizerKind) -> unit {
             let _ = emit(compiler, bytecode::Instruction::GetLoc(local));
             let _ = emit(compiler, bytecode::Instruction::IteratorClose);
         },
+        FinalizerKind::AsyncIterator(local) => compile_async_iterator_close(compiler, local),
+    }
+}
+
+fn compile_drop_object_result(compiler: Compiler) -> unit {
+    let _ = emit(compiler, bytecode::Instruction::Dup);
+    let _ = emit(compiler, bytecode::Instruction::IsUndefinedOrNull);
+    let invalid_nullish = emit(compiler, bytecode::Instruction::IfTrue(-1));
+    let _ = emit(compiler, bytecode::Instruction::Dup);
+    let _ = emit(compiler, bytecode::Instruction::TypeOf);
+    let _ = emit(compiler, bytecode::Instruction::Dup);
+    let object_name = string_constant(compiler, "object");
+    let _ = emit(compiler, bytecode::Instruction::PushConst(object_name));
+    let _ = emit(compiler, bytecode::Instruction::StrictEq);
+    let object_result = emit(compiler, bytecode::Instruction::IfTrue(-1));
+    let function_name = string_constant(compiler, "function");
+    let _ = emit(compiler, bytecode::Instruction::PushConst(function_name));
+    let _ = emit(compiler, bytecode::Instruction::StrictEq);
+    let function_result = emit(compiler, bytecode::Instruction::IfTrue(-1));
+    let invalid_target = current_offset(compiler);
+    let _ = patch_jump(compiler, invalid_nullish, invalid_target);
+    let _ = emit(compiler, bytecode::Instruction::GetPrototypeOf);
+    let _ = emit(compiler, bytecode::Instruction::Drop);
+    let invalid_end = emit(compiler, bytecode::Instruction::Goto(-1));
+    let object_target = current_offset(compiler);
+    let _ = patch_jump(compiler, object_result, object_target);
+    let _ = emit(compiler, bytecode::Instruction::Drop);
+    let valid_object = emit(compiler, bytecode::Instruction::Goto(-1));
+    let valid_target = current_offset(compiler);
+    let _ = patch_jump(compiler, function_result, valid_target);
+    let _ = patch_jump(compiler, valid_object, valid_target);
+    let _ = emit(compiler, bytecode::Instruction::Drop);
+    let _ = patch_jump(compiler, invalid_end, current_offset(compiler));
+}
+
+fn compile_async_iterator_close(compiler: Compiler, iterator: isize) -> unit {
+    let _ = emit(compiler, bytecode::Instruction::GetLoc(iterator));
+    let _ = emit(compiler, bytecode::Instruction::Dup);
+    let return_name = string_constant(compiler, "return");
+    let _ = emit(compiler, bytecode::Instruction::GetField(return_name));
+    let _ = emit(compiler, bytecode::Instruction::Dup);
+    let _ = emit(compiler, bytecode::Instruction::IsUndefinedOrNull);
+    let missing = emit(compiler, bytecode::Instruction::IfTrue(-1));
+    let _ = emit(compiler, bytecode::Instruction::CallMethod(0));
+    emit_suspension(compiler, true);
+    compile_drop_object_result(compiler);
+    let end = emit(compiler, bytecode::Instruction::Goto(-1));
+    let missing_target = current_offset(compiler);
+    let _ = patch_jump(compiler, missing, missing_target);
+    let _ = emit(compiler, bytecode::Instruction::Drop);
+    let _ = emit(compiler, bytecode::Instruction::Drop);
+    let _ = patch_jump(compiler, end, current_offset(compiler));
+}
+
+fn compile_async_iterator_close_throw(compiler: Compiler, iterator: isize, exception: isize) -> unit {
+    begin_protected_region(compiler);
+    compile_async_iterator_close(compiler, iterator);
+    let protected_segments = finish_protected_region(compiler);
+    let close_completed = emit(compiler, bytecode::Instruction::Goto(-1));
+    let handler_target = current_offset(compiler);
+    let _ = emit(compiler, bytecode::Instruction::Drop);
+    let rethrow_target = current_offset(compiler);
+    let _ = patch_jump(compiler, close_completed, rethrow_target);
+    let _ = emit(compiler, bytecode::Instruction::GetLoc(exception));
+    let _ = emit(compiler, bytecode::Instruction::Throw);
+    for (start, end) in protected_segments {
+        add_exception_handler(compiler, start, end, handler_target)
     }
 }
 
@@ -4858,11 +4926,20 @@ fn compile_for_iteration(
     pattern: ast::BindingPattern,
     initializer: Option[Ref[ast::Expr]],
     target: Option[Ref[ast::Expr]],
+    assignment_pattern: Option[Ref[ast::AssignmentPattern]],
     source: ast::Expr,
     body: ast::Stmt,
     span: ast::Span,
     enumerate: bool,
+    asynchronous: bool,
 ) -> unit {
+    if asynchronous {
+        if compiler.asynchronous {
+            compiler.used_await.set(true)
+        } else {
+            compile_error(compiler, "await is only valid in async functions", span)
+        }
+    } else {};
     push_scope(compiler);
     if kind != ast::VariableKind::Var {
         declare_pattern_bindings(compiler, pattern, binding_kind(kind))
@@ -4884,7 +4961,14 @@ fn compile_for_iteration(
     } else {
         Option::None
     };
-    let _ = emit(compiler, bytecode::Instruction::IteratorStart);
+    let _ = emit(
+        compiler,
+        if asynchronous {
+            bytecode::Instruction::AsyncIteratorStart
+        } else {
+            bytecode::Instruction::IteratorStart
+        },
+    );
     let next_local = new_local(compiler);
     let iterator_local = new_local(compiler);
     let _ = emit(compiler, bytecode::Instruction::PutLoc(next_local));
@@ -4892,14 +4976,26 @@ fn compile_for_iteration(
     let iterator_finalizer_depth = compiler.finalizers.len();
     if !enumerate {
         compiler.finalizers.push(
-            FinallyContext { kind: FinalizerKind::Iterator(iterator_local), active: true },
-        );
-        begin_protected_region(compiler)
+            FinallyContext {
+                kind: if asynchronous {
+                    FinalizerKind::AsyncIterator(iterator_local)
+                } else {
+                    FinalizerKind::Iterator(iterator_local)
+                },
+                active: true,
+            },
+        )
     } else {};
     let loop_target = current_offset(compiler);
     let _ = emit(compiler, bytecode::Instruction::GetLoc(iterator_local));
     let _ = emit(compiler, bytecode::Instruction::GetLoc(next_local));
-    let _ = emit(compiler, bytecode::Instruction::IteratorNext);
+    if asynchronous {
+        let _ = emit(compiler, bytecode::Instruction::IteratorCallNext);
+        emit_suspension(compiler, true);
+        let _ = emit(compiler, bytecode::Instruction::IteratorResult);
+    } else {
+        let _ = emit(compiler, bytecode::Instruction::IteratorNext);
+    };
     let done_jump = emit(compiler, bytecode::Instruction::IfTrue(-1));
     let value_index = string_constant(compiler, "value");
     let _ = emit(compiler, bytecode::Instruction::GetField(value_index));
@@ -4912,12 +5008,18 @@ fn compile_for_iteration(
         },
         None => Option::None,
     };
+    if !enumerate {
+        begin_protected_region(compiler)
+    } else {};
     if kind != ast::VariableKind::Var {
         clone_local_bindings(compiler, pattern_binding_indices(compiler, pattern))
     } else {};
-    match target {
-        Some(value) => compile_assignment_pattern_target(compiler, value.get(), span),
-        None => compile_binding_pattern(compiler, pattern),
+    match assignment_pattern {
+        Some(value) => compile_assignment_pattern(compiler, value.get()),
+        None => match target {
+            Some(value) => compile_assignment_pattern_target(compiler, value.get(), span),
+            None => compile_binding_pattern(compiler, pattern),
+        },
     };
     if enumerate {
         push_loop(compiler)
@@ -4968,10 +5070,17 @@ fn compile_for_iteration(
         let handler_target = current_offset(compiler);
         let exception_local = new_local(compiler);
         let _ = emit(compiler, bytecode::Instruction::PutLoc(exception_local));
-        let _ = emit(compiler, bytecode::Instruction::GetLoc(iterator_local));
-        let _ = emit(compiler, bytecode::Instruction::GetLoc(exception_local));
-        let _ = emit(compiler, bytecode::Instruction::IteratorCloseThrow);
-        let _ = emit(compiler, bytecode::Instruction::Throw);
+        if asynchronous {
+            let finalizer_index = compiler.finalizers.len() - 1;
+            compiler.finalizers[finalizer_index].active = false;
+            compile_async_iterator_close_throw(compiler, iterator_local, exception_local);
+            compiler.finalizers[finalizer_index].active = true;
+        } else {
+            let _ = emit(compiler, bytecode::Instruction::GetLoc(iterator_local));
+            let _ = emit(compiler, bytecode::Instruction::GetLoc(exception_local));
+            let _ = emit(compiler, bytecode::Instruction::IteratorCloseThrow);
+            let _ = emit(compiler, bytecode::Instruction::Throw);
+        };
         for (start, end) in protected_segments {
             add_exception_handler(compiler, start, end, handler_target)
         }
@@ -5299,17 +5408,29 @@ fn compile_statement(compiler: Compiler, statement: ast::Stmt) -> unit {
         ast::Stmt::For { initializer, test, update, body, .. } => {
             compile_for(compiler, initializer, test, update, body.get())
         },
-        ast::Stmt::ForOf { kind, pattern, target, iterable, body, span, .. } => {
+        ast::Stmt::ForOf {
+            kind,
+            pattern,
+            target,
+            assignment_pattern,
+            iterable,
+            body,
+            asynchronous,
+            span,
+            ..,
+        } => {
             compile_for_iteration(
                 compiler,
                 kind,
                 pattern.get(),
                 Option::None,
                 target,
+                assignment_pattern,
                 iterable.get(),
                 body.get(),
                 span,
                 false,
+                asynchronous,
             )
         },
         ast::Stmt::ForIn { kind, pattern, initializer, target, object, body, span, .. } => {
@@ -5319,10 +5440,12 @@ fn compile_statement(compiler: Compiler, statement: ast::Stmt) -> unit {
                 pattern.get(),
                 initializer,
                 target,
+                Option::None,
                 object.get(),
                 body.get(),
                 span,
                 true,
+                false,
             )
         },
         ast::Stmt::DoWhile { body, test, .. } => {
@@ -6533,8 +6656,20 @@ fn dynamic_parse_errors(value: parser::ParseResult) -> Vec[CompileError] {
     errors
 }
 
-fn dynamic_parameters(source: string) -> Result[Vec[ast::FunctionParameter], Vec[CompileError]] {
-    let parsed = parser::parse("function anonymous(\n" + source + "\n) {}");
+fn dynamic_function_prefix(kind: vm::FunctionKind) -> string {
+    match kind {
+        vm::FunctionKind::Ordinary => "function",
+        vm::FunctionKind::Generator => "function*",
+        vm::FunctionKind::Async => "async function",
+        vm::FunctionKind::AsyncGenerator => "async function*",
+    }
+}
+
+fn dynamic_parameters(kind: vm::FunctionKind, source: string) -> Result[
+    Vec[ast::FunctionParameter],
+    Vec[CompileError],
+] {
+    let parsed = parser::parse(dynamic_function_prefix(kind) + " anonymous(\n" + source + "\n) {}");
     let errors = dynamic_parse_errors(parsed);
     if !errors.is_empty() {
         return Result::Err(errors)
@@ -6552,9 +6687,13 @@ fn dynamic_parameters(source: string) -> Result[Vec[ast::FunctionParameter], Vec
         )
     } else {};
     match parsed.program.body[0] {
-        ast::Stmt::FunctionDeclaration { name, parameters, body, span, .. } => if name
+        ast::Stmt::FunctionDeclaration { name, parameters, body, generator, asynchronous, span } => if name
             == "anonymous"
-            && body.is_empty() {
+            && body.is_empty()
+            && generator
+                == (kind == vm::FunctionKind::Generator || kind == vm::FunctionKind::AsyncGenerator)
+            && asynchronous
+                == (kind == vm::FunctionKind::Async || kind == vm::FunctionKind::AsyncGenerator) {
             Result::Ok(parameters)
         } else {
             Result::Err(
@@ -6576,8 +6715,11 @@ fn dynamic_parameters(source: string) -> Result[Vec[ast::FunctionParameter], Vec
     }
 }
 
-fn dynamic_body(source: string) -> Result[(Vec[ast::Stmt], ast::Span), Vec[CompileError]] {
-    let parsed = parser::parse("function anonymous() {\n" + source + "\n}");
+fn dynamic_body(kind: vm::FunctionKind, source: string) -> Result[
+    (Vec[ast::Stmt], ast::Span),
+    Vec[CompileError],
+] {
+    let parsed = parser::parse(dynamic_function_prefix(kind) + " anonymous() {\n" + source + "\n}");
     let errors = dynamic_parse_errors(parsed);
     if !errors.is_empty() {
         return Result::Err(errors)
@@ -6595,9 +6737,13 @@ fn dynamic_body(source: string) -> Result[(Vec[ast::Stmt], ast::Span), Vec[Compi
         )
     } else {};
     match parsed.program.body[0] {
-        ast::Stmt::FunctionDeclaration { name, parameters, body, span, .. } => if name
+        ast::Stmt::FunctionDeclaration { name, parameters, body, generator, asynchronous, span } => if name
             == "anonymous"
-            && parameters.is_empty() {
+            && parameters.is_empty()
+            && generator
+                == (kind == vm::FunctionKind::Generator || kind == vm::FunctionKind::AsyncGenerator)
+            && asynchronous
+                == (kind == vm::FunctionKind::Async || kind == vm::FunctionKind::AsyncGenerator) {
             Result::Ok((body, span))
         } else {
             Result::Err(
@@ -6617,12 +6763,15 @@ fn dynamic_body(source: string) -> Result[(Vec[ast::Stmt], ast::Span), Vec[Compi
     }
 }
 
-pub fn compile_dynamic_function(parameter_source: string, body_source: string) -> Result[
-    bytecode::Function,
-    Vec[CompileError],
-] {
-    let parameters = dynamic_parameters(parameter_source)?;
-    let (body, span) = dynamic_body(body_source)?;
+pub fn compile_dynamic_function(
+    kind: vm::FunctionKind,
+    parameter_source: string,
+    body_source: string,
+) -> Result[bytecode::Function, Vec[CompileError]] {
+    let parameters = dynamic_parameters(kind, parameter_source)?;
+    let (body, span) = dynamic_body(kind, body_source)?;
+    let generator = kind == vm::FunctionKind::Generator || kind == vm::FunctionKind::AsyncGenerator;
+    let asynchronous = kind == vm::FunctionKind::Async || kind == vm::FunctionKind::AsyncGenerator;
     let parent = compiler_new(
         Vec::new(),
         Vec::new(),
@@ -6643,17 +6792,21 @@ pub fn compile_dynamic_function(parameter_source: string, body_source: string) -
         body,
         span,
         false,
-        true,
+        kind == vm::FunctionKind::Ordinary,
         false,
         false,
         false,
         false,
-        false,
-        false,
+        generator,
+        asynchronous,
     );
     function.set_definition_location(bytecode::SourceLocation { line: 1, column: 2 });
     function.set_source_text(
-        js_string("function anonymous(" + parameter_source + "\n) {\n" + body_source + "\n}"),
+        js_string(
+            dynamic_function_prefix(kind) + " anonymous(" + parameter_source + "\n) {\n"
+                + body_source
+                + "\n}",
+        ),
     );
     if !parent.errors.is_empty() {
         Result::Err(parent.errors)
@@ -6670,11 +6823,11 @@ pub fn compile_dynamic_function(parameter_source: string, body_source: string) -
     }
 }
 
-fn dynamic_function_compiler(parameter_source: string, body_source: string) -> Result[
+fn dynamic_function_compiler(kind: vm::FunctionKind, parameter_source: string, body_source: string) -> Result[
     bytecode::Function,
     string,
 ] {
-    match compile_dynamic_function(parameter_source, body_source) {
+    match compile_dynamic_function(kind, parameter_source, body_source) {
         Ok(value) => Result::Ok(value),
         Err(errors) => Result::Err(
             if errors.is_empty() {

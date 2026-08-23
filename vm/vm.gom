@@ -108,7 +108,15 @@ struct VmConstructorCallbacks {
     self_allocating: Option[VmSelfAllocatingConstructorCallable],
 }
 
-type DynamicFunctionCompiler = (string, string) -> Result[bytecode::Function, string];
+#[derive(PartialEq, Eq)]
+pub enum FunctionKind {
+    Ordinary,
+    Generator,
+    Async,
+    AsyncGenerator,
+}
+
+type DynamicFunctionCompiler = (FunctionKind, string, string) -> Result[bytecode::Function, string];
 
 type DynamicEvalCompiler = (string, Vec[bytecode::EvalBinding]) -> Result[
     bytecode::Function,
@@ -123,6 +131,11 @@ pub type DynamicModuleLoader = (runtime::Value, runtime::Value, runtime::Value, 
 pub type AsyncFunctionRunner = (runtime::Value, isize) -> Result[runtime::Value, VmError];
 
 pub type AsyncGeneratorRunner = (runtime::Value, isize) -> Result[runtime::Value, VmError];
+
+pub type AsyncFromSyncIteratorFactory = (runtime::Value, runtime::Value, isize) -> Result[
+    runtime::Value,
+    VmError,
+];
 
 pub struct HostPromiseCapability {
     promise_value: runtime::Value,
@@ -391,10 +404,16 @@ struct GeneratorFrame {
 struct GeneratorRuntime {
     states: HashMap[runtime::ObjectId, GeneratorFrame],
     prototype: Ref[Option[runtime::ObjectId]],
+    generator_function_prototype: Ref[Option[runtime::ObjectId]],
+    async_function_prototype: Ref[Option[runtime::ObjectId]],
+    async_iterator_prototype: Ref[Option[runtime::ObjectId]],
+    async_from_sync_iterator_prototype: Ref[Option[runtime::ObjectId]],
     async_generator_prototype: Ref[Option[runtime::ObjectId]],
+    async_generator_function_prototype: Ref[Option[runtime::ObjectId]],
     async_iterator_symbol: Ref[Option[runtime::Symbol]],
     async_function_runner: Ref[Option[AsyncFunctionRunner]],
     async_generator_runner: Ref[Option[AsyncGeneratorRunner]],
+    async_from_sync_iterator_factory: Ref[Option[AsyncFromSyncIteratorFactory]],
     async_roots: HashMap[runtime::ObjectId, bool],
 }
 
@@ -403,10 +422,16 @@ impl GeneratorRuntime {
         GeneratorRuntime {
             states: HashMap::new(),
             prototype: Ref::new(Option::None),
+            generator_function_prototype: Ref::new(Option::None),
+            async_function_prototype: Ref::new(Option::None),
+            async_iterator_prototype: Ref::new(Option::None),
+            async_from_sync_iterator_prototype: Ref::new(Option::None),
             async_generator_prototype: Ref::new(Option::None),
+            async_generator_function_prototype: Ref::new(Option::None),
             async_iterator_symbol: Ref::new(Option::None),
             async_function_runner: Ref::new(Option::None),
             async_generator_runner: Ref::new(Option::None),
+            async_from_sync_iterator_factory: Ref::new(Option::None),
             async_roots: HashMap::new(),
         }
     }
@@ -774,7 +799,18 @@ impl Context {
         push_optional_object_root(roots, self.global_object_value.get());
         push_optional_root(roots, self.regexp_constructor_value.get());
         push_optional_object_root(roots, self.generators_value.prototype.get());
+        push_optional_object_root(roots, self.generators_value.generator_function_prototype.get());
+        push_optional_object_root(roots, self.generators_value.async_function_prototype.get());
+        push_optional_object_root(roots, self.generators_value.async_iterator_prototype.get());
+        push_optional_object_root(
+            roots,
+            self.generators_value.async_from_sync_iterator_prototype.get(),
+        );
         push_optional_object_root(roots, self.generators_value.async_generator_prototype.get());
+        push_optional_object_root(
+            roots,
+            self.generators_value.async_generator_function_prototype.get(),
+        );
         for value in self.external_roots_value {
             roots.push(value.get())
         }
@@ -1011,6 +1047,64 @@ impl Context {
             Result::Ok(())
         } else {
             Result::Err(error(-1, VmErrorKind::TypeError("invalid generator prototype")))
+        }
+    }
+
+    pub fn set_function_kind_prototype(
+        self: Context,
+        kind: FunctionKind,
+        prototype: runtime::ObjectId,
+    ) -> Result[unit, VmError] {
+        if !self.heap_value.contains(prototype) {
+            return Result::Err(error(-1, VmErrorKind::TypeError("invalid function kind prototype")))
+        } else {};
+        match kind {
+            FunctionKind::Ordinary => if self.heap_value.set_function_prototype(prototype) {
+                Result::Ok(())
+            } else {
+                Result::Err(error(-1, VmErrorKind::TypeError("invalid function kind prototype")))
+            },
+            FunctionKind::Generator => {
+                self.generators_value.generator_function_prototype.set(Option::Some(prototype));
+                Result::Ok(())
+            },
+            FunctionKind::Async => {
+                self.generators_value.async_function_prototype.set(Option::Some(prototype));
+                Result::Ok(())
+            },
+            FunctionKind::AsyncGenerator => {
+                self.generators_value.async_generator_function_prototype.set(
+                    Option::Some(prototype),
+                );
+                Result::Ok(())
+            },
+        }
+    }
+
+    pub fn function_kind_prototype(self: Context, kind: FunctionKind) -> Option[runtime::ObjectId] {
+        match kind {
+            FunctionKind::Ordinary => self.heap_value.function_prototype(),
+            FunctionKind::Generator => self.generators_value.generator_function_prototype.get(),
+            FunctionKind::Async => self.generators_value.async_function_prototype.get(),
+            FunctionKind::AsyncGenerator => {
+                self.generators_value.async_generator_function_prototype.get()
+            },
+        }
+    }
+
+    pub fn set_async_iterator_prototypes(
+        self: Context,
+        prototype: runtime::ObjectId,
+        from_sync_prototype: runtime::ObjectId,
+    ) -> Result[unit, VmError] {
+        if self.heap_value.contains(prototype) && self.heap_value.contains(from_sync_prototype) {
+            self.generators_value.async_iterator_prototype.set(Option::Some(prototype));
+            self.generators_value.async_from_sync_iterator_prototype.set(
+                Option::Some(from_sync_prototype),
+            );
+            Result::Ok(())
+        } else {
+            Result::Err(error(-1, VmErrorKind::TypeError("invalid async iterator prototype")))
         }
     }
 
@@ -1287,18 +1381,19 @@ impl Context {
 
     pub fn set_dynamic_function_compiler(
         self: Context,
-        callback: (string, string) -> Result[bytecode::Function, string],
+        callback: (FunctionKind, string, string) -> Result[bytecode::Function, string],
     ) -> unit {
         self.dynamic_function_compiler_value.set(Option::Some(callback))
     }
 
     pub fn compile_dynamic_function_source(
         self: Context,
+        kind: FunctionKind,
         parameter_source: string,
         body_source: string,
     ) -> Result[bytecode::Function, VmError] {
         match self.dynamic_function_compiler_value.get() {
-            Some(callback) => match callback(parameter_source, body_source) {
+            Some(callback) => match callback(kind, parameter_source, body_source) {
                 Ok(value) => Result::Ok(value),
                 Err(message) => Result::Err(error(-1, VmErrorKind::SyntaxError(message))),
             },
@@ -1328,6 +1423,13 @@ impl Context {
 
     pub fn set_async_generator_runner(self: Context, callback: AsyncGeneratorRunner) -> unit {
         self.generators_value.async_generator_runner.set(Option::Some(callback))
+    }
+
+    pub fn set_async_from_sync_iterator_factory(
+        self: Context,
+        callback: AsyncFromSyncIteratorFactory,
+    ) -> unit {
+        self.generators_value.async_from_sync_iterator_factory.set(Option::Some(callback))
     }
 
     pub fn link_async_function(self: Context, promise: runtime::Value, generator: runtime::Value) -> Result[
@@ -2532,16 +2634,48 @@ fn materialize_rest_arguments(machine: Machine, offset: isize, start: isize) -> 
     Result::Ok(runtime::Value::Object(object))
 }
 
+fn function_kind(function: bytecode::Function) -> FunctionKind {
+    if function.generator() {
+        if function.asynchronous() {
+            FunctionKind::AsyncGenerator
+        } else {
+            FunctionKind::Generator
+        }
+    } else if function.asynchronous() {
+        FunctionKind::Async
+    } else {
+        FunctionKind::Ordinary
+    }
+}
+
+fn machine_function_kind_prototype(machine: Machine, kind: FunctionKind) -> Option[
+    runtime::ObjectId,
+] {
+    let configured = match kind {
+        FunctionKind::Ordinary => machine.heap.function_prototype(),
+        FunctionKind::Generator => machine.generators.generator_function_prototype.get(),
+        FunctionKind::Async => machine.generators.async_function_prototype.get(),
+        FunctionKind::AsyncGenerator => {
+            machine.generators.async_generator_function_prototype.get()
+        },
+    };
+    match configured {
+        Some(value) => Option::Some(value),
+        None => machine.heap.function_prototype(),
+    }
+}
+
 fn materialize_function(
     machine: Machine,
     offset: isize,
     identity: Option[u64],
     function: Ref[bytecode::Function],
 ) -> Result[runtime::Value, VmError] {
+    let kind = function_kind(function.get());
     match runtime::new_object(
         machine.heap,
         runtime::ObjectKind::Function,
-        match machine.heap.function_prototype() {
+        match machine_function_kind_prototype(machine, kind) {
             Some(value) => Option::Some(value),
             None => machine.heap.object_prototype(),
         },
@@ -2625,40 +2759,17 @@ fn materialize_function(
                     error(offset, VmErrorKind::TypeError("cannot initialize function name")),
                 )
             } else {};
-            match function.get().definition_location() {
-                Some(location) => if !runtime::define_own_property(
-                    machine.heap,
-                    object,
-                    runtime::string_property_key("lineNumber"),
-                    runtime::data_descriptor(
-                        runtime::Value::Int(location.line.to_i32()),
-                        false,
-                        false,
-                        true,
-                    ),
-                )
-                    || !runtime::define_own_property(
-                        machine.heap,
-                        object,
-                        runtime::string_property_key("columnNumber"),
-                        runtime::data_descriptor(
-                            runtime::Value::Int(location.column.to_i32()),
-                            false,
-                            false,
-                            true,
-                        ),
-                    ) {
-                    return Result::Err(
-                        error(
-                            offset,
-                            VmErrorKind::TypeError("cannot initialize function source position"),
-                        ),
-                    )
-                } else {},
-                None => (),
-            };
-            if function.get().constructable() {
-                let prototype = match runtime::new_ordinary_object(machine.heap, Option::None) {
+            if function.get().constructable() || function.get().generator() {
+                let instance_prototype = if function.get().generator() {
+                    if function.get().asynchronous() {
+                        machine.generators.async_generator_prototype.get()
+                    } else {
+                        machine.generators.prototype.get()
+                    }
+                } else {
+                    Option::None
+                };
+                let prototype = match runtime::new_ordinary_object(machine.heap, instance_prototype) {
                     Ok(value) => value,
                     Err(value) => {
                         return Result::Err(error(offset, VmErrorKind::TypeError(value.message)))
@@ -2669,8 +2780,16 @@ fn materialize_function(
                     object,
                     runtime::string_property_key("prototype"),
                     runtime::data_descriptor(runtime::Value::Object(prototype), true, false, false),
-                )
-                    || !runtime::define_own_property(
+                ) {
+                    return Result::Err(
+                        error(
+                            offset,
+                            VmErrorKind::TypeError("cannot initialize function prototype"),
+                        ),
+                    )
+                } else {};
+                if function.get().constructable()
+                    && !runtime::define_own_property(
                         machine.heap,
                         prototype,
                         runtime::string_property_key("constructor"),
@@ -3281,7 +3400,7 @@ fn write_object_property(
                 Result::Err(error(offset, VmErrorKind::TypeError("property is not writable")))
             },
             Err(value) => Result::Err(error(offset, VmErrorKind::TypeError(value.message))),
-        }
+        };
     } else {};
     match runtime::get_property_descriptor(machine.heap, object, key) {
         Ok(Some(runtime::PropertyDescriptor::Accessor { set: Some(setter), .. })) => {
@@ -4018,6 +4137,7 @@ fn start_async_iterator(machine: Machine, offset: isize) -> Result[unit, VmError
         },
         None => Option::None,
     };
+    let asynchronous = method.is_some();
     let selected = match method {
         Some(value) => value,
         None => {
@@ -4040,13 +4160,35 @@ fn start_async_iterator(machine: Machine, offset: isize) -> Result[unit, VmError
             error(offset, VmErrorKind::TypeError("value is not async iterable")),
         ),
     };
-    let iterator = call_value(machine, offset, selected, Vec::new(), source)?;
+    let mut iterator = call_value(machine, offset, selected, Vec::new(), source)?;
     match iterator {
         runtime::Value::Object(_) => (),
         _ => return Result::Err(
             error(offset, VmErrorKind::TypeError("async iterator result is not an object")),
         ),
     };
+    if !asynchronous {
+        let next = read_property(machine, offset, iterator, runtime::string_property_key("next"))?;
+        match next {
+            runtime::Value::Object(value) => if !value.is_callable() {
+                return Result::Err(
+                    error(offset, VmErrorKind::TypeError("iterator next is not callable")),
+                )
+            } else {},
+            _ => return Result::Err(
+                error(offset, VmErrorKind::TypeError("iterator next is not callable")),
+            ),
+        };
+        iterator = match machine.generators.async_from_sync_iterator_factory.get() {
+            Some(factory) => factory(iterator, next, machine.depth + 1)?,
+            None => return Result::Err(
+                error(
+                    offset,
+                    VmErrorKind::TypeError("async-from-sync iterator factory is not installed"),
+                ),
+            ),
+        };
+    } else {};
     let next = read_property(machine, offset, iterator, runtime::string_property_key("next"))?;
     match next {
         runtime::Value::Object(value) => if !value.is_callable() {
@@ -6508,14 +6650,31 @@ fn create_generator(
     new_target: Option[runtime::Value],
     eval_environment: Ref[Option[Ref[EvalEnvironment]]],
 ) -> Result[runtime::Value, VmError] {
-    let configured_prototype = if function.generator() && function.asynchronous() {
-        machine.generators.async_generator_prototype.get()
+    let configured_prototype = if function.generator() {
+        if function.asynchronous() {
+            machine.generators.async_generator_prototype.get()
+        } else {
+            machine.generators.prototype.get()
+        }
     } else {
-        machine.generators.prototype.get()
+        Option::None
     };
-    let prototype = match configured_prototype {
-        Some(value) => Option::Some(value),
-        None => machine.heap.object_prototype(),
+    let prototype = if function.generator() {
+        match read_object_property(
+            machine,
+            offset,
+            object,
+            runtime::Value::Object(object),
+            runtime::string_property_key("prototype"),
+        )? {
+            runtime::Value::Object(value) => Option::Some(value),
+            _ => match configured_prototype {
+                Some(value) => Option::Some(value),
+                None => machine.heap.object_prototype(),
+            },
+        }
+    } else {
+        machine.heap.object_prototype()
     };
     let generator = match runtime::new_ordinary_object(machine.heap, prototype) {
         Ok(value) => value,

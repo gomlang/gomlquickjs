@@ -1129,18 +1129,18 @@ fn generator_return(
     context.return_generator_at_depth(this_value, argument(arguments, 0), depth)
 }
 
-fn generator_iterator(this_value: runtime::Value, arguments: Vec[runtime::Value], depth: isize) -> Result[
-    runtime::Value,
-    vm::VmError,
-] {
-    let _ = arguments;
-    let _ = depth;
-    Result::Ok(this_value)
-}
-
-fn install_generator(context: vm::Context) -> Result[unit, BuiltinError] {
+fn install_generator(
+    context: vm::Context,
+    function_constructor: runtime::Value,
+    iterator_constructor: runtime::Value,
+) -> Result[unit, BuiltinError] {
     let heap = context.heap();
-    let prototype = match runtime::new_ordinary_object(heap, heap.object_prototype()) {
+    let iterator_constructor_object = function_object(iterator_constructor, "Iterator")?;
+    let iterator_prototype = match builtin_own_value(heap, iterator_constructor_object, "prototype")? {
+        runtime::Value::Object(value) => value,
+        _ => return Result::Err(BuiltinError { message: "Iterator prototype is invalid" }),
+    };
+    let prototype = match runtime::new_ordinary_object(heap, Option::Some(iterator_prototype)) {
         Ok(value) => value,
         Err(value) => return Result::Err(BuiltinError { message: value.message }),
     };
@@ -1189,25 +1189,42 @@ fn install_generator(context: vm::Context) -> Result[unit, BuiltinError] {
         true,
         true,
     )?;
-    let iterator = match context.iterator_symbol() {
+    define_to_string_tag(context, prototype, "Generator")?;
+    let function_prototype = match heap.function_prototype() {
         Some(value) => value,
-        None => return Result::Err(BuiltinError { message: "iterator symbol is not installed" }),
+        None => return Result::Err(BuiltinError { message: "Function prototype is not installed" }),
     };
-    let identity = allocate_vm_function_with_length(
+    let function_kind_prototype = match runtime::new_ordinary_object(
+        heap,
+        Option::Some(function_prototype),
+    ) {
+        Ok(value) => value,
+        Err(value) => return Result::Err(BuiltinError { message: value.message }),
+    };
+    let _ = install_dynamic_function_constructor(
         context,
-        "[Symbol.iterator]",
-        0,
-        generator_iterator,
+        function_constructor,
+        "GeneratorFunction",
+        vm::FunctionKind::Generator,
+        function_kind_prototype,
     )?;
-    if !runtime::define_own_property(
+    define_value(
+        heap,
+        function_kind_prototype,
+        "prototype",
+        runtime::Value::Object(prototype),
+        false,
+        true,
+    )?;
+    define_value(
         heap,
         prototype,
-        runtime::PropertyKey::Symbol(iterator),
-        runtime::data_descriptor(identity, true, false, true),
-    ) {
-        return Result::Err(BuiltinError { message: "cannot initialize generator iterator" })
-    } else {};
-    define_to_string_tag(context, prototype, "Generator")?;
+        "constructor",
+        runtime::Value::Object(function_kind_prototype),
+        false,
+        true,
+    )?;
+    define_to_string_tag(context, function_kind_prototype, "GeneratorFunction")?;
     match context.set_generator_prototype(prototype) {
         Ok(()) => Result::Ok(()),
         Err(error) => Result::Err(BuiltinError { message: error.kind.debug() }),
@@ -1712,13 +1729,13 @@ fn dynamic_function_source_text(value: runtime::Value) -> Result[string, vm::VmE
     }
 }
 
-fn dynamic_function_constructor_vm(
+fn dynamic_function_create(
     context: vm::Context,
-    this_value: runtime::Value,
+    kind: vm::FunctionKind,
     arguments: Vec[runtime::Value],
+    requested_prototype: Option[runtime::ObjectId],
     depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
-    let _ = this_value;
     let sources: Vec[string] = Vec::with_capacity(arguments.len());
     let mut index = 0;
     while index < arguments.len() {
@@ -1740,26 +1757,112 @@ fn dynamic_function_constructor_vm(
             index += 1;
         }
     } else {};
-    let wrapper = context.compile_dynamic_function_source(parameter_source, body_source)?;
+    let wrapper = context.compile_dynamic_function_source(kind, parameter_source, body_source)?;
     let function = context.execute(wrapper)?;
     match function {
-        runtime::Value::Object(object) => if runtime::define_own_property(
-            context.heap(),
-            object,
-            runtime::string_property_key("name"),
-            runtime::data_descriptor(
-                runtime::Value::String(js_string("anonymous")),
-                false,
-                false,
-                true,
-            ),
-        ) {
-            Result::Ok(function)
-        } else {
-            Result::Err(function_vm_error("cannot initialize dynamic function name"))
+        runtime::Value::Object(object) => {
+            match requested_prototype {
+                Some(prototype) => if !runtime::set_prototype_of(
+                    context.heap(),
+                    object,
+                    Option::Some(prototype),
+                ) {
+                    return Result::Err(
+                        function_vm_error("cannot initialize dynamic function prototype"),
+                    )
+                } else {},
+                None => (),
+            };
+            if runtime::define_own_property(
+                context.heap(),
+                object,
+                runtime::string_property_key("name"),
+                runtime::data_descriptor(
+                    runtime::Value::String(js_string("anonymous")),
+                    false,
+                    false,
+                    true,
+                ),
+            ) {
+                Result::Ok(function)
+            } else {
+                Result::Err(function_vm_error("cannot initialize dynamic function name"))
+            }
         },
         _ => Result::Err(function_vm_error("dynamic compilation did not produce a function")),
     }
+}
+
+fn dynamic_function_constructor_vm(
+    context: vm::Context,
+    kind: vm::FunctionKind,
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+    depth: isize,
+) -> Result[runtime::Value, vm::VmError] {
+    let _ = this_value;
+    dynamic_function_create(context, kind, arguments, Option::None, depth)
+}
+
+fn register_dynamic_function_constructor(
+    context: vm::Context,
+    constructor: runtime::Value,
+    kind: vm::FunctionKind,
+) -> Result[unit, BuiltinError] {
+    match context.set_vm_constructor_callback(
+        constructor,
+        |object, arguments, selected_prototype, new_target, depth| {
+            let _ = object;
+            let _ = new_target;
+            dynamic_function_create(context, kind, arguments, selected_prototype, depth)
+        },
+    ) {
+        Ok(()) => Result::Ok(()),
+        Err(error) => Result::Err(BuiltinError { message: error.kind.debug() }),
+    }
+}
+
+fn install_dynamic_function_constructor(
+    context: vm::Context,
+    function_constructor: runtime::Value,
+    name: string,
+    kind: vm::FunctionKind,
+    prototype: runtime::ObjectId,
+) -> Result[runtime::Value, BuiltinError] {
+    let constructor = allocate_vm_function_with_length(
+        context,
+        name,
+        1,
+        |this_value, arguments, depth| {
+            dynamic_function_constructor_vm(context, kind, this_value, arguments, depth)
+        },
+    )?;
+    let constructor_object = function_object(constructor, name)?;
+    let function_constructor_object = function_object(function_constructor, "Function")?;
+    if !runtime::set_prototype_of(
+        context.heap(),
+        constructor_object,
+        Option::Some(function_constructor_object),
+    ) {
+        return Result::Err(
+            BuiltinError { message: "cannot initialize " + name + " constructor prototype" },
+        )
+    } else {};
+    define_value(
+        context.heap(),
+        constructor_object,
+        "prototype",
+        runtime::Value::Object(prototype),
+        false,
+        false,
+    )?;
+    define_value(context.heap(), prototype, "constructor", constructor, false, true)?;
+    match context.set_function_kind_prototype(kind, prototype) {
+        Ok(()) => (),
+        Err(error) => return Result::Err(BuiltinError { message: error.kind.debug() }),
+    };
+    register_dynamic_function_constructor(context, constructor, kind)?;
+    Result::Ok(constructor)
 }
 
 fn object_prototype_has_own_property(
@@ -5443,7 +5546,13 @@ fn install_function(context: vm::Context, object_constructor: runtime::Value) ->
         context,
         "Function",
         |this_value, arguments, depth| {
-            dynamic_function_constructor_vm(context, this_value, arguments, depth)
+            dynamic_function_constructor_vm(
+                context,
+                vm::FunctionKind::Ordinary,
+                this_value,
+                arguments,
+                depth,
+            )
         },
     )?;
     let constructor_object = function_object(constructor, "Function")?;
@@ -5533,6 +5642,7 @@ fn install_function(context: vm::Context, object_constructor: runtime::Value) ->
         } else {}
     }
     define_value(context.heap(), prototype, "constructor", constructor, true, true)?;
+    register_dynamic_function_constructor(context, constructor, vm::FunctionKind::Ordinary)?;
     let object = function_object(object_constructor, "Object")?;
     let _ = runtime::set_prototype_of(context.heap(), object, Option::Some(prototype));
     reparent_callable_properties(context.heap(), object, prototype);
@@ -6396,7 +6506,7 @@ pub fn install(context: vm::Context) -> Result[Realm, BuiltinError] {
     let symbol = install_symbol(context)?;
     install_function_has_instance(context)?;
     let iterator = install_iterator(context)?;
-    install_generator(context)?;
+    install_generator(context, function, iterator)?;
     define_to_string_tag(context, reflect, "Reflect")?;
     define_to_string_tag(context, math_object, "Math")?;
     define_to_string_tag(context, json_object, "JSON")?;
@@ -6430,7 +6540,7 @@ pub fn install(context: vm::Context) -> Result[Realm, BuiltinError] {
     let _ = install_worker(context, os_object, buffers)?;
     let promise_queue = promise::JobQueue::new();
     context.set_microtask_queue(|| promise_queue.run_all(), || !promise_queue.is_empty());
-    let promise = install_promise_with_queue(context, promise_queue)?;
+    let promise = install_promise_with_queue(context, promise_queue, Option::Some(function))?;
     define_value(
         heap,
         os_object,

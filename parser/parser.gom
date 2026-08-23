@@ -3201,6 +3201,12 @@ fn parse_with_statement(parser: Parser) -> ast::Stmt {
 
 fn parse_for_statement(parser: Parser) -> ast::Stmt {
     let start = bump(parser).span.start;
+    let asynchronous = if at(parser, lexer::TokenKind::AwaitKeyword) {
+        bump(parser);
+        true
+    } else {
+        false
+    };
     if at(parser, lexer::TokenKind::LParen) {
         bump(parser);
     } else {
@@ -3223,6 +3229,13 @@ fn parse_for_statement(parser: Parser) -> ast::Stmt {
                     right: object,
                     ..,
                 } => {
+                    if asynchronous {
+                        report(
+                            parser,
+                            "`for await` only supports `of`",
+                            ast::expr_span(initializer.get()),
+                        )
+                    } else {};
                     let name = match pattern {
                         ast::BindingPattern::Identifier { name, .. } => name,
                         _ => "",
@@ -3283,11 +3296,16 @@ fn parse_for_statement(parser: Parser) -> ast::Stmt {
                     name,
                     pattern: Ref::new(pattern),
                     target: Option::None,
+                    assignment_pattern: Option::None,
                     iterable: Ref::new(source),
                     body: Ref::new(body),
+                    asynchronous,
                     span: ast::span(start, end),
                 }
             } else {
+                if asynchronous {
+                    report(parser, "`for await` only supports `of`", convert_span(separator.span))
+                } else {};
                 ast::Stmt::ForIn {
                     kind,
                     name,
@@ -3313,6 +3331,45 @@ fn parse_for_statement(parser: Parser) -> ast::Stmt {
         || at(parser, lexer::TokenKind::VarKeyword) {
         Option::Some(Ref::new(parse_variable_declaration(parser, true)))
     } else {
+        if at(parser, lexer::TokenKind::LBracket) || at(parser, lexer::TokenKind::LBrace) {
+            let saved = parser.index.get();
+            let saved_errors = parser.errors.len();
+            let assignment_pattern = parse_assignment_pattern(parser);
+            let separator = current_token(parser);
+            if separator.kind == lexer::TokenKind::Identifier && separator.value == "of"
+                && !separator.has_escape {
+                bump(parser);
+                let iterable = if at(parser, lexer::TokenKind::RParen) || at_eof(parser) {
+                    error_expr(parser, "expected iterable expression")
+                } else {
+                    parse_expression(parser)
+                };
+                let _ = finish_right_paren(parser, "expected `)` after for-of clauses");
+                let body = parse_required_statement(parser);
+                let end = stmt_end(body);
+                return ast::Stmt::ForOf {
+                    kind: ast::VariableKind::Var,
+                    name: "",
+                    pattern: Ref::new(
+                        ast::BindingPattern::Identifier {
+                            name: "",
+                            span: ast::assignment_pattern_span(assignment_pattern),
+                        },
+                    ),
+                    target: Option::None,
+                    assignment_pattern: Option::Some(Ref::new(assignment_pattern)),
+                    iterable: Ref::new(iterable),
+                    body: Ref::new(body),
+                    asynchronous,
+                    span: ast::span(start, end),
+                }
+            } else {
+                parser.index.set(saved);
+                while parser.errors.len() > saved_errors {
+                    let _ = parser.errors.pop();
+                }
+            }
+        } else {};
         let expression = parse_expression(parser);
         if current_token(parser).kind == lexer::TokenKind::Identifier
             && current_token(parser).value == "of"
@@ -3336,13 +3393,18 @@ fn parse_for_statement(parser: Parser) -> ast::Stmt {
                     ast::BindingPattern::Identifier { name: "", span: ast::expr_span(expression) },
                 ),
                 target: Option::Some(Ref::new(expression)),
+                assignment_pattern: Option::None,
                 iterable: Ref::new(iterable),
                 body: Ref::new(body),
+                asynchronous,
                 span: ast::span(start, end),
             }
         } else {};
         match expression {
             ast::Expr::Binary { operator: ast::BinaryOperator::In, left, right, .. } => {
+                if asynchronous {
+                    report(parser, "`for await` only supports `of`", ast::expr_span(expression))
+                } else {};
                 if !assignment_target(left.get()) {
                     report(parser, "invalid for-in assignment target", ast::expr_span(left.get()))
                 } else {};
@@ -3400,6 +3462,9 @@ fn parse_for_statement(parser: Parser) -> ast::Stmt {
     let _ = finish_right_paren(parser, "expected `)` after for clauses");
     let body = parse_required_statement(parser);
     let end = stmt_end(body);
+    if asynchronous {
+        report(parser, "`for await` only supports `of`", ast::span(start, end))
+    } else {};
     ast::Stmt::For { initializer, test, update, body: Ref::new(body), span: ast::span(start, end) }
 }
 

@@ -1666,14 +1666,503 @@ fn promise_object_drain(
     Result::Ok(array_length_value(queue.run_all()))
 }
 
-fn async_generator_identity(
+#[derive(PartialEq, Eq)]
+enum AsyncFromSyncOperation {
+    Next,
+    Throw,
+    Return,
+}
+
+struct AsyncFromSyncIteratorState {
+    iterator: runtime::Value,
+    next: runtime::Value,
+}
+
+fn async_from_sync_gc_edges(
+    heap: runtime::Heap,
+    states: HashMap[runtime::ObjectId, AsyncFromSyncIteratorState],
+) -> Vec[runtime::GcEdge] {
+    let edges: Vec[runtime::GcEdge] = Vec::new();
+    let stale: Vec[runtime::ObjectId] = Vec::new();
+    for (object, state) in states.entries() {
+        if heap.contains(object) {
+            edges.push(
+                runtime::GcEdge {
+                    owner: object,
+                    values: Vec::from_array([state.iterator, state.next]),
+                },
+            )
+        } else {
+            stale.push(object)
+        }
+    }
+    for object in stale {
+        let _ = states.remove(object);
+    }
+    edges
+}
+
+fn async_from_sync_state(
+    states: HashMap[runtime::ObjectId, AsyncFromSyncIteratorState],
+    value: runtime::Value,
+) -> Result[AsyncFromSyncIteratorState, promise::PromiseFailure] {
+    match value {
+        runtime::Value::Object(object) => match states.get(object) {
+            Some(state) => Result::Ok(state),
+            None => Result::Err(
+                promise::PromiseFailure::TypeError(
+                    "Async-from-Sync Iterator method called on incompatible receiver",
+                ),
+            ),
+        },
+        _ => Result::Err(
+            promise::PromiseFailure::TypeError(
+                "Async-from-Sync Iterator method called on incompatible receiver",
+            ),
+        ),
+    }
+}
+
+fn async_from_sync_capability(
+    heap: runtime::Heap,
+    promise_states: HashMap[runtime::ObjectId, promise::Promise],
+    queue: promise::JobQueue,
+    promise_prototype: runtime::ObjectId,
+) -> Result[(promise::PromiseCapability, runtime::Value), vm::VmError] {
+    let capability = promise::PromiseCapability::new(queue);
+    match promise_object_wrap(heap, promise_states, promise_prototype, capability.promise()) {
+        Ok(value) => Result::Ok((capability, value)),
+        Err(error) => Result::Err(function_vm_error(error.message)),
+    }
+}
+
+fn async_from_sync_reject(capability: promise::PromiseCapability, failure: promise::PromiseFailure) -> unit {
+    let _ = capability.reject(failure);
+}
+
+fn async_from_sync_reject_vm(capability: promise::PromiseCapability, error: vm::VmError) -> unit {
+    async_from_sync_reject(capability, promise_object_vm_failure(error))
+}
+
+fn async_from_sync_method_missing(value: runtime::Value) -> bool {
+    match value {
+        runtime::Value::Undefined | runtime::Value::Null => true,
+        _ => false,
+    }
+}
+
+fn async_from_sync_close(context: vm::Context, iterator: runtime::Value, depth: isize) -> unit {
+    let method = match context.read_property_at_depth(
+        iterator,
+        runtime::Value::String(js_string("return")),
+        depth,
+    ) {
+        Ok(value) => value,
+        Err(_) => return,
+    };
+    if async_from_sync_method_missing(method) {
+        return
+    } else {};
+    if !promise_object_callable(method) {
+        return
+    } else {};
+    let _ = match context.invoke_with_this_at_depth(method, Vec::new(), iterator, depth) {
+        Ok(value) => value,
+        Err(_) => return,
+    };
+}
+
+fn async_from_sync_resolve_result(
+    context: vm::Context,
+    capability: promise::PromiseCapability,
+    value: runtime::Value,
+    done: bool,
+) -> unit {
+    match async_generator_iteration_result(context.heap(), value, done) {
+        Ok(result) => {
+            let _ = capability.resolve(promise::value(result));
+        },
+        Err(error) => async_from_sync_reject(capability, error),
+    }
+}
+
+fn async_from_sync_settle(
+    context: vm::Context,
+    promise_states: HashMap[runtime::ObjectId, promise::Promise],
+    queue: promise::JobQueue,
+    promise_prototype: runtime::ObjectId,
+    capability: promise::PromiseCapability,
+    value: runtime::Value,
+    done: bool,
+    close_on_rejection: bool,
+    iterator: runtime::Value,
+    depth: isize,
+    roots: Vec[runtime::Value],
+) -> unit {
+    let awaited = match promise_object_resolution(
+        context,
+        context.heap(),
+        promise_states,
+        promise_prototype,
+        value,
+    ) {
+        Ok(resolution) => promise::Promise::resolved(queue, resolution),
+        Err(error) => {
+            if close_on_rejection {
+                async_from_sync_close(context, iterator, depth)
+            } else {};
+            async_from_sync_reject(capability, error);
+            return
+        },
+    };
+    let on_fulfilled: Option[
+        (promise::PromiseFulfillment) -> Result[promise::PromiseResolution, promise::PromiseFailure],
+    ] = Option::Some(
+        |fulfillment| {
+            let value = match promise_object_fulfillment_value(context.heap(), fulfillment) {
+                Ok(value) => value,
+                Err(error) => {
+                    async_from_sync_reject(
+                        capability,
+                        promise::PromiseFailure::TypeError(error.message),
+                    );
+                    return Result::Ok(promise::value(runtime::Value::Undefined))
+                },
+            };
+            match async_generator_iteration_result(context.heap(), value, done) {
+                Ok(result) => {
+                    let _ = capability.resolve(promise::value(result));
+                },
+                Err(error) => async_from_sync_reject(capability, error),
+            };
+            Result::Ok(promise::value(runtime::Value::Undefined))
+        },
+    );
+    let on_rejected: Option[
+        (promise::PromiseFailure) -> Result[promise::PromiseResolution, promise::PromiseFailure],
+    ] = Option::Some(
+        |failure| {
+            if close_on_rejection {
+                async_from_sync_close(context, iterator, depth)
+            } else {};
+            async_from_sync_reject(capability, failure);
+            Result::Ok(promise::value(runtime::Value::Undefined))
+        },
+    );
+    let _ = awaited.then_with_roots(on_fulfilled, on_rejected, roots);
+}
+
+fn async_from_sync_result(context: vm::Context, result: runtime::Value, depth: isize) -> Result[
+    (runtime::Value, bool),
+    vm::VmError,
+] {
+    match result {
+        runtime::Value::Object(_) => (),
+        _ => return Result::Err(function_vm_error("sync iterator method result is not an object")),
+    };
+    let done = context.read_property_at_depth(
+        result,
+        runtime::Value::String(js_string("done")),
+        depth,
+    )?;
+    let value = context.read_property_at_depth(
+        result,
+        runtime::Value::String(js_string("value")),
+        depth,
+    )?;
+    Result::Ok((value, runtime::to_boolean(done)))
+}
+
+fn async_from_sync_arguments(arguments: Vec[runtime::Value]) -> Vec[runtime::Value] {
+    if arguments.is_empty() {
+        Vec::new()
+    } else {
+        Vec::from_array([arguments[0]])
+    }
+}
+
+fn async_from_sync_method(
+    context: vm::Context,
+    promise_states: HashMap[runtime::ObjectId, promise::Promise],
+    queue: promise::JobQueue,
+    promise_prototype: runtime::ObjectId,
+    states: HashMap[runtime::ObjectId, AsyncFromSyncIteratorState],
+    operation: AsyncFromSyncOperation,
     this_value: runtime::Value,
     arguments: Vec[runtime::Value],
     depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
+    let (capability, promise_value) = async_from_sync_capability(
+        context.heap(),
+        promise_states,
+        queue,
+        promise_prototype,
+    )?;
+    let state = match async_from_sync_state(states, this_value) {
+        Ok(value) => value,
+        Err(error) => {
+            async_from_sync_reject(capability, error);
+            return Result::Ok(promise_value)
+        },
+    };
+    let method = match operation {
+        AsyncFromSyncOperation::Next => state.next,
+        AsyncFromSyncOperation::Throw => match context.read_property_at_depth(
+            state.iterator,
+            runtime::Value::String(js_string("throw")),
+            depth,
+        ) {
+            Ok(value) => value,
+            Err(error) => {
+                async_from_sync_reject_vm(capability, error);
+                return Result::Ok(promise_value)
+            },
+        },
+        AsyncFromSyncOperation::Return => match context.read_property_at_depth(
+            state.iterator,
+            runtime::Value::String(js_string("return")),
+            depth,
+        ) {
+            Ok(value) => value,
+            Err(error) => {
+                async_from_sync_reject_vm(capability, error);
+                return Result::Ok(promise_value)
+            },
+        },
+    };
+    if operation == AsyncFromSyncOperation::Return && async_from_sync_method_missing(method) {
+        async_from_sync_resolve_result(context, capability, argument(arguments, 0), true);
+        return Result::Ok(promise_value)
+    } else {};
+    if operation == AsyncFromSyncOperation::Throw && async_from_sync_method_missing(method) {
+        let return_method = match context.read_property_at_depth(
+            state.iterator,
+            runtime::Value::String(js_string("return")),
+            depth,
+        ) {
+            Ok(value) => value,
+            Err(error) => {
+                async_from_sync_reject_vm(capability, error);
+                return Result::Ok(promise_value)
+            },
+        };
+        if !async_from_sync_method_missing(return_method) {
+            if !promise_object_callable(return_method) {
+                async_from_sync_reject(
+                    capability,
+                    promise::PromiseFailure::TypeError("sync iterator return is not callable"),
+                );
+                return Result::Ok(promise_value)
+            } else {};
+            let returned = match context.invoke_with_this_at_depth(
+                return_method,
+                Vec::new(),
+                state.iterator,
+                depth,
+            ) {
+                Ok(value) => value,
+                Err(error) => {
+                    async_from_sync_reject_vm(capability, error);
+                    return Result::Ok(promise_value)
+                },
+            };
+            match returned {
+                runtime::Value::Object(_) => (),
+                _ => {
+                    async_from_sync_reject(
+                        capability,
+                        promise::PromiseFailure::TypeError(
+                            "sync iterator return result is not an object",
+                        ),
+                    );
+                    return Result::Ok(promise_value)
+                },
+            }
+        } else {};
+        async_from_sync_reject(
+            capability,
+            promise::PromiseFailure::TypeError("sync iterator does not provide a throw method"),
+        );
+        return Result::Ok(promise_value)
+    } else {};
+    if !promise_object_callable(method) {
+        async_from_sync_reject(
+            capability,
+            promise::PromiseFailure::TypeError(
+                if operation == AsyncFromSyncOperation::Next {
+                    "sync iterator next is not callable"
+                } else if operation == AsyncFromSyncOperation::Throw {
+                    "sync iterator throw is not callable"
+                } else {
+                    "sync iterator return is not callable"
+                },
+            ),
+        );
+        return Result::Ok(promise_value)
+    } else {};
+    let result = match context.invoke_with_this_at_depth(
+        method,
+        async_from_sync_arguments(arguments),
+        state.iterator,
+        depth,
+    ) {
+        Ok(value) => value,
+        Err(error) => {
+            async_from_sync_reject_vm(capability, error);
+            return Result::Ok(promise_value)
+        },
+    };
+    let (value, done) = match async_from_sync_result(context, result, depth) {
+        Ok(value) => value,
+        Err(error) => {
+            async_from_sync_reject_vm(capability, error);
+            return Result::Ok(promise_value)
+        },
+    };
+    async_from_sync_settle(
+        context,
+        promise_states,
+        queue,
+        promise_prototype,
+        capability,
+        value,
+        done,
+        operation != AsyncFromSyncOperation::Return && !done,
+        state.iterator,
+        depth,
+        Vec::from_array([state.iterator, state.next, result, promise_value]),
+    );
+    Result::Ok(promise_value)
+}
+
+fn async_iterator_identity(this_value: runtime::Value, arguments: Vec[runtime::Value], depth: isize) -> Result[
+    runtime::Value,
+    vm::VmError,
+] {
     let _ = arguments;
     let _ = depth;
     Result::Ok(this_value)
+}
+
+fn install_async_function_kind(
+    context: vm::Context,
+    function_constructor: Option[runtime::Value],
+    name: string,
+    kind: vm::FunctionKind,
+) -> Result[runtime::ObjectId, BuiltinError] {
+    let parent = match context.heap().function_prototype() {
+        Some(value) => Option::Some(value),
+        None => context.heap().object_prototype(),
+    };
+    let prototype = match allocate_ordinary(context.heap(), parent) {
+        Ok(value) => value,
+        Err(error) => return Result::Err(BuiltinError { message: error.message }),
+    };
+    match function_constructor {
+        Some(constructor) => {
+            let _ = install_dynamic_function_constructor(
+                context,
+                constructor,
+                name,
+                kind,
+                prototype,
+            )?;
+        },
+        None => match context.set_function_kind_prototype(kind, prototype) {
+            Ok(()) => (),
+            Err(error) => return Result::Err(BuiltinError { message: error.kind.debug() }),
+        },
+    };
+    define_to_string_tag(context, prototype, name)?;
+    Result::Ok(prototype)
+}
+
+fn install_async_iterator(
+    context: vm::Context,
+    promise_states: HashMap[runtime::ObjectId, promise::Promise],
+    queue: promise::JobQueue,
+    promise_prototype: runtime::ObjectId,
+) -> Result[runtime::ObjectId, BuiltinError] {
+    let heap = context.heap();
+    let prototype = match allocate_ordinary(heap, heap.object_prototype()) {
+        Ok(value) => value,
+        Err(error) => return Result::Err(BuiltinError { message: error.message }),
+    };
+    let from_sync_prototype = match allocate_ordinary(heap, Option::Some(prototype)) {
+        Ok(value) => value,
+        Err(error) => return Result::Err(BuiltinError { message: error.message }),
+    };
+    let states: HashMap[runtime::ObjectId, AsyncFromSyncIteratorState] = HashMap::new();
+    for (name, operation) in Vec::from_array(
+        [
+            ("next", AsyncFromSyncOperation::Next),
+            ("throw", AsyncFromSyncOperation::Throw),
+            ("return", AsyncFromSyncOperation::Return),
+        ],
+    ) {
+        define_value(
+            heap,
+            from_sync_prototype,
+            name,
+            allocate_vm_function_with_length(
+                context,
+                name,
+                1,
+                |this_value, arguments, depth| {
+                    async_from_sync_method(
+                        context,
+                        promise_states,
+                        queue,
+                        promise_prototype,
+                        states,
+                        operation,
+                        this_value,
+                        arguments,
+                        depth,
+                    )
+                },
+            )?,
+            true,
+            true,
+        )?
+    }
+    match context.well_known_symbol(vm::WellKnownSymbolKind::AsyncIterator) {
+        Some(symbol) => {
+            let identity = allocate_vm_function_with_length(
+                context,
+                "[Symbol.asyncIterator]",
+                0,
+                async_iterator_identity,
+            )?;
+            if !runtime::define_own_property(
+                heap,
+                prototype,
+                runtime::PropertyKey::Symbol(symbol),
+                runtime::data_descriptor(identity, true, false, true),
+            ) {
+                return Result::Err(
+                    BuiltinError { message: "cannot initialize async iterator prototype" },
+                )
+            } else {}
+        },
+        None => (),
+    };
+    match context.set_async_iterator_prototypes(prototype, from_sync_prototype) {
+        Ok(()) => (),
+        Err(error) => return Result::Err(BuiltinError { message: error.kind.debug() }),
+    };
+    context.add_external_edge_provider(|| async_from_sync_gc_edges(context.heap(), states));
+    context.set_async_from_sync_iterator_factory(
+        |iterator, next, _| {
+            let object = match allocate_ordinary(context.heap(), Option::Some(from_sync_prototype)) {
+                Ok(value) => value,
+                Err(error) => return Result::Err(function_vm_error(error.message)),
+            };
+            states[object] = AsyncFromSyncIteratorState { iterator, next };
+            Result::Ok(runtime::Value::Object(object))
+        },
+    );
+    Result::Ok(prototype)
 }
 
 fn install_async_generator(
@@ -1681,9 +2170,11 @@ fn install_async_generator(
     states: HashMap[runtime::ObjectId, promise::Promise],
     queue: promise::JobQueue,
     promise_prototype: runtime::ObjectId,
+    async_iterator_prototype: runtime::ObjectId,
+    function_constructor: Option[runtime::Value],
 ) -> Result[unit, BuiltinError] {
     let heap = context.heap();
-    let prototype = match allocate_ordinary(heap, heap.object_prototype()) {
+    let prototype = match allocate_ordinary(heap, Option::Some(async_iterator_prototype)) {
         Ok(value) => value,
         Err(error) => return Result::Err(BuiltinError { message: error.message }),
     };
@@ -1721,28 +2212,29 @@ fn install_async_generator(
             true,
         )?
     }
-    match context.well_known_symbol(vm::WellKnownSymbolKind::AsyncIterator) {
-        Some(async_iterator) => {
-            let identity = allocate_vm_function_with_length(
-                context,
-                "[Symbol.asyncIterator]",
-                0,
-                async_generator_identity,
-            )?;
-            if !runtime::define_own_property(
-                heap,
-                prototype,
-                runtime::PropertyKey::Symbol(async_iterator),
-                runtime::data_descriptor(identity, true, false, true),
-            ) {
-                return Result::Err(
-                    BuiltinError { message: "cannot initialize async generator iterator" },
-                )
-            } else {}
-        },
-        None => (),
-    };
     define_to_string_tag(context, prototype, "AsyncGenerator")?;
+    let function_kind_prototype = install_async_function_kind(
+        context,
+        function_constructor,
+        "AsyncGeneratorFunction",
+        vm::FunctionKind::AsyncGenerator,
+    )?;
+    define_value(
+        heap,
+        function_kind_prototype,
+        "prototype",
+        runtime::Value::Object(prototype),
+        false,
+        true,
+    )?;
+    define_value(
+        heap,
+        prototype,
+        "constructor",
+        runtime::Value::Object(function_kind_prototype),
+        false,
+        true,
+    )?;
     match context.set_async_generator_prototype(prototype) {
         Ok(()) => (),
         Err(error) => return Result::Err(BuiltinError { message: error.kind.debug() }),
@@ -1751,10 +2243,11 @@ fn install_async_generator(
     Result::Ok(())
 }
 
-pub fn install_promise_with_queue(context: vm::Context, queue: promise::JobQueue) -> Result[
-    runtime::Value,
-    BuiltinError,
-] {
+pub fn install_promise_with_queue(
+    context: vm::Context,
+    queue: promise::JobQueue,
+    function_constructor: Option[runtime::Value],
+) -> Result[runtime::Value, BuiltinError] {
     let heap = context.heap();
     let prototype = match allocate_ordinary(heap, Option::None) {
         Ok(value) => value,
@@ -1762,7 +2255,21 @@ pub fn install_promise_with_queue(context: vm::Context, queue: promise::JobQueue
     };
     let states: HashMap[runtime::ObjectId, promise::Promise] = HashMap::new();
     context.add_external_edge_provider(|| promise_object_gc_edges(context.heap(), states));
-    install_async_generator(context, states, queue, prototype)?;
+    let _ = install_async_function_kind(
+        context,
+        function_constructor,
+        "AsyncFunction",
+        vm::FunctionKind::Async,
+    )?;
+    let async_iterator_prototype = install_async_iterator(context, states, queue, prototype)?;
+    install_async_generator(
+        context,
+        states,
+        queue,
+        prototype,
+        async_iterator_prototype,
+        function_constructor,
+    )?;
     define_to_string_tag(context, prototype, "Promise")?;
     define_value(
         heap,
@@ -1997,5 +2504,5 @@ pub fn install_promise_with_queue(context: vm::Context, queue: promise::JobQueue
 }
 
 pub fn install_promise(context: vm::Context) -> Result[runtime::Value, BuiltinError] {
-    install_promise_with_queue(context, promise::JobQueue::new())
+    install_promise_with_queue(context, promise::JobQueue::new(), Option::None)
 }
