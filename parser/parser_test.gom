@@ -1395,6 +1395,59 @@ fn parses_async_function_arrow_and_await_syntax() -> unit {
 }
 
 #[test]
+fn contextualizes_await_and_yield_identifiers_across_function_boundaries() -> unit {
+    let result = parse(
+        "var await = 1; var yield = 2; var \\u0061wait = 3; var \\u0079ield = 4; function ordinary(await, yield) { return await + yield; } let first = await => await; let second = yield => yield; async function asyncOuter() { function nested(await) { return await; } return () => await; } function* generatorOuter() { function nested(yield) { return yield; } return () => yield; } let {await: renamed, yield} = source; try {} catch (await) { await; } await: { break await; } yield: { break yield; } function await() {} function* yield() {}",
+    );
+    testing::assert_eq(result.errors.len(), 0);
+    testing::assert_eq(result.program.body.len(), 15)
+}
+
+#[test]
+fn disambiguates_contextual_identifier_division_from_await_yield_regexp_operands() -> unit {
+    let result = parse(
+        "var await = 24; var yield = 18; let first = await / 2 / 3; let second = yield / 3 / 2; async function matches() { return (await /x/).test('x'); } function* pattern() { yield /y/; } async function asyncOuter() { return () => await / 2; } function* generatorOuter() { return () => yield / 2; }",
+    );
+    testing::assert_eq(result.errors.len(), 0)
+}
+
+#[test]
+fn disambiguates_division_after_contextual_member_names() -> unit {
+    let result = parse(
+        "let target = {await: 12, yield: 18}; let first = target.await / 3; target.yield /= 2; let second = target?.await / 2; let third = new target.await / 2; async function read() { return target.await / 2; } class Holder { static { target.yield / 2; } }",
+    );
+    testing::assert_eq(result.errors.len(), 0)
+}
+
+#[test]
+fn enforces_class_strict_context_and_static_await_boundaries() -> unit {
+    let invalid = parse(
+        "var yield = Object; class Heritage extends yield {} class Computed { [yield]() {} } class Field { value = yield; } class StaticYield { static { yield; } } var await = 1; class StaticAwait { static { await; } } class Nested { [(() => yield)()]() {} }",
+    );
+    testing::assert(invalid.errors.len() >= 6);
+    let valid = parse(
+        "var await = 4; class Valid { [await]() {} value = await; static { function nested(await) { return await; } let read = () => await; } }",
+    );
+    testing::assert_eq(valid.errors.len(), 0)
+}
+
+#[test]
+fn enforces_await_and_yield_parameter_module_and_power_boundaries() -> unit {
+    let defaults = parse(
+        "async function invalidAwait(value = await 1) {} function* invalidYield(value = yield 1) {} async function nestedAwait(value = () => await) {} function* nestedYield(value = () => yield) {}",
+    );
+    testing::assert_eq(defaults.errors.len(), 2);
+    let module = parse_module(
+        "export const value = await Promise.resolve(1); function nested() { var await = 2; return await; }",
+    );
+    testing::assert(module.errors.len() >= 2);
+    let power = parse("async function powers() { await 2 ** 3; (await 2) ** 3; await (2 ** 3); }");
+    testing::assert_eq(power.errors.len(), 1);
+    let names = parse("let first = async function await() {}; let second = function* yield() {};");
+    testing::assert_eq(names.errors.len(), 2)
+}
+
+#[test]
 fn terminates_block_arrow_expressions_before_line_break_continuations() -> unit {
     let result = parse("() => {}\n() => {}; () => {}\n+1;");
     testing::assert_eq(result.errors.len(), 0);

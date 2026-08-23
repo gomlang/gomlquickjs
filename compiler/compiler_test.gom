@@ -3117,9 +3117,7 @@ fn pending_async_generator_requests_survive_explicit_collection() -> unit {
 fn await_context_and_async_constructors_report_compile_errors() -> unit {
     match compile("await 1;") {
         Ok(_) => testing::fail("expected await context error"),
-        Err(errors) => testing::assert(
-            has_message(errors, "await is only valid in async functions"),
-        ),
+        Err(_) => (),
     };
     match compile("for await (let value of []) {}") {
         Ok(_) => testing::fail("expected for-await context error"),
@@ -3134,6 +3132,108 @@ fn await_context_and_async_constructors_report_compile_errors() -> unit {
     match compile("class Invalid { async constructor() {} }") {
         Ok(_) => testing::fail("expected async constructor error"),
         Err(errors) => testing::assert(has_message(errors, "class constructor cannot be async")),
+    }
+}
+
+#[test]
+fn executes_contextual_await_and_yield_identifiers() -> unit {
+    match execute_source_with_builtins(
+        "var await = 1; var yield = 2; let arrowAwait = (await => await + 1)(3); let arrowYield = (yield => yield + 1)(4); function sum(await, yield) { return await + yield; } function escaped() { var \\u0061wait = 5; var \\u0079ield = 6; return await + yield; } function destructure(source) { let {await, yield} = source; return await + yield; } let caught = 0; try { throw 7; } catch (yield) { caught = yield; } let labelled = 0; await: { labelled = 8; break await; labelled = 0; } async function asyncOuter() { return (() => await)(); } function* generatorOuter() { return (() => yield)(); } async function asyncEval() { return eval('await'); } function* generatorEval() { return eval('yield'); } let asyncValue = 0; let evalValue = 0; asyncOuter().then(value => asyncValue = value); asyncEval().then(value => evalValue = value); Promise.drainJobs(); return arrowAwait === 4 && arrowYield === 5 && sum(2, 3) === 5 && escaped() === 11 && destructure({await: 4, yield: 5}) === 9 && caught === 7 && labelled === 8 && asyncValue === 1 && generatorOuter().next().value === 2 && evalValue === 1 && generatorEval().next().value === 2;",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected contextual identifier result"),
+    }
+}
+
+#[test]
+fn executes_contextual_identifier_division_and_preserves_regexp_operands() -> unit {
+    match execute_source_with_builtins(
+        "var await = 24; var yield = 18; let first = await / 2 / 3; let second = yield / 3 / 2; async function matches() { return (await /x/).test('x'); } function* pattern() { yield /y/; } async function asyncOuter() { return () => await / 2; } function* generatorOuter() { return (() => yield / 2)(); } return first === 4 && second === 3 && pattern().next().value.test('y') && generatorOuter().next().value === 9;",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected contextual division result"),
+    }
+}
+
+#[test]
+fn class_strict_context_rejects_yield_and_static_block_await() -> unit {
+    let invalid = Vec::from_array(
+        [
+            "var yield = Object; class Invalid extends yield {}",
+            "var subject; class Invalid extends (delete subject) {}",
+            "var yield = 'name'; class Invalid { [yield]() {} }",
+            "var subject; class Invalid { [delete subject]() {} }",
+            "var yield = 1; class Invalid { value = yield; }",
+            "var yield = 1; class Invalid { static { yield; } }",
+            "var await = 1; class Invalid { static { await; } }",
+            "var yield = 1; class Invalid { [(() => yield)()]() {} }",
+        ],
+    );
+    for source in invalid {
+        match compile(source) {
+            Ok(_) => testing::fail("expected class contextual early error"),
+            Err(_) => (),
+        }
+    }
+    match compile(
+        "var await = 4; class Valid { [await]() {} value = await; static { function nested(await) { return await; } let read = () => await; } }",
+    ) {
+        Ok(_) => (),
+        Err(_) => testing::fail("expected nested static block await reset"),
+    };
+    match execute_source_with_builtins(
+        "let evalRejected = false; try { class EvalProbe { [eval(\"with ({}) {}\")]() {} } } catch (error) { evalRejected = error instanceof SyntaxError; } let assignmentRejected = false; try { class AssignmentProbe { [strictClassMissing = 1]() {} } } catch (error) { assignmentRejected = error instanceof ReferenceError; } return evalRejected && assignmentRejected && typeof strictClassMissing === 'undefined';",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected strict class expression semantics"),
+    }
+}
+
+#[test]
+fn enforces_contextual_await_yield_early_errors() -> unit {
+    match compile("'use strict'; var yield = 1;") {
+        Ok(_) => testing::fail("expected strict yield binding error"),
+        Err(errors) => testing::assert(has_message(errors, "yield")),
+    };
+    match compile("'use strict'; var \\u0079ield = 1;") {
+        Ok(_) => testing::fail("expected escaped strict yield binding error"),
+        Err(errors) => testing::assert(has_message(errors, "yield")),
+    };
+    match compile_module("var await = 1;") {
+        Ok(_) => testing::fail("expected module await binding error"),
+        Err(errors) => testing::assert(has_message(errors, "reserved word")),
+    };
+    match compile_module("function nested() { var await = 1; return await; }") {
+        Ok(_) => testing::fail("expected nested module await error"),
+        Err(errors) => testing::assert(has_message(errors, "reserved word")),
+    };
+    match compile("async function invalid(value = await 1) {}") {
+        Ok(_) => testing::fail("expected await parameter initializer error"),
+        Err(errors) => testing::assert(has_message(errors, "parameter initializer")),
+    };
+    match compile("function* invalid(value = yield 1) {}") {
+        Ok(_) => testing::fail("expected yield parameter initializer error"),
+        Err(errors) => testing::assert(has_message(errors, "parameter initializer")),
+    };
+    match compile("async function invalid() { return await 2 ** 3; }") {
+        Ok(_) => testing::fail("expected await exponentiation error"),
+        Err(errors) => testing::assert(has_message(errors, "left operand")),
+    };
+    match compile(
+        "async function validAwait(value = () => await) { return (await 2) ** 3 + await (2 ** 3); } function* validYield(value = () => yield) { return value; } async function await() {} function* yield() {}",
+    ) {
+        Ok(_) => (),
+        Err(_) => testing::fail("expected nested contextual identifier forms"),
+    }
+}
+
+#[test]
+fn inherited_strict_eval_rejects_yield_identifiers() -> unit {
+    match execute_source_with_builtins(
+        "let rejected = false; function strict() { 'use strict'; try { eval('var yield = 1;'); } catch (error) { rejected = error instanceof SyntaxError; } } strict(); return rejected;",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected strict eval rejection"),
     }
 }
 

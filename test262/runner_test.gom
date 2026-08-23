@@ -12,12 +12,32 @@ fn empty_harness(name: string) -> Result[string, string] {
 }
 
 fn sample_harness(name: string) -> Result[string, string] {
-    if name == "sta.js" {
-        Result::Ok("let harness_order = 40;")
-    } else if name == "assert.js" {
-        Result::Ok("harness_order = harness_order + 1;")
+    if name == "assert.js" {
+        Result::Ok("var harness_order = 'assert';")
+    } else if name == "sta.js" {
+        Result::Ok("harness_order += ',sta';")
     } else if name == "extra.js" {
-        Result::Ok("harness_order = harness_order + 1;")
+        Result::Ok("harness_order += ',extra';")
+    } else {
+        Result::Err("missing")
+    }
+}
+
+fn sloppy_harness(name: string) -> Result[string, string] {
+    if name == "assert.js" {
+        Result::Ok("var harness_sloppy = (function() { return this; })() !== undefined;")
+    } else if name == "sta.js" {
+        Result::Ok("")
+    } else {
+        Result::Err("missing")
+    }
+}
+
+fn throwing_harness(name: string) -> Result[string, string] {
+    if name == "assert.js" {
+        Result::Ok("throw new TypeError('harness failure');")
+    } else if name == "sta.js" {
+        Result::Ok("")
     } else {
         Result::Err("missing")
     }
@@ -34,17 +54,47 @@ fn case_from(source: string) -> TestCase {
 }
 
 #[test]
-fn prepares_default_harnesses_in_test262_order() -> unit {
+fn prepares_strict_test_source_and_runs_harnesses_in_test262_order() -> unit {
     let case = case_from(
-        "/*---\nincludes: [extra.js, assert.js]\nflags: [noStrict]\n---*/\nreturn harness_order;",
+        "/*---\nincludes: [extra.js, assert.js]\nflags: [onlyStrict]\n---*/\nif (harness_order !== 'assert,sta,extra') throw new Error('harness order');",
     );
-    match prepare_source(case, SourceVariant::Sloppy, sample_harness) {
+    match prepare_source(case, SourceVariant::Strict, sample_harness) {
         Ok(value) => testing::assert(
             value
-                == "let harness_order = 40;\nharness_order = harness_order + 1;\nharness_order = harness_order + 1;\n/*---\nincludes: [extra.js, assert.js]\nflags: [noStrict]\n---*/\nreturn harness_order;\n",
+                == "\"use strict\";\n/*---\nincludes: [extra.js, assert.js]\nflags: [onlyStrict]\n---*/\nif (harness_order !== 'assert,sta,extra') throw new Error('harness order');\n",
         ),
         Err(value) => testing::fail(value),
+    };
+    let results = run(case, sample_harness);
+    testing::assert_eq(results[0].status, RunStatus::Passed)
+}
+
+#[test]
+fn preserves_raw_source_exactly() -> unit {
+    let source = "/*---\nflags: [raw]\n---*/\n0;";
+    match prepare_source(case_from(source), SourceVariant::Raw, throwing_harness) {
+        Ok(value) => testing::assert(value == source),
+        Err(value) => testing::fail(value),
     }
+}
+
+#[test]
+fn executes_harness_separately_and_never_uses_it_as_a_negative_result() -> unit {
+    let strict = run(
+        case_from(
+            "/*---\nflags: [onlyStrict]\n---*/\nif (!harness_sloppy) throw new Error('strict harness');",
+        ),
+        sloppy_harness,
+    );
+    testing::assert_eq(strict[0].status, RunStatus::Passed);
+    let negative = run(
+        case_from(
+            "/*---\nflags: [noStrict]\nnegative:\n  phase: runtime\n  type: TypeError\n---*/\nthrow new TypeError('test failure');",
+        ),
+        throwing_harness,
+    );
+    testing::assert_eq(negative[0].status, RunStatus::Failed);
+    testing::assert(negative[0].message.contains("harness runtime"))
 }
 
 #[test]
@@ -59,6 +109,67 @@ fn passes_positive_and_parse_negative_cases() -> unit {
         empty_harness,
     );
     testing::assert_eq(negative[0].status, RunStatus::Passed)
+}
+
+#[test]
+fn rejects_negative_phase_and_type_mismatches() -> unit {
+    let wrong_type = run(
+        case_from(
+            "/*---\nflags: [raw]\nnegative:\n  phase: parse\n  type: ReferenceError\n---*/\nlet = ;",
+        ),
+        empty_harness,
+    );
+    testing::assert_eq(wrong_type[0].status, RunStatus::Failed);
+    testing::assert(wrong_type[0].message.contains("parse SyntaxError"));
+    let wrong_phase = run(
+        case_from(
+            "/*---\nflags: [raw]\nnegative:\n  phase: resolution\n  type: SyntaxError\n---*/\nlet = ;",
+        ),
+        empty_harness,
+    );
+    testing::assert_eq(wrong_phase[0].status, RunStatus::Failed);
+    testing::assert(wrong_phase[0].message.contains("parse SyntaxError"))
+}
+
+#[test]
+fn skips_unsupported_features_and_blocking_hosts() -> unit {
+    let unsupported = run(
+        case_from("/*---\nflags: [raw]\nfeatures: [ShadowRealm]\n---*/\n0;"),
+        empty_harness,
+    );
+    testing::assert_eq(unsupported[0].status, RunStatus::Skipped);
+    testing::assert(unsupported[0].message.contains("ShadowRealm"));
+    let cannot_block = run(
+        case_from("/*---\nflags: [raw, CanBlockIsTrue]\n---*/\n0;"),
+        empty_harness,
+    );
+    testing::assert_eq(cannot_block[0].status, RunStatus::Skipped);
+    let supported = run(
+        case_from("/*---\nflags: [raw, CanBlockIsFalse]\nfeatures: [BigInt]\n---*/\n1n;"),
+        empty_harness,
+    );
+    testing::assert_eq(supported[0].status, RunStatus::Passed);
+    for feature in Vec::from_array(
+        [
+            "export-defer",
+            "import-text",
+            "immutable-arraybuffer",
+            "host-gc-required",
+            "cross-realm",
+            "intl-normative-optional",
+            "tail-call-optimization",
+        ],
+    ) {
+        let skipped = run(
+            case_from("/*---\nflags: [raw]\nfeatures: [" + feature + "]\n---*/\n0;"),
+            empty_harness,
+        );
+        testing::assert_eq(skipped[0].status, RunStatus::Skipped)
+    }
+    match run_file("test/intl402/missing.js", "harness") {
+        Ok(results) => testing::assert_eq(results[0].status, RunStatus::Skipped),
+        Err(message) => testing::fail(message),
+    }
 }
 
 #[test]
@@ -84,7 +195,50 @@ fn matches_runtime_type_errors_and_rejects_wrong_types() -> unit {
         ),
         empty_harness,
     );
-    testing::assert_eq(reference[0].status, RunStatus::Passed)
+    testing::assert_eq(reference[0].status, RunStatus::Passed);
+    let thrown = run(
+        case_from(
+            "/*---\nflags: [raw]\nnegative:\n  phase: runtime\n  type: TypeError\n---*/\nthrow new TypeError('expected');",
+        ),
+        empty_harness,
+    );
+    testing::assert_eq(thrown[0].status, RunStatus::Passed);
+    let thrown_wrong = run(
+        case_from(
+            "/*---\nflags: [raw]\nnegative:\n  phase: runtime\n  type: RangeError\n---*/\nthrow new TypeError('expected');",
+        ),
+        empty_harness,
+    );
+    testing::assert_eq(thrown_wrong[0].status, RunStatus::Failed);
+    testing::assert(thrown_wrong[0].message.contains("TypeError"));
+    let spoofed = run(
+        case_from(
+            "/*---\nflags: [raw]\nnegative:\n  phase: runtime\n  type: TypeError\n---*/\nthrow {name: 'TypeError', constructor: null};",
+        ),
+        empty_harness,
+    );
+    testing::assert_eq(spoofed[0].status, RunStatus::Failed);
+    let constructor_spoofed = run(
+        case_from(
+            "/*---\nflags: [raw]\nnegative:\n  phase: runtime\n  type: TypeError\n---*/\nthrow {constructor: {name: 'TypeError'}};",
+        ),
+        empty_harness,
+    );
+    testing::assert_eq(constructor_spoofed[0].status, RunStatus::Failed);
+    let renamed = run(
+        case_from(
+            "/*---\nflags: [raw]\nnegative:\n  phase: runtime\n  type: TypeError\n---*/\nlet error = new TypeError('expected'); error.name = 'RangeError'; throw error;",
+        ),
+        empty_harness,
+    );
+    testing::assert_eq(renamed[0].status, RunStatus::Passed);
+    let constructor_renamed = run(
+        case_from(
+            "/*---\nflags: [raw]\nnegative:\n  phase: runtime\n  type: TypeError\n---*/\nlet error = new TypeError('expected'); error.constructor = RangeError; throw error;",
+        ),
+        empty_harness,
+    );
+    testing::assert_eq(constructor_renamed[0].status, RunStatus::Passed)
 }
 
 #[test]
@@ -123,6 +277,13 @@ fn runner_write(path: string, source: string) -> unit {
     }
 }
 
+fn runner_expect_status(results: Vec[RunResult], expected: RunStatus) -> unit {
+    testing::assert_eq(results.len(), 1);
+    if results[0].status != expected {
+        testing::fail(results[0].message)
+    } else {}
+}
+
 #[test]
 fn run_file_executes_module_graphs_and_resolution_negatives() -> unit {
     let directory = "__gomlquickjs_test262_modules_94c2__";
@@ -130,17 +291,14 @@ fn run_file_executes_module_graphs_and_resolution_negatives() -> unit {
     let _ = fs::remove_dir_all(directory);
     let _ = fs::create_dir_all(harness);
     runner_write(harness + "/sta.js", "");
-    runner_write(harness + "/assert.js", "");
+    runner_write(harness + "/assert.js", "var harnessVisible = 42;");
     runner_write(directory + "/dependency.js", "export default 42;");
     runner_write(
         directory + "/positive.js",
-        "/*---\nflags: [module]\n---*/\nimport answer from './dependency.js'; if (answer !== 42) throw new Error('wrong answer');",
+        "/*---\nflags: [module]\n---*/\nimport answer from './dependency.js'; if (answer !== 42 || harnessVisible !== 42) throw new Error('wrong answer');",
     );
     match run_file(directory + "/positive.js", harness) {
-        Ok(results) => {
-            testing::assert_eq(results.len(), 1);
-            testing::assert_eq(results[0].status, RunStatus::Passed)
-        },
+        Ok(results) => runner_expect_status(results, RunStatus::Passed),
         Err(message) => testing::fail(message),
     };
     runner_write(
@@ -148,7 +306,95 @@ fn run_file_executes_module_graphs_and_resolution_negatives() -> unit {
         "/*---\nflags: [module]\nnegative:\n  phase: resolution\n  type: SyntaxError\n---*/\nimport {missing} from './dependency.js';",
     );
     match run_file(directory + "/negative.js", harness) {
-        Ok(results) => testing::assert_eq(results[0].status, RunStatus::Passed),
+        Ok(results) => runner_expect_status(results, RunStatus::Passed),
+        Err(message) => testing::fail(message),
+    };
+    runner_write(
+        directory + "/wrong_type.js",
+        "/*---\nflags: [module]\nnegative:\n  phase: resolution\n  type: ReferenceError\n---*/\nimport {missing} from './dependency.js';",
+    );
+    match run_file(directory + "/wrong_type.js", harness) {
+        Ok(results) => runner_expect_status(results, RunStatus::Failed),
+        Err(message) => testing::fail(message),
+    };
+    runner_write(
+        directory + "/wrong_phase.js",
+        "/*---\nflags: [module]\nnegative:\n  phase: runtime\n  type: SyntaxError\n---*/\nimport {missing} from './dependency.js';",
+    );
+    match run_file(directory + "/wrong_phase.js", harness) {
+        Ok(results) => runner_expect_status(results, RunStatus::Failed),
+        Err(message) => testing::fail(message),
+    };
+    runner_write(
+        directory + "/runtime.js",
+        "/*---\nflags: [module]\nnegative:\n  phase: runtime\n  type: TypeError\n---*/\nthrow new TypeError('expected');",
+    );
+    match run_file(directory + "/runtime.js", harness) {
+        Ok(results) => runner_expect_status(results, RunStatus::Passed),
+        Err(message) => testing::fail(message),
+    };
+    runner_write(
+        directory + "/native_runtime.js",
+        "/*---\nflags: [module]\nnegative:\n  phase: runtime\n  type: TypeError\n---*/\nnull.value;",
+    );
+    match run_file(directory + "/native_runtime.js", harness) {
+        Ok(results) => runner_expect_status(results, RunStatus::Passed),
+        Err(message) => testing::fail(message),
+    };
+    runner_write(
+        directory + "/spoofed_runtime.js",
+        "/*---\nflags: [module]\nnegative:\n  phase: runtime\n  type: TypeError\n---*/\nthrow 'TypeError: fake';",
+    );
+    match run_file(directory + "/spoofed_runtime.js", harness) {
+        Ok(results) => runner_expect_status(results, RunStatus::Failed),
+        Err(message) => testing::fail(message),
+    };
+    runner_write(
+        directory + "/object_spoofed_runtime.js",
+        "/*---\nflags: [module]\nnegative:\n  phase: runtime\n  type: TypeError\n---*/\nthrow {constructor: {name: 'TypeError'}};",
+    );
+    match run_file(directory + "/object_spoofed_runtime.js", harness) {
+        Ok(results) => runner_expect_status(results, RunStatus::Failed),
+        Err(message) => testing::fail(message),
+    };
+    runner_write(
+        directory + "/renamed_runtime.js",
+        "/*---\nflags: [module]\nnegative:\n  phase: runtime\n  type: TypeError\n---*/\nlet error = new TypeError('expected'); error.name = 'RangeError'; throw error;",
+    );
+    match run_file(directory + "/renamed_runtime.js", harness) {
+        Ok(results) => runner_expect_status(results, RunStatus::Passed),
+        Err(message) => testing::fail(message),
+    };
+    runner_write(
+        directory + "/constructor_renamed_runtime.js",
+        "/*---\nflags: [module]\nnegative:\n  phase: runtime\n  type: TypeError\n---*/\nlet error = new TypeError('expected'); error.constructor = RangeError; throw error;",
+    );
+    match run_file(directory + "/constructor_renamed_runtime.js", harness) {
+        Ok(results) => runner_expect_status(results, RunStatus::Passed),
+        Err(message) => testing::fail(message),
+    };
+    runner_write(
+        directory + "/async_runtime.js",
+        "/*---\nflags: [module]\nnegative:\n  phase: runtime\n  type: RangeError\n---*/\nawait Promise.reject(new RangeError('expected'));",
+    );
+    match run_file(directory + "/async_runtime.js", harness) {
+        Ok(results) => runner_expect_status(results, RunStatus::Passed),
+        Err(message) => testing::fail(message),
+    };
+    runner_write(
+        directory + "/spoofed_async_runtime.js",
+        "/*---\nflags: [module]\nnegative:\n  phase: runtime\n  type: RangeError\n---*/\nawait Promise.reject('RangeError: fake');",
+    );
+    match run_file(directory + "/spoofed_async_runtime.js", harness) {
+        Ok(results) => runner_expect_status(results, RunStatus::Failed),
+        Err(message) => testing::fail(message),
+    };
+    runner_write(
+        directory + "/pending_async_runtime.js",
+        "/*---\nflags: [module]\nnegative:\n  phase: runtime\n  type: RuntimeError\n---*/\nawait new Promise(function() {});",
+    );
+    match run_file(directory + "/pending_async_runtime.js", harness) {
+        Ok(results) => runner_expect_status(results, RunStatus::Passed),
         Err(message) => testing::fail(message),
     };
     runner_write(
@@ -156,7 +402,21 @@ fn run_file_executes_module_graphs_and_resolution_negatives() -> unit {
         "/*---\nflags: [module, async]\n---*/\nimport answer from './dependency.js'; async function check() { if (await answer !== 42) throw 'wrong'; } check().then($DONE, $DONE);",
     );
     match run_file(directory + "/async.js", harness) {
-        Ok(results) => testing::assert_eq(results[0].status, RunStatus::Passed),
+        Ok(results) => runner_expect_status(results, RunStatus::Passed),
+        Err(message) => testing::fail(message),
+    };
+    runner_write(directory + "/helper_FIXTURE.js", "not standalone metadata");
+    match run_file(directory + "/helper_FIXTURE.js", harness) {
+        Ok(results) => runner_expect_status(results, RunStatus::Skipped),
+        Err(message) => testing::fail(message),
+    };
+    runner_write(harness + "/assert.js", "throw new TypeError('harness failure');");
+    runner_write(
+        directory + "/harness_negative.js",
+        "/*---\nflags: [module]\nnegative:\n  phase: runtime\n  type: TypeError\n---*/\nthrow new TypeError('test failure');",
+    );
+    match run_file(directory + "/harness_negative.js", harness) {
+        Ok(results) => runner_expect_status(results, RunStatus::Failed),
         Err(message) => testing::fail(message),
     };
     let _ = fs::remove_dir_all(directory);

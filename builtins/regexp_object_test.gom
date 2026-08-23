@@ -151,6 +151,112 @@ fn regexp_set_last_index(heap: runtime::Heap, object: runtime::ObjectId, value: 
     }
 }
 
+fn regexp_allocate_object(context: vm::Context) -> runtime::ObjectId {
+    match runtime::new_ordinary_object(context.heap(), Option::None) {
+        Ok(value) => value,
+        Err(value) => {
+            testing::fail(value.message);
+            regexp_expect_object(runtime::Value::Undefined)
+        },
+    }
+}
+
+fn regexp_vm_function(
+    context: vm::Context,
+    callback: (runtime::Value, Vec[runtime::Value], isize) -> Result[runtime::Value, vm::VmError],
+) -> runtime::Value {
+    regexp_expect_value(context.new_vm_function(callback))
+}
+
+fn regexp_define_data(
+    context: vm::Context,
+    object: runtime::ObjectId,
+    name: string,
+    value: runtime::Value,
+) -> unit {
+    testing::assert(
+        runtime::define_own_property(
+            context.heap(),
+            object,
+            runtime::string_property_key(name),
+            runtime::data_descriptor(value, true, true, true),
+        ),
+    )
+}
+
+fn regexp_define_symbol_data(
+    context: vm::Context,
+    object: runtime::ObjectId,
+    symbol: runtime::Symbol,
+    value: runtime::Value,
+) -> unit {
+    testing::assert(
+        runtime::define_own_property(
+            context.heap(),
+            object,
+            runtime::PropertyKey::Symbol(symbol),
+            runtime::data_descriptor(value, true, true, true),
+        ),
+    )
+}
+
+fn regexp_define_getter(
+    context: vm::Context,
+    object: runtime::ObjectId,
+    name: string,
+    getter: runtime::Value,
+) -> unit {
+    testing::assert(
+        runtime::define_own_property(
+            context.heap(),
+            object,
+            runtime::string_property_key(name),
+            runtime::accessor_descriptor(Option::Some(getter), Option::None, true, true),
+        ),
+    )
+}
+
+fn regexp_define_symbol_getter(
+    context: vm::Context,
+    object: runtime::ObjectId,
+    symbol: runtime::Symbol,
+    getter: runtime::Value,
+) -> unit {
+    testing::assert(
+        runtime::define_own_property(
+            context.heap(),
+            object,
+            runtime::PropertyKey::Symbol(symbol),
+            runtime::accessor_descriptor(Option::Some(getter), Option::None, true, true),
+        ),
+    )
+}
+
+fn regexp_construct(
+    context: vm::Context,
+    constructor: runtime::Value,
+    arguments: Vec[runtime::Value],
+    new_target: runtime::Value,
+) -> Result[runtime::Value, vm::VmError] {
+    context.construct_with_new_target_at_depth(constructor, arguments, new_target, 0)
+}
+
+fn regexp_assert_type_error(value: Result[runtime::Value, vm::VmError]) -> unit {
+    match value {
+        Err(vm::VmError { kind: vm::VmErrorKind::TypeError(_), .. }) => (),
+        _ => testing::fail("expected TypeError"),
+    }
+}
+
+fn regexp_assert_thrown(value: Result[runtime::Value, vm::VmError], expected: runtime::Value) -> unit {
+    match value {
+        Err(vm::VmError { kind: vm::VmErrorKind::Thrown(value), .. }) => {
+            testing::assert(runtime::same_value(value, expected))
+        },
+        _ => testing::fail("expected thrown value"),
+    }
+}
+
 #[test]
 fn regexp_constructor_exposes_canonical_instance_properties() -> unit {
     let context = vm::Context::new(runtime::Heap::new());
@@ -506,4 +612,622 @@ fn unicode_regexp_rewinds_last_index_from_a_trailing_surrogate() -> unit {
     let full = regexp_expect_object(regexp_property(context, indices, "0"));
     testing::assert_eq(regexp_expect_int(regexp_property(context, full, "0")), 0);
     testing::assert_eq(regexp_expect_int(regexp_property(context, full, "1")), 2)
+}
+
+#[test]
+fn regexp_call_construct_identity_and_derived_prototype() -> unit {
+    let context = vm::Context::new(runtime::Heap::new());
+    let installed = match install_regexp_runtime(context) {
+        Ok(value) => value,
+        Err(value) => {
+            testing::fail(value.message);
+            return
+        },
+    };
+    let instance = regexp_new(context, installed.constructor, "a", "g");
+    let called = regexp_expect_value(
+        regexp_invoke(
+            context,
+            installed.constructor,
+            Vec::from_array([runtime::Value::Object(instance)]),
+        ),
+    );
+    testing::assert(runtime::same_value(called, runtime::Value::Object(instance)));
+    let constructed = regexp_expect_object(
+        regexp_expect_value(
+            regexp_construct(
+                context,
+                installed.constructor,
+                Vec::from_array([runtime::Value::Object(instance)]),
+                installed.constructor,
+            ),
+        ),
+    );
+    testing::assert(constructed != instance);
+    let derived_prototype = regexp_allocate_object(context);
+    testing::assert(
+        runtime::set_prototype_of(
+            context.heap(),
+            derived_prototype,
+            Option::Some(installed.prototype),
+        ),
+    );
+    let new_target = regexp_vm_function(
+        context,
+        |this_value, arguments, depth| {
+            let _ = this_value;
+            let _ = arguments;
+            let _ = depth;
+            Result::Ok(runtime::Value::Undefined)
+        },
+    );
+    match context.mark_native_constructor(new_target) {
+        Ok(()) => (),
+        Err(value) => testing::fail(value.kind.debug()),
+    };
+    regexp_define_data(
+        context,
+        regexp_expect_object(new_target),
+        "prototype",
+        runtime::Value::Object(derived_prototype),
+    );
+    let derived = regexp_expect_object(
+        regexp_expect_value(
+            regexp_construct(
+                context,
+                installed.constructor,
+                Vec::from_array([runtime::Value::String(js_string("b"))]),
+                new_target,
+            ),
+        ),
+    );
+    match context.heap().get(derived) {
+        Some(value) => testing::assert(value.prototype() == Option::Some(derived_prototype)),
+        None => testing::fail("missing derived RegExp"),
+    };
+    testing::assert(
+        regexp_expect_string(regexp_property(context, derived, "source")) == js_string("b"),
+    )
+}
+
+#[test]
+fn regexp_is_regexp_uses_match_and_internal_slots() -> unit {
+    let context = vm::Context::new(runtime::Heap::new());
+    let match_symbol = runtime::Symbol::new(7101, Option::Some("match"));
+    context.set_well_known_symbol(vm::WellKnownSymbolKind::Match, match_symbol);
+    let constructor = regexp_expect_install(install_regexp(context));
+    let fake = regexp_allocate_object(context);
+    regexp_define_symbol_data(context, fake, match_symbol, runtime::Value::Bool(true));
+    regexp_define_data(context, fake, "source", runtime::Value::String(js_string("fake")));
+    regexp_define_data(context, fake, "flags", runtime::Value::String(js_string("m")));
+    let copied = regexp_expect_object(
+        regexp_expect_value(
+            regexp_invoke(context, constructor, Vec::from_array([runtime::Value::Object(fake)])),
+        ),
+    );
+    testing::assert(
+        regexp_expect_string(regexp_property(context, copied, "source")) == js_string("fake"),
+    );
+    testing::assert(
+        regexp_expect_string(regexp_property(context, copied, "flags")) == js_string("m"),
+    );
+    regexp_define_data(context, fake, "constructor", constructor);
+    let identity = regexp_expect_value(
+        regexp_invoke(context, constructor, Vec::from_array([runtime::Value::Object(fake)])),
+    );
+    testing::assert(runtime::same_value(identity, runtime::Value::Object(fake)));
+    let internal = regexp_new(context, constructor, "internal", "i");
+    regexp_define_symbol_data(context, internal, match_symbol, runtime::Value::Bool(false));
+    let cloned = regexp_expect_object(
+        regexp_expect_value(
+            regexp_invoke(context, constructor, Vec::from_array([runtime::Value::Object(internal)])),
+        ),
+    );
+    testing::assert(cloned != internal);
+    testing::assert(
+        regexp_expect_string(regexp_property(context, cloned, "source")) == js_string("internal"),
+    );
+    testing::assert(
+        regexp_expect_string(regexp_property(context, cloned, "flags")) == js_string("i"),
+    )
+}
+
+#[test]
+fn regexp_prototype_is_an_unbranded_sentinel() -> unit {
+    let context = vm::Context::new(runtime::Heap::new());
+    let installed = match install_regexp_runtime(context) {
+        Ok(value) => value,
+        Err(value) => {
+            testing::fail(value.message);
+            return
+        },
+    };
+    testing::assert(
+        regexp_expect_string(regexp_property(context, installed.prototype, "source"))
+            == js_string("(?:)"),
+    );
+    testing::assert(
+        regexp_expect_string(regexp_property(context, installed.prototype, "flags"))
+            == js_string(""),
+    );
+    match regexp_property(context, installed.prototype, "global") {
+        runtime::Value::Undefined => (),
+        _ => testing::fail("expected undefined prototype flag"),
+    };
+    testing::assert(context.object_builtin_tag(installed.prototype).is_none());
+    let rendered = regexp_expect_value(
+        regexp_invoke_method(
+            context,
+            runtime::Value::Object(installed.prototype),
+            regexp_property(context, installed.prototype, "toString"),
+            Vec::new(),
+        ),
+    );
+    testing::assert(regexp_expect_string(rendered) == js_string("/(?:)/"));
+    for name in Vec::from_array(["exec", "test", "compile"]) {
+        regexp_assert_type_error(
+            regexp_invoke_method(
+                context,
+                runtime::Value::Object(installed.prototype),
+                regexp_property(context, installed.prototype, name),
+                Vec::new(),
+            ),
+        )
+    }
+}
+
+#[test]
+fn regexp_exec_and_test_apply_dynamic_conversions_in_order() -> unit {
+    let context = vm::Context::new(runtime::Heap::new());
+    let constructor = regexp_expect_install(install_regexp(context));
+    let trace = Ref::new("");
+    let input = regexp_allocate_object(context);
+    let input_to_string = regexp_vm_function(
+        context,
+        |this_value, arguments, depth| {
+            let _ = this_value;
+            let _ = arguments;
+            let _ = depth;
+            trace.set(trace.get() + "input,");
+            Result::Ok(runtime::Value::String(js_string("ba")))
+        },
+    );
+    regexp_define_data(context, input, "toString", input_to_string);
+    let last_index = regexp_allocate_object(context);
+    let last_index_value_of = regexp_vm_function(
+        context,
+        |this_value, arguments, depth| {
+            let _ = this_value;
+            let _ = arguments;
+            let _ = depth;
+            trace.set(trace.get() + "lastIndex,");
+            Result::Ok(runtime::Value::Float(1.9))
+        },
+    );
+    regexp_define_data(context, last_index, "valueOf", last_index_value_of);
+    let instance = regexp_new(context, constructor, "a", "g");
+    regexp_set_last_index(context.heap(), instance, runtime::Value::Object(last_index));
+    let result = regexp_expect_object(
+        regexp_expect_value(
+            regexp_invoke_method(
+                context,
+                runtime::Value::Object(instance),
+                regexp_property(context, instance, "exec"),
+                Vec::from_array([runtime::Value::Object(input)]),
+            ),
+        ),
+    );
+    testing::assert_eq(regexp_expect_int(regexp_property(context, result, "index")), 1);
+    testing::assert(trace.get() == "input,lastIndex,");
+    trace.set("");
+    let non_indexed = regexp_new(context, constructor, "a", "");
+    regexp_set_last_index(context.heap(), non_indexed, runtime::Value::Object(last_index));
+    let matched = regexp_expect_value(
+        regexp_invoke_method(
+            context,
+            runtime::Value::Object(non_indexed),
+            regexp_property(context, non_indexed, "test"),
+            Vec::from_array([runtime::Value::Object(input)]),
+        ),
+    );
+    testing::assert(regexp_expect_bool(matched));
+    testing::assert(trace.get() == "input,lastIndex,")
+}
+
+#[test]
+fn regexp_test_dispatches_dynamic_exec_and_checks_its_result() -> unit {
+    let context = vm::Context::new(runtime::Heap::new());
+    let constructor = regexp_expect_install(install_regexp(context));
+    let instance = regexp_new(context, constructor, "a", "");
+    let marker = runtime::Value::Object(regexp_allocate_object(context));
+    let observed = Ref::new(false);
+    let argument_count = Ref::new(0);
+    let custom_result = runtime::Value::Object(regexp_allocate_object(context));
+    let custom_exec = regexp_vm_function(
+        context,
+        |this_value, arguments, depth| {
+            let _ = depth;
+            testing::assert(runtime::same_value(this_value, runtime::Value::Object(instance)));
+            argument_count.set(arguments.len());
+            observed.set(runtime::same_value(argument(arguments, 0), marker));
+            Result::Ok(custom_result)
+        },
+    );
+    regexp_define_data(context, instance, "exec", custom_exec);
+    let test = regexp_property(context, instance, "test");
+    testing::assert(
+        regexp_expect_bool(
+            regexp_expect_value(
+                regexp_invoke_method(
+                    context,
+                    runtime::Value::Object(instance),
+                    test,
+                    Vec::from_array([marker, runtime::Value::Int(1)]),
+                ),
+            ),
+        ),
+    );
+    testing::assert(observed.get());
+    testing::assert_eq(argument_count.get(), 1);
+    let invalid_exec = regexp_vm_function(
+        context,
+        |this_value, arguments, depth| {
+            let _ = this_value;
+            let _ = arguments;
+            let _ = depth;
+            Result::Ok(runtime::Value::Int(1))
+        },
+    );
+    regexp_define_data(context, instance, "exec", invalid_exec);
+    regexp_assert_type_error(
+        regexp_invoke_method(
+            context,
+            runtime::Value::Object(instance),
+            test,
+            Vec::from_array([marker]),
+        ),
+    );
+    regexp_define_data(context, instance, "exec", runtime::Value::Int(1));
+    testing::assert(
+        regexp_expect_bool(
+            regexp_expect_value(
+                regexp_invoke_method(
+                    context,
+                    runtime::Value::Object(instance),
+                    test,
+                    Vec::from_array([runtime::Value::String(js_string("ba"))]),
+                ),
+            ),
+        ),
+    );
+    testing::assert(
+        runtime::delete_property(context.heap(), instance, runtime::string_property_key("exec")),
+    );
+    testing::assert(runtime::set_prototype_of(context.heap(), instance, Option::None));
+    testing::assert(
+        !regexp_expect_bool(
+            regexp_expect_value(
+                regexp_invoke_method(
+                    context,
+                    runtime::Value::Object(instance),
+                    test,
+                    Vec::from_array([runtime::Value::String(js_string("zz"))]),
+                ),
+            ),
+        ),
+    );
+    let unbranded = regexp_allocate_object(context);
+    regexp_assert_type_error(
+        regexp_invoke_method(
+            context,
+            runtime::Value::Object(unbranded),
+            test,
+            Vec::from_array([marker]),
+        ),
+    )
+}
+
+#[test]
+fn regexp_compile_and_exec_preserve_conversion_errors_and_brand_order() -> unit {
+    let context = vm::Context::new(runtime::Heap::new());
+    let constructor = regexp_expect_install(install_regexp(context));
+    let trace = Ref::new("");
+    let pattern = regexp_allocate_object(context);
+    regexp_define_data(
+        context,
+        pattern,
+        "toString",
+        regexp_vm_function(
+            context,
+            |this_value, arguments, depth| {
+                let _ = this_value;
+                let _ = arguments;
+                let _ = depth;
+                trace.set(trace.get() + "pattern,");
+                Result::Ok(runtime::Value::String(js_string("b")))
+            },
+        ),
+    );
+    let flags = regexp_allocate_object(context);
+    regexp_define_data(
+        context,
+        flags,
+        "toString",
+        regexp_vm_function(
+            context,
+            |this_value, arguments, depth| {
+                let _ = this_value;
+                let _ = arguments;
+                let _ = depth;
+                trace.set(trace.get() + "flags,");
+                Result::Ok(runtime::Value::String(js_string("i")))
+            },
+        ),
+    );
+    let instance = regexp_new(context, constructor, "a", "g");
+    let compile_method = regexp_property(context, instance, "compile");
+    let result = regexp_expect_value(
+        regexp_invoke_method(
+            context,
+            runtime::Value::Object(instance),
+            compile_method,
+            Vec::from_array([runtime::Value::Object(pattern), runtime::Value::Object(flags)]),
+        ),
+    );
+    testing::assert(runtime::same_value(result, runtime::Value::Object(instance)));
+    testing::assert(trace.get() == "pattern,flags,");
+    testing::assert(
+        regexp_expect_string(regexp_property(context, instance, "source")) == js_string("b"),
+    );
+    testing::assert(
+        regexp_expect_string(regexp_property(context, instance, "flags")) == js_string("i"),
+    );
+    trace.set("");
+    regexp_assert_type_error(
+        regexp_invoke_method(
+            context,
+            runtime::Value::Object(regexp_allocate_object(context)),
+            compile_method,
+            Vec::from_array([runtime::Value::Object(pattern)]),
+        ),
+    );
+    testing::assert(trace.get() == "");
+    let token = runtime::Value::String(js_string("input failure"));
+    let throwing_input = regexp_allocate_object(context);
+    regexp_define_data(
+        context,
+        throwing_input,
+        "toString",
+        regexp_vm_function(
+            context,
+            |this_value, arguments, depth| {
+                let _ = this_value;
+                let _ = arguments;
+                let _ = depth;
+                trace.set(trace.get() + "input,");
+                Result::Err(vm::VmError { offset: -1, kind: vm::VmErrorKind::Thrown(token) })
+            },
+        ),
+    );
+    let guarded_last_index = regexp_allocate_object(context);
+    regexp_define_data(
+        context,
+        guarded_last_index,
+        "valueOf",
+        regexp_vm_function(
+            context,
+            |this_value, arguments, depth| {
+                let _ = this_value;
+                let _ = arguments;
+                let _ = depth;
+                trace.set(trace.get() + "lastIndex,");
+                Result::Ok(runtime::Value::Int(0))
+            },
+        ),
+    );
+    let global = regexp_new(context, constructor, "a", "g");
+    regexp_set_last_index(context.heap(), global, runtime::Value::Object(guarded_last_index));
+    trace.set("");
+    regexp_assert_thrown(
+        regexp_invoke_method(
+            context,
+            runtime::Value::Object(global),
+            regexp_property(context, global, "exec"),
+            Vec::from_array([runtime::Value::Object(throwing_input)]),
+        ),
+        token,
+    );
+    testing::assert(trace.get() == "input,")
+}
+
+#[test]
+fn regexp_compile_updates_state_before_last_index_failure() -> unit {
+    let context = vm::Context::new(runtime::Heap::new());
+    let constructor = regexp_expect_install(install_regexp(context));
+    let instance = regexp_new(context, constructor, "a", "g");
+    testing::assert(
+        runtime::define_own_property(
+            context.heap(),
+            instance,
+            runtime::string_property_key("lastIndex"),
+            runtime::data_descriptor(runtime::Value::Int(7), false, false, false),
+        ),
+    );
+    regexp_assert_type_error(
+        regexp_invoke_method(
+            context,
+            runtime::Value::Object(instance),
+            regexp_property(context, instance, "compile"),
+            Vec::from_array([runtime::Value::String(js_string("b"))]),
+        ),
+    );
+    testing::assert(
+        regexp_expect_string(regexp_property(context, instance, "source")) == js_string("b"),
+    );
+    testing::assert_eq(regexp_expect_int(regexp_property(context, instance, "lastIndex")), 7)
+}
+
+#[test]
+fn regexp_constructor_conversion_order_crosses_new_target_prototype() -> unit {
+    let context = vm::Context::new(runtime::Heap::new());
+    let match_symbol = runtime::Symbol::new(7102, Option::Some("match"));
+    context.set_well_known_symbol(vm::WellKnownSymbolKind::Match, match_symbol);
+    let constructor = regexp_expect_install(install_regexp(context));
+    let trace = Ref::new("");
+    let source = regexp_allocate_object(context);
+    regexp_define_data(
+        context,
+        source,
+        "toString",
+        regexp_vm_function(
+            context,
+            |this_value, arguments, depth| {
+                let _ = this_value;
+                let _ = arguments;
+                let _ = depth;
+                trace.set(trace.get() + "sourceString,");
+                let _ = context.collect_garbage();
+                Result::Ok(runtime::Value::String(js_string("ordered")))
+            },
+        ),
+    );
+    let flags = regexp_allocate_object(context);
+    regexp_define_data(
+        context,
+        flags,
+        "toString",
+        regexp_vm_function(
+            context,
+            |this_value, arguments, depth| {
+                let _ = this_value;
+                let _ = arguments;
+                let _ = depth;
+                trace.set(trace.get() + "flagsString,");
+                let _ = context.collect_garbage();
+                Result::Ok(runtime::Value::String(js_string("m")))
+            },
+        ),
+    );
+    let fake = regexp_allocate_object(context);
+    regexp_define_symbol_getter(
+        context,
+        fake,
+        match_symbol,
+        regexp_vm_function(
+            context,
+            |this_value, arguments, depth| {
+                let _ = this_value;
+                let _ = arguments;
+                let _ = depth;
+                trace.set(trace.get() + "match,");
+                Result::Ok(runtime::Value::Bool(true))
+            },
+        ),
+    );
+    regexp_define_getter(
+        context,
+        fake,
+        "source",
+        regexp_vm_function(
+            context,
+            |this_value, arguments, depth| {
+                let _ = this_value;
+                let _ = arguments;
+                let _ = depth;
+                trace.set(trace.get() + "source,");
+                Result::Ok(runtime::Value::Object(source))
+            },
+        ),
+    );
+    regexp_define_getter(
+        context,
+        fake,
+        "flags",
+        regexp_vm_function(
+            context,
+            |this_value, arguments, depth| {
+                let _ = this_value;
+                let _ = arguments;
+                let _ = depth;
+                trace.set(trace.get() + "flags,");
+                let root = Ref::new(runtime::Value::Object(flags));
+                context.add_external_root(root);
+                let _ = context.collect_garbage();
+                let _ = context.remove_external_root(root);
+                Result::Ok(runtime::Value::Object(flags))
+            },
+        ),
+    );
+    let derived_prototype = regexp_allocate_object(context);
+    let derived_prototype_root = Ref::new(runtime::Value::Object(derived_prototype));
+    context.add_external_root(derived_prototype_root);
+    let new_target = regexp_vm_function(
+        context,
+        |this_value, arguments, depth| {
+            let _ = this_value;
+            let _ = arguments;
+            let _ = depth;
+            Result::Ok(runtime::Value::Undefined)
+        },
+    );
+    match context.mark_native_constructor(new_target) {
+        Ok(()) => (),
+        Err(value) => testing::fail(value.kind.debug()),
+    };
+    regexp_define_getter(
+        context,
+        regexp_expect_object(new_target),
+        "prototype",
+        regexp_vm_function(
+            context,
+            |this_value, arguments, depth| {
+                let _ = this_value;
+                let _ = arguments;
+                let _ = depth;
+                trace.set(trace.get() + "prototype,");
+                let root = Ref::new(runtime::Value::Object(derived_prototype));
+                context.add_external_root(root);
+                let _ = context.collect_garbage();
+                let _ = context.remove_external_root(root);
+                Result::Ok(runtime::Value::Object(derived_prototype))
+            },
+        ),
+    );
+    let result = regexp_expect_object(
+        regexp_expect_value(
+            regexp_construct(
+                context,
+                constructor,
+                Vec::from_array([runtime::Value::Object(fake)]),
+                new_target,
+            ),
+        ),
+    );
+    let _ = context.remove_external_root(derived_prototype_root);
+    testing::assert(trace.get() == "match,source,flags,sourceString,prototype,flagsString,");
+    match context.heap().get(result) {
+        Some(value) => testing::assert(value.prototype() == Option::Some(derived_prototype)),
+        None => testing::fail("missing ordered RegExp"),
+    }
+}
+
+#[test]
+fn regexp_state_table_does_not_retain_instances() -> unit {
+    let context = vm::Context::new(runtime::Heap::new());
+    let installed = match install_regexp_runtime(context) {
+        Ok(value) => value,
+        Err(value) => {
+            testing::fail(value.message);
+            return
+        },
+    };
+    let instance = regexp_new(context, installed.constructor, "ephemeral", "g");
+    testing::assert(context.heap().contains(instance));
+    testing::assert(installed.states.get(instance).is_some());
+    let _ = context.collect_garbage();
+    testing::assert(!context.heap().contains(instance));
+    testing::assert(context.heap().contains(installed.prototype));
+    testing::assert(context.heap().contains(regexp_expect_object(installed.constructor)));
+    let _ = context.collect_garbage();
+    testing::assert(installed.states.get(instance).is_none())
 }
