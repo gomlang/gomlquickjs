@@ -24,6 +24,8 @@ ordinary `yield`, and `yield *` completion delegation,
 standard source-function length metadata, mapped and unmapped arguments objects
 with strict callee poison accessors,
 strict-directive propagation and strict/sloppy `this`, property-write, and deletion semantics,
+contextual `await` and `yield` grammar across ordinary, async, generator, class, and module goals,
+including top-level module await and early errors in parameters and exponentiation,
 standard source and built-in function name and length descriptors with bound-name inference,
 native arbitrary-precision BigInt arithmetic,
 plain, interpolated, and tagged template literals with stable frozen template objects,
@@ -55,6 +57,10 @@ name and select the participating capture. RegExp includes QuickJS-compatible
 `compile()` state replacement and normalized `toString()` output, and exposes the corresponding Symbol.match,
 Symbol.matchAll, Symbol.search, Symbol.replace, and Symbol.split methods. MatchAll returns a
 state-cloned iterable that preserves the source RegExp lastIndex and advances Unicode empty matches by code point.
+RegExp call and construct paths distinguish identity from cloning, preserve derived `newTarget`
+prototypes, honor `Symbol.match`, dynamically coerce constructor, input, flags, and `lastIndex`
+values, dispatch `test()` through an overridden `exec`, and keep `RegExp.prototype` as the
+unbranded sentinel required by QuickJS.
 Class declarations and expressions support base and derived
 constructors, heritage prototype chains, `super()` and `super` property access,
 instance and static methods, getters and setters, and public instance and static
@@ -175,9 +181,14 @@ their awaited chain or request queue settles because their remaining native capt
 all exposed as precise heap edges.
 The Test262 runner parses metadata, loads harness files, handles strict/sloppy,
 module, and positive/negative variants, executes synchronous and asynchronous module graphs with
-harness setup in the same realm, and executes script and module async variants
-through a realm-local `$DONE` callback after draining Promise and host jobs. It
-does not yet provide a wall-clock timeout for indefinitely pending async tests.
+harness setup separately in the same realm, and executes script and module async variants
+through a realm-local `$DONE` callback after draining Promise and host jobs. Parse, resolution,
+and runtime negatives require matching phases and error types; module errors retain structured
+runtime types instead of inferring them from diagnostic text. Fixture files, unsupported proposal
+features, blocking-host cases, and Intl402 paths are skipped before execution. The runner does not
+yet provide a wall-clock timeout for indefinitely pending async tests. Non-strict harness `var`
+and function declarations persist through the global object, but top-level harness `let`, `const`,
+and `class` declarations are not yet shared with subsequent scripts or modules.
 
 Run the module tests with:
 
