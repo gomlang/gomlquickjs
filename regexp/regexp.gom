@@ -3,28 +3,28 @@ package regexp;
 use gomlang::quickjs::runtime;
 use gomlang::quickjs::unicode;
 
-const MAX_NESTING: int = 256;
+const MAX_NESTING: isize = 256;
 
-const MAX_REPEAT: int = 100000;
+const MAX_REPEAT: isize = 100000;
 
-const MAX_CAPTURES: int = 255;
+const MAX_CAPTURES: isize = 255;
 
 #[derive(PartialEq, Eq, Debug)]
 pub struct RegexError {
     pub message: string,
-    pub offset: int,
+    pub offset: isize,
 }
 
 #[derive(PartialEq, Eq, Debug)]
 pub struct RegexCapture {
-    pub start: int,
-    pub end: int,
+    pub start: isize,
+    pub end: isize,
 }
 
 #[derive(PartialEq, Eq)]
 pub struct RegexMatch {
-    pub start: int,
-    pub end: int,
+    pub start: isize,
+    pub end: isize,
     pub captures: Vec[Option[RegexCapture]],
 }
 
@@ -37,11 +37,11 @@ impl Debug for RegexMatch {
 }
 
 impl RegexMatch {
-    pub fn capture_count(self: RegexMatch) -> int {
+    pub fn capture_count(self: RegexMatch) -> isize {
         self.captures.len() - 1
     }
 
-    pub fn capture(self: RegexMatch, index: int) -> Option[RegexCapture] {
+    pub fn capture(self: RegexMatch, index: isize) -> Option[RegexCapture] {
         if index < 0 || index >= self.captures.len() {
             Option::None
         } else {
@@ -51,29 +51,29 @@ impl RegexMatch {
 }
 
 struct Quantifier {
-    minimum: int,
-    maximum: Option[int],
+    minimum: isize,
+    maximum: Option[isize],
     greedy: bool,
 }
 
 enum Node {
     Empty,
-    Literal(uint32),
+    Literal(u32),
     Any,
     Start,
     End,
     WordBoundary(bool),
     Class(unicode::CharRange, bool),
-    ClassSet(unicode::CharRange, Vec[runtime::JsString], int),
-    Sequence(Vec[int]),
-    Alternation(Vec[int]),
-    Repeat(int, int, Option[int], bool),
-    Capture(int, int),
-    BackReference(Vec[int]),
-    LookAhead(int, bool),
-    LookBehind(int, bool),
-    Group(int),
-    ScopedFlags(int, RegexFlags),
+    ClassSet(unicode::CharRange, Vec[runtime::JsString], isize),
+    Sequence(Vec[isize]),
+    Alternation(Vec[isize]),
+    Repeat(isize, isize, Option[isize], bool),
+    Capture(isize, isize),
+    BackReference(Vec[isize]),
+    LookAhead(isize, bool),
+    LookBehind(isize, bool),
+    Group(isize),
+    ScopedFlags(isize, RegexFlags),
 }
 
 fn unicode_mode(flags: RegexFlags) -> bool {
@@ -82,10 +82,10 @@ fn unicode_mode(flags: RegexFlags) -> bool {
 
 pub struct Regex {
     nodes: Vec[Node],
-    root: int,
+    root: isize,
     flags: RegexFlags,
     canonicalizer: unicode::CaseCanonicalizer,
-    capture_count: int,
+    capture_count: isize,
     capture_names: Vec[Option[runtime::JsString]],
 }
 
@@ -93,20 +93,20 @@ struct Parser {
     pattern: runtime::JsString,
     flags: Ref[RegexFlags],
     canonicalizer: unicode::CaseCanonicalizer,
-    index: Ref[int],
-    depth: Ref[int],
-    capture_count: Ref[int],
-    total_captures: int,
+    index: Ref[isize],
+    depth: Ref[isize],
+    capture_count: Ref[isize],
+    total_captures: isize,
     capture_names: Vec[Option[runtime::JsString]],
     nodes: Vec[Node],
 }
 
 struct CaptureMetadata {
-    count: int,
+    count: isize,
     names: Vec[Option[runtime::JsString]],
 }
 
-fn regex_error(message: string, offset: int) -> RegexError {
+fn regex_error(message: string, offset: isize) -> RegexError {
     RegexError { message, offset }
 }
 
@@ -120,7 +120,7 @@ fn parser_new(pattern: runtime::JsString, flags: RegexFlags, metadata: CaptureMe
         capture_count: Ref::new(0),
         total_captures: metadata.count,
         capture_names: metadata.names,
-        nodes: Vec::[],
+        nodes: Vec::new(),
     }
 }
 
@@ -128,7 +128,7 @@ fn parser_at_end(parser: Parser) -> bool {
     parser.index.get() >= parser.pattern.len()
 }
 
-fn parser_current(parser: Parser) -> Option[uint16] {
+fn parser_current(parser: Parser) -> Option[u16] {
     if parser_at_end(parser) {
         Option::None
     } else {
@@ -136,7 +136,7 @@ fn parser_current(parser: Parser) -> Option[uint16] {
     }
 }
 
-fn parser_peek(parser: Parser, distance: int) -> Option[uint16] {
+fn parser_peek(parser: Parser, distance: isize) -> Option[u16] {
     let index = parser.index.get() + distance;
     if index < 0 || index >= parser.pattern.len() {
         Option::None
@@ -145,7 +145,7 @@ fn parser_peek(parser: Parser, distance: int) -> Option[uint16] {
     }
 }
 
-fn parser_advance(parser: Parser) -> Option[uint16] {
+fn parser_advance(parser: Parser) -> Option[u16] {
     match parser_current(parser) {
         Some(value) => {
             parser.index.set(parser.index.get() + 1);
@@ -155,7 +155,7 @@ fn parser_advance(parser: Parser) -> Option[uint16] {
     }
 }
 
-fn parser_consume(parser: Parser, expected: uint16) -> bool {
+fn parser_consume(parser: Parser, expected: u16) -> bool {
     match parser_current(parser) {
         Some(value) => {
             if value == expected {
@@ -169,36 +169,36 @@ fn parser_consume(parser: Parser, expected: uint16) -> bool {
     }
 }
 
-fn parser_push_node(parser: Parser, node: Node) -> int {
+fn parser_push_node(parser: Parser, node: Node) -> isize {
     let index = parser.nodes.len();
     parser.nodes.push(node);
     index
 }
 
-fn is_decimal_digit(value: uint16) -> bool {
+fn is_decimal_digit(value: u16) -> bool {
     value >= 48 && value <= 57
 }
 
-fn group_hex_digit(value: uint16) -> Option[uint32] {
+fn group_hex_digit(value: u16) -> Option[u32] {
     if value >= 48 && value <= 57 {
-        Option::Some((value - 48).to_uint32())
+        Option::Some((value - 48).to_u32())
     } else if value >= 65 && value <= 70 {
-        Option::Some((value - 55).to_uint32())
+        Option::Some((value - 55).to_u32())
     } else if value >= 97 && value <= 102 {
-        Option::Some((value - 87).to_uint32())
+        Option::Some((value - 87).to_u32())
     } else {
         Option::None
     }
 }
 
-fn parse_group_fixed_escape(pattern: runtime::JsString, start: int) -> Result[
-    (uint32, int),
+fn parse_group_fixed_escape(pattern: runtime::JsString, start: isize) -> Result[
+    (u32, isize),
     RegexError,
 ] {
     if start + 6 > pattern.len() || pattern.get(start) != 92 || pattern.get(start + 1) != 117 {
         return Result::Err(regex_error("invalid group name escape", start))
     } else {};
-    let mut value: uint32 = 0;
+    let mut value: u32 = 0;
     let mut index = start + 2;
     while index < start + 6 {
         let digit = match group_hex_digit(pattern.get(index)) {
@@ -211,15 +211,15 @@ fn parse_group_fixed_escape(pattern: runtime::JsString, start: int) -> Result[
     Result::Ok((value, index))
 }
 
-fn parse_group_unicode_escape(pattern: runtime::JsString, start: int) -> Result[
-    (uint32, int),
+fn parse_group_unicode_escape(pattern: runtime::JsString, start: isize) -> Result[
+    (u32, isize),
     RegexError,
 ] {
     if start + 2 > pattern.len() || pattern.get(start) != 92 || pattern.get(start + 1) != 117 {
         return Result::Err(regex_error("invalid group name escape", start))
     } else {};
     if start + 2 < pattern.len() && pattern.get(start + 2) == 123 {
-        let mut value: uint32 = 0;
+        let mut value: u32 = 0;
         let mut index = start + 3;
         let mut any = false;
         while index < pattern.len() && pattern.get(index) != 125 {
@@ -256,37 +256,34 @@ fn parse_group_unicode_escape(pattern: runtime::JsString, start: int) -> Result[
     }
 }
 
-fn group_identifier_start(tables: unicode::IdentifierTables, value: uint32) -> bool {
+fn group_identifier_start(tables: unicode::IdentifierTables, value: u32) -> bool {
     value == 36 || value == 95 || tables.is_start(value)
 }
 
-fn group_identifier_continue(tables: unicode::IdentifierTables, value: uint32) -> bool {
+fn group_identifier_continue(tables: unicode::IdentifierTables, value: u32) -> bool {
     value == 36 || value == 95 || value == 0x200c || value == 0x200d || tables.is_continue(value)
 }
 
-fn append_group_code_point(output: Vec[uint16], value: uint32, offset: int) -> Result[
-    unit,
-    RegexError,
-] {
+fn append_group_code_point(output: Vec[u16], value: u32, offset: isize) -> Result[unit, RegexError] {
     if value > 0x10ffff || (value >= 0xd800 && value <= 0xdfff) {
         Result::Err(regex_error("invalid group name code point", offset))
     } else if value <= 0xffff {
-        output.push(value.to_uint16());
+        output.push(value.to_u16());
         Result::Ok(())
     } else {
         let scalar = value - 0x10000;
-        output.push((0xd800 + (scalar >> 10)).to_uint16());
-        output.push((0xdc00 + (scalar & 0x3ff)).to_uint16());
+        output.push((0xd800 + (scalar >> 10)).to_u16());
+        output.push((0xdc00 + (scalar & 0x3ff)).to_u16());
         Result::Ok(())
     }
 }
 
-fn parse_group_name(pattern: runtime::JsString, start: int) -> Result[
-    (runtime::JsString, int),
+fn parse_group_name(pattern: runtime::JsString, start: isize) -> Result[
+    (runtime::JsString, isize),
     RegexError,
 ] {
     let tables = unicode::IdentifierTables::new();
-    let output: Vec[uint16] = Vec::[];
+    let output: Vec[u16] = Vec::new();
     let mut index = start;
     let mut first = true;
     while index < pattern.len() {
@@ -301,9 +298,9 @@ fn parse_group_name(pattern: runtime::JsString, start: int) -> Result[
         let (value, next) = if pattern.get(index) == 92 {
             parse_group_unicode_escape(pattern, index)?
         } else {
-            let first_unit = pattern.get(index).to_uint32();
+            let first_unit = pattern.get(index).to_u32();
             if first_unit >= 0xd800 && first_unit <= 0xdbff && index + 1 < pattern.len() {
-                let second = pattern.get(index + 1).to_uint32();
+                let second = pattern.get(index + 1).to_u32();
                 if second >= 0xdc00 && second <= 0xdfff {
                     (0x10000 + ((first_unit - 0xd800) << 10) + second - 0xdc00, index + 2)
                 } else {
@@ -328,8 +325,8 @@ fn parse_group_name(pattern: runtime::JsString, start: int) -> Result[
     Result::Err(regex_error("unterminated group name", start))
 }
 
-fn find_capture_names(names: Vec[Option[runtime::JsString]], name: runtime::JsString) -> Vec[int] {
-    let matches: Vec[int] = Vec::[];
+fn find_capture_names(names: Vec[Option[runtime::JsString]], name: runtime::JsString) -> Vec[isize] {
+    let matches: Vec[isize] = Vec::new();
     let mut index = 1;
     while index < names.len() {
         match names[index] {
@@ -359,8 +356,8 @@ fn capture_metadata(pattern: runtime::JsString) -> Result[CaptureMetadata, Regex
     let mut in_class = false;
     let mut count = 0;
     let mut alternative_scope = 0;
-    let names: Vec[Option[runtime::JsString]] = Vec::[Option::None];
-    let name_scopes: Vec[int] = Vec::[0];
+    let names: Vec[Option[runtime::JsString]] = Vec::from_array([Option::None]);
+    let name_scopes: Vec[isize] = Vec::from_array([0]);
     while index < pattern.len() {
         let current = pattern.get(index);
         if current == 92 {
@@ -420,7 +417,7 @@ fn parser_starts_counted_quantifier(parser: Parser) -> bool {
     }
 }
 
-fn parse_decimal_count(parser: Parser) -> Result[int, RegexError] {
+fn parse_decimal_count(parser: Parser) -> Result[isize, RegexError] {
     let start = parser.index.get();
     let mut value = 0;
     let mut any = false;
@@ -430,7 +427,7 @@ fn parse_decimal_count(parser: Parser) -> Result[int, RegexError] {
             break
         } else {};
         any = true;
-        let digit = (current - 48).to_int();
+        let digit = (current - 48).to_isize();
         if value > (MAX_REPEAT - digit) / 10 {
             return Result::Err(regex_error("quantifier exceeds implementation limit", start))
         } else {};
@@ -445,12 +442,12 @@ fn parse_decimal_count(parser: Parser) -> Result[int, RegexError] {
 }
 
 enum DecimalEscape {
-    BackReference(int),
-    Literal(uint32),
+    BackReference(isize),
+    Literal(u32),
 }
 
-fn parse_legacy_octal(parser: Parser, first: uint16) -> uint32 {
-    let mut value = (first - 48).to_uint32();
+fn parse_legacy_octal(parser: Parser, first: u16) -> u32 {
+    let mut value = (first - 48).to_u32();
     let maximum_digits = if first <= 51 {
         3
     } else {
@@ -460,7 +457,7 @@ fn parse_legacy_octal(parser: Parser, first: uint16) -> uint32 {
     while count < maximum_digits {
         match parser_current(parser) {
             Some(current) => if current >= 48 && current <= 55 {
-                value = value * 8 + (current - 48).to_uint32();
+                value = value * 8 + (current - 48).to_u32();
                 parser_advance(parser);
                 count += 1;
             } else {
@@ -472,7 +469,7 @@ fn parse_legacy_octal(parser: Parser, first: uint16) -> uint32 {
     value
 }
 
-fn parse_decimal_escape(parser: Parser, offset: int) -> Result[DecimalEscape, RegexError] {
+fn parse_decimal_escape(parser: Parser, offset: isize) -> Result[DecimalEscape, RegexError] {
     let start = parser.index.get();
     let mut value = 0;
     let mut overflow = false;
@@ -481,7 +478,7 @@ fn parse_decimal_escape(parser: Parser, offset: int) -> Result[DecimalEscape, Re
         if !is_decimal_digit(current) {
             break
         } else {};
-        let digit = (current - 48).to_int();
+        let digit = (current - 48).to_isize();
         if value > (MAX_CAPTURES - digit) / 10 {
             overflow = true;
         } else if !overflow {
@@ -499,13 +496,13 @@ fn parse_decimal_escape(parser: Parser, offset: int) -> Result[DecimalEscape, Re
         if first >= 49 && first <= 55 {
             Result::Ok(DecimalEscape::Literal(parse_legacy_octal(parser, first)))
         } else {
-            Result::Ok(DecimalEscape::Literal(first.to_uint32()))
+            Result::Ok(DecimalEscape::Literal(first.to_u32()))
         }
     }
 }
 
 enum ClassUnit {
-    Single(uint32),
+    Single(u32),
     Set(unicode::CharRange),
 }
 
@@ -516,12 +513,12 @@ struct ClassSet {
 
 struct ClassSetOperand {
     value: ClassSet,
-    single: Option[uint32],
-    offset: int,
+    single: Option[u32],
+    offset: isize,
 }
 
 fn class_set_empty() -> ClassSet {
-    ClassSet { range: unicode::CharRange::new(), strings: Vec::[] }
+    ClassSet { range: unicode::CharRange::new(), strings: Vec::new() }
 }
 
 fn class_set_contains_string(values: Vec[runtime::JsString], value: runtime::JsString) -> bool {
@@ -543,7 +540,7 @@ fn class_set_add_string(values: Vec[runtime::JsString], value: runtime::JsString
     } else {}
 }
 
-fn class_string_compare(left: runtime::JsString, right: runtime::JsString) -> int {
+fn class_string_compare(left: runtime::JsString, right: runtime::JsString) -> isize {
     let limit = if left.len() < right.len() {
         left.len()
     } else {
@@ -567,7 +564,7 @@ fn class_string_compare(left: runtime::JsString, right: runtime::JsString) -> in
     }
 }
 
-fn class_set_max_string_length(strings: Vec[runtime::JsString]) -> int {
+fn class_set_max_string_length(strings: Vec[runtime::JsString]) -> isize {
     let mut maximum = 0;
     for value in strings {
         if value.len() > maximum {
@@ -629,7 +626,7 @@ fn class_set_union(left: ClassSet, right: ClassSet) -> ClassSet {
 }
 
 fn class_set_intersection(left: ClassSet, right: ClassSet) -> ClassSet {
-    let strings: Vec[runtime::JsString] = Vec::[];
+    let strings: Vec[runtime::JsString] = Vec::new();
     for value in left.strings {
         if class_set_contains_string(right.strings, value) {
             strings.push(value)
@@ -639,7 +636,7 @@ fn class_set_intersection(left: ClassSet, right: ClassSet) -> ClassSet {
 }
 
 fn class_set_difference(left: ClassSet, right: ClassSet) -> ClassSet {
-    let strings: Vec[runtime::JsString] = Vec::[];
+    let strings: Vec[runtime::JsString] = Vec::new();
     for value in left.strings {
         if !class_set_contains_string(right.strings, value) {
             strings.push(value)
@@ -648,7 +645,7 @@ fn class_set_difference(left: ClassSet, right: ClassSet) -> ClassSet {
     ClassSet { range: left.range.difference(right.range), strings }
 }
 
-fn add_known_range(range: unicode::CharRange, first: uint32, last: uint32) -> unit {
+fn add_known_range(range: unicode::CharRange, first: u32, last: u32) -> unit {
     match range.add_range(first, last) {
         Ok(()) => (),
         Err(_) => (),
@@ -689,7 +686,7 @@ struct EscapedClass {
     negated: bool,
 }
 
-fn escaped_class(value: uint16) -> Option[EscapedClass] {
+fn escaped_class(value: u16) -> Option[EscapedClass] {
     if value == 100 {
         Option::Some(EscapedClass { range: digit_class(), negated: false })
     } else if value == 68 {
@@ -707,7 +704,7 @@ fn escaped_class(value: uint16) -> Option[EscapedClass] {
     }
 }
 
-fn hex_digit(value: uint16) -> Option[uint16] {
+fn hex_digit(value: u16) -> Option[u16] {
     if value >= 48 && value <= 57 {
         Option::Some(value - 48)
     } else if value >= 65 && value <= 70 {
@@ -719,8 +716,8 @@ fn hex_digit(value: uint16) -> Option[uint16] {
     }
 }
 
-fn parse_fixed_hex(parser: Parser, digits: int, offset: int) -> Result[uint32, RegexError] {
-    let mut value: uint32 = 0;
+fn parse_fixed_hex(parser: Parser, digits: isize, offset: isize) -> Result[u32, RegexError] {
+    let mut value: u32 = 0;
     let mut index = 0;
     while index < digits {
         let current = match parser_advance(parser) {
@@ -731,19 +728,19 @@ fn parse_fixed_hex(parser: Parser, digits: int, offset: int) -> Result[uint32, R
             Some(digit) => digit,
             None => return Result::Err(regex_error("invalid hexadecimal escape", offset)),
         };
-        value = value * 16 + digit.to_uint32();
+        value = value * 16 + digit.to_u32();
         index += 1;
     }
     Result::Ok(value)
 }
 
-fn parse_unicode_code_point_escape(parser: Parser, offset: int) -> Result[uint32, RegexError] {
+fn parse_unicode_code_point_escape(parser: Parser, offset: isize) -> Result[u32, RegexError] {
     parser_advance(parser);
-    let mut value: uint32 = 0;
+    let mut value: u32 = 0;
     let mut any = false;
     while !parser_at_end(parser) && parser_current(parser) != Option::Some(125) {
         let digit = match hex_digit(parser_current(parser).unwrap_or(0)) {
-            Some(value) => value.to_uint32(),
+            Some(value) => value.to_u32(),
             None => return Result::Err(regex_error("invalid Unicode code point escape", offset)),
         };
         if value > (0x10ffff - digit) / 16 {
@@ -760,7 +757,7 @@ fn parse_unicode_code_point_escape(parser: Parser, offset: int) -> Result[uint32
     }
 }
 
-fn parse_character_escape(parser: Parser, offset: int, in_class: bool) -> Result[uint32, RegexError] {
+fn parse_character_escape(parser: Parser, offset: isize, in_class: bool) -> Result[u32, RegexError] {
     let value = match parser_advance(parser) {
         Some(value) => value,
         None => return Result::Err(regex_error("unterminated escape sequence", offset)),
@@ -791,10 +788,10 @@ fn parse_character_escape(parser: Parser, offset: int, in_class: bool) -> Result
             None => return Result::Err(regex_error("unterminated control escape", offset)),
         };
         if (control >= 65 && control <= 90) || (control >= 97 && control <= 122) {
-            Result::Ok((control & 31).to_uint32())
+            Result::Ok((control & 31).to_u32())
         } else if in_class && !unicode_mode(parser.flags.get())
             && ((control >= 48 && control <= 57) || control == 95) {
-            Result::Ok((control & 31).to_uint32())
+            Result::Ok((control & 31).to_u32())
         } else {
             Result::Err(regex_error("invalid control escape", offset))
         }
@@ -823,11 +820,11 @@ fn parse_character_escape(parser: Parser, offset: int, in_class: bool) -> Result
             || (value >= 97 && value <= 122)) {
         Result::Err(regex_error("invalid identity escape in unicode mode", offset))
     } else {
-        Result::Ok(value.to_uint32())
+        Result::Ok(value.to_u32())
     }
 }
 
-fn parser_code_point(parser: Parser, first: uint16) -> uint32 {
+fn parser_code_point(parser: Parser, first: u16) -> u32 {
     if unicode_mode(parser.flags.get()) && runtime::is_high_surrogate(first) {
         match parser_current(parser) {
             Some(second) => match runtime::combine_surrogates(first, second) {
@@ -835,17 +832,17 @@ fn parser_code_point(parser: Parser, first: uint16) -> uint32 {
                     parser_advance(parser);
                     value
                 },
-                None => first.to_uint32(),
+                None => first.to_u32(),
             },
-            None => first.to_uint32(),
+            None => first.to_u32(),
         }
     } else {
-        first.to_uint32()
+        first.to_u32()
     }
 }
 
-fn parse_escaped_code_point(parser: Parser, offset: int, in_class: bool) -> Result[
-    uint32,
+fn parse_escaped_code_point(parser: Parser, offset: isize, in_class: bool) -> Result[
+    u32,
     RegexError,
 ] {
     let first = parse_character_escape(parser, offset, in_class)?;
@@ -866,7 +863,7 @@ fn parse_escaped_code_point(parser: Parser, offset: int, in_class: bool) -> Resu
     }
 }
 
-fn add_class_range(range: unicode::CharRange, first: uint32, last: uint32, offset: int) -> Result[
+fn add_class_range(range: unicode::CharRange, first: u32, last: u32, offset: isize) -> Result[
     unit,
     RegexError,
 ] {
@@ -893,7 +890,7 @@ fn parser_class_range(parser: Parser, escaped: EscapedClass) -> unicode::CharRan
     }
 }
 
-fn parse_property_escape(parser: Parser, offset: int) -> Result[ClassSet, RegexError] {
+fn parse_property_escape(parser: Parser, offset: isize) -> Result[ClassSet, RegexError] {
     let marker = parser_advance(parser).unwrap_or(0);
     if !unicode_mode(parser.flags.get()) {
         return Result::Err(regex_error("Unicode property escape requires `u` or `v` mode", offset))
@@ -941,7 +938,7 @@ fn parse_property_escape(parser: Parser, offset: int) -> Result[ClassSet, RegexE
                     range
                 }
             };
-            Result::Ok(ClassSet { range: result, strings: Vec::[] })
+            Result::Ok(ClassSet { range: result, strings: Vec::new() })
         },
         unicode::RegExpProperty::Strings(strings) => {
             if !flags.unicode_sets {
@@ -950,11 +947,11 @@ fn parse_property_escape(parser: Parser, offset: int) -> Result[ClassSet, RegexE
                 return Result::Err(regex_error("cannot negate a Unicode string property", offset))
             } else {};
             let result = class_set_empty();
-            let scalar_values: Vec[uint32] = Vec::[];
+            let scalar_values: Vec[u32] = Vec::new();
             for value in strings {
                 let sequence_string = runtime::JsString::from_code_units(value);
                 let code_point = if sequence_string.len() == 1 {
-                    Option::Some(sequence_string.get(0).to_uint32())
+                    Option::Some(sequence_string.get(0).to_u32())
                 } else if sequence_string.len() == 2 {
                     runtime::combine_surrogates(sequence_string.get(0), sequence_string.get(1))
                 } else {
@@ -987,9 +984,9 @@ fn parse_property_escape(parser: Parser, offset: int) -> Result[ClassSet, RegexE
 fn add_parser_class_range(
     parser: Parser,
     range: unicode::CharRange,
-    first: uint32,
-    last: uint32,
-    offset: int,
+    first: u32,
+    last: u32,
+    offset: isize,
 ) -> Result[unit, RegexError] {
     let values = unicode::CharRange::new();
     add_class_range(values, first, last, offset)?;
@@ -1001,9 +998,9 @@ fn add_parser_class_range(
     Result::Ok(())
 }
 
-fn append_class_code_point(output: Vec[uint16], value: uint32) -> unit {
+fn append_class_code_point(output: Vec[u16], value: u32) -> unit {
     if value <= 0xffff {
-        output.push(value.to_uint16())
+        output.push(value.to_u16())
     } else {
         match runtime::split_code_point(value) {
             Some((high, low)) => {
@@ -1019,17 +1016,17 @@ fn canonicalize_class_string(parser: Parser, value: runtime::JsString) -> runtim
     if !parser.flags.get().ignore_case {
         return value
     } else {};
-    let output: Vec[uint16] = Vec::with_capacity(value.len());
+    let output: Vec[u16] = Vec::with_capacity(value.len());
     let mut index = 0;
     while index < value.len() {
         let first = value.get(index);
         let (code_point, width) = if runtime::is_high_surrogate(first) && index + 1 < value.len() {
             match runtime::combine_surrogates(first, value.get(index + 1)) {
                 Some(value) => (value, 2),
-                None => (first.to_uint32(), 1),
+                None => (first.to_u32(), 1),
             }
         } else {
-            (first.to_uint32(), 1)
+            (first.to_u32(), 1)
         };
         append_class_code_point(output, parser.canonicalizer.canonicalize(code_point));
         index += width;
@@ -1037,18 +1034,18 @@ fn canonicalize_class_string(parser: Parser, value: runtime::JsString) -> runtim
     runtime::JsString::from_code_units(output)
 }
 
-fn class_set_from_single(parser: Parser, value: uint32, offset: int) -> Result[ClassSet, RegexError] {
+fn class_set_from_single(parser: Parser, value: u32, offset: isize) -> Result[ClassSet, RegexError] {
     let range = unicode::CharRange::new();
     add_parser_class_range(parser, range, value, value, offset)?;
-    Result::Ok(ClassSet { range, strings: Vec::[] })
+    Result::Ok(ClassSet { range, strings: Vec::new() })
 }
 
-fn class_set_add_sequence(parser: Parser, target: ClassSet, value: runtime::JsString, offset: int) -> Result[
+fn class_set_add_sequence(parser: Parser, target: ClassSet, value: runtime::JsString, offset: isize) -> Result[
     unit,
     RegexError,
 ] {
     let code_point = if value.len() == 1 {
-        Option::Some(value.get(0).to_uint32())
+        Option::Some(value.get(0).to_u32())
     } else if value.len() == 2 {
         runtime::combine_surrogates(value.get(0), value.get(1))
     } else {
@@ -1093,13 +1090,13 @@ fn parse_class_unit(parser: Parser) -> Result[ClassUnit, RegexError] {
     }
 }
 
-fn parse_v_string_disjunction(parser: Parser, offset: int) -> Result[ClassSet, RegexError] {
+fn parse_v_string_disjunction(parser: Parser, offset: isize) -> Result[ClassSet, RegexError] {
     parser_advance(parser);
     if !parser_consume(parser, 123) {
         return Result::Err(regex_error("expected `{` after `\\q`", offset))
     } else {};
     let result = class_set_empty();
-    let units: Vec[uint16] = Vec::[];
+    let units: Vec[u16] = Vec::new();
     loop {
         match parser_current(parser) {
             Some(124) | Some(125) => {
@@ -1170,7 +1167,7 @@ fn parse_v_base_operand(parser: Parser) -> Result[ClassSetOperand, RegexError] {
                         ClassSetOperand {
                             value: ClassSet {
                                 range: parser_class_range(parser, escaped),
-                                strings: Vec::[],
+                                strings: Vec::new(),
                             },
                             single: Option::None,
                             offset,
@@ -1220,7 +1217,7 @@ fn parse_v_operand(parser: Parser) -> Result[ClassSetOperand, RegexError] {
                     add_parser_class_range(parser, range, first_value, last_value, first.offset)?;
                     Result::Ok(
                         ClassSetOperand {
-                            value: ClassSet { range, strings: Vec::[] },
+                            value: ClassSet { range, strings: Vec::new() },
                             single: Option::None,
                             offset: first.offset,
                         },
@@ -1237,7 +1234,7 @@ fn parse_v_operand(parser: Parser) -> Result[ClassSetOperand, RegexError] {
     }
 }
 
-fn v_set_operator(parser: Parser) -> int {
+fn v_set_operator(parser: Parser) -> isize {
     if parser_current(parser) == Option::Some(38) && parser_peek(parser, 1) == Option::Some(38) {
         1
     } else if parser_current(parser) == Option::Some(45)
@@ -1248,7 +1245,7 @@ fn v_set_operator(parser: Parser) -> int {
     }
 }
 
-fn parse_v_union(parser: Parser) -> Result[(ClassSet, int), RegexError] {
+fn parse_v_union(parser: Parser) -> Result[(ClassSet, isize), RegexError] {
     let mut result = class_set_empty();
     let mut count = 0;
     while !parser_at_end(parser) && parser_current(parser) != Option::Some(93)
@@ -1259,7 +1256,7 @@ fn parse_v_union(parser: Parser) -> Result[(ClassSet, int), RegexError] {
     Result::Ok((result, count))
 }
 
-fn parse_v_class_value(parser: Parser, offset: int) -> Result[ClassSet, RegexError] {
+fn parse_v_class_value(parser: Parser, offset: isize) -> Result[ClassSet, RegexError] {
     let negated = parser_consume(parser, 94);
     let (mut result, left_count) = parse_v_union(parser)?;
     let mut operation = v_set_operator(parser);
@@ -1296,13 +1293,13 @@ fn parse_v_class_value(parser: Parser, offset: int) -> Result[ClassSet, RegexErr
     Result::Ok(result)
 }
 
-fn parse_v_class(parser: Parser, offset: int) -> Result[int, RegexError] {
+fn parse_v_class(parser: Parser, offset: isize) -> Result[isize, RegexError] {
     let value = parse_v_class_value(parser, offset)?;
     let maximum = class_set_max_string_length(value.strings);
     Result::Ok(parser_push_node(parser, Node::ClassSet(value.range, value.strings, maximum)))
 }
 
-fn parse_class(parser: Parser, offset: int) -> Result[int, RegexError] {
+fn parse_class(parser: Parser, offset: isize) -> Result[isize, RegexError] {
     if parser.flags.get().unicode_sets {
         return parse_v_class(parser, offset)
     } else {};
@@ -1358,7 +1355,7 @@ fn parse_class(parser: Parser, offset: int) -> Result[int, RegexError] {
     Result::Err(regex_error("unterminated character class", offset))
 }
 
-fn modifier_index(value: uint16) -> int {
+fn modifier_index(value: u16) -> isize {
     if value == 105 {
         0
     } else if value == 109 {
@@ -1370,9 +1367,9 @@ fn modifier_index(value: uint16) -> int {
     }
 }
 
-fn inline_flags(parser: Parser, offset: int) -> Result[RegexFlags, RegexError] {
-    let additions: Vec[bool] = Vec::[false, false, false];
-    let removals: Vec[bool] = Vec::[false, false, false];
+fn inline_flags(parser: Parser, offset: isize) -> Result[RegexFlags, RegexError] {
+    let additions: Vec[bool] = Vec::from_array([false, false, false]);
+    let removals: Vec[bool] = Vec::from_array([false, false, false]);
     let mut removing = false;
     let mut any = false;
     while !parser_at_end(parser) && parser_current(parser) != Option::Some(58) {
@@ -1430,7 +1427,7 @@ fn inline_flags(parser: Parser, offset: int) -> Result[RegexFlags, RegexError] {
     )
 }
 
-fn parse_atom(parser: Parser) -> Result[int, RegexError] {
+fn parse_atom(parser: Parser) -> Result[isize, RegexError] {
     let offset = parser.index.get();
     let value = match parser_advance(parser) {
         Some(value) => value,
@@ -1572,7 +1569,10 @@ fn parse_atom(parser: Parser) -> Result[int, RegexError] {
                 } else if current >= 49 && current <= 57 {
                     match parse_decimal_escape(parser, offset)? {
                         DecimalEscape::BackReference(capture) => Result::Ok(
-                            parser_push_node(parser, Node::BackReference(Vec::[capture])),
+                            parser_push_node(
+                                parser,
+                                Node::BackReference(Vec::from_array([capture])),
+                            ),
                         ),
                         DecimalEscape::Literal(value) => {
                             Result::Ok(parser_push_node(parser, Node::Literal(value)))
@@ -1586,7 +1586,9 @@ fn parse_atom(parser: Parser) -> Result[int, RegexError] {
                     parser_advance(parser);
                     let slash = parser_push_node(parser, Node::Literal(92));
                     let letter = parser_push_node(parser, Node::Literal(99));
-                    Result::Ok(parser_push_node(parser, Node::Sequence(Vec::[slash, letter])))
+                    Result::Ok(
+                        parser_push_node(parser, Node::Sequence(Vec::from_array([slash, letter]))),
+                    )
                 } else {
                     let escaped = parse_escaped_code_point(parser, offset, false)?;
                     Result::Ok(parser_push_node(parser, Node::Literal(escaped)))
@@ -1608,7 +1610,7 @@ fn parse_atom(parser: Parser) -> Result[int, RegexError] {
     }
 }
 
-fn parser_valid_counted_quantifier_at(parser: Parser, offset: int) -> bool {
+fn parser_valid_counted_quantifier_at(parser: Parser, offset: isize) -> bool {
     let mut index = offset + 1;
     if index >= parser.pattern.len() || !is_decimal_digit(parser.pattern.get(index)) {
         return false
@@ -1629,7 +1631,7 @@ fn parser_valid_counted_quantifier_at(parser: Parser, offset: int) -> bool {
     }
 }
 
-fn parser_starts_counted_quantifier_at(parser: Parser, offset: int) -> bool {
+fn parser_starts_counted_quantifier_at(parser: Parser, offset: isize) -> bool {
     if offset + 1 >= parser.pattern.len() {
         false
     } else if unicode_mode(parser.flags.get()) {
@@ -1639,7 +1641,7 @@ fn parser_starts_counted_quantifier_at(parser: Parser, offset: int) -> bool {
     }
 }
 
-fn parse_counted_quantifier(parser: Parser, offset: int) -> Result[Quantifier, RegexError] {
+fn parse_counted_quantifier(parser: Parser, offset: isize) -> Result[Quantifier, RegexError] {
     parser.index.set(parser.index.get() + 1);
     let minimum = parse_decimal_count(parser)?;
     let maximum = if parser_consume(parser, 125) {
@@ -1696,7 +1698,7 @@ fn parse_quantifier(parser: Parser) -> Result[Option[Quantifier], RegexError] {
     }
 }
 
-fn parse_repetition(parser: Parser) -> Result[int, RegexError] {
+fn parse_repetition(parser: Parser) -> Result[isize, RegexError] {
     let atom = parse_atom(parser)?;
     let quantifier_offset = parser.index.get();
     let lookahead = match parser.nodes[atom] {
@@ -1745,8 +1747,8 @@ fn parser_starts_simple_quantifier(parser: Parser) -> bool {
     }
 }
 
-fn parse_sequence(parser: Parser) -> Result[int, RegexError] {
-    let children: Vec[int] = Vec::[];
+fn parse_sequence(parser: Parser) -> Result[isize, RegexError] {
+    let children: Vec[isize] = Vec::new();
     while !parser_at_end(parser) {
         match parser_current(parser) {
             Some(41) | Some(124) => break,
@@ -1762,8 +1764,8 @@ fn parse_sequence(parser: Parser) -> Result[int, RegexError] {
     }
 }
 
-fn parse_alternation(parser: Parser) -> Result[int, RegexError] {
-    let branches: Vec[int] = Vec::[];
+fn parse_alternation(parser: Parser) -> Result[isize, RegexError] {
+    let branches: Vec[isize] = Vec::new();
     branches.push(parse_sequence(parser)?);
     while parser_consume(parser, 124) {
         branches.push(parse_sequence(parser)?)
@@ -1815,11 +1817,11 @@ pub fn compile_utf8_with_flags(pattern: string, flags: string) -> Result[Regex, 
 
 #[derive(PartialEq, Eq)]
 struct MatchState {
-    position: int,
+    position: isize,
     captures: Vec[Option[RegexCapture]],
 }
 
-fn empty_captures(count: int) -> Vec[Option[RegexCapture]] {
+fn empty_captures(count: isize) -> Vec[Option[RegexCapture]] {
     let values: Vec[Option[RegexCapture]] = Vec::with_capacity(count + 1);
     let mut index = 0;
     while index <= count {
@@ -1839,7 +1841,7 @@ fn copy_captures(values: Vec[Option[RegexCapture]]) -> Vec[Option[RegexCapture]]
     output
 }
 
-fn with_capture(state: MatchState, index: int, value: Option[RegexCapture]) -> MatchState {
+fn with_capture(state: MatchState, index: isize, value: Option[RegexCapture]) -> MatchState {
     let captures = copy_captures(state.captures);
     captures.set(index, value);
     MatchState { position: state.position, captures }
@@ -1864,7 +1866,7 @@ fn append_unique_all(target: Vec[MatchState], source: Vec[MatchState]) -> unit {
     }
 }
 
-fn clear_node_capture_slots(regex: Regex, node: int, captures: Vec[Option[RegexCapture]]) -> unit {
+fn clear_node_capture_slots(regex: Regex, node: isize, captures: Vec[Option[RegexCapture]]) -> unit {
     match regex.nodes[node] {
         Node::Sequence(children) | Node::Alternation(children) => {
             let mut index = 0;
@@ -1884,13 +1886,13 @@ fn clear_node_capture_slots(regex: Regex, node: int, captures: Vec[Option[RegexC
     }
 }
 
-fn clear_node_captures(regex: Regex, node: int, state: MatchState) -> MatchState {
+fn clear_node_captures(regex: Regex, node: isize, state: MatchState) -> MatchState {
     let captures = copy_captures(state.captures);
     clear_node_capture_slots(regex, node, captures);
     MatchState { position: state.position, captures }
 }
 
-fn node_contains_capture(regex: Regex, node: int) -> bool {
+fn node_contains_capture(regex: Regex, node: isize) -> bool {
     match regex.nodes[node] {
         Node::Capture(_, _) => true,
         Node::Sequence(children) | Node::Alternation(children) => {
@@ -1908,7 +1910,44 @@ fn node_contains_capture(regex: Regex, node: int) -> bool {
     }
 }
 
-fn repeat_limit(minimum: int, maximum: Option[int], input_length: int) -> int {
+fn node_may_match_empty(regex: Regex, node: isize) -> bool {
+    match regex.nodes[node] {
+        Node::Empty | Node::Start | Node::End | Node::WordBoundary(_) | Node::BackReference(_) | Node::LookAhead(_, _) | Node::LookBehind(_, _) => true,
+        Node::Literal(_) | Node::Any | Node::Class(_, _) => false,
+        Node::ClassSet(_, strings, _) => {
+            for value in strings {
+                if value.len() == 0 {
+                    return true
+                } else {}
+            }
+            false
+        },
+        Node::Sequence(children) => {
+            for child in children {
+                if !node_may_match_empty(regex, child) {
+                    return false
+                } else {}
+            }
+            true
+        },
+        Node::Alternation(children) => {
+            for child in children {
+                if node_may_match_empty(regex, child) {
+                    return true
+                } else {}
+            }
+            false
+        },
+        Node::Repeat(child, minimum, _, _) => {
+            minimum == 0 || node_may_match_empty(regex, child)
+        },
+        Node::Capture(child, _) | Node::Group(child) | Node::ScopedFlags(child, _) => {
+            node_may_match_empty(regex, child)
+        },
+    }
+}
+
+fn repeat_limit(minimum: isize, maximum: Option[isize], input_length: isize) -> isize {
     match maximum {
         Some(value) => value,
         None => minimum + input_length + 1,
@@ -1916,13 +1955,13 @@ fn repeat_limit(minimum: int, maximum: Option[int], input_length: int) -> int {
 }
 
 enum RepeatWork {
-    Explore(int, MatchState),
+    Explore(isize, MatchState),
     Accept(MatchState),
 }
 
 #[derive(PartialEq, Eq)]
 struct RepeatVisit {
-    count: int,
+    count: isize,
     state: MatchState,
 }
 
@@ -1931,8 +1970,8 @@ fn repeat_push_explore(
     visited: Vec[RepeatVisit],
     visited_positions: Vec[bool],
     fast_positions: bool,
-    minimum: int,
-    count: int,
+    minimum: isize,
+    count: isize,
     state: MatchState,
 ) -> unit {
     if fast_positions && count >= minimum {
@@ -1972,24 +2011,25 @@ fn repeat_accept(
 fn match_repeat(
     regex: Regex,
     flags: RegexFlags,
-    child: int,
-    minimum: int,
-    maximum: Option[int],
+    child: isize,
+    minimum: isize,
+    maximum: Option[isize],
     greedy: bool,
     input: runtime::JsString,
     start: MatchState,
     backward: bool,
 ) -> Vec[MatchState] {
-    let output: Vec[MatchState] = Vec::[];
-    let work: Vec[RepeatWork] = Vec::[];
-    let visited: Vec[RepeatVisit] = Vec::[];
+    let output: Vec[MatchState] = Vec::new();
+    let work: Vec[RepeatWork] = Vec::new();
+    let visited: Vec[RepeatVisit] = Vec::new();
     let visited_positions: Vec[bool] = Vec::with_capacity(input.len() + 1);
     let accepted_positions: Vec[bool] = Vec::with_capacity(input.len() + 1);
     for _ in 0..input.len() + 1 {
         visited_positions.push(false);
         accepted_positions.push(false)
     }
-    let fast_positions = maximum.is_none() && !node_contains_capture(regex, child);
+    let fast_positions = maximum.is_none() && !node_contains_capture(regex, child)
+        && !node_may_match_empty(regex, child);
     repeat_push_explore(work, visited, visited_positions, fast_positions, minimum, 0, start);
     let limit = repeat_limit(minimum, maximum, input.len());
     while !work.is_empty() {
@@ -2042,15 +2082,15 @@ fn match_repeat(
 fn match_sequence(
     regex: Regex,
     flags: RegexFlags,
-    children: Vec[int],
+    children: Vec[isize],
     input: runtime::JsString,
     start: MatchState,
     backward: bool,
 ) -> Vec[MatchState] {
-    let mut positions = Vec::[start];
+    let mut positions = Vec::from_array([start]);
     let mut child_index = 0;
     while child_index < children.len() && !positions.is_empty() {
-        let next: Vec[MatchState] = Vec::[];
+        let next: Vec[MatchState] = Vec::new();
         let mut position_index = 0;
         let node_index = if backward {
             children.len() - child_index - 1
@@ -2077,7 +2117,7 @@ fn match_sequence(
     positions
 }
 
-fn class_matches(range: unicode::CharRange, negated: bool, value: uint32) -> bool {
+fn class_matches(range: unicode::CharRange, negated: bool, value: u32) -> bool {
     let contains = range.contains(value);
     if negated {
         !contains
@@ -2091,9 +2131,9 @@ fn class_string_match_width(
     flags: RegexFlags,
     expected: runtime::JsString,
     input: runtime::JsString,
-    position: int,
+    position: isize,
     backward: bool,
-) -> Option[int] {
+) -> Option[isize] {
     let mut expected_position = if backward {
         expected.len()
     } else {
@@ -2141,12 +2181,12 @@ fn class_set_string_outcomes(
     regex: Regex,
     flags: RegexFlags,
     strings: Vec[runtime::JsString],
-    maximum: int,
+    maximum: isize,
     input: runtime::JsString,
     state: MatchState,
     backward: bool,
 ) -> Vec[MatchState] {
-    let output: Vec[MatchState] = Vec::[];
+    let output: Vec[MatchState] = Vec::new();
     let available = if backward {
         state.position
     } else {
@@ -2207,9 +2247,9 @@ fn class_set_string_outcomes(
 fn class_string_compare_input(
     value: runtime::JsString,
     input: runtime::JsString,
-    start: int,
-    length: int,
-) -> int {
+    start: isize,
+    length: isize,
+) -> isize {
     let limit = if value.len() < length {
         value.len()
     } else {
@@ -2236,8 +2276,8 @@ fn class_string_compare_input(
 fn class_set_contains_input(
     strings: Vec[runtime::JsString],
     input: runtime::JsString,
-    start: int,
-    length: int,
+    start: isize,
+    length: isize,
 ) -> bool {
     let mut low = 0;
     let mut high = strings.len();
@@ -2255,15 +2295,15 @@ fn class_set_contains_input(
     false
 }
 
-fn is_line_terminator(value: uint16) -> bool {
+fn is_line_terminator(value: u16) -> bool {
     value == 10 || value == 13 || value == 0x2028 || value == 0x2029
 }
 
-fn dot_matches(flags: RegexFlags, value: uint32) -> bool {
-    flags.dot_all || value > 0xffff || !is_line_terminator(value.to_uint16())
+fn dot_matches(flags: RegexFlags, value: u32) -> bool {
+    flags.dot_all || value > 0xffff || !is_line_terminator(value.to_u16())
 }
 
-fn literal_matches(regex: Regex, flags: RegexFlags, expected: uint32, actual: uint32) -> bool {
+fn literal_matches(regex: Regex, flags: RegexFlags, expected: u32, actual: u32) -> bool {
     if flags.ignore_case {
         regex.canonicalizer.canonicalize(expected) == regex.canonicalizer.canonicalize(actual)
     } else {
@@ -2271,39 +2311,42 @@ fn literal_matches(regex: Regex, flags: RegexFlags, expected: uint32, actual: ui
     }
 }
 
-fn input_forward_code_point(input: runtime::JsString, position: int, unicode: bool) -> (uint32, int) {
+fn input_forward_code_point(input: runtime::JsString, position: isize, unicode: bool) -> (
+    u32,
+    isize,
+) {
     let first = input.get(position);
     if unicode && runtime::is_high_surrogate(first) && position + 1 < input.len() {
         match runtime::combine_surrogates(first, input.get(position + 1)) {
             Some(value) => (value, 2),
-            None => (first.to_uint32(), 1),
+            None => (first.to_u32(), 1),
         }
     } else {
-        (first.to_uint32(), 1)
+        (first.to_u32(), 1)
     }
 }
 
-fn input_backward_code_point(input: runtime::JsString, position: int, unicode: bool) -> (
-    uint32,
-    int,
+fn input_backward_code_point(input: runtime::JsString, position: isize, unicode: bool) -> (
+    u32,
+    isize,
 ) {
     let last = input.get(position - 1);
     if unicode && runtime::is_low_surrogate(last) && position >= 2 {
         match runtime::combine_surrogates(input.get(position - 2), last) {
             Some(value) => (value, 2),
-            None => (last.to_uint32(), 1),
+            None => (last.to_u32(), 1),
         }
     } else {
-        (last.to_uint32(), 1)
+        (last.to_u32(), 1)
     }
 }
 
-fn starts_line(flags: RegexFlags, input: runtime::JsString, position: int) -> bool {
+fn starts_line(flags: RegexFlags, input: runtime::JsString, position: isize) -> bool {
     position == 0
         || (flags.multiline && position > 0 && is_line_terminator(input.get(position - 1)))
 }
 
-fn ends_line(flags: RegexFlags, input: runtime::JsString, position: int) -> bool {
+fn ends_line(flags: RegexFlags, input: runtime::JsString, position: isize) -> bool {
     position == input.len()
         || (position < input.len() && is_line_terminator(input.get(position))
             && (flags.multiline || position + 1 == input.len()
@@ -2311,7 +2354,7 @@ fn ends_line(flags: RegexFlags, input: runtime::JsString, position: int) -> bool
                     && input.get(position + 1) == 10)))
 }
 
-fn word_code_point(regex: Regex, flags: RegexFlags, value: uint32) -> bool {
+fn word_code_point(regex: Regex, flags: RegexFlags, value: u32) -> bool {
     let value = if flags.ignore_case && unicode_mode(flags) {
         regex.canonicalizer.canonicalize(value)
     } else {
@@ -2321,15 +2364,15 @@ fn word_code_point(regex: Regex, flags: RegexFlags, value: uint32) -> bool {
         || (value >= 97 && value <= 122)
 }
 
-fn word_at(regex: Regex, flags: RegexFlags, input: runtime::JsString, position: int) -> bool {
+fn word_at(regex: Regex, flags: RegexFlags, input: runtime::JsString, position: isize) -> bool {
     if position < 0 || position >= input.len() {
         false
     } else {
-        word_code_point(regex, flags, input.get(position).to_uint32())
+        word_code_point(regex, flags, input.get(position).to_u32())
     }
 }
 
-fn is_word_boundary(regex: Regex, flags: RegexFlags, input: runtime::JsString, position: int) -> bool {
+fn is_word_boundary(regex: Regex, flags: RegexFlags, input: runtime::JsString, position: isize) -> bool {
     word_at(regex, flags, input, position - 1) != word_at(regex, flags, input, position)
 }
 
@@ -2338,7 +2381,7 @@ fn backreference_matches(
     flags: RegexFlags,
     input: runtime::JsString,
     capture: RegexCapture,
-    position: int,
+    position: isize,
 ) -> bool {
     let length = capture.end - capture.start;
     if position + length > input.len() {
@@ -2349,8 +2392,8 @@ fn backreference_matches(
             if !literal_matches(
                 regex,
                 flags,
-                input.get(capture.start + index).to_uint32(),
-                input.get(position + index).to_uint32(),
+                input.get(capture.start + index).to_u32(),
+                input.get(position + index).to_u32(),
             ) {
                 return false
             } else {};
@@ -2365,7 +2408,7 @@ fn backward_backreference_matches(
     flags: RegexFlags,
     input: runtime::JsString,
     capture: RegexCapture,
-    position: int,
+    position: isize,
 ) -> bool {
     let length = capture.end - capture.start;
     if position - length < 0 {
@@ -2376,8 +2419,8 @@ fn backward_backreference_matches(
             if !literal_matches(
                 regex,
                 flags,
-                input.get(capture.end - index - 1).to_uint32(),
-                input.get(position - index - 1).to_uint32(),
+                input.get(capture.end - index - 1).to_u32(),
+                input.get(position - index - 1).to_u32(),
             ) {
                 return false
             } else {};
@@ -2390,7 +2433,7 @@ fn backward_backreference_matches(
 fn match_backreferences(
     regex: Regex,
     flags: RegexFlags,
-    indices: Vec[int],
+    indices: Vec[isize],
     input: runtime::JsString,
     state: MatchState,
     backward: bool,
@@ -2402,36 +2445,38 @@ fn match_backreferences(
                 && backward_backreference_matches(regex, flags, input, capture, state.position))
                 || (!backward && backreference_matches(regex, flags, input, capture, state.position)) {
                 let length = capture.end - capture.start;
-                return Vec::[
-                    MatchState {
-                        position: if backward {
-                            state.position - length
-                        } else {
-                            state.position + length
+                return Vec::from_array(
+                    [
+                        MatchState {
+                            position: if backward {
+                                state.position - length
+                            } else {
+                                state.position + length
+                            },
+                            captures: state.captures,
                         },
-                        captures: state.captures,
-                    },
-                ]
+                    ],
+                )
             } else {
-                return Vec::[]
+                return Vec::new()
             },
             None => {},
         };
         index += 1;
     }
-    Vec::[state]
+    Vec::from_array([state])
 }
 
 fn match_node_direction_flags(
     regex: Regex,
     flags: RegexFlags,
-    node: int,
+    node: isize,
     input: runtime::JsString,
     state: MatchState,
     backward: bool,
 ) -> Vec[MatchState] {
     match regex.nodes[node] {
-        Node::Empty => Vec::[state],
+        Node::Empty => Vec::from_array([state]),
         Node::Literal(expected) => {
             let available = if backward {
                 state.position > 0
@@ -2445,21 +2490,23 @@ fn match_node_direction_flags(
                     input_forward_code_point(input, state.position, unicode_mode(flags))
                 };
                 if literal_matches(regex, flags, expected, actual) {
-                    Vec::[
-                        MatchState {
-                            position: if backward {
-                                state.position - width
-                            } else {
-                                state.position + width
+                    Vec::from_array(
+                        [
+                            MatchState {
+                                position: if backward {
+                                    state.position - width
+                                } else {
+                                    state.position + width
+                                },
+                                captures: state.captures,
                             },
-                            captures: state.captures,
-                        },
-                    ]
+                        ],
+                    )
                 } else {
-                    Vec::[]
+                    Vec::new()
                 }
             } else {
-                Vec::[]
+                Vec::new()
             }
         },
         Node::Any => {
@@ -2475,42 +2522,44 @@ fn match_node_direction_flags(
                     input_forward_code_point(input, state.position, unicode_mode(flags))
                 };
                 if dot_matches(flags, actual) {
-                    Vec::[
-                        MatchState {
-                            position: if backward {
-                                state.position - width
-                            } else {
-                                state.position + width
+                    Vec::from_array(
+                        [
+                            MatchState {
+                                position: if backward {
+                                    state.position - width
+                                } else {
+                                    state.position + width
+                                },
+                                captures: state.captures,
                             },
-                            captures: state.captures,
-                        },
-                    ]
+                        ],
+                    )
                 } else {
-                    Vec::[]
+                    Vec::new()
                 }
             } else {
-                Vec::[]
+                Vec::new()
             }
         },
         Node::Start => {
             if starts_line(flags, input, state.position) {
-                Vec::[state]
+                Vec::from_array([state])
             } else {
-                Vec::[]
+                Vec::new()
             }
         },
         Node::End => {
             if ends_line(flags, input, state.position) {
-                Vec::[state]
+                Vec::from_array([state])
             } else {
-                Vec::[]
+                Vec::new()
             }
         },
         Node::WordBoundary(expected) => {
             if is_word_boundary(regex, flags, input, state.position) == expected {
-                Vec::[state]
+                Vec::from_array([state])
             } else {
-                Vec::[]
+                Vec::new()
             }
         },
         Node::Class(range, negated) => {
@@ -2526,21 +2575,23 @@ fn match_node_direction_flags(
                     input_forward_code_point(input, state.position, unicode_mode(flags))
                 };
                 if class_matches(range, negated, actual) {
-                    Vec::[
-                        MatchState {
-                            position: if backward {
-                                state.position - width
-                            } else {
-                                state.position + width
+                    Vec::from_array(
+                        [
+                            MatchState {
+                                position: if backward {
+                                    state.position - width
+                                } else {
+                                    state.position + width
+                                },
+                                captures: state.captures,
                             },
-                            captures: state.captures,
-                        },
-                    ]
+                        ],
+                    )
                 } else {
-                    Vec::[]
+                    Vec::new()
                 }
             } else {
-                Vec::[]
+                Vec::new()
             }
         },
         Node::ClassSet(range, strings, maximum) => {
@@ -2584,7 +2635,7 @@ fn match_node_direction_flags(
             match_sequence(regex, flags, children, input, state, backward)
         },
         Node::Alternation(branches) => {
-            let output: Vec[MatchState] = Vec::[];
+            let output: Vec[MatchState] = Vec::new();
             let mut index = 0;
             while index < branches.len() {
                 append_unique_all(
@@ -2638,15 +2689,17 @@ fn match_node_direction_flags(
             let outcomes = match_node_direction_flags(regex, flags, child, input, reset, false);
             if positive {
                 if outcomes.is_empty() {
-                    Vec::[]
+                    Vec::new()
                 } else {
                     let selected = outcomes[0];
-                    Vec::[MatchState { position: state.position, captures: selected.captures }]
+                    Vec::from_array(
+                        [MatchState { position: state.position, captures: selected.captures }],
+                    )
                 }
             } else if outcomes.is_empty() {
-                Vec::[reset]
+                Vec::from_array([reset])
             } else {
-                Vec::[]
+                Vec::new()
             }
         },
         Node::LookBehind(child, positive) => {
@@ -2654,15 +2707,17 @@ fn match_node_direction_flags(
             let outcomes = match_node_direction_flags(regex, flags, child, input, reset, true);
             if positive {
                 if outcomes.is_empty() {
-                    Vec::[]
+                    Vec::new()
                 } else {
                     let selected = outcomes[0];
-                    Vec::[MatchState { position: state.position, captures: selected.captures }]
+                    Vec::from_array(
+                        [MatchState { position: state.position, captures: selected.captures }],
+                    )
                 }
             } else if outcomes.is_empty() {
-                Vec::[reset]
+                Vec::from_array([reset])
             } else {
-                Vec::[]
+                Vec::new()
             }
         },
         Node::Group(child) => {
@@ -2676,7 +2731,7 @@ fn match_node_direction_flags(
 
 fn match_node_direction(
     regex: Regex,
-    node: int,
+    node: isize,
     input: runtime::JsString,
     state: MatchState,
     backward: bool,
@@ -2684,13 +2739,13 @@ fn match_node_direction(
     match_node_direction_flags(regex, regex.flags, node, input, state, backward)
 }
 
-fn match_node(regex: Regex, node: int, input: runtime::JsString, state: MatchState) -> Vec[
+fn match_node(regex: Regex, node: isize, input: runtime::JsString, state: MatchState) -> Vec[
     MatchState,
 ] {
     match_node_direction(regex, node, input, state, false)
 }
 
-pub fn match_at(regex: Regex, input: runtime::JsString, start: int) -> Option[RegexMatch] {
+pub fn match_at(regex: Regex, input: runtime::JsString, start: isize) -> Option[RegexMatch] {
     if start < 0 || start > input.len() {
         return Option::None
     } else {};
@@ -2731,11 +2786,11 @@ pub fn is_match(regex: Regex, input: runtime::JsString) -> bool {
 }
 
 impl Regex {
-    pub fn capture_count(self: Regex) -> int {
+    pub fn capture_count(self: Regex) -> isize {
         self.capture_count
     }
 
-    pub fn capture_name(self: Regex, index: int) -> Option[runtime::JsString] {
+    pub fn capture_name(self: Regex, index: isize) -> Option[runtime::JsString] {
         if index <= 0 || index >= self.capture_names.len() {
             Option::None
         } else {
@@ -2751,7 +2806,7 @@ impl Regex {
         search(self, input)
     }
 
-    pub fn match_at(self: Regex, input: runtime::JsString, start: int) -> Option[RegexMatch] {
+    pub fn match_at(self: Regex, input: runtime::JsString, start: isize) -> Option[RegexMatch] {
         match_at(self, input, start)
     }
 
