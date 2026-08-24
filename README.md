@@ -55,8 +55,11 @@ named replacement substitutions, the `d` capture-indices flag with named index g
 and global or sticky indexing. Mutually exclusive alternatives may reuse a capture
 name and select the participating capture. RegExp includes QuickJS-compatible
 `compile()` state replacement and normalized `toString()` output, and exposes the corresponding Symbol.match,
-Symbol.matchAll, Symbol.search, Symbol.replace, and Symbol.split methods. MatchAll returns a
-state-cloned iterable that preserves the source RegExp lastIndex and advances Unicode empty matches by code point.
+Symbol.matchAll, Symbol.search, Symbol.replace, and Symbol.split methods. All five symbol methods
+use the dynamic RegExpExec path, including overridden `exec` methods and observable result fields.
+MatchAll and split honor RegExp species constructors, and MatchAll returns a GC-rooted matcher
+iterator with a shared QuickJS-compatible RegExp String Iterator prototype that preserves the source
+RegExp lastIndex and advances Unicode empty matches by code point.
 RegExp call and construct paths distinguish identity from cloning, preserve derived `newTarget`
 prototypes, honor `Symbol.match`, dynamically coerce constructor, input, flags, and `lastIndex`
 values, dispatch `test()` through an overridden `exec`, and keep `RegExp.prototype` as the
@@ -72,7 +75,12 @@ computed, and call chains with grouped reference and delete semantics,
 `new.target`, object-method home objects, and direct-eval inheritance of `this`,
 `new.target`, and `super`, including static and runtime-computed eval var propagation into parameter and
 function environments, plus nested `with` identifier reads, writes, updates, deletion, lexical shadowing,
-and `Symbol.unscopables` across closures and direct eval. A qjs
+and `Symbol.unscopables` across closures and direct eval. Script execution uses a context-persistent
+global lexical environment with TDZ, mutable `let`, immutable `const`, nondeletable bindings,
+QuickJS-compatible global var and function descriptors, atomic declaration checks, and runtime
+identity checks that distinguish direct eval from a shadowing callable. Sloppy direct and indirect
+global eval also preflight var and function declarations atomically before updating configurable
+global properties. A qjs
 command, native shortest-roundtrip ECMAScript number conversion, exact fixed,
 exponential, precision, and 2–36 radix Number formatting, and a strict
 UTF-16 JSON codec with reviver source contexts, VM-aware replacers, indentation,
@@ -186,9 +194,10 @@ through a realm-local `$DONE` callback after draining Promise and host jobs. Par
 and runtime negatives require matching phases and error types; module errors retain structured
 runtime types instead of inferring them from diagnostic text. Fixture files, unsupported proposal
 features, blocking-host cases, and Intl402 paths are skipped before execution. The runner does not
-yet provide a wall-clock timeout for indefinitely pending async tests. Non-strict harness `var`
-and function declarations persist through the global object, but top-level harness `let`, `const`,
-and `class` declarations are not yet shared with subsequent scripts or modules.
+yet provide a wall-clock timeout for indefinitely pending async tests. Harness `var` and function
+declarations persist through the global object, while top-level harness `let`, `const`, and `class`
+declarations persist through the realm's global lexical environment and are visible to subsequent
+scripts and modules.
 
 Run the module tests with:
 
