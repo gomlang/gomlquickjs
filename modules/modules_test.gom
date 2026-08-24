@@ -93,6 +93,53 @@ fn in_memory_modules_preserve_separate_source_display_names() -> unit {
 }
 
 #[test]
+fn modules_resolve_script_global_lexicals_without_leaking_module_bindings() -> unit {
+    let (context, global) = module_test_context();
+    let harness = match compiler::compile_script("let harnessLexical = 40;") {
+        Ok(value) => value,
+        Err(errors) => {
+            if !errors.is_empty() {
+                testing::fail(errors[0].message)
+            } else {
+                testing::fail("cannot compile harness Script")
+            };
+            return
+        },
+    };
+    match context.execute_script(harness) {
+        Ok(_) => (),
+        Err(error) => {
+            testing::fail(error.kind.debug());
+            return
+        },
+    };
+    let namespace = match execute_source(
+        context,
+        global,
+        "__gomlquickjs_global_lexical_module__.mjs",
+        "const moduleLocal = 2; export const result = harnessLexical + moduleLocal;",
+    ) {
+        Ok(value) => value,
+        Err(error) => {
+            testing::fail(error.path + ": " + error.message);
+            runtime::Value::Undefined
+        },
+    };
+    module_expect_number(module_read(context, namespace, "result"), 42);
+    let probe = match compiler::compile_script("typeof moduleLocal;") {
+        Ok(value) => value,
+        Err(_) => {
+            testing::fail("cannot compile Script probe");
+            return
+        },
+    };
+    match context.execute_script(probe) {
+        Ok(value) => module_expect_string(value, "undefined"),
+        Err(error) => testing::fail(error.kind.debug()),
+    }
+}
+
+#[test]
 fn named_imports_aliases_and_live_bindings_execute() -> unit {
     let directory = "__gomlquickjs_modules_named_7d31__";
     let _ = fs::remove_dir_all(directory);

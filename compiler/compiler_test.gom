@@ -41,6 +41,23 @@ fn execute_source_with_builtins(source: string) -> runtime::Value {
     execute_source_with_builtins_named(source, "<input>")
 }
 
+fn script_test_context() -> vm::Context {
+    let context = vm::Context::new(runtime::Heap::new());
+    install_dynamic_function_compiler(context);
+    match builtins::install(context) {
+        Ok(_) => (),
+        Err(value) => testing::fail(value.message),
+    };
+    context
+}
+
+fn execute_script_source(context: vm::Context, source: string) -> Result[
+    runtime::Value,
+    vm::VmError,
+] {
+    context.execute_script(expect_function(compile_script(source)))
+}
+
 fn execute_source_with_builtins_named(source: string, source_name: string) -> runtime::Value {
     let function = expect_function(compile_with_source_name(source, source_name));
     let context = vm::Context::new(runtime::Heap::new());
@@ -1081,11 +1098,83 @@ fn direct_eval_inherits_new_target_and_super_context() -> unit {
 }
 
 #[test]
-fn direct_eval_and_default_parameters_use_separate_linked_environments() -> unit {
+fn dynamic_eval_declarations_preserve_source_order_and_kind() -> unit {
+    let function = match compile_dynamic_eval(
+        "function first() {} if (true) { var second; } var repeated; function repeated() {}",
+        Vec::new(),
+    ) {
+        Ok(value) => value,
+        Err(errors) => {
+            if errors.is_empty() {
+                testing::fail("dynamic eval compilation failed")
+            } else {
+                testing::fail(errors[0].message)
+            };
+            return
+        },
+    };
+    let declarations = function.eval_declarations();
+    testing::assert_eq(declarations.len(), 4);
+    testing::assert_eq(declarations[0].name, "first");
+    testing::assert_eq(declarations[0].kind, bytecode::EvalDeclarationKind::Function);
+    testing::assert_eq(declarations[1].name, "second");
+    testing::assert_eq(declarations[1].kind, bytecode::EvalDeclarationKind::Var);
+    testing::assert_eq(declarations[2].name, "repeated");
+    testing::assert_eq(declarations[2].kind, bytecode::EvalDeclarationKind::Var);
+    testing::assert_eq(declarations[3].name, "repeated");
+    testing::assert_eq(declarations[3].kind, bytecode::EvalDeclarationKind::Function);
+    let strict = match compile_dynamic_eval(
+        "'use strict'; var local; function localFunction() {}",
+        Vec::new(),
+    ) {
+        Ok(value) => value,
+        Err(_) => {
+            testing::fail("strict dynamic eval compilation failed");
+            return
+        },
+    };
+    testing::assert(strict.eval_declarations().is_empty())
+}
+
+#[test]
+fn global_dynamic_eval_instantiation_follows_property_descriptor_rules_atomically() -> unit {
     match execute_source_with_builtins(
-        "let strictError = false; function strictFactory() { 'use strict'; return function(a = eval('var arguments')) {}; } try { strictFactory()(); } catch (error) { strictError = error instanceof SyntaxError; } let globalC = 'global'; let first = function(a = eval('var c = 1'), probe = () => c) { var c = 2; return c + ':' + probe(); }; let second = function(a = eval('var arguments = 1'), probe = () => arguments) { var arguments = 2; return arguments + ':' + probe(); }; let third = function named(a = eval('var c = 1'), b = c, probe = () => c) { return b + ':' + c + ':' + probe(); }; let fourth = function(a, b = globalC, probe = () => globalC) { eval('var globalC = 1'); return globalC + ':' + b + ':' + probe(); }; let fifth = function(a = eval('var c = 1'), probe = (value = eval('c')) => value) { return probe(); }; return strictError && first() === '2:1' && second() === '2:1' && third() === '1:1:1' && fourth() === '1:global:global' && fifth() === 1 && globalC === 'global';",
+        "let setterCalls = 0; Object.defineProperty(globalThis, 'evalFunction', {set: function(value) { setterCalls += 1; }, enumerable: false, configurable: true}); eval('function evalFunction() { return 42; }'); let functionDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'evalFunction'); let replacedAccessor = setterCalls === 0 && evalFunction() === 42 && functionDescriptor.value === evalFunction && functionDescriptor.writable && functionDescriptor.enumerable && functionDescriptor.configurable; Object.defineProperty(globalThis, 'allowedData', {value: 1, writable: true, enumerable: true, configurable: false}); eval('function allowedData() { return 7; }'); let allowedDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'allowedData'); let allowedDataResult = allowedData() === 7 && allowedDescriptor.writable && allowedDescriptor.enumerable && !allowedDescriptor.configurable; Object.defineProperty(globalThis, 'hiddenData', {value: 1, writable: true, enumerable: false, configurable: false}); Object.defineProperty(globalThis, 'readonlyData', {value: 1, writable: false, enumerable: true, configurable: false}); let hiddenRejected = false; let readonlyRejected = false; try { eval('function hiddenData() {}'); } catch (error) { hiddenRejected = error instanceof TypeError; } try { eval('function readonlyData() {}'); } catch (error) { readonlyRejected = error instanceof TypeError; } let accessorVarSets = 0; Object.defineProperty(globalThis, 'accessorVar', {set: function(value) { accessorVarSets += 1; }, configurable: false}); eval('var accessorVar;'); let varPreserved = accessorVarSets === 0 && Object.getOwnPropertyDescriptor(globalThis, 'accessorVar').set !== undefined; Object.defineProperty(globalThis, 'blockedFunction', {get: function() { return 1; }, configurable: false}); let accessorRejected = false; try { eval('function blockedFunction() {}'); } catch (error) { accessorRejected = error instanceof TypeError; } let stagedGetter = function() { return 9; }; Object.defineProperty(globalThis, 'stagedFunction', {get: stagedGetter, configurable: true}); Object.preventExtensions(globalThis); let atomicRejected = false; try { eval('function stagedFunction() {}; var missingEvalVariable;'); } catch (error) { atomicRejected = error instanceof TypeError; } let stagedDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'stagedFunction'); return replacedAccessor && allowedDataResult && hiddenRejected && readonlyRejected && varPreserved && accessorRejected && atomicRejected && stagedDescriptor.get === stagedGetter && !Object.hasOwn(globalThis, 'missingEvalVariable');",
     ) {
         runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected global eval declaration instantiation result"),
+    }
+}
+
+#[test]
+fn indirect_global_eval_uses_atomic_declaration_instantiation() -> unit {
+    match execute_source_with_builtins(
+        "let indirectEval = eval; let setterCalls = 0; Object.defineProperty(globalThis, 'indirectFunction', {set: function(value) { setterCalls += 1; }, configurable: true}); indirectEval('function indirectFunction() { return 8; }'); let replaced = setterCalls === 0 && indirectFunction() === 8 && Object.getOwnPropertyDescriptor(globalThis, 'indirectFunction').configurable; let stagedGetter = function() { return 1; }; Object.defineProperty(globalThis, 'indirectStaged', {get: stagedGetter, configurable: true}); Object.preventExtensions(globalThis); let rejected = false; try { indirectEval('function indirectStaged() {}; var indirectMissing;'); } catch (error) { rejected = error instanceof TypeError; } let descriptor = Object.getOwnPropertyDescriptor(globalThis, 'indirectStaged'); return replaced && rejected && descriptor.get === stagedGetter && !Object.hasOwn(globalThis, 'indirectMissing');",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected indirect global eval instantiation result"),
+    }
+}
+
+#[test]
+fn direct_function_eval_instantiates_bindings_without_global_property_checks() -> unit {
+    match execute_source_with_builtins(
+        "function createLocalBindings() { eval('var localValue = 40; function localFunction() { return localValue + 2; }'); return localFunction(); } Object.preventExtensions(globalThis); return createLocalBindings() === 42 && !Object.hasOwn(globalThis, 'localValue') && !Object.hasOwn(globalThis, 'localFunction');",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected function eval environment result"),
+    }
+}
+
+#[test]
+fn direct_eval_and_default_parameters_use_separate_linked_environments() -> unit {
+    match execute_source_with_builtins(
+        "let observe = function(callback) { try { return callback(); } catch (error) { return '!' + error.name; } }; let strictError = false; function strictFactory() { 'use strict'; return function(a = eval('var arguments')) {}; } try { strictFactory()(); } catch (error) { strictError = error instanceof SyntaxError; } let globalC = 'global'; let first = function(a = eval('var c = 1'), probe = () => c) { var c = 2; return c + ':' + probe(); }; let second = function(a = eval('var arguments = 1'), probe = () => arguments) { var arguments = 2; return arguments + ':' + probe(); }; let third = function named(a = eval('var c = 1'), b = c, probe = () => c) { return b + ':' + c + ':' + probe(); }; let fourth = function(a, b = globalC, probe = () => globalC) { eval('var globalC = 1'); return globalC + ':' + b + ':' + probe(); }; let fifth = function(a = eval('var c = 1'), probe = (value = eval('c')) => value) { return probe(); }; return strictError + '|' + observe(() => first()) + '|' + observe(() => second()) + '|' + observe(() => third()) + '|' + observe(() => fourth()) + '|' + observe(() => fifth()) + '|' + globalC;",
+    ) {
+        runtime::Value::String(value) => testing::assert_eq(
+            value.to_host_string().unwrap_or("invalid"),
+            "true|2:1|2:1|1:1:1|1:global:global|1|global",
+        ),
         _ => testing::fail("expected linked eval and parameter environments"),
     }
 }
@@ -1776,7 +1865,7 @@ fn creates_fresh_private_brands_and_captures_them_lexically() -> unit {
 #[test]
 fn dispatches_string_pattern_methods_through_regexp_state() -> unit {
     match execute_source_with_builtins(
-        "let capture = 'zab'.match(new RegExp('(a)(b)?')); let global = new RegExp('(a)(b)?', 'g'); let matches = 'abac'.match(global); let search = 'xxab'.search(new RegExp('a.')); let substituted = 'abac'.replace(new RegExp('(a)(b)?', 'g'), \"[$&:$1:$2:$`:$']\"); let called = 'abac'.replace(new RegExp('(a)(b)?', 'g'), (whole, a, b, offset) => whole + a + (b === undefined ? '_' : b) + offset); let split = 'a1b22c'.split(new RegExp('(\\\\d+)', 'g')); let empty = '😀'.match(new RegExp('(?:)', 'gu')); let sticky = new RegExp('a', 'y'); sticky.lastIndex = 1; let stickyMatch = 'ba'.match(sticky); let rejected = false; try { 'aa'.replaceAll(new RegExp('a'), 'b'); } catch (error) { rejected = error instanceof TypeError; } return capture[0] === 'ab' && capture[1] === 'a' && capture[2] === 'b' && capture.index === 1 && matches.join('|') === 'ab|a' && global.lastIndex === 0 && search === 2 && substituted === '[ab:a:b::ac][a:a::ab:c]c' && called === 'abab0aa_2c' && split.join('|') === 'a|1|b|22|c' && empty.length === 2 && stickyMatch[0] === 'a' && sticky.lastIndex === 2 && 'a2'.match('\\\\d')[0] === '2' && rejected;",
+        "let capture = 'zab'.match(new RegExp('(a)(b)?')); let global = new RegExp('(a)(b)?', 'g'); let matches = 'abac'.match(global); let search = 'xxab'.search(new RegExp('a.')); let substituted = 'abac'.replace(new RegExp('(a)(b)?', 'g'), \"[$&:$1:$2:$`:$']\"); let called = 'abac'.replace(new RegExp('(a)(b)?', 'g'), (whole, a, b, offset) => whole + a + (b === undefined ? '_' : b) + offset); let numericRegexp = 'ab'.replace(new RegExp('(a)(b)'), '$0,$00,$01,$09,$10'); let numericString = 'ab'.replace('a', '$0,$00,$01,$09,$10'); let split = 'a1b22c'.split(new RegExp('(\\\\d+)', 'g')); let empty = '😀'.match(new RegExp('(?:)', 'gu')); let sticky = new RegExp('a', 'y'); sticky.lastIndex = 1; let stickyMatch = 'ba'.match(sticky); let rejected = false; try { 'aa'.replaceAll(new RegExp('a'), 'b'); } catch (error) { rejected = error instanceof TypeError; } return capture[0] === 'ab' && capture[1] === 'a' && capture[2] === 'b' && capture.index === 1 && matches.join('|') === 'ab|a' && global.lastIndex === 0 && search === 2 && substituted === '[ab:a:b::ac][a:a::ab:c]c' && called === 'abab0aa_2c' && numericRegexp === '$0,$00,a,$09,a0' && numericString === '$0,$00,$01,$09,$10b' && split.join('|') === 'a|1|b|22|c' && empty.length === 2 && stickyMatch[0] === 'a' && sticky.lastIndex === 2 && 'a2'.match('\\\\d')[0] === '2' && rejected;",
     ) {
         runtime::Value::Bool(value) => testing::assert(value),
         _ => testing::fail("expected String RegExp dispatch result"),
@@ -3630,7 +3719,7 @@ fn quickjs_os_chdir_coordinates_relative_io_processes_and_signals() -> unit {
 #[test]
 fn quickjs_std_load_script_executes_in_the_global_realm() -> unit {
     match execute_source_with_builtins(
-        "let path = '/tmp/gomlquickjs-load-script-' + Date.now() + '.js'; let file = std.open(path, 'w'); file.puts('globalThis.__loadedByStd = 42;'); file.close(); std.loadScript(path); os.remove(path); return globalThis.__loadedByStd === 42;",
+        "let path = '/tmp/gomlquickjs-load-script-' + Date.now() + '.js'; let file = std.open(path, 'w'); file.puts('let __loadedByStd = 42;'); file.close(); std.loadScript(path); os.remove(path); return __loadedByStd === 42 && !Object.prototype.hasOwnProperty.call(globalThis, '__loadedByStd');",
     ) {
         runtime::Value::Bool(value) => testing::assert(value),
         _ => testing::fail("expected std.loadScript result"),
@@ -3669,5 +3758,290 @@ fn import_meta_requires_module_compilation() -> unit {
     match compile_module("export const value = await Promise.resolve(42);") {
         Ok(value) => testing::assert(value.function.asynchronous()),
         Err(_) => testing::fail("expected top-level await module compilation"),
+    }
+}
+
+#[test]
+fn script_global_lexicals_persist_with_tdz_const_closures_and_context_isolation() -> unit {
+    let context = script_test_context();
+    match execute_script_source(
+        context,
+        "let hidden = 40; const fixed = 2; function read() { return hidden + fixed; } class Box { value() { return hidden; } }",
+    ) {
+        Ok(_) => (),
+        Err(value) => testing::fail(value.kind.debug()),
+    };
+    expect_int(execute_script_source(context, "read();").unwrap_or(runtime::Value::Undefined), 42);
+    expect_int(
+        execute_script_source(context, "hidden = 41; read();").unwrap_or(runtime::Value::Undefined),
+        43,
+    );
+    expect_int(
+        execute_script_source(context, "new Box().value();").unwrap_or(runtime::Value::Undefined),
+        41,
+    );
+    match context.global_object() {
+        Some(global) => match context.heap().get(global) {
+            Some(value) => testing::assert(
+                value.own_property(runtime::string_property_key("hidden")).is_none(),
+            ),
+            None => testing::fail("missing global object"),
+        },
+        None => testing::fail("missing global object"),
+    };
+    match execute_script_source(context, "fixed = 3;") {
+        Err(vm::VmError { kind: vm::VmErrorKind::TypeError(_), .. }) => (),
+        _ => testing::fail("expected const assignment TypeError"),
+    };
+    match execute_script_source(context, "delete hidden;") {
+        Ok(runtime::Value::Bool(value)) => testing::assert(!value),
+        _ => testing::fail("expected nondeletable lexical binding"),
+    };
+    match execute_script_source(context, "before; let before = 1;") {
+        Err(vm::VmError { kind: vm::VmErrorKind::ReferenceError(_), .. }) => (),
+        _ => testing::fail("expected global lexical TDZ ReferenceError"),
+    };
+    match execute_script_source(context, "let pending = missingInitializer();") {
+        Err(vm::VmError { kind: vm::VmErrorKind::ReferenceError(_), .. }) => (),
+        _ => testing::fail("expected failing lexical initializer"),
+    };
+    match execute_script_source(context, "typeof pending;") {
+        Err(vm::VmError { kind: vm::VmErrorKind::ReferenceError(_), .. }) => (),
+        _ => testing::fail("expected persistent uninitialized lexical binding"),
+    };
+    match execute_script_source(context, "var earlier; let hidden;") {
+        Err(vm::VmError { kind: vm::VmErrorKind::SyntaxError(_), .. }) => (),
+        _ => testing::fail("expected cross-Script declaration conflict"),
+    };
+    match context.global_object() {
+        Some(global) => match context.heap().get(global) {
+            Some(value) => testing::assert(
+                value.own_property(runtime::string_property_key("earlier")).is_none(),
+            ),
+            None => testing::fail("missing global object"),
+        },
+        None => testing::fail("missing global object"),
+    };
+    match execute_script_source(
+        context,
+        "let rooted = {value: 9}; function rootedValue() { return rooted.value; }",
+    ) {
+        Ok(_) => (),
+        Err(value) => testing::fail(value.kind.debug()),
+    };
+    let _ = context.collect_garbage();
+    expect_int(
+        execute_script_source(context, "rootedValue();").unwrap_or(runtime::Value::Undefined),
+        9,
+    );
+    let isolated = script_test_context();
+    expect_string(
+        execute_script_source(isolated, "typeof hidden;").unwrap_or(runtime::Value::Undefined),
+        "undefined",
+    )
+}
+
+#[test]
+fn eval_script_persists_lexicals_while_indirect_and_shadowed_eval_do_not() -> unit {
+    let context = script_test_context();
+    match execute_script_source(context, "std.evalScript('let persisted = 40; persisted + 2');") {
+        Ok(value) => expect_int(value, 42),
+        Err(value) => testing::fail(value.kind.debug()),
+    };
+    expect_int(
+        execute_script_source(context, "std.evalScript('persisted');").unwrap_or(
+            runtime::Value::Undefined,
+        ),
+        40,
+    );
+    expect_int(
+        execute_script_source(context, "std.evalScript({toString() { return '6 * 7'; }});").unwrap_or(
+            runtime::Value::Undefined,
+        ),
+        42,
+    );
+    expect_string(
+        execute_script_source(
+            context,
+            "(0, eval)('let transient = 1; transient'); (0, eval)('typeof transient');",
+        ).unwrap_or(runtime::Value::Undefined),
+        "undefined",
+    );
+    match execute_script_source(context, "let eval = function() { return 7; };") {
+        Ok(_) => (),
+        Err(value) => testing::fail(value.kind.debug()),
+    };
+    expect_int(
+        execute_script_source(context, "eval('var leaked = 1');").unwrap_or(
+            runtime::Value::Undefined,
+        ),
+        7,
+    );
+    expect_string(
+        execute_script_source(context, "typeof leaked;").unwrap_or(runtime::Value::Undefined),
+        "undefined",
+    );
+    let skipped = script_test_context();
+    expect_string(
+        execute_script_source(skipped, "if (false) eval('var ghost'); typeof ghost;").unwrap_or(
+            runtime::Value::Undefined,
+        ),
+        "undefined",
+    );
+    match skipped.global_object() {
+        Some(global) => match skipped.heap().get(global) {
+            Some(value) => testing::assert(
+                value.own_property(runtime::string_property_key("ghost")).is_none(),
+            ),
+            None => testing::fail("missing global object"),
+        },
+        None => testing::fail("missing global object"),
+    };
+    let replaced = script_test_context();
+    expect_int(
+        execute_script_source(
+            replaced,
+            "globalThis.eval = function() { return 8; }; eval('var replacedLeak = 1');",
+        ).unwrap_or(runtime::Value::Undefined),
+        8,
+    );
+    expect_string(
+        execute_script_source(replaced, "typeof replacedLeak;").unwrap_or(runtime::Value::Undefined),
+        "undefined",
+    );
+    let with_shadow = script_test_context();
+    expect_int(
+        execute_script_source(
+            with_shadow,
+            "let withResult = 0; with ({eval: function() { return 9; }}) { withResult = eval('var withLeak = 1'); } withResult;",
+        ).unwrap_or(runtime::Value::Undefined),
+        9,
+    );
+    expect_string(
+        execute_script_source(with_shadow, "typeof withLeak;").unwrap_or(runtime::Value::Undefined),
+        "undefined",
+    );
+    let nested_shadow = script_test_context();
+    expect_int(
+        execute_script_source(
+            nested_shadow,
+            "let eval = function() { return 0; }; function write() { eval('var phantom'); phantom = 1; return phantom; } write();",
+        ).unwrap_or(runtime::Value::Undefined),
+        1,
+    );
+    expect_int(
+        execute_script_source(nested_shadow, "globalThis.phantom;").unwrap_or(
+            runtime::Value::Undefined,
+        ),
+        1,
+    )
+}
+
+#[test]
+fn script_var_and_function_descriptors_follow_global_instantiation_rules() -> unit {
+    let context = script_test_context();
+    match execute_script_source(context, "var createdVar; function createdFunction() {}") {
+        Ok(_) => (),
+        Err(value) => testing::fail(value.kind.debug()),
+    };
+    let global = match context.global_object() {
+        Some(value) => value,
+        None => {
+            testing::fail("missing global object");
+            return
+        },
+    };
+    match context.heap().get(global) {
+        Some(value) => for name in Vec::from_array(["createdVar", "createdFunction"]) {
+            match value.own_property(runtime::string_property_key(name)) {
+                Some(descriptor) => {
+                    testing::assert(runtime::descriptor_is_data(descriptor));
+                    testing::assert(runtime::descriptor_writable(descriptor));
+                    testing::assert(runtime::descriptor_enumerable(descriptor));
+                    testing::assert(!runtime::descriptor_configurable(descriptor))
+                },
+                None => testing::fail("missing Script global property"),
+            }
+        },
+        None => testing::fail("missing global object"),
+    };
+    match execute_script_source(context, "delete createdVar;") {
+        Ok(runtime::Value::Bool(value)) => testing::assert(!value),
+        _ => testing::fail("expected nondeletable Script var"),
+    };
+    match execute_script_source(
+        context,
+        "Object.defineProperty(globalThis, 'reusable', {value: 1, writable: true, enumerable: false, configurable: true});",
+    ) {
+        Ok(_) => (),
+        Err(value) => testing::fail(value.kind.debug()),
+    };
+    match execute_script_source(context, "var reusable;") {
+        Ok(_) => (),
+        Err(value) => testing::fail(value.kind.debug()),
+    };
+    match context.heap().get(global).and_then(
+        |value| value.own_property(runtime::string_property_key("reusable")),
+    ) {
+        Some(descriptor) => {
+            testing::assert(runtime::descriptor_configurable(descriptor));
+            testing::assert(!runtime::descriptor_enumerable(descriptor));
+            match runtime::descriptor_value(descriptor) {
+                Some(value) => expect_int(value, 1),
+                None => testing::fail("expected reusable data property"),
+            }
+        },
+        None => testing::fail("missing reusable property"),
+    };
+    match execute_script_source(context, "let reusable = 2; reusable;") {
+        Ok(value) => expect_int(value, 2),
+        Err(value) => testing::fail(value.kind.debug()),
+    };
+    expect_int(
+        execute_script_source(context, "globalThis.reusable;").unwrap_or(runtime::Value::Undefined),
+        1,
+    )
+}
+
+#[test]
+fn script_instantiation_checks_conflicts_in_source_declaration_order() -> unit {
+    let function_first = script_test_context();
+    match execute_script_source(function_first, "let existing = 1;") {
+        Ok(_) => (),
+        Err(value) => testing::fail(value.kind.debug()),
+    };
+    match execute_script_source(function_first, "Object.preventExtensions(globalThis);") {
+        Ok(_) => (),
+        Err(value) => testing::fail(value.kind.debug()),
+    };
+    match execute_script_source(function_first, "function missing() {} let existing;") {
+        Err(vm::VmError { kind: vm::VmErrorKind::TypeError(_), .. }) => (),
+        _ => testing::fail("expected earlier function declaration TypeError"),
+    };
+    let lexical_first = script_test_context();
+    match execute_script_source(lexical_first, "let existing = 1;") {
+        Ok(_) => (),
+        Err(value) => testing::fail(value.kind.debug()),
+    };
+    match execute_script_source(lexical_first, "Object.preventExtensions(globalThis);") {
+        Ok(_) => (),
+        Err(value) => testing::fail(value.kind.debug()),
+    };
+    match execute_script_source(lexical_first, "let existing; function missing() {}") {
+        Err(vm::VmError { kind: vm::VmErrorKind::SyntaxError(_), .. }) => (),
+        _ => testing::fail("expected earlier lexical declaration SyntaxError"),
+    };
+    let nested_var_first = script_test_context();
+    match execute_script_source(nested_var_first, "let existing = 1;") {
+        Ok(_) => (),
+        Err(value) => testing::fail(value.kind.debug()),
+    };
+    match execute_script_source(nested_var_first, "Object.preventExtensions(globalThis);") {
+        Ok(_) => (),
+        Err(value) => testing::fail(value.kind.debug()),
+    };
+    match execute_script_source(nested_var_first, "if (true) { var nestedMissing; } let existing;") {
+        Err(vm::VmError { kind: vm::VmErrorKind::TypeError(_), .. }) => (),
+        _ => testing::fail("expected nested var source-order TypeError"),
     }
 }

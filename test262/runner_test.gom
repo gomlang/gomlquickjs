@@ -43,6 +43,16 @@ fn throwing_harness(name: string) -> Result[string, string] {
     }
 }
 
+fn lexical_harness(name: string) -> Result[string, string] {
+    if name == "assert.js" {
+        Result::Ok("let harness_lexical = 40; const harness_constant = 2;")
+    } else if name == "sta.js" {
+        Result::Ok("")
+    } else {
+        Result::Err("missing")
+    }
+}
+
 fn case_from(source: string) -> TestCase {
     match parse(source) {
         Ok(value) => value,
@@ -95,6 +105,20 @@ fn executes_harness_separately_and_never_uses_it_as_a_negative_result() -> unit 
     );
     testing::assert_eq(negative[0].status, RunStatus::Failed);
     testing::assert(negative[0].message.contains("harness runtime"))
+}
+
+#[test]
+fn exposes_harness_global_lexicals_to_a_separately_compiled_test_script() -> unit {
+    let results = run(
+        case_from(
+            "/*---\nflags: [noStrict]\n---*/\nif (harness_lexical + harness_constant !== 42) throw new Error('missing lexical');",
+        ),
+        lexical_harness,
+    );
+    if results[0].status == RunStatus::Failed {
+        testing::fail(results[0].message)
+    } else {};
+    testing::assert_eq(results[0].status, RunStatus::Passed)
 }
 
 #[test]
@@ -291,7 +315,7 @@ fn run_file_executes_module_graphs_and_resolution_negatives() -> unit {
     let _ = fs::remove_dir_all(directory);
     let _ = fs::create_dir_all(harness);
     runner_write(harness + "/sta.js", "");
-    runner_write(harness + "/assert.js", "var harnessVisible = 42;");
+    runner_write(harness + "/assert.js", "let harnessVisible = 42;");
     runner_write(directory + "/dependency.js", "export default 42;");
     runner_write(
         directory + "/positive.js",

@@ -1195,3 +1195,388 @@ fn inherited_accessor_getter_receives_original_receiver() -> unit {
         Err(value) => testing::fail(value.kind.debug()),
     }
 }
+
+fn script_function(
+    constants: Vec[bytecode::Constant],
+    code: Vec[bytecode::Instruction],
+    bindings: Vec[bytecode::ScriptBinding],
+) -> bytecode::Function {
+    let function = bytecode::Function::new(constants, code, 0);
+    function.set_script_bindings(bindings);
+    function
+}
+
+fn script_binding(name: string, kind: bytecode::ScriptBindingKind) -> bytecode::ScriptBinding {
+    bytecode::ScriptBinding { name, kind }
+}
+
+fn eval_declaration(name: string, kind: bytecode::EvalDeclarationKind) -> bytecode::EvalDeclaration {
+    bytecode::EvalDeclaration { name, kind }
+}
+
+fn eval_declaration_test_compiler(source: string, bindings: Vec[bytecode::EvalBinding]) -> Result[
+    bytecode::Function,
+    bytecode::SourceError,
+] {
+    let _ = bindings;
+    let function = if source == "function" {
+        let value = bytecode::Function::new(
+            Vec::from_array([bytecode::Constant::String(test_js_string("declared"))]),
+            Vec::from_array(
+                [
+                    bytecode::Instruction::PushI32(42),
+                    bytecode::Instruction::SetEval(0),
+                    bytecode::Instruction::Drop,
+                    bytecode::Instruction::ReturnUndef,
+                ],
+            ),
+            0,
+        );
+        value.set_eval_declarations(
+            Vec::from_array([eval_declaration("declared", bytecode::EvalDeclarationKind::Function)]),
+        );
+        value
+    } else if source == "blocked" {
+        let value = bytecode::Function::new(
+            Vec::new(),
+            Vec::from_array([bytecode::Instruction::ReturnUndef]),
+            0,
+        );
+        value.set_eval_declarations(
+            Vec::from_array([eval_declaration("blocked", bytecode::EvalDeclarationKind::Function)]),
+        );
+        value
+    } else {
+        let value = bytecode::Function::new(
+            Vec::new(),
+            Vec::from_array([bytecode::Instruction::ReturnUndef]),
+            0,
+        );
+        value.set_eval_declarations(
+            Vec::from_array(
+                [
+                    eval_declaration("staged", bytecode::EvalDeclarationKind::Function),
+                    eval_declaration("missing", bytecode::EvalDeclarationKind::Var),
+                ],
+            ),
+        );
+        value
+    };
+    Result::Ok(function)
+}
+
+fn eval_declaration_caller(source: string) -> bytecode::Function {
+    let function = bytecode::Function::new(
+        Vec::from_array([bytecode::Constant::String(test_js_string(source))]),
+        Vec::from_array(
+            [
+                bytecode::Instruction::GetLoc(0),
+                bytecode::Instruction::PushConst(0),
+                bytecode::Instruction::Eval(1, 0),
+                bytecode::Instruction::Return,
+            ],
+        ),
+        1,
+    );
+    function.set_eval_sites(Vec::from_array([Vec::new()]));
+    function
+}
+
+fn execute_eval_declaration_source(context: Context, intrinsic: runtime::Value, source: string) -> Result[
+    runtime::Value,
+    VmError,
+] {
+    context.execute_with_locals(eval_declaration_caller(source), Vec::from_array([intrinsic]))
+}
+
+#[test]
+fn script_global_lexical_bindings_are_persistent_nondeletable_and_gc_rooted() -> unit {
+    let heap = runtime::Heap::new();
+    let global = expect_object(runtime::new_ordinary_object(heap, Option::None));
+    let context = Context::new(heap);
+    match context.set_global_object(global) {
+        Ok(()) => (),
+        Err(value) => testing::fail(value.kind.debug()),
+    };
+    let declaration = script_function(
+        Vec::from_array([bytecode::Constant::String(test_js_string("kept"))]),
+        Vec::from_array(
+            [
+                bytecode::Instruction::NewObject,
+                bytecode::Instruction::InitGlobalLexical(0),
+                bytecode::Instruction::ReturnUndef,
+            ],
+        ),
+        Vec::from_array([script_binding("kept", bytecode::ScriptBindingKind::Let)]),
+    );
+    match context.execute_script(declaration) {
+        Ok(_) => (),
+        Err(value) => testing::fail(value.kind.debug()),
+    };
+    let _ = context.collect_garbage();
+    let reader = bytecode::Function::new(
+        Vec::from_array([bytecode::Constant::String(test_js_string("kept"))]),
+        Vec::from_array([bytecode::Instruction::GetEval(0), bytecode::Instruction::Return]),
+        0,
+    );
+    match context.execute(reader) {
+        Ok(runtime::Value::Object(value)) => testing::assert(heap.contains(value)),
+        _ => testing::fail("expected rooted global lexical object"),
+    };
+    let deletion = bytecode::Function::new(
+        Vec::from_array([bytecode::Constant::String(test_js_string("kept"))]),
+        Vec::from_array([bytecode::Instruction::DeleteEval(0), bytecode::Instruction::Return]),
+        0,
+    );
+    match context.execute(deletion) {
+        Ok(runtime::Value::Bool(value)) => testing::assert(!value),
+        _ => testing::fail("expected nondeletable global lexical binding"),
+    };
+    let constant = script_function(
+        Vec::from_array([bytecode::Constant::String(test_js_string("fixed"))]),
+        Vec::from_array(
+            [
+                bytecode::Instruction::PushI32(1),
+                bytecode::Instruction::InitGlobalLexical(0),
+                bytecode::Instruction::ReturnUndef,
+            ],
+        ),
+        Vec::from_array([script_binding("fixed", bytecode::ScriptBindingKind::Const)]),
+    );
+    match context.execute_script(constant) {
+        Ok(_) => (),
+        Err(value) => testing::fail(value.kind.debug()),
+    };
+    let write = bytecode::Function::new(
+        Vec::from_array([bytecode::Constant::String(test_js_string("fixed"))]),
+        Vec::from_array(
+            [
+                bytecode::Instruction::PushI32(2),
+                bytecode::Instruction::SetEval(0),
+                bytecode::Instruction::Return,
+            ],
+        ),
+        0,
+    );
+    match context.execute(write) {
+        Err(VmError { kind: VmErrorKind::TypeError(_), .. }) => (),
+        _ => testing::fail("expected immutable global lexical binding"),
+    }
+}
+
+#[test]
+fn script_function_instantiation_replaces_configurable_accessors_without_calling_setters() -> unit {
+    let heap = runtime::Heap::new();
+    let global = expect_object(runtime::new_ordinary_object(heap, Option::None));
+    let context = Context::new(heap);
+    match context.set_global_object(global) {
+        Ok(()) => (),
+        Err(value) => testing::fail(value.kind.debug()),
+    };
+    let throwing_setter = bytecode::Function::new(
+        Vec::new(),
+        Vec::from_array([bytecode::Instruction::ThrowTypeError]),
+        0,
+    );
+    let setter_factory = bytecode::Function::new(
+        Vec::from_array([bytecode::Constant::Function(Ref::new(throwing_setter))]),
+        Vec::from_array([bytecode::Instruction::PushConst(0), bytecode::Instruction::Return]),
+        0,
+    );
+    let setter = match context.execute(setter_factory) {
+        Ok(value) => value,
+        Err(value) => {
+            testing::fail(value.kind.debug());
+            runtime::Value::Undefined
+        },
+    };
+    testing::assert(
+        runtime::define_own_property(
+            heap,
+            global,
+            runtime::string_property_key("declared"),
+            runtime::accessor_descriptor(Option::None, Option::Some(setter), true, true),
+        ),
+    );
+    let declaration = script_function(
+        Vec::from_array([bytecode::Constant::String(test_js_string("declared"))]),
+        Vec::from_array(
+            [
+                bytecode::Instruction::PushI32(42),
+                bytecode::Instruction::SetEval(0),
+                bytecode::Instruction::Drop,
+                bytecode::Instruction::ReturnUndef,
+            ],
+        ),
+        Vec::from_array([script_binding("declared", bytecode::ScriptBindingKind::Function)]),
+    );
+    match context.execute_script(declaration) {
+        Ok(_) => (),
+        Err(value) => testing::fail(value.kind.debug()),
+    };
+    match heap.get(global).and_then(
+        |value| value.own_property(runtime::string_property_key("declared")),
+    ) {
+        Some(descriptor) => {
+            testing::assert(runtime::descriptor_is_data(descriptor));
+            testing::assert(runtime::descriptor_writable(descriptor));
+            testing::assert(runtime::descriptor_enumerable(descriptor));
+            testing::assert(!runtime::descriptor_configurable(descriptor));
+            match runtime::descriptor_value(descriptor) {
+                Some(value) => testing::assert_eq(expect_number(value), 42.0),
+                None => testing::fail("expected function data value"),
+            }
+        },
+        None => testing::fail("expected global function property"),
+    }
+}
+
+#[test]
+fn script_instantiation_rejects_nonconfigurable_accessors_and_is_atomic_on_nonextensible_globals() -> unit {
+    let heap = runtime::Heap::new();
+    let global = expect_object(runtime::new_ordinary_object(heap, Option::None));
+    testing::assert(
+        runtime::define_own_property(
+            heap,
+            global,
+            runtime::string_property_key("blocked"),
+            runtime::accessor_descriptor(Option::None, Option::None, true, false),
+        ),
+    );
+    testing::assert(
+        runtime::define_own_property(
+            heap,
+            global,
+            runtime::string_property_key("staged"),
+            runtime::accessor_descriptor(Option::None, Option::None, true, true),
+        ),
+    );
+    let context = Context::new(heap);
+    match context.set_global_object(global) {
+        Ok(()) => (),
+        Err(value) => testing::fail(value.kind.debug()),
+    };
+    let blocked = script_function(
+        Vec::new(),
+        Vec::from_array([bytecode::Instruction::ReturnUndef]),
+        Vec::from_array([script_binding("blocked", bytecode::ScriptBindingKind::Function)]),
+    );
+    match context.execute_script(blocked) {
+        Err(VmError { kind: VmErrorKind::TypeError(_), .. }) => (),
+        _ => testing::fail("expected nonconfigurable accessor rejection"),
+    };
+    match heap.get(global) {
+        Some(value) => value.prevent_extensions(),
+        None => testing::fail("missing global object"),
+    };
+    let atomic = script_function(
+        Vec::new(),
+        Vec::from_array([bytecode::Instruction::ReturnUndef]),
+        Vec::from_array(
+            [
+                script_binding("staged", bytecode::ScriptBindingKind::Function),
+                script_binding("missing", bytecode::ScriptBindingKind::Var),
+            ],
+        ),
+    );
+    match context.execute_script(atomic) {
+        Err(VmError { kind: VmErrorKind::TypeError(_), .. }) => (),
+        _ => testing::fail("expected nonextensible global rejection"),
+    };
+    match heap.get(global) {
+        Some(value) => {
+            match value.own_property(runtime::string_property_key("staged")) {
+                Some(descriptor) => {
+                    testing::assert(!runtime::descriptor_is_data(descriptor));
+                    testing::assert(runtime::descriptor_configurable(descriptor))
+                },
+                None => testing::fail("expected original staged property"),
+            };
+            testing::assert(value.own_property(runtime::string_property_key("missing")).is_none())
+        },
+        None => testing::fail("missing global object"),
+    }
+}
+
+#[test]
+fn dynamic_eval_instantiation_replaces_accessors_and_preflights_atomically() -> unit {
+    let heap = runtime::Heap::new();
+    let global = expect_object(runtime::new_ordinary_object(heap, Option::None));
+    let context = Context::new(heap);
+    match context.set_global_object(global) {
+        Ok(()) => (),
+        Err(value) => testing::fail(value.kind.debug()),
+    };
+    context.set_dynamic_eval_compiler(eval_declaration_test_compiler);
+    let intrinsic = expect_native(context.new_native_function(native_sum));
+    context.set_intrinsic_eval(intrinsic);
+    let throwing_setter = expect_native(context.new_native_function(native_failure));
+    testing::assert(
+        runtime::define_own_property(
+            heap,
+            global,
+            runtime::string_property_key("declared"),
+            runtime::accessor_descriptor(Option::None, Option::Some(throwing_setter), false, true),
+        ),
+    );
+    match execute_eval_declaration_source(context, intrinsic, "function") {
+        Ok(_) => (),
+        Err(value) => testing::fail(value.kind.debug()),
+    };
+    match heap.get(global).and_then(
+        |value| value.own_property(runtime::string_property_key("declared")),
+    ) {
+        Some(descriptor) => {
+            testing::assert(runtime::descriptor_is_data(descriptor));
+            testing::assert(runtime::descriptor_writable(descriptor));
+            testing::assert(runtime::descriptor_enumerable(descriptor));
+            testing::assert(runtime::descriptor_configurable(descriptor));
+            match runtime::descriptor_value(descriptor) {
+                Some(value) => testing::assert_eq(expect_number(value), 42.0),
+                None => testing::fail("expected eval function data value"),
+            }
+        },
+        None => testing::fail("expected eval function property"),
+    };
+    testing::assert(
+        runtime::define_own_property(
+            heap,
+            global,
+            runtime::string_property_key("blocked"),
+            runtime::accessor_descriptor(Option::None, Option::None, true, false),
+        ),
+    );
+    match execute_eval_declaration_source(context, intrinsic, "blocked") {
+        Err(VmError { kind: VmErrorKind::TypeError(_), .. }) => (),
+        _ => testing::fail("expected eval function accessor rejection"),
+    };
+    testing::assert(
+        runtime::define_own_property(
+            heap,
+            global,
+            runtime::string_property_key("staged"),
+            runtime::accessor_descriptor(Option::None, Option::None, true, true),
+        ),
+    );
+    match heap.get(global) {
+        Some(value) => value.prevent_extensions(),
+        None => testing::fail("missing global object"),
+    };
+    match execute_eval_declaration_source(context, intrinsic, "atomic") {
+        Err(VmError { kind: VmErrorKind::TypeError(_), .. }) => (),
+        _ => testing::fail("expected atomic eval declaration rejection"),
+    };
+    match heap.get(global) {
+        Some(value) => {
+            match value.own_property(runtime::string_property_key("staged")) {
+                Some(descriptor) => {
+                    testing::assert(!runtime::descriptor_is_data(descriptor));
+                    testing::assert(runtime::descriptor_configurable(descriptor))
+                },
+                None => testing::fail("expected original eval property"),
+            };
+            testing::assert(value.own_property(runtime::string_property_key("missing")).is_none())
+        },
+        None => testing::fail("missing global object"),
+    }
+}

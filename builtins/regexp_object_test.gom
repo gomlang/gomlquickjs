@@ -839,16 +839,37 @@ fn regexp_test_dispatches_dynamic_exec_and_checks_its_result() -> unit {
     let context = vm::Context::new(runtime::Heap::new());
     let constructor = regexp_expect_install(install_regexp(context));
     let instance = regexp_new(context, constructor, "a", "");
-    let marker = runtime::Value::Object(regexp_allocate_object(context));
+    let marker_object = regexp_allocate_object(context);
+    let marker = runtime::Value::Object(marker_object);
+    let trace = Ref::new("");
+    regexp_define_data(
+        context,
+        marker_object,
+        "toString",
+        regexp_vm_function(
+            context,
+            |this_value, arguments, depth| {
+                let _ = this_value;
+                let _ = arguments;
+                let _ = depth;
+                trace.set(trace.get() + "input,");
+                let _ = context.collect_garbage();
+                Result::Ok(runtime::Value::String(js_string("converted")))
+            },
+        ),
+    );
     let observed = Ref::new(false);
     let argument_count = Ref::new(0);
     let custom_result = runtime::Value::Object(regexp_allocate_object(context));
+    let custom_result_root = Ref::new(custom_result);
+    context.add_external_root(custom_result_root);
     let custom_exec = regexp_vm_function(
         context,
         |this_value, arguments, depth| {
             let _ = depth;
             testing::assert(runtime::same_value(this_value, runtime::Value::Object(instance)));
             argument_count.set(arguments.len());
+            trace.set(trace.get() + "exec,");
             observed.set(runtime::same_value(argument(arguments, 0), marker));
             Result::Ok(custom_result)
         },
@@ -869,6 +890,12 @@ fn regexp_test_dispatches_dynamic_exec_and_checks_its_result() -> unit {
     );
     testing::assert(observed.get());
     testing::assert_eq(argument_count.get(), 1);
+    testing::assert(trace.get() == "exec,");
+    regexp_assert_type_error(
+        regexp_invoke_method(context, runtime::Value::Int(1), test, Vec::from_array([marker])),
+    );
+    testing::assert(trace.get() == "exec,");
+    let _ = context.remove_external_root(custom_result_root);
     let invalid_exec = regexp_vm_function(
         context,
         |this_value, arguments, depth| {

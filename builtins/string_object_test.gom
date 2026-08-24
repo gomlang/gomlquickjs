@@ -87,6 +87,62 @@ fn string_test_object(value: runtime::Value, fallback: runtime::ObjectId) -> run
     }
 }
 
+fn string_test_symbol(context: vm::Context, kind: vm::WellKnownSymbolKind) -> runtime::Symbol {
+    match context.well_known_symbol(kind) {
+        Some(value) => value,
+        None => {
+            testing::fail("missing well-known symbol");
+            runtime::Symbol::new(9900, Option::None)
+        },
+    }
+}
+
+fn string_test_symbol_method(
+    context: vm::Context,
+    prototype: runtime::ObjectId,
+    kind: vm::WellKnownSymbolKind,
+) -> runtime::Value {
+    expect_value(
+        context.read_property_at_depth(
+            runtime::Value::Object(prototype),
+            runtime::Value::Symbol(string_test_symbol(context, kind)),
+            0,
+        ),
+    )
+}
+
+fn string_test_regexp_constructor(context: vm::Context, realm: Realm) -> runtime::Value {
+    property(context.heap(), realm.global_object(), "RegExp")
+}
+
+fn string_test_regexp_prototype(context: vm::Context, constructor: runtime::Value) -> runtime::ObjectId {
+    regexp_expect_object(property(context.heap(), regexp_expect_object(constructor), "prototype"))
+}
+
+fn string_test_define_accessor(
+    context: vm::Context,
+    object: runtime::ObjectId,
+    name: string,
+    getter: runtime::Value,
+    setter: runtime::Value,
+) -> unit {
+    testing::assert(
+        runtime::define_own_property(
+            context.heap(),
+            object,
+            runtime::string_property_key(name),
+            runtime::accessor_descriptor(Option::Some(getter), Option::Some(setter), true, true),
+        ),
+    )
+}
+
+fn string_test_mark_constructor(context: vm::Context, value: runtime::Value) -> unit {
+    match context.mark_native_constructor(value) {
+        Ok(()) => (),
+        Err(value) => testing::fail(value.kind.debug()),
+    }
+}
+
 #[test]
 fn string_prototype_links_constructor_and_dispatches_from_primitives() -> unit {
     let context = vm::Context::new(runtime::Heap::new());
@@ -370,4 +426,1293 @@ fn string_methods_reject_invalid_to_string_receivers_and_repeat_counts() -> unit
         Err(vm::VmError { kind: vm::VmErrorKind::RangeError(_), .. }) => (),
         _ => testing::fail("expected repetition RangeError"),
     }
+}
+
+#[test]
+fn regexp_symbol_match_and_search_use_dynamic_exec_with_gc_roots() -> unit {
+    let context = vm::Context::new(runtime::Heap::new());
+    let realm = expect_realm(install(context));
+    let constructor = string_test_regexp_constructor(context, realm);
+    let prototype = string_test_regexp_prototype(context, constructor);
+    let match_method = string_test_symbol_method(context, prototype, vm::WellKnownSymbolKind::Match);
+    let match_receiver = regexp_allocate_object(context);
+    regexp_define_data(context, match_receiver, "lastIndex", runtime::Value::Int(9));
+    regexp_define_getter(
+        context,
+        match_receiver,
+        "flags",
+        regexp_vm_function(
+            context,
+            |this_value, arguments, depth| {
+                let _ = this_value;
+                let _ = arguments;
+                let _ = depth;
+                let _ = context.collect_garbage();
+                Result::Ok(runtime::Value::String(js_string("g")))
+            },
+        ),
+    );
+    let match_result = regexp_allocate_object(context);
+    regexp_define_getter(
+        context,
+        match_result,
+        "0",
+        regexp_vm_function(
+            context,
+            |this_value, arguments, depth| {
+                let _ = this_value;
+                let _ = arguments;
+                let _ = depth;
+                let _ = context.collect_garbage();
+                Result::Ok(runtime::Value::String(js_string("x")))
+            },
+        ),
+    );
+    let match_result_root = Ref::new(runtime::Value::Object(match_result));
+    context.add_external_root(match_result_root);
+    let match_calls = Ref::new(0);
+    regexp_define_data(
+        context,
+        match_receiver,
+        "exec",
+        regexp_vm_function(
+            context,
+            |this_value, arguments, depth| {
+                let _ = depth;
+                testing::assert(
+                    runtime::same_value(this_value, runtime::Value::Object(match_receiver)),
+                );
+                testing::assert_eq(arguments.len(), 1);
+                let call = match_calls.get();
+                match_calls.set(call + 1);
+                let _ = context.collect_garbage();
+                if call == 0 {
+                    let _ = context.remove_external_root(match_result_root);
+                    Result::Ok(runtime::Value::Object(match_result))
+                } else {
+                    Result::Ok(runtime::Value::Null)
+                }
+            },
+        ),
+    );
+    let matches = regexp_expect_object(
+        regexp_expect_value(
+            regexp_invoke_method(
+                context,
+                runtime::Value::Object(match_receiver),
+                match_method,
+                Vec::from_array([runtime::Value::String(js_string("abc"))]),
+            ),
+        ),
+    );
+    testing::assert_eq(match_calls.get(), 2);
+    assert_value(property(context.heap(), matches, "length"), runtime::Value::Int(1));
+    assert_value(property(context.heap(), matches, "0"), runtime::Value::String(js_string("x")));
+    let search_method = string_test_symbol_method(
+        context,
+        prototype,
+        vm::WellKnownSymbolKind::Search,
+    );
+    let search_receiver = regexp_allocate_object(context);
+    let previous = runtime::Value::Object(regexp_allocate_object(context));
+    let previous_root = Ref::new(previous);
+    context.add_external_root(previous_root);
+    let last_index = Ref::new(previous);
+    let get_count = Ref::new(0);
+    let trace = Ref::new("");
+    let last_index_getter = regexp_vm_function(
+        context,
+        |this_value, arguments, depth| {
+            let _ = this_value;
+            let _ = arguments;
+            let _ = depth;
+            let count = get_count.get();
+            get_count.set(count + 1);
+            trace.set(
+                trace.get()
+                    + if count == 0 {
+                        "getPrevious,"
+                    } else {
+                        "getCurrent,"
+                    },
+            );
+            let _ = context.collect_garbage();
+            if count == 0 {
+                let _ = context.remove_external_root(previous_root);
+            } else {};
+            Result::Ok(last_index.get())
+        },
+    );
+    let last_index_setter = regexp_vm_function(
+        context,
+        |this_value, arguments, depth| {
+            let _ = this_value;
+            let _ = depth;
+            let value = argument(arguments, 0);
+            if runtime::same_value(value, previous) {
+                trace.set(trace.get() + "restore,")
+            } else {
+                trace.set(trace.get() + "zero,")
+            };
+            last_index.set(value);
+            let _ = context.collect_garbage();
+            Result::Ok(runtime::Value::Undefined)
+        },
+    );
+    string_test_define_accessor(
+        context,
+        search_receiver,
+        "lastIndex",
+        last_index_getter,
+        last_index_setter,
+    );
+    let search_result = regexp_allocate_object(context);
+    regexp_define_getter(
+        context,
+        search_result,
+        "index",
+        regexp_vm_function(
+            context,
+            |this_value, arguments, depth| {
+                let _ = this_value;
+                let _ = arguments;
+                let _ = depth;
+                trace.set(trace.get() + "index,");
+                let _ = context.collect_garbage();
+                Result::Ok(runtime::Value::Int(3))
+            },
+        ),
+    );
+    let search_result_root = Ref::new(runtime::Value::Object(search_result));
+    context.add_external_root(search_result_root);
+    regexp_define_data(
+        context,
+        search_receiver,
+        "exec",
+        regexp_vm_function(
+            context,
+            |this_value, arguments, depth| {
+                let _ = this_value;
+                let _ = arguments;
+                let _ = depth;
+                trace.set(trace.get() + "exec,");
+                last_index.set(runtime::Value::Int(2));
+                let _ = context.collect_garbage();
+                let _ = context.remove_external_root(search_result_root);
+                Result::Ok(runtime::Value::Object(search_result))
+            },
+        ),
+    );
+    assert_value(
+        regexp_expect_value(
+            regexp_invoke_method(
+                context,
+                runtime::Value::Object(search_receiver),
+                search_method,
+                Vec::from_array([runtime::Value::String(js_string("input"))]),
+            ),
+        ),
+        runtime::Value::Int(3),
+    );
+    testing::assert(runtime::same_value(last_index.get(), previous));
+    testing::assert(trace.get() == "getPrevious,zero,exec,getCurrent,restore,index,")
+}
+
+#[test]
+fn regexp_symbol_replace_observes_result_fields_and_functional_replacer() -> unit {
+    let context = vm::Context::new(runtime::Heap::new());
+    let realm = expect_realm(install(context));
+    let constructor = string_test_regexp_constructor(context, realm);
+    let prototype = string_test_regexp_prototype(context, constructor);
+    let replace_method = string_test_symbol_method(
+        context,
+        prototype,
+        vm::WellKnownSymbolKind::Replace,
+    );
+    let trace = Ref::new("");
+    let input = regexp_allocate_object(context);
+    regexp_define_data(
+        context,
+        input,
+        "toString",
+        regexp_vm_function(
+            context,
+            |this_value, arguments, depth| {
+                let _ = this_value;
+                let _ = arguments;
+                let _ = depth;
+                trace.set(trace.get() + "input,");
+                let _ = context.collect_garbage();
+                Result::Ok(runtime::Value::String(js_string("abc")))
+            },
+        ),
+    );
+    let replacement = regexp_allocate_object(context);
+    regexp_define_data(
+        context,
+        replacement,
+        "toString",
+        regexp_vm_function(
+            context,
+            |this_value, arguments, depth| {
+                let _ = this_value;
+                let _ = arguments;
+                let _ = depth;
+                trace.set(trace.get() + "replacement,");
+                let _ = context.collect_garbage();
+                Result::Ok(runtime::Value::String(js_string("$1-$<name>")))
+            },
+        ),
+    );
+    let matched_value = regexp_allocate_object(context);
+    regexp_define_data(
+        context,
+        matched_value,
+        "toString",
+        regexp_vm_function(
+            context,
+            |this_value, arguments, depth| {
+                let _ = this_value;
+                let _ = arguments;
+                let _ = depth;
+                trace.set(trace.get() + "matchedString,");
+                let _ = context.collect_garbage();
+                Result::Ok(runtime::Value::String(js_string("b")))
+            },
+        ),
+    );
+    let capture_value = regexp_allocate_object(context);
+    regexp_define_data(
+        context,
+        capture_value,
+        "toString",
+        regexp_vm_function(
+            context,
+            |this_value, arguments, depth| {
+                let _ = this_value;
+                let _ = arguments;
+                let _ = depth;
+                trace.set(trace.get() + "captureString,");
+                let _ = context.collect_garbage();
+                Result::Ok(runtime::Value::String(js_string("B")))
+            },
+        ),
+    );
+    let index_value = regexp_allocate_object(context);
+    regexp_define_data(
+        context,
+        index_value,
+        "valueOf",
+        regexp_vm_function(
+            context,
+            |this_value, arguments, depth| {
+                let _ = this_value;
+                let _ = arguments;
+                let _ = depth;
+                trace.set(trace.get() + "indexValue,");
+                let _ = context.collect_garbage();
+                Result::Ok(runtime::Value::Int(1))
+            },
+        ),
+    );
+    let named_value = regexp_allocate_object(context);
+    regexp_define_data(
+        context,
+        named_value,
+        "toString",
+        regexp_vm_function(
+            context,
+            |this_value, arguments, depth| {
+                let _ = this_value;
+                let _ = arguments;
+                let _ = depth;
+                trace.set(trace.get() + "namedString,");
+                let _ = context.collect_garbage();
+                Result::Ok(runtime::Value::String(js_string("N")))
+            },
+        ),
+    );
+    let groups = regexp_allocate_object(context);
+    regexp_define_getter(
+        context,
+        groups,
+        "name",
+        regexp_vm_function(
+            context,
+            |this_value, arguments, depth| {
+                let _ = this_value;
+                let _ = arguments;
+                let _ = depth;
+                trace.set(trace.get() + "named,");
+                let _ = context.collect_garbage();
+                Result::Ok(runtime::Value::Object(named_value))
+            },
+        ),
+    );
+    let result = regexp_allocate_object(context);
+    regexp_define_data(context, result, "matchedValue", runtime::Value::Object(matched_value));
+    regexp_define_data(context, result, "captureValue", runtime::Value::Object(capture_value));
+    regexp_define_data(context, result, "indexValue", runtime::Value::Object(index_value));
+    regexp_define_data(context, result, "groupsValue", runtime::Value::Object(groups));
+    regexp_define_data(context, groups, "namedValue", runtime::Value::Object(named_value));
+    regexp_define_getter(
+        context,
+        result,
+        "length",
+        regexp_vm_function(
+            context,
+            |this_value, arguments, depth| {
+                let _ = this_value;
+                let _ = arguments;
+                let _ = depth;
+                trace.set(trace.get() + "length,");
+                let _ = context.collect_garbage();
+                Result::Ok(runtime::Value::Int(2))
+            },
+        ),
+    );
+    regexp_define_getter(
+        context,
+        result,
+        "0",
+        regexp_vm_function(
+            context,
+            |this_value, arguments, depth| {
+                let _ = this_value;
+                let _ = arguments;
+                let _ = depth;
+                trace.set(trace.get() + "zero,");
+                let _ = context.collect_garbage();
+                Result::Ok(runtime::Value::Object(matched_value))
+            },
+        ),
+    );
+    regexp_define_getter(
+        context,
+        result,
+        "index",
+        regexp_vm_function(
+            context,
+            |this_value, arguments, depth| {
+                let _ = this_value;
+                let _ = arguments;
+                let _ = depth;
+                trace.set(trace.get() + "index,");
+                let _ = context.collect_garbage();
+                Result::Ok(runtime::Value::Object(index_value))
+            },
+        ),
+    );
+    regexp_define_getter(
+        context,
+        result,
+        "1",
+        regexp_vm_function(
+            context,
+            |this_value, arguments, depth| {
+                let _ = this_value;
+                let _ = arguments;
+                let _ = depth;
+                trace.set(trace.get() + "capture,");
+                let _ = context.collect_garbage();
+                Result::Ok(runtime::Value::Object(capture_value))
+            },
+        ),
+    );
+    regexp_define_getter(
+        context,
+        result,
+        "groups",
+        regexp_vm_function(
+            context,
+            |this_value, arguments, depth| {
+                let _ = this_value;
+                let _ = arguments;
+                let _ = depth;
+                trace.set(trace.get() + "groups,");
+                let _ = context.collect_garbage();
+                Result::Ok(runtime::Value::Object(groups))
+            },
+        ),
+    );
+    let result_root = Ref::new(runtime::Value::Object(result));
+    context.add_external_root(result_root);
+    let calls = Ref::new(0);
+    let exec = regexp_vm_function(
+        context,
+        |this_value, arguments, depth| {
+            let _ = this_value;
+            let _ = arguments;
+            let _ = depth;
+            trace.set(trace.get() + "execCall,");
+            let call = calls.get();
+            calls.set(call + 1);
+            let _ = context.collect_garbage();
+            if call == 0 {
+                let _ = context.remove_external_root(result_root);
+                Result::Ok(runtime::Value::Object(result))
+            } else {
+                Result::Ok(runtime::Value::Null)
+            }
+        },
+    );
+    let receiver = regexp_allocate_object(context);
+    regexp_define_data(context, receiver, "lastIndex", runtime::Value::Int(0));
+    regexp_define_data(context, receiver, "execValue", exec);
+    regexp_define_getter(
+        context,
+        receiver,
+        "exec",
+        regexp_vm_function(
+            context,
+            |this_value, arguments, depth| {
+                let _ = this_value;
+                let _ = arguments;
+                let _ = depth;
+                trace.set(trace.get() + "execGet,");
+                let _ = context.collect_garbage();
+                Result::Ok(exec)
+            },
+        ),
+    );
+    regexp_define_getter(
+        context,
+        receiver,
+        "flags",
+        regexp_vm_function(
+            context,
+            |this_value, arguments, depth| {
+                let _ = this_value;
+                let _ = arguments;
+                let _ = depth;
+                trace.set(trace.get() + "flags,");
+                let _ = context.collect_garbage();
+                Result::Ok(runtime::Value::String(js_string("g")))
+            },
+        ),
+    );
+    assert_value(
+        regexp_expect_value(
+            regexp_invoke_method(
+                context,
+                runtime::Value::Object(receiver),
+                replace_method,
+                Vec::from_array(
+                    [runtime::Value::Object(input), runtime::Value::Object(replacement)],
+                ),
+            ),
+        ),
+        runtime::Value::String(js_string("aB-Nc")),
+    );
+    testing::assert(
+        trace.get()
+            == "input,replacement,flags,execGet,execCall,zero,matchedString,execGet,execCall,length,zero,matchedString,index,indexValue,capture,captureString,groups,named,namedString,",
+    );
+    trace.set("");
+    calls.set(0);
+    context.add_external_root(result_root);
+    let replacer_result = regexp_allocate_object(context);
+    regexp_define_data(
+        context,
+        replacer_result,
+        "toString",
+        regexp_vm_function(
+            context,
+            |this_value, arguments, depth| {
+                let _ = this_value;
+                let _ = arguments;
+                let _ = depth;
+                trace.set(trace.get() + "replacerString,");
+                let _ = context.collect_garbage();
+                Result::Ok(runtime::Value::String(js_string("X")))
+            },
+        ),
+    );
+    let replacer_result_root = Ref::new(runtime::Value::Object(replacer_result));
+    context.add_external_root(replacer_result_root);
+    let replacer = regexp_vm_function(
+        context,
+        |this_value, arguments, depth| {
+            let _ = this_value;
+            let _ = depth;
+            trace.set(trace.get() + "replacer,");
+            testing::assert_eq(arguments.len(), 5);
+            assert_value(arguments[0], runtime::Value::String(js_string("b")));
+            assert_value(arguments[1], runtime::Value::String(js_string("B")));
+            assert_value(arguments[2], runtime::Value::Int(1));
+            assert_value(arguments[3], runtime::Value::String(js_string("abc")));
+            assert_value(arguments[4], runtime::Value::Object(groups));
+            let _ = context.collect_garbage();
+            let _ = context.remove_external_root(replacer_result_root);
+            Result::Ok(runtime::Value::Object(replacer_result))
+        },
+    );
+    assert_value(
+        regexp_expect_value(
+            regexp_invoke_method(
+                context,
+                runtime::Value::Object(receiver),
+                replace_method,
+                Vec::from_array([runtime::Value::Object(input), replacer]),
+            ),
+        ),
+        runtime::Value::String(js_string("aXc")),
+    );
+    testing::assert(
+        trace.get()
+            == "input,flags,execGet,execCall,zero,matchedString,execGet,execCall,length,zero,matchedString,index,indexValue,capture,captureString,groups,replacer,replacerString,",
+    )
+}
+
+#[test]
+fn regexp_symbol_match_all_uses_species_and_keeps_iterator_matcher_alive() -> unit {
+    let context = vm::Context::new(runtime::Heap::new());
+    let realm = expect_realm(install(context));
+    let constructor = string_test_regexp_constructor(context, realm);
+    let prototype = string_test_regexp_prototype(context, constructor);
+    let match_all_method = string_test_symbol_method(
+        context,
+        prototype,
+        vm::WellKnownSymbolKind::MatchAll,
+    );
+    let trace = Ref::new("");
+    let input = regexp_allocate_object(context);
+    regexp_define_data(
+        context,
+        input,
+        "toString",
+        regexp_vm_function(
+            context,
+            |this_value, arguments, depth| {
+                let _ = this_value;
+                let _ = arguments;
+                let _ = depth;
+                trace.set(trace.get() + "input,");
+                let _ = context.collect_garbage();
+                Result::Ok(runtime::Value::String(js_string("abc")))
+            },
+        ),
+    );
+    let match_result = regexp_allocate_object(context);
+    regexp_define_getter(
+        context,
+        match_result,
+        "0",
+        regexp_vm_function(
+            context,
+            |this_value, arguments, depth| {
+                let _ = this_value;
+                let _ = arguments;
+                let _ = depth;
+                trace.set(trace.get() + "zero,");
+                let _ = context.collect_garbage();
+                Result::Ok(runtime::Value::String(js_string("m")))
+            },
+        ),
+    );
+    let match_result_root = Ref::new(runtime::Value::Object(match_result));
+    context.add_external_root(match_result_root);
+    let matcher = regexp_allocate_object(context);
+    let matcher_root = Ref::new(runtime::Value::Object(matcher));
+    context.add_external_root(matcher_root);
+    let matcher_last_index = Ref::new(runtime::Value::Int(0));
+    let matcher_last_index_getter = regexp_vm_function(
+        context,
+        |this_value, arguments, depth| {
+            let _ = this_value;
+            let _ = arguments;
+            let _ = depth;
+            trace.set(trace.get() + "matcherGet,");
+            let _ = context.collect_garbage();
+            Result::Ok(matcher_last_index.get())
+        },
+    );
+    let matcher_last_index_setter = regexp_vm_function(
+        context,
+        |this_value, arguments, depth| {
+            let _ = this_value;
+            let _ = depth;
+            trace.set(trace.get() + "matcherSet,");
+            matcher_last_index.set(argument(arguments, 0));
+            let _ = context.collect_garbage();
+            Result::Ok(runtime::Value::Undefined)
+        },
+    );
+    string_test_define_accessor(
+        context,
+        matcher,
+        "lastIndex",
+        matcher_last_index_getter,
+        matcher_last_index_setter,
+    );
+    let exec_calls = Ref::new(0);
+    let matcher_exec = regexp_vm_function(
+        context,
+        |this_value, arguments, depth| {
+            let _ = depth;
+            testing::assert(runtime::same_value(this_value, runtime::Value::Object(matcher)));
+            testing::assert_eq(arguments.len(), 1);
+            trace.set(trace.get() + "execCall,");
+            let call = exec_calls.get();
+            exec_calls.set(call + 1);
+            let _ = context.collect_garbage();
+            if call == 0 {
+                let _ = context.remove_external_root(match_result_root);
+                Result::Ok(runtime::Value::Object(match_result))
+            } else {
+                Result::Ok(runtime::Value::Null)
+            }
+        },
+    );
+    regexp_define_data(context, matcher, "execValue", matcher_exec);
+    regexp_define_getter(
+        context,
+        matcher,
+        "exec",
+        regexp_vm_function(
+            context,
+            |this_value, arguments, depth| {
+                let _ = this_value;
+                let _ = arguments;
+                let _ = depth;
+                trace.set(trace.get() + "execGet,");
+                let _ = context.collect_garbage();
+                Result::Ok(matcher_exec)
+            },
+        ),
+    );
+    let species_constructor = regexp_vm_function(
+        context,
+        |this_value, arguments, depth| {
+            let _ = this_value;
+            let _ = depth;
+            trace.set(trace.get() + "construct,");
+            testing::assert_eq(arguments.len(), 2);
+            testing::assert(
+                runtime::same_value(arguments[1], runtime::Value::String(js_string("g"))),
+            );
+            let _ = context.collect_garbage();
+            let _ = context.remove_external_root(matcher_root);
+            Result::Ok(runtime::Value::Object(matcher))
+        },
+    );
+    string_test_mark_constructor(context, species_constructor);
+    let holder = regexp_allocate_object(context);
+    regexp_define_data(context, holder, "speciesValue", species_constructor);
+    regexp_define_symbol_getter(
+        context,
+        holder,
+        string_test_symbol(context, vm::WellKnownSymbolKind::Species),
+        regexp_vm_function(
+            context,
+            |this_value, arguments, depth| {
+                let _ = this_value;
+                let _ = arguments;
+                let _ = depth;
+                trace.set(trace.get() + "species,");
+                let _ = context.collect_garbage();
+                Result::Ok(species_constructor)
+            },
+        ),
+    );
+    let last_index_value = regexp_allocate_object(context);
+    regexp_define_data(
+        context,
+        last_index_value,
+        "valueOf",
+        regexp_vm_function(
+            context,
+            |this_value, arguments, depth| {
+                let _ = this_value;
+                let _ = arguments;
+                let _ = depth;
+                trace.set(trace.get() + "lastIndexValue,");
+                let _ = context.collect_garbage();
+                Result::Ok(runtime::Value::Float(2.9))
+            },
+        ),
+    );
+    let receiver = regexp_allocate_object(context);
+    regexp_define_data(context, receiver, "holderValue", runtime::Value::Object(holder));
+    regexp_define_data(
+        context,
+        receiver,
+        "lastIndexValue",
+        runtime::Value::Object(last_index_value),
+    );
+    regexp_define_getter(
+        context,
+        receiver,
+        "constructor",
+        regexp_vm_function(
+            context,
+            |this_value, arguments, depth| {
+                let _ = this_value;
+                let _ = arguments;
+                let _ = depth;
+                trace.set(trace.get() + "constructor,");
+                let _ = context.collect_garbage();
+                Result::Ok(runtime::Value::Object(holder))
+            },
+        ),
+    );
+    regexp_define_getter(
+        context,
+        receiver,
+        "flags",
+        regexp_vm_function(
+            context,
+            |this_value, arguments, depth| {
+                let _ = this_value;
+                let _ = arguments;
+                let _ = depth;
+                trace.set(trace.get() + "flags,");
+                let _ = context.collect_garbage();
+                Result::Ok(runtime::Value::String(js_string("g")))
+            },
+        ),
+    );
+    regexp_define_getter(
+        context,
+        receiver,
+        "lastIndex",
+        regexp_vm_function(
+            context,
+            |this_value, arguments, depth| {
+                let _ = this_value;
+                let _ = arguments;
+                let _ = depth;
+                trace.set(trace.get() + "lastIndex,");
+                let _ = context.collect_garbage();
+                Result::Ok(runtime::Value::Object(last_index_value))
+            },
+        ),
+    );
+    let iterator = regexp_expect_object(
+        regexp_expect_value(
+            regexp_invoke_method(
+                context,
+                runtime::Value::Object(receiver),
+                match_all_method,
+                Vec::from_array([runtime::Value::Object(input)]),
+            ),
+        ),
+    );
+    testing::assert(
+        trace.get()
+            == "input,constructor,species,flags,construct,lastIndex,lastIndexValue,matcherSet,",
+    );
+    assert_value(matcher_last_index.get(), runtime::Value::Int(2));
+    let iterator_root = Ref::new(runtime::Value::Object(iterator));
+    context.add_external_root(iterator_root);
+    let _ = context.collect_garbage();
+    let next = regexp_property(context, iterator, "next");
+    let first = regexp_expect_object(
+        regexp_expect_value(
+            regexp_invoke_method(context, runtime::Value::Object(iterator), next, Vec::new()),
+        ),
+    );
+    assert_value(property(context.heap(), first, "done"), runtime::Value::Bool(false));
+    assert_value(property(context.heap(), first, "value"), runtime::Value::Object(match_result));
+    let second = regexp_expect_object(
+        regexp_expect_value(
+            regexp_invoke_method(context, runtime::Value::Object(iterator), next, Vec::new()),
+        ),
+    );
+    assert_value(property(context.heap(), second, "done"), runtime::Value::Bool(true));
+    assert_value(property(context.heap(), second, "value"), runtime::Value::Undefined);
+    let _ = context.remove_external_root(iterator_root);
+    testing::assert(
+        trace.get()
+            == "input,constructor,species,flags,construct,lastIndex,lastIndexValue,matcherSet,execGet,execCall,zero,execGet,execCall,",
+    )
+}
+
+#[test]
+fn regexp_string_iterators_share_pinned_prototype_and_survive_collection() -> unit {
+    let context = vm::Context::new(runtime::Heap::new());
+    let realm = expect_realm(install(context));
+    let constructor = string_test_regexp_constructor(context, realm);
+    let regexp_prototype = string_test_regexp_prototype(context, constructor);
+    let match_all = string_test_symbol_method(
+        context,
+        regexp_prototype,
+        vm::WellKnownSymbolKind::MatchAll,
+    );
+    let regexp = regexp_new(context, constructor, "a", "g");
+    let first_iterator = regexp_expect_object(
+        regexp_expect_value(
+            regexp_invoke_method(
+                context,
+                runtime::Value::Object(regexp),
+                match_all,
+                Vec::from_array([runtime::Value::String(js_string("a"))]),
+            ),
+        ),
+    );
+    let second_iterator = regexp_expect_object(
+        regexp_expect_value(
+            regexp_invoke_method(
+                context,
+                runtime::Value::Object(regexp),
+                match_all,
+                Vec::from_array([runtime::Value::String(js_string("a"))]),
+            ),
+        ),
+    );
+    testing::assert_eq(runtime::own_property_keys(context.heap(), first_iterator).len(), 0);
+    testing::assert_eq(runtime::own_property_keys(context.heap(), second_iterator).len(), 0);
+    let shared_prototype = match context.heap().get(first_iterator) {
+        Some(value) => match value.prototype() {
+            Some(value) => value,
+            None => {
+                testing::fail("expected RegExp string iterator prototype");
+                first_iterator
+            },
+        },
+        None => {
+            testing::fail("expected live RegExp string iterator");
+            first_iterator
+        },
+    };
+    match context.heap().get(second_iterator) {
+        Some(value) => testing::assert(value.prototype() == Option::Some(shared_prototype)),
+        None => testing::fail("expected live RegExp string iterator"),
+    };
+    let iterator_prototype = match iterator_prototype_from_global(context) {
+        Some(value) => value,
+        None => {
+            testing::fail("expected Iterator prototype");
+            shared_prototype
+        },
+    };
+    match context.heap().get(shared_prototype) {
+        Some(value) => testing::assert(value.prototype() == Option::Some(iterator_prototype)),
+        None => testing::fail("expected live RegExp string iterator prototype"),
+    };
+    testing::assert_eq(runtime::own_property_keys(context.heap(), shared_prototype).len(), 2);
+    let next_descriptor = match context.heap().get(shared_prototype).and_then(
+        |value| value.own_property(runtime::string_property_key("next")),
+    ) {
+        Some(value) => value,
+        None => {
+            testing::fail("expected RegExp string iterator next");
+            runtime::data_descriptor(runtime::Value::Undefined, false, false, false)
+        },
+    };
+    testing::assert(runtime::descriptor_writable(next_descriptor));
+    testing::assert(!runtime::descriptor_enumerable(next_descriptor));
+    testing::assert(runtime::descriptor_configurable(next_descriptor));
+    let next = match runtime::descriptor_value(next_descriptor) {
+        Some(value) => value,
+        None => {
+            testing::fail("expected RegExp string iterator next value");
+            runtime::Value::Undefined
+        },
+    };
+    let next_object = regexp_expect_object(next);
+    assert_value(
+        regexp_property(context, next_object, "name"),
+        runtime::Value::String(js_string("next")),
+    );
+    assert_value(regexp_property(context, next_object, "length"), runtime::Value::Int(0));
+    let tag_symbol = string_test_symbol(context, vm::WellKnownSymbolKind::ToStringTag);
+    let tag_descriptor = match context.heap().get(shared_prototype).and_then(
+        |value| value.own_property(runtime::PropertyKey::Symbol(tag_symbol)),
+    ) {
+        Some(value) => value,
+        None => {
+            testing::fail("expected RegExp string iterator tag");
+            runtime::data_descriptor(runtime::Value::Undefined, false, false, false)
+        },
+    };
+    testing::assert(!runtime::descriptor_writable(tag_descriptor));
+    testing::assert(!runtime::descriptor_enumerable(tag_descriptor));
+    testing::assert(runtime::descriptor_configurable(tag_descriptor));
+    match runtime::descriptor_value(tag_descriptor) {
+        Some(value) => assert_value(
+            value,
+            runtime::Value::String(js_string("RegExp String Iterator")),
+        ),
+        None => testing::fail("expected RegExp string iterator tag value"),
+    };
+    let iterator_symbol = match context.iterator_symbol() {
+        Some(value) => value,
+        None => {
+            testing::fail("expected iterator symbol");
+            runtime::Symbol::new(9901, Option::None)
+        },
+    };
+    let identity = regexp_expect_value(
+        context.read_property_at_depth(
+            runtime::Value::Object(first_iterator),
+            runtime::Value::Symbol(iterator_symbol),
+            0,
+        ),
+    );
+    assert_value(
+        regexp_expect_value(
+            regexp_invoke_method(
+                context,
+                runtime::Value::Object(first_iterator),
+                identity,
+                Vec::new(),
+            ),
+        ),
+        runtime::Value::Object(first_iterator),
+    );
+    let iterator_root = Ref::new(runtime::Value::Object(first_iterator));
+    context.add_external_root(iterator_root);
+    let _ = context.collect_garbage();
+    testing::assert(context.heap().contains(shared_prototype));
+    testing::assert(context.heap().contains(next_object));
+    let match_result = regexp_expect_object(
+        regexp_expect_value(
+            regexp_invoke_method(context, runtime::Value::Object(first_iterator), next, Vec::new()),
+        ),
+    );
+    assert_value(regexp_property(context, match_result, "done"), runtime::Value::Bool(false));
+    let match_value = regexp_expect_object(regexp_property(context, match_result, "value"));
+    assert_value(regexp_property(context, match_value, "0"), runtime::Value::String(js_string("a")));
+    let done_result = regexp_expect_object(
+        regexp_expect_value(
+            regexp_invoke_method(context, runtime::Value::Object(first_iterator), next, Vec::new()),
+        ),
+    );
+    assert_value(regexp_property(context, done_result, "done"), runtime::Value::Bool(true));
+    let _ = context.remove_external_root(iterator_root);
+}
+
+#[test]
+fn regexp_symbol_split_observes_species_unicode_exec_captures_and_limit() -> unit {
+    let context = vm::Context::new(runtime::Heap::new());
+    let realm = expect_realm(install(context));
+    let constructor = string_test_regexp_constructor(context, realm);
+    let prototype = string_test_regexp_prototype(context, constructor);
+    let split_method = string_test_symbol_method(context, prototype, vm::WellKnownSymbolKind::Split);
+    let trace = Ref::new("");
+    let input_string = runtime::JsString::from_code_units(Vec::from_array([0xd83d, 0xde00, 0x78]));
+    let input = regexp_allocate_object(context);
+    regexp_define_data(
+        context,
+        input,
+        "toString",
+        regexp_vm_function(
+            context,
+            |this_value, arguments, depth| {
+                let _ = this_value;
+                let _ = arguments;
+                let _ = depth;
+                trace.set(trace.get() + "input,");
+                let _ = context.collect_garbage();
+                Result::Ok(runtime::Value::String(input_string))
+            },
+        ),
+    );
+    let capture = regexp_allocate_object(context);
+    regexp_define_data(
+        context,
+        capture,
+        "toString",
+        regexp_vm_function(
+            context,
+            |this_value, arguments, depth| {
+                let _ = this_value;
+                let _ = arguments;
+                let _ = depth;
+                trace.set(trace.get() + "captureString,");
+                Result::Ok(runtime::Value::String(js_string("wrong")))
+            },
+        ),
+    );
+    let zero_result = regexp_allocate_object(context);
+    let result = regexp_allocate_object(context);
+    regexp_define_data(context, result, "captureValue", runtime::Value::Object(capture));
+    regexp_define_data(context, result, "zeroValue", runtime::Value::Object(zero_result));
+    regexp_define_getter(
+        context,
+        result,
+        "length",
+        regexp_vm_function(
+            context,
+            |this_value, arguments, depth| {
+                let _ = this_value;
+                let _ = arguments;
+                let _ = depth;
+                trace.set(trace.get() + "length,");
+                let _ = context.collect_garbage();
+                Result::Ok(runtime::Value::Int(2))
+            },
+        ),
+    );
+    regexp_define_getter(
+        context,
+        result,
+        "1",
+        regexp_vm_function(
+            context,
+            |this_value, arguments, depth| {
+                let _ = this_value;
+                let _ = arguments;
+                let _ = depth;
+                trace.set(trace.get() + "capture,");
+                let _ = context.collect_garbage();
+                Result::Ok(runtime::Value::Object(capture))
+            },
+        ),
+    );
+    let zero_result_root = Ref::new(runtime::Value::Object(zero_result));
+    let result_root = Ref::new(runtime::Value::Object(result));
+    context.add_external_root(zero_result_root);
+    context.add_external_root(result_root);
+    let splitter = regexp_allocate_object(context);
+    let splitter_root = Ref::new(runtime::Value::Object(splitter));
+    context.add_external_root(splitter_root);
+    let last_index = Ref::new(runtime::Value::Int(0));
+    let setter_calls = Ref::new(0);
+    let last_index_getter = regexp_vm_function(
+        context,
+        |this_value, arguments, depth| {
+            let _ = this_value;
+            let _ = arguments;
+            let _ = depth;
+            match last_index.get() {
+                runtime::Value::Int(0) => trace.set(trace.get() + "get0,"),
+                runtime::Value::Int(3) => trace.set(trace.get() + "get3,"),
+                _ => trace.set(trace.get() + "getOther,"),
+            };
+            let _ = context.collect_garbage();
+            Result::Ok(last_index.get())
+        },
+    );
+    let last_index_setter = regexp_vm_function(
+        context,
+        |this_value, arguments, depth| {
+            let _ = this_value;
+            let _ = depth;
+            let value = argument(arguments, 0);
+            if runtime::same_value(value, runtime::Value::Int(0)) {
+                trace.set(trace.get() + "set0,")
+            } else if runtime::same_value(value, runtime::Value::Int(2)) {
+                trace.set(trace.get() + "set2,")
+            } else {
+                trace.set(trace.get() + "setOther,")
+            };
+            setter_calls.set(setter_calls.get() + 1);
+            last_index.set(value);
+            let _ = context.collect_garbage();
+            Result::Ok(runtime::Value::Undefined)
+        },
+    );
+    string_test_define_accessor(
+        context,
+        splitter,
+        "lastIndex",
+        last_index_getter,
+        last_index_setter,
+    );
+    let exec_calls = Ref::new(0);
+    let splitter_exec = regexp_vm_function(
+        context,
+        |this_value, arguments, depth| {
+            let _ = depth;
+            testing::assert(runtime::same_value(this_value, runtime::Value::Object(splitter)));
+            testing::assert_eq(arguments.len(), 1);
+            trace.set(trace.get() + "execCall,");
+            let call = exec_calls.get();
+            exec_calls.set(call + 1);
+            if call == 0 {
+                last_index.set(runtime::Value::Int(0));
+                let _ = context.collect_garbage();
+                let _ = context.remove_external_root(zero_result_root);
+                Result::Ok(runtime::Value::Object(zero_result))
+            } else {
+                last_index.set(runtime::Value::Int(3));
+                let _ = context.collect_garbage();
+                let _ = context.remove_external_root(result_root);
+                Result::Ok(runtime::Value::Object(result))
+            }
+        },
+    );
+    regexp_define_data(context, splitter, "execValue", splitter_exec);
+    regexp_define_getter(
+        context,
+        splitter,
+        "exec",
+        regexp_vm_function(
+            context,
+            |this_value, arguments, depth| {
+                let _ = this_value;
+                let _ = arguments;
+                let _ = depth;
+                trace.set(trace.get() + "execGet,");
+                let _ = context.collect_garbage();
+                Result::Ok(splitter_exec)
+            },
+        ),
+    );
+    let species_constructor = regexp_vm_function(
+        context,
+        |this_value, arguments, depth| {
+            let _ = this_value;
+            let _ = depth;
+            trace.set(trace.get() + "construct,");
+            testing::assert_eq(arguments.len(), 2);
+            assert_value(arguments[1], runtime::Value::String(js_string("uy")));
+            let _ = context.collect_garbage();
+            let _ = context.remove_external_root(splitter_root);
+            Result::Ok(runtime::Value::Object(splitter))
+        },
+    );
+    string_test_mark_constructor(context, species_constructor);
+    let holder = regexp_allocate_object(context);
+    regexp_define_data(context, holder, "speciesValue", species_constructor);
+    regexp_define_symbol_getter(
+        context,
+        holder,
+        string_test_symbol(context, vm::WellKnownSymbolKind::Species),
+        regexp_vm_function(
+            context,
+            |this_value, arguments, depth| {
+                let _ = this_value;
+                let _ = arguments;
+                let _ = depth;
+                trace.set(trace.get() + "species,");
+                let _ = context.collect_garbage();
+                Result::Ok(species_constructor)
+            },
+        ),
+    );
+    let receiver = regexp_allocate_object(context);
+    regexp_define_data(context, receiver, "holderValue", runtime::Value::Object(holder));
+    regexp_define_getter(
+        context,
+        receiver,
+        "constructor",
+        regexp_vm_function(
+            context,
+            |this_value, arguments, depth| {
+                let _ = this_value;
+                let _ = arguments;
+                let _ = depth;
+                trace.set(trace.get() + "constructor,");
+                let _ = context.collect_garbage();
+                Result::Ok(runtime::Value::Object(holder))
+            },
+        ),
+    );
+    regexp_define_getter(
+        context,
+        receiver,
+        "flags",
+        regexp_vm_function(
+            context,
+            |this_value, arguments, depth| {
+                let _ = this_value;
+                let _ = arguments;
+                let _ = depth;
+                trace.set(trace.get() + "flags,");
+                let _ = context.collect_garbage();
+                Result::Ok(runtime::Value::String(js_string("u")))
+            },
+        ),
+    );
+    let limit = regexp_allocate_object(context);
+    regexp_define_data(
+        context,
+        limit,
+        "valueOf",
+        regexp_vm_function(
+            context,
+            |this_value, arguments, depth| {
+                let _ = this_value;
+                let _ = arguments;
+                let _ = depth;
+                trace.set(trace.get() + "limit,");
+                let _ = context.collect_garbage();
+                Result::Ok(runtime::Value::Int(10))
+            },
+        ),
+    );
+    let parts = regexp_expect_object(
+        regexp_expect_value(
+            regexp_invoke_method(
+                context,
+                runtime::Value::Object(receiver),
+                split_method,
+                Vec::from_array([runtime::Value::Object(input), runtime::Value::Object(limit)]),
+            ),
+        ),
+    );
+    testing::assert_eq(setter_calls.get(), 2);
+    assert_value(property(context.heap(), parts, "length"), runtime::Value::Int(3));
+    assert_value(
+        property(context.heap(), parts, "0"),
+        runtime::Value::String(input_string.slice(0, 2)),
+    );
+    assert_value(property(context.heap(), parts, "1"), runtime::Value::Object(capture));
+    assert_value(property(context.heap(), parts, "2"), runtime::Value::String(js_string("")));
+    testing::assert(
+        trace.get()
+            == "input,constructor,species,flags,construct,limit,set0,execGet,execCall,get0,set2,execGet,execCall,get3,length,capture,",
+    );
+    trace.set("");
+    exec_calls.set(0);
+    setter_calls.set(0);
+    last_index.set(runtime::Value::Int(0));
+    context.add_external_root(splitter_root);
+    context.add_external_root(zero_result_root);
+    context.add_external_root(result_root);
+    let truncated = regexp_expect_object(
+        regexp_expect_value(
+            regexp_invoke_method(
+                context,
+                runtime::Value::Object(receiver),
+                split_method,
+                Vec::from_array([runtime::Value::Object(input), runtime::Value::Int(1)]),
+            ),
+        ),
+    );
+    assert_value(property(context.heap(), truncated, "length"), runtime::Value::Int(1));
+    assert_value(
+        property(context.heap(), truncated, "0"),
+        runtime::Value::String(input_string.slice(0, 2)),
+    );
+    testing::assert(
+        trace.get()
+            == "input,constructor,species,flags,construct,set0,execGet,execCall,get0,set2,execGet,execCall,get3,",
+    )
+}
+
+#[test]
+fn regexp_symbol_methods_reject_primitive_custom_exec_results() -> unit {
+    let context = vm::Context::new(runtime::Heap::new());
+    let realm = expect_realm(install(context));
+    let constructor = string_test_regexp_constructor(context, realm);
+    let prototype = string_test_regexp_prototype(context, constructor);
+    let match_method = string_test_symbol_method(context, prototype, vm::WellKnownSymbolKind::Match);
+    let receiver = regexp_allocate_object(context);
+    regexp_define_data(context, receiver, "flags", runtime::Value::String(js_string("")));
+    regexp_define_data(
+        context,
+        receiver,
+        "exec",
+        regexp_vm_function(
+            context,
+            |this_value, arguments, depth| {
+                let _ = this_value;
+                let _ = arguments;
+                let _ = depth;
+                Result::Ok(runtime::Value::Int(1))
+            },
+        ),
+    );
+    regexp_assert_type_error(
+        regexp_invoke_method(
+            context,
+            runtime::Value::Object(receiver),
+            match_method,
+            Vec::from_array([runtime::Value::String(js_string("input"))]),
+        ),
+    )
 }
