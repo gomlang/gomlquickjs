@@ -973,6 +973,71 @@ fn regexp_execute_at_depth(
     }
 }
 
+fn regexp_exec_at_depth(
+    context: vm::Context,
+    states: HashMap[runtime::ObjectId, RegExpState],
+    receiver: runtime::Value,
+    input: runtime::Value,
+    depth: isize,
+) -> Result[runtime::Value, vm::VmError] {
+    regexp_with_root(
+        context,
+        receiver,
+        || regexp_with_root(
+            context,
+            input,
+            || {
+                let exec = context.read_property_at_depth(
+                    receiver,
+                    runtime::Value::String(js_string("exec")),
+                    depth,
+                )?;
+                regexp_with_root(
+                    context,
+                    exec,
+                    || {
+                        let result = match exec {
+                            runtime::Value::Object(object) => if object.is_callable() {
+                                context.invoke_with_this_at_depth(
+                                    exec,
+                                    Vec::from_array([input]),
+                                    receiver,
+                                    depth,
+                                )?
+                            } else {
+                                regexp_execute_at_depth(
+                                    context,
+                                    states,
+                                    receiver,
+                                    Vec::from_array([input]),
+                                    depth,
+                                )?
+                            },
+                            _ => regexp_execute_at_depth(
+                                context,
+                                states,
+                                receiver,
+                                Vec::from_array([input]),
+                                depth,
+                            )?,
+                        };
+                        match result {
+                            runtime::Value::Null | runtime::Value::Object(_) => {
+                                Result::Ok(result)
+                            },
+                            _ => Result::Err(
+                                function_vm_error(
+                                    "RegExp exec method must return an object or null",
+                                ),
+                            ),
+                        }
+                    },
+                )
+            },
+        ),
+    )
+}
+
 fn regexp_test_at_depth(
     context: vm::Context,
     states: HashMap[runtime::ObjectId, RegExpState],
@@ -980,24 +1045,7 @@ fn regexp_test_at_depth(
     arguments: Vec[runtime::Value],
     depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
-    let exec = context.read_property_at_depth(
-        this_value,
-        runtime::Value::String(js_string("exec")),
-        depth,
-    )?;
-    let result = match exec {
-        runtime::Value::Object(object) => if object.is_callable() {
-            context.invoke_with_this_at_depth(
-                exec,
-                Vec::from_array([argument(arguments, 0)]),
-                this_value,
-                depth,
-            )?
-        } else {
-            regexp_execute_at_depth(context, states, this_value, arguments, depth)?
-        },
-        _ => regexp_execute_at_depth(context, states, this_value, arguments, depth)?,
-    };
+    let result = regexp_exec_at_depth(context, states, this_value, argument(arguments, 0), depth)?;
     match result {
         runtime::Value::Null => Result::Ok(runtime::Value::Bool(false)),
         runtime::Value::Object(_) => Result::Ok(runtime::Value::Bool(true)),

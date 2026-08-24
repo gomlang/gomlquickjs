@@ -1075,7 +1075,26 @@ fn global_eval(
     };
     let bindings: Vec[bytecode::EvalBinding] = Vec::new();
     let function = context.compile_dynamic_eval_source(text, bindings)?;
-    context.execute(function)
+    context.execute_eval(function)
+}
+
+fn global_eval_script(
+    context: vm::Context,
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+    depth: isize,
+) -> Result[runtime::Value, vm::VmError] {
+    let _ = this_value;
+    let source = string_value_at_depth(context, argument(arguments, 0), depth)?;
+    let text = match source {
+        runtime::Value::String(value) => match value.to_host_string() {
+            Ok(value) => value,
+            Err(value) => return Result::Err(function_syntax_error(value.debug())),
+        },
+        _ => return Result::Err(function_vm_error("evalScript source is not a string")),
+    };
+    let function = context.compile_dynamic_script_source(text, "<evalScript>")?;
+    context.execute_script(function)
 }
 
 fn global_load_script(
@@ -1097,9 +1116,8 @@ fn global_load_script(
         Ok(value) => value,
         Err(value) => return Result::Err(function_vm_error(value)),
     };
-    let bindings: Vec[bytecode::EvalBinding] = Vec::new();
-    let function = context.compile_dynamic_eval_source(source, bindings)?;
-    context.execute(function)
+    let function = context.compile_dynamic_script_source(source, path)?;
+    context.execute_script(function)
 }
 
 fn generator_next(
@@ -6585,8 +6603,10 @@ pub fn install(context: vm::Context) -> Result[Realm, BuiltinError] {
     install_regexp_string_methods(
         context,
         string_prototype,
+        regexp,
         regexp_install.prototype,
         regexp_install.states,
+        iterator,
     )?;
     let _ = install_bjson(context, buffers, date)?;
     for (value, name) in Vec::from_array(
@@ -6795,21 +6815,16 @@ pub fn install(context: vm::Context) -> Result[Realm, BuiltinError] {
     )?;
     define_string_function(context, global, "escape", global_escape, 1, false)?;
     define_string_function(context, global, "unescape", global_unescape, 1, false)?;
-    define_value(
-        heap,
-        global,
+    let eval_function = allocate_vm_function_with_length(
+        context,
         "eval",
-        allocate_vm_function_with_length(
-            context,
-            "eval",
-            1,
-            |this_value, arguments, depth| {
-                global_eval(context, this_value, arguments, depth)
-            },
-        )?,
-        true,
-        true,
+        1,
+        |this_value, arguments, depth| {
+            global_eval(context, this_value, arguments, depth)
+        },
     )?;
+    context.set_intrinsic_eval(eval_function);
+    define_value(heap, global, "eval", eval_function, true, true)?;
     define_value(
         heap,
         global,

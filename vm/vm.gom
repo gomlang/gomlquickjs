@@ -123,6 +123,8 @@ type DynamicEvalCompiler = (string, Vec[bytecode::EvalBinding]) -> Result[
     bytecode::SourceError,
 ];
 
+type DynamicScriptCompiler = (string, string) -> Result[bytecode::Function, bytecode::SourceError];
+
 pub type DynamicModuleLoader = (runtime::Value, runtime::Value, runtime::Value, isize) -> Result[
     runtime::Value,
     VmError,
@@ -332,6 +334,12 @@ struct EvalEnvironment {
     parent: Option[Ref[EvalEnvironment]],
 }
 
+struct GlobalLexicalBinding {
+    value: Ref[runtime::Value],
+    initialized: Ref[bool],
+    mutable: bool,
+}
+
 struct Closure {
     function: Ref[bytecode::Function],
     upvalues: Vec[UpvalueCell],
@@ -488,10 +496,12 @@ struct Machine {
     primitive_prototypes: PrimitivePrototypes,
     error_prototypes: ErrorPrototypes,
     object_builtin_tags: HashMap[runtime::ObjectId, runtime::JsString],
+    global_lexical_bindings: HashMap[string, GlobalLexicalBinding],
     regexp_constructor: Option[runtime::Value],
     iterator_symbol: Option[runtime::Symbol],
     to_primitive_symbol: Option[runtime::Symbol],
     has_instance_symbol: Option[runtime::Symbol],
+    intrinsic_eval: Option[runtime::Value],
     callee: Option[runtime::Value],
     arguments: Vec[runtime::Value],
     arguments_object: Ref[Option[runtime::ObjectId]],
@@ -524,9 +534,12 @@ pub struct Context {
     regexp_constructor_value: Ref[Option[runtime::Value]],
     well_known_symbols_value: WellKnownSymbols,
     iterator_symbol_value: Ref[Option[runtime::Symbol]],
+    intrinsic_eval_value: Ref[Option[runtime::Value]],
     object_builtin_tags_value: HashMap[runtime::ObjectId, runtime::JsString],
+    global_lexical_bindings_value: HashMap[string, GlobalLexicalBinding],
     dynamic_function_compiler_value: Ref[Option[DynamicFunctionCompiler]],
     dynamic_eval_compiler_value: Ref[Option[DynamicEvalCompiler]],
+    dynamic_script_compiler_value: Ref[Option[DynamicScriptCompiler]],
     dynamic_module_loader_value: Ref[Option[DynamicModuleLoader]],
     promise_capability_factory_value: Ref[Option[HostPromiseCapabilityFactory]],
     active_frames_value: Vec[ActiveFrame],
@@ -702,9 +715,12 @@ impl Context {
             regexp_constructor_value: Ref::new(Option::None),
             well_known_symbols_value: WellKnownSymbols::new(),
             iterator_symbol_value: Ref::new(Option::None),
+            intrinsic_eval_value: Ref::new(Option::None),
             object_builtin_tags_value: HashMap::new(),
+            global_lexical_bindings_value: HashMap::new(),
             dynamic_function_compiler_value: Ref::new(Option::None),
             dynamic_eval_compiler_value: Ref::new(Option::None),
+            dynamic_script_compiler_value: Ref::new(Option::None),
             dynamic_module_loader_value: Ref::new(Option::None),
             promise_capability_factory_value: Ref::new(Option::None),
             active_frames_value: Vec::new(),
@@ -798,6 +814,7 @@ impl Context {
         let edges: Vec[runtime::GcEdge] = Vec::new();
         push_optional_object_root(roots, self.global_object_value.get());
         push_optional_root(roots, self.regexp_constructor_value.get());
+        push_optional_root(roots, self.intrinsic_eval_value.get());
         push_optional_object_root(roots, self.generators_value.prototype.get());
         push_optional_object_root(roots, self.generators_value.generator_function_prototype.get());
         push_optional_object_root(roots, self.generators_value.async_function_prototype.get());
@@ -821,6 +838,11 @@ impl Context {
         }
         for (_, value) in self.virtual_modules_value.entries() {
             roots.push(value)
+        }
+        for (_, binding) in self.global_lexical_bindings_value.entries() {
+            if binding.initialized.get() {
+                roots.push(binding.value.get())
+            } else {}
         }
         for frame in self.active_frames_value {
             push_active_frame_roots(roots, frame)
@@ -1318,6 +1340,7 @@ impl Context {
             primitive_prototypes: self.primitive_prototypes_value,
             error_prototypes: self.error_prototypes_value,
             object_builtin_tags: self.object_builtin_tags_value,
+            global_lexical_bindings: self.global_lexical_bindings_value,
             regexp_constructor: self.regexp_constructor_value.get(),
             iterator_symbol: self.iterator_symbol_value.get(),
             to_primitive_symbol: self.well_known_symbols_value.slot(
@@ -1326,6 +1349,7 @@ impl Context {
             has_instance_symbol: self.well_known_symbols_value.slot(
                 WellKnownSymbolKind::HasInstance,
             ).get(),
+            intrinsic_eval: self.intrinsic_eval_value.get(),
             callee: frame.callee,
             arguments: frame.arguments,
             arguments_object: frame.arguments_object,
@@ -1379,6 +1403,10 @@ impl Context {
         }
     }
 
+    pub fn set_intrinsic_eval(self: Context, value: runtime::Value) -> unit {
+        self.intrinsic_eval_value.set(Option::Some(value))
+    }
+
     pub fn set_dynamic_function_compiler(
         self: Context,
         callback: (FunctionKind, string, string) -> Result[bytecode::Function, string],
@@ -1411,6 +1439,13 @@ impl Context {
         ],
     ) -> unit {
         self.dynamic_eval_compiler_value.set(Option::Some(callback))
+    }
+
+    pub fn set_dynamic_script_compiler(
+        self: Context,
+        callback: (string, string) -> Result[bytecode::Function, bytecode::SourceError],
+    ) -> unit {
+        self.dynamic_script_compiler_value.set(Option::Some(callback))
     }
 
     pub fn set_dynamic_module_loader(self: Context, callback: DynamicModuleLoader) -> unit {
@@ -1593,6 +1628,23 @@ impl Context {
             },
             None => Result::Err(
                 error(-1, VmErrorKind::TypeError("dynamic eval compiler is not installed")),
+            ),
+        }
+    }
+
+    pub fn compile_dynamic_script_source(self: Context, source: string, source_name: string) -> Result[
+        bytecode::Function,
+        VmError,
+    ] {
+        match self.dynamic_script_compiler_value.get() {
+            Some(callback) => match callback(source, source_name) {
+                Ok(value) => Result::Ok(value),
+                Err(value) => Result::Err(
+                    error(-1, VmErrorKind::SyntaxErrorAt(value.message, value.location)),
+                ),
+            },
+            None => Result::Err(
+                error(-1, VmErrorKind::TypeError("dynamic Script compiler is not installed")),
             ),
         }
     }
@@ -2901,6 +2953,53 @@ fn eval_environment_cell(environment: Option[Ref[EvalEnvironment]], name: string
     }
 }
 
+fn eval_environment_cell_with_depth(
+    environment: Option[Ref[EvalEnvironment]],
+    name: string,
+    depth: isize,
+) -> Option[Ref[runtime::Value]] {
+    let mut current = environment;
+    let mut remaining = depth;
+    while remaining > 0 {
+        match current {
+            Some(value) => match value.get().values.get(name) {
+                Some(cell) => return Option::Some(cell),
+                None => {
+                    current = value.get().parent;
+                    remaining -= 1;
+                },
+            },
+            None => return Option::None,
+        }
+    }
+    Option::None
+}
+
+fn delete_eval_binding_with_depth(machine: Machine, offset: isize, index: isize, depth: isize) -> Result[
+    bool,
+    VmError,
+] {
+    let name = eval_name(machine, offset, index)?;
+    let mut current = machine.eval_environment.get();
+    let mut remaining = depth;
+    while remaining > 0 {
+        match current {
+            Some(environment) => {
+                let value = environment.get();
+                if value.values.get(name).is_some() {
+                    value.values.remove(name);
+                    return Result::Ok(true)
+                } else {
+                    current = value.parent;
+                    remaining -= 1;
+                }
+            },
+            None => return Result::Ok(false),
+        }
+    }
+    Result::Ok(false)
+}
+
 fn read_eval_binding(machine: Machine, offset: isize, index: isize, missing_is_undefined: bool) -> Result[
     runtime::Value,
     VmError,
@@ -2908,24 +3007,40 @@ fn read_eval_binding(machine: Machine, offset: isize, index: isize, missing_is_u
     let name = eval_name(machine, offset, index)?;
     match eval_environment_cell(machine.eval_environment.get(), name) {
         Some(cell) => Result::Ok(cell.get()),
-        None => {
-            let object = global_object(machine, offset)?;
-            let key = field_key(machine, offset, index)?;
-            if missing_is_undefined {
-                match runtime::get_property_descriptor(machine.heap, object, key) {
-                    Ok(Some(_)) => read_object_property(
-                        machine,
-                        offset,
-                        object,
-                        runtime::Value::Object(object),
-                        key,
-                    ),
-                    Ok(None) => Result::Ok(runtime::Value::Undefined),
-                    Err(value) => Result::Err(error(offset, VmErrorKind::TypeError(value.message))),
-                }
+        None => match machine.global_lexical_bindings.get(name) {
+            Some(binding) => if binding.initialized.get() {
+                Result::Ok(binding.value.get())
             } else {
-                read_global_property(machine, offset, object, key)
-            }
+                Result::Err(
+                    error(
+                        offset,
+                        VmErrorKind::ReferenceError(
+                            "cannot access '" + name + "' before initialization",
+                        ),
+                    ),
+                )
+            },
+            None => {
+                let object = global_object(machine, offset)?;
+                let key = field_key(machine, offset, index)?;
+                if missing_is_undefined {
+                    match runtime::get_property_descriptor(machine.heap, object, key) {
+                        Ok(Some(_)) => read_object_property(
+                            machine,
+                            offset,
+                            object,
+                            runtime::Value::Object(object),
+                            key,
+                        ),
+                        Ok(None) => Result::Ok(runtime::Value::Undefined),
+                        Err(value) => Result::Err(
+                            error(offset, VmErrorKind::TypeError(value.message)),
+                        ),
+                    }
+                } else {
+                    read_global_property(machine, offset, object, key)
+                }
+            },
         },
     }
 }
@@ -2940,16 +3055,57 @@ fn write_eval_binding(machine: Machine, offset: isize, index: isize, value: runt
             cell.set(value);
             Result::Ok(())
         },
-        None => {
-            let object = global_object(machine, offset)?;
-            write_property(
-                machine,
-                offset,
-                runtime::Value::Object(object),
-                field_key(machine, offset, index)?,
-                value,
-            )
+        None => match machine.global_lexical_bindings.get(name) {
+            Some(binding) => if !binding.initialized.get() {
+                Result::Err(
+                    error(
+                        offset,
+                        VmErrorKind::ReferenceError(
+                            "cannot access '" + name + "' before initialization",
+                        ),
+                    ),
+                )
+            } else if !binding.mutable {
+                Result::Err(
+                    error(offset, VmErrorKind::TypeError("assignment to constant variable")),
+                )
+            } else {
+                binding.value.set(value);
+                Result::Ok(())
+            },
+            None => {
+                let object = global_object(machine, offset)?;
+                write_property(
+                    machine,
+                    offset,
+                    runtime::Value::Object(object),
+                    field_key(machine, offset, index)?,
+                    value,
+                )
+            },
         },
+    }
+}
+
+fn initialize_global_lexical_binding(machine: Machine, offset: isize, index: isize) -> Result[
+    unit,
+    VmError,
+] {
+    let name = eval_name(machine, offset, index)?;
+    let value = pop(machine, offset)?;
+    match machine.global_lexical_bindings.get(name) {
+        Some(binding) => if binding.initialized.get() {
+            Result::Err(
+                error(offset, VmErrorKind::TypeError("global lexical binding is initialized")),
+            )
+        } else {
+            binding.value.set(value);
+            binding.initialized.set(true);
+            Result::Ok(())
+        },
+        None => Result::Err(
+            error(offset, VmErrorKind::TypeError("global lexical binding is not instantiated")),
+        ),
     }
 }
 
@@ -2964,6 +3120,11 @@ fn initialize_eval_binding(machine: Machine, offset: isize, index: isize) -> Res
             Result::Ok(())
         },
         None => {
+            if machine.global_lexical_bindings.get(name).is_some() {
+                return Result::Err(
+                    error(offset, VmErrorKind::SyntaxError("global lexical binding already exists")),
+                )
+            } else {};
             let object = global_object(machine, offset)?;
             let key = field_key(machine, offset, index)?;
             let exists = match machine.heap.get(object) {
@@ -3000,6 +3161,9 @@ fn delete_eval_binding(machine: Machine, offset: isize, index: isize) -> Result[
                 }
             },
             None => {
+                if machine.global_lexical_bindings.get(name).is_some() {
+                    return Result::Ok(false)
+                } else {};
                 return Result::Ok(
                     runtime::delete_property(
                         machine.heap,
@@ -6574,6 +6738,7 @@ fn evaluate_source(
     };
     let locals = initialize_call_locals(function, Vec::new(), offset)?;
     let upvalues = capture_eval_upvalues(machine, offset, function)?;
+    instantiate_eval_declarations(machine, offset, function)?;
     execute_initialized(
         function,
         machine.heap,
@@ -6590,10 +6755,12 @@ fn evaluate_source(
         machine.primitive_prototypes,
         machine.error_prototypes,
         machine.object_builtin_tags,
+        machine.global_lexical_bindings,
         machine.regexp_constructor,
         machine.iterator_symbol,
         machine.to_primitive_symbol,
         machine.has_instance_symbol,
+        machine.intrinsic_eval,
         Option::None,
         Vec::new(),
         locals,
@@ -6981,10 +7148,12 @@ fn call_value_with_mode_rooted(
                         machine.primitive_prototypes,
                         machine.error_prototypes,
                         machine.object_builtin_tags,
+                        machine.global_lexical_bindings,
                         machine.regexp_constructor,
                         machine.iterator_symbol,
                         machine.to_primitive_symbol,
                         machine.has_instance_symbol,
+                        machine.intrinsic_eval,
                         Option::Some(runtime::Value::Object(object)),
                         arguments,
                         locals,
@@ -7615,15 +7784,62 @@ fn step(machine: Machine, offset: isize, instruction: bytecode::Instruction) -> 
         bytecode::Instruction::GetEvalOrUndefined(index) => {
             machine.stack.push(read_eval_binding(machine, offset, index, true)?)
         },
+        bytecode::Instruction::GetEvalOrUpvalue(index, upvalue, depth) => {
+            let name = eval_name(machine, offset, index)?;
+            let value = match eval_environment_cell_with_depth(
+                machine.eval_environment.get(),
+                name,
+                depth,
+            ) {
+                Some(cell) => cell.get(),
+                None => upvalue_get(machine, offset, upvalue)?,
+            };
+            machine.stack.push(value);
+        },
+        bytecode::Instruction::GetEvalOrArguments(index, depth) => {
+            let name = eval_name(machine, offset, index)?;
+            let value = match eval_environment_cell_with_depth(
+                machine.eval_environment.get(),
+                name,
+                depth,
+            ) {
+                Some(cell) => cell.get(),
+                None => materialize_arguments(machine, offset)?,
+            };
+            machine.stack.push(value);
+        },
         bytecode::Instruction::SetEval(index) => {
             let value = pop(machine, offset)?;
             write_eval_binding(machine, offset, index, value)?;
             machine.stack.push(value);
         },
+        bytecode::Instruction::SetEvalOrUpvalue(index, upvalue, depth, writable, throws_on_write,) => {
+            let value = pop(machine, offset)?;
+            let name = eval_name(machine, offset, index)?;
+            match eval_environment_cell_with_depth(machine.eval_environment.get(), name, depth) {
+                Some(cell) => cell.set(value),
+                None => if throws_on_write {
+                    return Result::Err(
+                        error(offset, VmErrorKind::TypeError("assignment to immutable binding")),
+                    )
+                } else if writable {
+                    upvalue_put(machine, offset, upvalue, value)?
+                } else {},
+            };
+            machine.stack.push(value);
+        },
         bytecode::Instruction::DeleteEval(index) => {
             machine.stack.push(runtime::Value::Bool(delete_eval_binding(machine, offset, index)?));
         },
+        bytecode::Instruction::DeleteEvalOrFalse(index, depth) => {
+            machine.stack.push(
+                runtime::Value::Bool(delete_eval_binding_with_depth(machine, offset, index, depth)?),
+            );
+        },
         bytecode::Instruction::InitEval(index) => initialize_eval_binding(machine, offset, index)?,
+        bytecode::Instruction::InitGlobalLexical(index) => {
+            initialize_global_lexical_binding(machine, offset, index)?
+        },
         bytecode::Instruction::EnterEvalEnvironment => enter_eval_environment(machine),
         bytecode::Instruction::GetField(index) => {
             let receiver = pop(machine, offset)?;
@@ -7768,8 +7984,19 @@ fn step(machine: Machine, offset: isize, instruction: bytecode::Instruction) -> 
                 Some(value) => value,
                 None => return Result::Err(error(offset, VmErrorKind::InvalidConstant(site))),
             };
-            let value = evaluate_source(machine, offset, arguments, bindings)?;
-            machine.stack.push(value)
+            let callee_index = machine.stack.len() - arguments - 1;
+            let direct = callee_index >= 0
+                && match machine.intrinsic_eval {
+                    Some(intrinsic) => runtime::same_value(machine.stack[callee_index], intrinsic),
+                    None => false,
+                };
+            if direct {
+                let _ = machine.stack.remove(callee_index);
+                let value = evaluate_source(machine, offset, arguments, bindings)?;
+                machine.stack.push(value)
+            } else {
+                push_call(machine, offset, arguments, false)?
+            }
         },
         bytecode::Instruction::DynamicImport => push_dynamic_import(machine, offset)?,
         bytecode::Instruction::InitializeInstanceFields => {
@@ -7936,10 +8163,12 @@ fn execute_initialized(
     primitive_prototypes: PrimitivePrototypes,
     error_prototypes: ErrorPrototypes,
     object_builtin_tags: HashMap[runtime::ObjectId, runtime::JsString],
+    global_lexical_bindings: HashMap[string, GlobalLexicalBinding],
     regexp_constructor: Option[runtime::Value],
     iterator_symbol: Option[runtime::Symbol],
     to_primitive_symbol: Option[runtime::Symbol],
     has_instance_symbol: Option[runtime::Symbol],
+    intrinsic_eval: Option[runtime::Value],
     callee: Option[runtime::Value],
     arguments: Vec[runtime::Value],
     locals: Vec[Ref[runtime::Value]],
@@ -7998,10 +8227,12 @@ fn execute_initialized(
         primitive_prototypes,
         error_prototypes,
         object_builtin_tags,
+        global_lexical_bindings,
         regexp_constructor,
         iterator_symbol,
         to_primitive_symbol,
         has_instance_symbol,
+        intrinsic_eval,
         callee,
         arguments,
         arguments_object,
@@ -8091,7 +8322,369 @@ fn execute_machine_from(machine: Machine, start: isize) -> Result[ExecutionResul
     Result::Err(error(offset, VmErrorKind::InvalidJump(offset)))
 }
 
+struct GlobalPropertyStage {
+    name: string,
+    previous: Option[runtime::PropertyDescriptor],
+}
+
+fn script_binding_is_lexical(kind: bytecode::ScriptBindingKind) -> bool {
+    match kind {
+        bytecode::ScriptBindingKind::Let | bytecode::ScriptBindingKind::Const => true,
+        bytecode::ScriptBindingKind::Var | bytecode::ScriptBindingKind::Function => false,
+    }
+}
+
+fn can_declare_global_var(target: runtime::Object, name: string) -> bool {
+    target.own_property(runtime::string_property_key(name)).is_some() || target.extensible()
+}
+
+fn can_declare_global_function(target: runtime::Object, name: string) -> bool {
+    match target.own_property(runtime::string_property_key(name)) {
+        None => target.extensible(),
+        Some(descriptor) => runtime::descriptor_configurable(descriptor)
+            || runtime::descriptor_is_data(descriptor) && runtime::descriptor_writable(descriptor)
+                && runtime::descriptor_enumerable(descriptor),
+    }
+}
+
+fn rollback_global_property_stages(
+    heap: runtime::Heap,
+    global: runtime::ObjectId,
+    stages: Vec[GlobalPropertyStage],
+) -> unit {
+    let mut index = stages.len();
+    while index > 0 {
+        index -= 1;
+        let stage = stages[index];
+        let key = runtime::string_property_key(stage.name);
+        match stage.previous {
+            Some(descriptor) => {
+                let _ = runtime::define_own_property(heap, global, key, descriptor);
+            },
+            None => {
+                let _ = runtime::delete_property(heap, global, key);
+            },
+        }
+    }
+}
+
+fn stage_global_property(
+    heap: runtime::Heap,
+    global: runtime::ObjectId,
+    name: string,
+    previous: Option[runtime::PropertyDescriptor],
+    stages: Vec[GlobalPropertyStage],
+) -> bool {
+    if runtime::define_own_property(
+        heap,
+        global,
+        runtime::string_property_key(name),
+        runtime::data_descriptor(runtime::Value::Undefined, true, true, true),
+    ) {
+        stages.push(GlobalPropertyStage { name, previous });
+        true
+    } else {
+        false
+    }
+}
+
+fn instantiate_global_eval_declarations(
+    heap: runtime::Heap,
+    global: runtime::ObjectId,
+    global_lexical_bindings: HashMap[string, GlobalLexicalBinding],
+    declarations: Vec[bytecode::EvalDeclaration],
+    offset: isize,
+) -> Result[unit, VmError] {
+    let target = match heap.get(global) {
+        Some(value) => value,
+        None => return Result::Err(
+            error(offset, VmErrorKind::TypeError("global object is no longer alive")),
+        ),
+    };
+    for declaration in declarations {
+        if global_lexical_bindings.get(declaration.name).is_some() {
+            return Result::Err(
+                error(
+                    offset,
+                    VmErrorKind::SyntaxError(
+                        "identifier '" + declaration.name + "' has already been declared",
+                    ),
+                ),
+            )
+        } else {};
+        let allowed = if declaration.kind == bytecode::EvalDeclarationKind::Function {
+            can_declare_global_function(target, declaration.name)
+        } else {
+            can_declare_global_var(target, declaration.name)
+        };
+        if !allowed {
+            return Result::Err(
+                error(
+                    offset,
+                    VmErrorKind::TypeError(
+                        "cannot declare eval variable '" + declaration.name + "'",
+                    ),
+                ),
+            )
+        } else {}
+    }
+    let stages: Vec[GlobalPropertyStage] = Vec::new();
+    for declaration in declarations {
+        let previous = target.own_property(runtime::string_property_key(declaration.name));
+        let should_stage = if declaration.kind == bytecode::EvalDeclarationKind::Function {
+            match previous {
+                Some(descriptor) => runtime::descriptor_configurable(descriptor),
+                None => true,
+            }
+        } else {
+            previous.is_none()
+        };
+        if should_stage && !stage_global_property(heap, global, declaration.name, previous, stages) {
+            rollback_global_property_stages(heap, global, stages);
+            return Result::Err(
+                error(
+                    offset,
+                    VmErrorKind::TypeError(
+                        "cannot declare eval variable '" + declaration.name + "'",
+                    ),
+                ),
+            )
+        } else {}
+    }
+    Result::Ok(())
+}
+
+fn instantiate_eval_declarations(machine: Machine, offset: isize, function: bytecode::Function) -> Result[
+    unit,
+    VmError,
+] {
+    let declarations = function.eval_declarations();
+    if declarations.is_empty() {
+        return Result::Ok(())
+    } else {};
+    match machine.eval_environment.get() {
+        Some(environment) => {
+            let values = environment.get().values;
+            for declaration in declarations {
+                if values.get(declaration.name).is_none() {
+                    values[declaration.name] = Ref::new(runtime::Value::Undefined);
+                } else {}
+            }
+            Result::Ok(())
+        },
+        None => {
+            let global = global_object(machine, offset)?;
+            instantiate_global_eval_declarations(
+                machine.heap,
+                global,
+                machine.global_lexical_bindings,
+                declarations,
+                offset,
+            )
+        },
+    }
+}
+
+fn instantiate_script_bindings(context: Context, function: bytecode::Function) -> Result[
+    unit,
+    VmError,
+] {
+    let bindings = function.script_bindings();
+    if bindings.is_empty() {
+        return Result::Ok(())
+    } else {};
+    let global = match context.global_object_value.get() {
+        Some(value) => value,
+        None => return Result::Err(
+            error(-1, VmErrorKind::TypeError("global object is not installed")),
+        ),
+    };
+    let target = match context.heap_value.get(global) {
+        Some(value) => value,
+        None => return Result::Err(
+            error(-1, VmErrorKind::TypeError("global object is no longer alive")),
+        ),
+    };
+    let declarations: Vec[bytecode::ScriptBinding] = Vec::new();
+    for binding in bindings {
+        let mut declaration_index = -1;
+        let mut index = 0;
+        while index < declarations.len() {
+            if declarations[index].name == binding.name {
+                declaration_index = index;
+                break
+            } else {};
+            index += 1;
+        }
+        if declaration_index >= 0 {
+            let previous = declarations[declaration_index].kind;
+            if script_binding_is_lexical(previous) || script_binding_is_lexical(binding.kind) {
+                return Result::Err(
+                    error(
+                        -1,
+                        VmErrorKind::SyntaxError(
+                            "identifier '" + binding.name + "' has already been declared",
+                        ),
+                    ),
+                )
+            } else if previous == bytecode::ScriptBindingKind::Var
+                && binding.kind == bytecode::ScriptBindingKind::Function {
+                declarations[declaration_index] = binding;
+            } else {}
+        } else {
+            declarations.push(binding)
+        }
+    }
+    for declaration in declarations {
+        let name = declaration.name;
+        let kind = declaration.kind;
+        if script_binding_is_lexical(kind) {
+            if context.global_lexical_bindings_value.get(name).is_some() {
+                return Result::Err(
+                    error(
+                        -1,
+                        VmErrorKind::SyntaxError(
+                            "identifier '" + name + "' has already been declared",
+                        ),
+                    ),
+                )
+            } else {};
+            match target.own_property(runtime::string_property_key(name)) {
+                Some(descriptor) => if !runtime::descriptor_configurable(descriptor) {
+                    return Result::Err(
+                        error(
+                            -1,
+                            VmErrorKind::SyntaxError(
+                                "identifier '" + name + "' has already been declared",
+                            ),
+                        ),
+                    )
+                } else {},
+                None => (),
+            }
+        } else {
+            if context.global_lexical_bindings_value.get(name).is_some() {
+                return Result::Err(
+                    error(
+                        -1,
+                        VmErrorKind::SyntaxError(
+                            "identifier '" + name + "' has already been declared",
+                        ),
+                    ),
+                )
+            } else {};
+            let allowed = if kind == bytecode::ScriptBindingKind::Function {
+                can_declare_global_function(target, name)
+            } else {
+                can_declare_global_var(target, name)
+            };
+            if !allowed {
+                return Result::Err(
+                    error(-1, VmErrorKind::TypeError("cannot declare global '" + name + "'")),
+                )
+            } else {}
+        }
+    }
+    let stages: Vec[GlobalPropertyStage] = Vec::new();
+    for declaration in declarations {
+        let name = declaration.name;
+        let kind = declaration.kind;
+        if kind == bytecode::ScriptBindingKind::Function {
+            let previous = target.own_property(runtime::string_property_key(name));
+            let should_stage = match previous {
+                Some(descriptor) => runtime::descriptor_configurable(descriptor),
+                None => true,
+            };
+            if should_stage
+                && !stage_global_property(context.heap_value, global, name, previous, stages) {
+                rollback_global_property_stages(context.heap_value, global, stages);
+                return Result::Err(
+                    error(
+                        -1,
+                        VmErrorKind::TypeError("cannot declare global function '" + name + "'"),
+                    ),
+                )
+            } else {}
+        } else {}
+    }
+    for declaration in declarations {
+        let name = declaration.name;
+        let kind = declaration.kind;
+        if kind == bytecode::ScriptBindingKind::Var
+            && target.own_property(runtime::string_property_key(name)).is_none()
+            && !stage_global_property(context.heap_value, global, name, Option::None, stages) {
+            rollback_global_property_stages(context.heap_value, global, stages);
+            return Result::Err(
+                error(-1, VmErrorKind::TypeError("cannot declare global variable '" + name + "'")),
+            )
+        } else {}
+    }
+    for stage in stages {
+        if !runtime::define_own_property(
+            context.heap_value,
+            global,
+            runtime::string_property_key(stage.name),
+            runtime::data_descriptor(runtime::Value::Undefined, true, true, false),
+        ) {
+            return Result::Err(
+                error(-1, VmErrorKind::TypeError("cannot finalize global declaration")),
+            )
+        } else {}
+    }
+    for declaration in declarations {
+        let name = declaration.name;
+        let kind = declaration.kind;
+        if script_binding_is_lexical(kind) {
+            context.global_lexical_bindings_value[name] = GlobalLexicalBinding {
+                value: Ref::new(runtime::Value::Undefined),
+                initialized: Ref::new(false),
+                mutable: kind == bytecode::ScriptBindingKind::Let,
+            };
+        } else {}
+    }
+    Result::Ok(())
+}
+
 impl Context {
+    pub fn execute_eval(self: Context, function: bytecode::Function) -> Result[
+        runtime::Value,
+        VmError,
+    ] {
+        let verification = bytecode::verify(function);
+        if !verification.errors.is_empty() {
+            return Result::Err(error(-1, VmErrorKind::VerificationFailed(verification.errors)))
+        } else {};
+        let declarations = function.eval_declarations();
+        if !declarations.is_empty() {
+            let global = match self.global_object_value.get() {
+                Some(value) => value,
+                None => return Result::Err(
+                    error(-1, VmErrorKind::TypeError("global object is not installed")),
+                ),
+            };
+            instantiate_global_eval_declarations(
+                self.heap_value,
+                global,
+                self.global_lexical_bindings_value,
+                declarations,
+                -1,
+            )?
+        } else {};
+        self.execute(function)
+    }
+
+    pub fn execute_script(self: Context, function: bytecode::Function) -> Result[
+        runtime::Value,
+        VmError,
+    ] {
+        let verification = bytecode::verify(function);
+        if !verification.errors.is_empty() {
+            return Result::Err(error(-1, VmErrorKind::VerificationFailed(verification.errors)))
+        } else {};
+        instantiate_script_bindings(self, function)?;
+        self.execute(function)
+    }
+
     pub fn execute(self: Context, function: bytecode::Function) -> Result[runtime::Value, VmError] {
         let global_this = match self.global_object_value.get() {
             Some(value) => runtime::Value::Object(value),
@@ -8114,10 +8707,12 @@ impl Context {
                 self.primitive_prototypes_value,
                 self.error_prototypes_value,
                 self.object_builtin_tags_value,
+                self.global_lexical_bindings_value,
                 self.regexp_constructor_value.get(),
                 self.iterator_symbol_value.get(),
                 self.well_known_symbols_value.slot(WellKnownSymbolKind::ToPrimitive).get(),
                 self.well_known_symbols_value.slot(WellKnownSymbolKind::HasInstance).get(),
+                self.intrinsic_eval_value.get(),
                 Option::None,
                 Vec::new(),
                 Vec::new(),
@@ -8154,10 +8749,12 @@ impl Context {
             self.primitive_prototypes_value,
             self.error_prototypes_value,
             self.object_builtin_tags_value,
+            self.global_lexical_bindings_value,
             self.regexp_constructor_value.get(),
             self.iterator_symbol_value.get(),
             self.well_known_symbols_value.slot(WellKnownSymbolKind::ToPrimitive).get(),
             self.well_known_symbols_value.slot(WellKnownSymbolKind::HasInstance).get(),
+            self.intrinsic_eval_value.get(),
             Option::None,
             Vec::new(),
             locals,
@@ -8209,10 +8806,12 @@ impl Context {
                 self.primitive_prototypes_value,
                 self.error_prototypes_value,
                 self.object_builtin_tags_value,
+                self.global_lexical_bindings_value,
                 self.regexp_constructor_value.get(),
                 self.iterator_symbol_value.get(),
                 self.well_known_symbols_value.slot(WellKnownSymbolKind::ToPrimitive).get(),
                 self.well_known_symbols_value.slot(WellKnownSymbolKind::HasInstance).get(),
+                self.intrinsic_eval_value.get(),
                 Option::None,
                 Vec::new(),
                 Vec::new(),
@@ -8255,10 +8854,12 @@ impl Context {
             self.primitive_prototypes_value,
             self.error_prototypes_value,
             self.object_builtin_tags_value,
+            self.global_lexical_bindings_value,
             self.regexp_constructor_value.get(),
             self.iterator_symbol_value.get(),
             self.well_known_symbols_value.slot(WellKnownSymbolKind::ToPrimitive).get(),
             self.well_known_symbols_value.slot(WellKnownSymbolKind::HasInstance).get(),
+            self.intrinsic_eval_value.get(),
             Option::None,
             Vec::new(),
             locals,
@@ -8375,10 +8976,12 @@ impl Context {
             self.primitive_prototypes_value,
             self.error_prototypes_value,
             self.object_builtin_tags_value,
+            self.global_lexical_bindings_value,
             self.regexp_constructor_value.get(),
             self.iterator_symbol_value.get(),
             self.well_known_symbols_value.slot(WellKnownSymbolKind::ToPrimitive).get(),
             self.well_known_symbols_value.slot(WellKnownSymbolKind::HasInstance).get(),
+            self.intrinsic_eval_value.get(),
             Option::None,
             Vec::new(),
             locals,
@@ -8428,10 +9031,12 @@ impl Context {
             self.primitive_prototypes_value,
             self.error_prototypes_value,
             self.object_builtin_tags_value,
+            self.global_lexical_bindings_value,
             self.regexp_constructor_value.get(),
             self.iterator_symbol_value.get(),
             self.well_known_symbols_value.slot(WellKnownSymbolKind::ToPrimitive).get(),
             self.well_known_symbols_value.slot(WellKnownSymbolKind::HasInstance).get(),
+            self.intrinsic_eval_value.get(),
             Option::None,
             Vec::new(),
             locals,
@@ -8536,10 +9141,12 @@ impl Context {
             self.primitive_prototypes_value,
             self.error_prototypes_value,
             self.object_builtin_tags_value,
+            self.global_lexical_bindings_value,
             self.regexp_constructor_value.get(),
             self.iterator_symbol_value.get(),
             self.well_known_symbols_value.slot(WellKnownSymbolKind::ToPrimitive).get(),
             self.well_known_symbols_value.slot(WellKnownSymbolKind::HasInstance).get(),
+            self.intrinsic_eval_value.get(),
             Option::None,
             Vec::new(),
             locals,
@@ -8762,10 +9369,12 @@ impl Context {
             self.primitive_prototypes_value,
             self.error_prototypes_value,
             self.object_builtin_tags_value,
+            self.global_lexical_bindings_value,
             self.regexp_constructor_value.get(),
             self.iterator_symbol_value.get(),
             self.well_known_symbols_value.slot(WellKnownSymbolKind::ToPrimitive).get(),
             self.well_known_symbols_value.slot(WellKnownSymbolKind::HasInstance).get(),
+            self.intrinsic_eval_value.get(),
             Option::None,
             Vec::new(),
             locals,
@@ -8815,10 +9424,12 @@ impl Context {
             self.primitive_prototypes_value,
             self.error_prototypes_value,
             self.object_builtin_tags_value,
+            self.global_lexical_bindings_value,
             self.regexp_constructor_value.get(),
             self.iterator_symbol_value.get(),
             self.well_known_symbols_value.slot(WellKnownSymbolKind::ToPrimitive).get(),
             self.well_known_symbols_value.slot(WellKnownSymbolKind::HasInstance).get(),
+            self.intrinsic_eval_value.get(),
             Option::None,
             Vec::new(),
             locals,

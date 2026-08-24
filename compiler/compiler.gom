@@ -79,6 +79,8 @@ struct OuterBinding {
     name: string,
     source: bytecode::UpvalueSource,
     kind: BindingKind,
+    declaration_target: bool,
+    environment_depth: isize,
 }
 
 struct Upvalue {
@@ -131,6 +133,12 @@ struct ProtectedContext {
     active: bool,
 }
 
+struct DynamicEvalDeclaration {
+    name: string,
+    kind: bytecode::EvalDeclarationKind,
+    offset: isize,
+}
+
 struct Compiler {
     constants: Vec[bytecode::Constant],
     code: Vec[bytecode::Instruction],
@@ -168,11 +176,16 @@ struct Compiler {
     allow_unknown_globals: Ref[bool],
     pending_loop_label: Ref[Option[string]],
     direct_eval: Ref[bool],
-    predeclaring_eval: Ref[bool],
     dynamic_eval_vars: Vec[string],
+    dynamic_eval_declarations: Vec[DynamicEvalDeclaration],
     with_bindings: Vec[WithBinding],
     next_with_binding: Ref[isize],
     module_mode: Ref[bool],
+    script_mode: Ref[bool],
+    global_lexical_indices: HashMap[string, isize],
+    global_var_kinds: HashMap[string, bytecode::ScriptBindingKind],
+    global_declaration_offsets: HashMap[string, isize],
+    runtime_eval_environment: bool,
 }
 
 enum AssignmentStorage {
@@ -180,6 +193,11 @@ enum AssignmentStorage {
     Upvalue(isize),
     Global(isize),
     Eval(isize),
+    EvalOrUpvalue {
+        name: isize,
+        upvalue: isize,
+        depth: isize,
+    },
     Field {
         object: isize,
         property: isize,
@@ -392,7 +410,72 @@ fn declare_in_scope(
 fn declare_current(compiler: Compiler, name: string, kind: BindingKind, span: ast::Span) -> Option[
     Binding,
 ] {
-    declare_in_scope(compiler, compiler.scopes.len() - 1, name, kind, span)
+    let scope_index = compiler.scopes.len() - 1;
+    if compiler.script_mode.get() && scope_index == 0
+        && (kind == BindingKind::Let || kind == BindingKind::Const)
+        && compiler.global_var_kinds.get(name).is_some() {
+        compile_error(compiler, "duplicate declaration of `" + name + "`", span)
+    } else {};
+    let binding = declare_in_scope(compiler, scope_index, name, kind, span);
+    match binding {
+        Some(value) => if compiler.script_mode.get() && scope_index == 0
+            && (kind == BindingKind::Let || kind == BindingKind::Const) {
+            compiler.global_lexical_indices[name] = value.index;
+            record_global_declaration_offset(compiler, name, span.start);
+        } else {},
+        None => (),
+    };
+    binding
+}
+
+fn is_global_lexical_binding(compiler: Compiler, binding: Binding) -> bool {
+    match compiler.global_lexical_indices.get(binding.name) {
+        Some(index) => index == binding.index,
+        None => false,
+    }
+}
+
+fn record_global_declaration_offset(compiler: Compiler, name: string, offset: isize) -> unit {
+    match compiler.global_declaration_offsets.get(name) {
+        Some(previous) => if offset < previous {
+            compiler.global_declaration_offsets[name] = offset;
+        } else {},
+        None => {
+            compiler.global_declaration_offsets[name] = offset;
+        },
+    }
+}
+
+fn script_global_var_scope(compiler: Compiler) -> bool {
+    compiler.script_mode.get() && compiler.var_scope_index.get() == 0
+}
+
+fn is_script_global_var(compiler: Compiler, name: string) -> bool {
+    compiler.global_var_kinds.get(name).is_some()
+}
+
+fn record_global_var(
+    compiler: Compiler,
+    name: string,
+    kind: bytecode::ScriptBindingKind,
+    span: ast::Span,
+) -> unit {
+    record_global_declaration_offset(compiler, name, span.start);
+    match compiler.scopes[0].bindings.get(name) {
+        Some(binding) => if binding.kind != BindingKind::Var {
+            compile_error(compiler, "duplicate declaration of `" + name + "`", span)
+        } else {},
+        None => (),
+    };
+    match compiler.global_var_kinds.get(name) {
+        Some(bytecode::ScriptBindingKind::Function) => (),
+        Some(_) => if kind == bytecode::ScriptBindingKind::Function {
+            compiler.global_var_kinds[name] = kind;
+        } else {},
+        None => {
+            compiler.global_var_kinds[name] = kind;
+        },
+    }
 }
 
 fn lookup_binding(compiler: Compiler, name: string) -> Option[Binding] {
@@ -527,12 +610,32 @@ fn resolve_upvalue(compiler: Compiler, name: string) -> Option[(isize, BindingKi
     }
 }
 
+fn current_eval_environment_depth(compiler: Compiler) -> isize {
+    if !compiler.runtime_eval_environment {
+        0
+    } else if compiler.var_scope_index.get() > 0 {
+        2
+    } else {
+        1
+    }
+}
+
+fn outer_binding_environment_depth(compiler: Compiler, name: string) -> isize {
+    match lookup_outer_binding(compiler, name) {
+        Some(binding) => current_eval_environment_depth(compiler) + binding.environment_depth,
+        None => current_eval_environment_depth(compiler),
+    }
+}
+
 fn visible_bindings(compiler: Compiler) -> Vec[OuterBinding] {
     let bindings: Vec[OuterBinding] = Vec::new();
     let mut scope_index = compiler.scopes.len();
     while scope_index > 0 {
         scope_index -= 1;
         for (name, binding) in compiler.scopes[scope_index].bindings.entries() {
+            if is_global_lexical_binding(compiler, binding) {
+                continue
+            } else {};
             let mut found = false;
             for current in bindings {
                 if current.name == name {
@@ -545,6 +648,13 @@ fn visible_bindings(compiler: Compiler) -> Vec[OuterBinding] {
                         name,
                         source: bytecode::UpvalueSource::Local(binding.index),
                         kind: binding.kind,
+                        declaration_target: scope_index >= compiler.var_scope_index.get(),
+                        environment_depth: if compiler.runtime_eval_environment
+                            && scope_index < compiler.var_scope_index.get() {
+                            compiler.var_scope_index.get() - scope_index
+                        } else {
+                            0
+                        },
                     },
                 )
             } else {}
@@ -567,6 +677,13 @@ fn visible_bindings(compiler: Compiler) -> Vec[OuterBinding] {
                     name: outer.name,
                     source: bytecode::UpvalueSource::Upvalue(index),
                     kind: outer.kind,
+                    declaration_target: if compiler.runtime_eval_environment {
+                        false
+                    } else {
+                        outer.declaration_target
+                    },
+                    environment_depth: current_eval_environment_depth(compiler)
+                        + outer.environment_depth,
                 },
             )
         } else {}
@@ -584,7 +701,15 @@ fn arrow_outer_bindings(compiler: Compiler) -> Vec[OuterBinding] {
     } else {
         bytecode::UpvalueSource::This
     };
-    bindings.push(OuterBinding { name: "$this", source: this_source, kind: BindingKind::Const });
+    bindings.push(
+        OuterBinding {
+            name: "$this",
+            source: this_source,
+            kind: BindingKind::Const,
+            declaration_target: false,
+            environment_depth: 0,
+        },
+    );
     let arguments_source = if compiler.lexical_arguments {
         match resolve_upvalue(compiler, "$arguments") {
             Some((index, _)) => Option::Some(bytecode::UpvalueSource::Upvalue(index)),
@@ -597,7 +722,17 @@ fn arrow_outer_bindings(compiler: Compiler) -> Vec[OuterBinding] {
     };
     match arguments_source {
         Some(source) => bindings.push(
-            OuterBinding { name: "$arguments", source, kind: BindingKind::Const },
+            OuterBinding {
+                name: "$arguments",
+                source,
+                kind: BindingKind::Const,
+                declaration_target: false,
+                environment_depth: if compiler.lexical_arguments {
+                    outer_binding_environment_depth(compiler, "$arguments")
+                } else {
+                    current_eval_environment_depth(compiler)
+                },
+            },
         ),
         None => (),
     };
@@ -618,6 +753,8 @@ fn current_eval_bindings(compiler: Compiler) -> Vec[bytecode::EvalBinding] {
                 writable: binding.kind != BindingKind::Const
                     && binding.kind != BindingKind::NamedFunction,
                 named_function: binding.kind == BindingKind::NamedFunction,
+                declaration_target: binding.declaration_target,
+                environment_depth: binding.environment_depth,
             },
         )
     }
@@ -629,6 +766,8 @@ fn current_eval_bindings(compiler: Compiler) -> Vec[bytecode::EvalBinding] {
                 variable: false,
                 writable: false,
                 named_function: false,
+                declaration_target: false,
+                environment_depth: 0,
             },
         )
     } else {};
@@ -640,6 +779,8 @@ fn current_eval_bindings(compiler: Compiler) -> Vec[bytecode::EvalBinding] {
                 variable: false,
                 writable: false,
                 named_function: false,
+                declaration_target: false,
+                environment_depth: 0,
             },
         )
     } else {};
@@ -651,6 +792,8 @@ fn current_eval_bindings(compiler: Compiler) -> Vec[bytecode::EvalBinding] {
                 variable: false,
                 writable: false,
                 named_function: false,
+                declaration_target: false,
+                environment_depth: 0,
             },
         )
     } else {};
@@ -663,23 +806,6 @@ fn add_eval_site(compiler: Compiler, bindings: Vec[bytecode::EvalBinding]) -> is
     index
 }
 
-fn predeclare_static_eval_vars(compiler: Compiler, arguments: Vec[ast::Expr]) -> unit {
-    if compiler_is_strict(compiler) || arguments.is_empty() {
-        return
-    } else {};
-    match arguments[0] {
-        ast::Expr::String { value, .. } => {
-            let parsed = parser::parse(value);
-            if parsed.errors.is_empty() {
-                compiler.predeclaring_eval.set(true);
-                collect_var_body(compiler, parsed.program.body);
-                compiler.predeclaring_eval.set(false);
-            } else {}
-        },
-        _ => (),
-    }
-}
-
 fn has_dynamic_eval_var(compiler: Compiler, name: string) -> bool {
     for current in compiler.dynamic_eval_vars {
         if current == name {
@@ -689,10 +815,34 @@ fn has_dynamic_eval_var(compiler: Compiler, name: string) -> bool {
     false
 }
 
-fn add_dynamic_eval_var(compiler: Compiler, name: string) -> unit {
+fn add_dynamic_eval_var(
+    compiler: Compiler,
+    name: string,
+    kind: bytecode::EvalDeclarationKind,
+    span: ast::Span,
+) -> unit {
     if !has_dynamic_eval_var(compiler, name) {
         compiler.dynamic_eval_vars.push(name)
-    } else {}
+    } else {};
+    compiler.dynamic_eval_declarations.push(
+        DynamicEvalDeclaration { name, kind, offset: span.start },
+    )
+}
+
+fn dynamic_eval_declarations(compiler: Compiler) -> Vec[bytecode::EvalDeclaration] {
+    let ordered: Vec[DynamicEvalDeclaration] = Vec::new();
+    for declaration in compiler.dynamic_eval_declarations {
+        let mut index = 0;
+        while index < ordered.len() && ordered[index].offset <= declaration.offset {
+            index += 1;
+        }
+        ordered.insert(index, declaration)
+    }
+    let result: Vec[bytecode::EvalDeclaration] = Vec::new();
+    for declaration in ordered {
+        result.push(bytecode::EvalDeclaration { name: declaration.name, kind: declaration.kind })
+    }
+    result
 }
 
 fn dynamic_eval_var_conflicts_current_scope(compiler: Compiler, name: string) -> bool {
@@ -720,16 +870,30 @@ fn declare_var_pattern(compiler: Compiler, pattern: ast::BindingPattern) -> unit
         let scope_index = compiler.var_scope_index.get();
         match compiler.scopes[scope_index].bindings.get(name) {
             Some(binding) => if binding.kind != BindingKind::Var {
-                if !compiler.predeclaring_eval.get() {
-                    compile_error(compiler, "duplicate declaration of `" + name + "`", span)
-                } else {}
+                compile_error(compiler, "duplicate declaration of `" + name + "`", span)
             } else {},
-            None => if compiler.direct_eval.get() && !compiler_is_strict(compiler) {
+            None => if script_global_var_scope(compiler) {
+                record_global_var(compiler, name, bytecode::ScriptBindingKind::Var, span)
+            } else if compiler.direct_eval.get() && !compiler_is_strict(compiler) {
                 match lookup_outer_binding(compiler, name) {
-                    Some(binding) => if binding.kind != BindingKind::Var {
-                        compile_error(compiler, "duplicate declaration of `" + name + "`", span)
-                    } else {},
-                    None => add_dynamic_eval_var(compiler, name),
+                    Some(binding) => if binding.declaration_target {
+                        if binding.kind != BindingKind::Var {
+                            compile_error(compiler, "duplicate declaration of `" + name + "`", span)
+                        } else {}
+                    } else {
+                        add_dynamic_eval_var(
+                            compiler,
+                            name,
+                            bytecode::EvalDeclarationKind::Var,
+                            span,
+                        )
+                    },
+                    None => add_dynamic_eval_var(
+                        compiler,
+                        name,
+                        bytecode::EvalDeclarationKind::Var,
+                        span,
+                    ),
                 }
             } else {
                 let index = new_local(compiler);
@@ -737,9 +901,7 @@ fn declare_var_pattern(compiler: Compiler, pattern: ast::BindingPattern) -> unit
                     name,
                     Binding { name, index, kind: BindingKind::Var, span },
                 );
-                if !compiler.predeclaring_eval.get() {
-                    compiler.var_indices.push(index)
-                } else {}
+                compiler.var_indices.push(index)
             },
         }
     }
@@ -880,6 +1042,9 @@ fn declare_lexical_statement(compiler: Compiler, statement: ast::Stmt) -> unit {
         ast::Stmt::FunctionDeclaration { name, span, .. } => {
             if name == "" {
                 compile_error(compiler, "function declaration requires a name", span)
+            } else if compiler.script_mode.get() && compiler.scopes.len() == 1 {
+                validate_strict_identifier(compiler, name, span);
+                record_global_var(compiler, name, bytecode::ScriptBindingKind::Function, span)
             } else {
                 match compiler.scopes[compiler.scopes.len() - 1].bindings.get(name) {
                     Some(binding) => {
@@ -890,14 +1055,28 @@ fn declare_lexical_statement(compiler: Compiler, statement: ast::Stmt) -> unit {
                     },
                     None => if compiler.direct_eval.get() && !compiler_is_strict(compiler) {
                         match lookup_outer_binding(compiler, name) {
-                            Some(binding) => if binding.kind != BindingKind::Var {
-                                compile_error(
+                            Some(binding) => if binding.declaration_target {
+                                if binding.kind != BindingKind::Var {
+                                    compile_error(
+                                        compiler,
+                                        "duplicate declaration of `" + name + "`",
+                                        span,
+                                    )
+                                } else {}
+                            } else {
+                                add_dynamic_eval_var(
                                     compiler,
-                                    "duplicate declaration of `" + name + "`",
+                                    name,
+                                    bytecode::EvalDeclarationKind::Function,
                                     span,
                                 )
-                            } else {},
-                            None => add_dynamic_eval_var(compiler, name),
+                            },
+                            None => add_dynamic_eval_var(
+                                compiler,
+                                name,
+                                bytecode::EvalDeclarationKind::Function,
+                                span,
+                            ),
                         }
                     } else {
                         let _ = declare_current(compiler, name, BindingKind::Var, span);
@@ -1532,35 +1711,68 @@ fn parse_bigint(value: string) -> Result[runtime::BigInt, string] {
 
 fn compile_plain_identifier(compiler: Compiler, name: string, span: ast::Span) -> unit {
     match lookup_binding(compiler, name) {
-        Some(binding) => {
+        Some(binding) => if is_global_lexical_binding(compiler, binding) {
+            let index = string_constant(compiler, name);
+            let _ = emit(compiler, bytecode::Instruction::GetEval(index));
+        } else {
             let _ = emit(compiler, bytecode::Instruction::GetLoc(binding.index));
         },
-        None => match resolve_upvalue(compiler, name) {
-            Some((index, _)) => {
-                let _ = emit(compiler, bytecode::Instruction::GetUpvalue(index));
-            },
-            None => {
-                if name == "arguments" && compiler.lexical_arguments {
-                    match resolve_upvalue(compiler, "$arguments") {
-                        Some((index, _)) => {
-                            let _ = emit(compiler, bytecode::Instruction::GetUpvalue(index));
-                            return
-                        },
-                        None => (),
+        None => if has_dynamic_eval_var(compiler, name) {
+            let index = string_constant(compiler, name);
+            let _ = emit(compiler, bytecode::Instruction::GetEval(index));
+        } else {
+            match resolve_upvalue(compiler, name) {
+                Some((index, _)) => {
+                    let depth = outer_binding_environment_depth(compiler, name);
+                    if depth > 0 {
+                        let name_index = string_constant(compiler, name);
+                        let _ = emit(
+                            compiler,
+                            bytecode::Instruction::GetEvalOrUpvalue(name_index, index, depth),
+                        );
+                    } else {
+                        let _ = emit(compiler, bytecode::Instruction::GetUpvalue(index));
                     }
-                } else {};
-                if name == "arguments" && compiler.arguments_available {
-                    let _ = emit(compiler, bytecode::Instruction::PushArguments);
-                    return
-                } else if is_known_global(name) || compiler.allow_unknown_globals.get() {
-                    let index = string_constant(compiler, name);
-                    let _ = emit(compiler, bytecode::Instruction::GetEval(index));
-                    return
-                } else {
-                    compile_error(compiler, "undefined identifier `" + name + "`", span)
-                };
-                let _ = emit(compiler, bytecode::Instruction::Undefined);
-            },
+                },
+                None => {
+                    if name == "arguments" && compiler.lexical_arguments {
+                        match resolve_upvalue(compiler, "$arguments") {
+                            Some((index, _)) => {
+                                let name_index = string_constant(compiler, name);
+                                let depth = outer_binding_environment_depth(compiler, "$arguments");
+                                let _ = emit(
+                                    compiler,
+                                    bytecode::Instruction::GetEvalOrUpvalue(
+                                        name_index,
+                                        index,
+                                        depth,
+                                    ),
+                                );
+                                return
+                            },
+                            None => (),
+                        }
+                    } else {};
+                    if name == "arguments" && compiler.arguments_available {
+                        let name_index = string_constant(compiler, name);
+                        let _ = emit(
+                            compiler,
+                            bytecode::Instruction::GetEvalOrArguments(
+                                name_index,
+                                current_eval_environment_depth(compiler),
+                            ),
+                        );
+                        return
+                    } else if is_known_global(name) || compiler.allow_unknown_globals.get() {
+                        let index = string_constant(compiler, name);
+                        let _ = emit(compiler, bytecode::Instruction::GetEval(index));
+                        return
+                    } else {
+                        compile_error(compiler, "undefined identifier `" + name + "`", span)
+                    };
+                    let _ = emit(compiler, bytecode::Instruction::Undefined);
+                },
+            }
         },
     }
 }
@@ -2165,12 +2377,10 @@ fn compile_call(
     let call_offset = first_source_byte_between(compiler, ast::expr_span(callee).end, call_span.end);
     if !spread
         && match callee {
-            ast::Expr::Identifier { name, .. } => name == "eval"
-                && lookup_binding(compiler, name).is_none()
-                && lookup_outer_binding(compiler, name).is_none(),
+            ast::Expr::Identifier { name, .. } => name == "eval",
             _ => false,
         } {
-        predeclare_static_eval_vars(compiler, arguments);
+        compile_identifier(compiler, "eval", ast::expr_span(callee));
         for argument in arguments {
             compile_expression(compiler, argument)
         }
@@ -2440,9 +2650,27 @@ fn compile_construct(compiler: Compiler, callee: ast::Expr, arguments: Vec[ast::
 }
 
 fn compile_plain_identifier_delete(compiler: Compiler, name: string) -> unit {
-    if lookup_binding(compiler, name).is_some() || lookup_outer_binding(compiler, name).is_some()
-        || name == "arguments" && (compiler.arguments_available || compiler.lexical_arguments) {
+    if has_dynamic_eval_var(compiler, name) {
+        let index = string_constant(compiler, name);
+        let _ = emit(compiler, bytecode::Instruction::DeleteEval(index));
+    } else if lookup_binding(compiler, name).is_some() {
         let _ = emit(compiler, bytecode::Instruction::PushFalse);
+    } else if lookup_outer_binding(compiler, name).is_some() {
+        let depth = outer_binding_environment_depth(compiler, name);
+        if depth > 0 {
+            let index = string_constant(compiler, name);
+            let _ = emit(compiler, bytecode::Instruction::DeleteEvalOrFalse(index, depth));
+        } else {
+            let _ = emit(compiler, bytecode::Instruction::PushFalse);
+        }
+    } else if name == "arguments" && (compiler.arguments_available || compiler.lexical_arguments) {
+        let depth = if compiler.lexical_arguments {
+            outer_binding_environment_depth(compiler, "$arguments")
+        } else {
+            current_eval_environment_depth(compiler)
+        };
+        let index = string_constant(compiler, name);
+        let _ = emit(compiler, bytecode::Instruction::DeleteEvalOrFalse(index, depth));
     } else {
         let index = string_constant(compiler, name);
         let _ = emit(compiler, bytecode::Instruction::DeleteEval(index));
@@ -2642,30 +2870,73 @@ fn compile_unary(
             } else {
                 validate_strict_identifier(compiler, name, span);
                 match lookup_binding(compiler, name) {
-                    Some(binding) => {
+                    Some(binding) => if is_global_lexical_binding(compiler, binding) {
+                        let index = string_constant(compiler, name);
+                        let _ = emit(compiler, bytecode::Instruction::GetEval(index));
+                    } else {
                         let _ = emit(compiler, bytecode::Instruction::GetLoc(binding.index));
                     },
-                    None => match resolve_upvalue(compiler, name) {
-                        Some((index, _)) => {
-                            let _ = emit(compiler, bytecode::Instruction::GetUpvalue(index));
-                        },
-                        None => if name == "arguments" && compiler.lexical_arguments {
-                            match resolve_upvalue(compiler, "$arguments") {
-                                Some((index, _)) => {
+                    None => if has_dynamic_eval_var(compiler, name) {
+                        let index = string_constant(compiler, name);
+                        let _ = emit(compiler, bytecode::Instruction::GetEval(index));
+                    } else {
+                        match resolve_upvalue(compiler, name) {
+                            Some((index, _)) => {
+                                let depth = outer_binding_environment_depth(compiler, name);
+                                if depth > 0 {
+                                    let name_index = string_constant(compiler, name);
+                                    let _ = emit(
+                                        compiler,
+                                        bytecode::Instruction::GetEvalOrUpvalue(
+                                            name_index,
+                                            index,
+                                            depth,
+                                        ),
+                                    );
+                                } else {
                                     let _ = emit(compiler, bytecode::Instruction::GetUpvalue(index));
-                                },
-                                None => {
-                                    let _ = emit(compiler, bytecode::Instruction::Undefined);
-                                },
-                            }
-                        } else if name == "arguments" && compiler.arguments_available {
-                            let _ = emit(compiler, bytecode::Instruction::PushArguments);
-                        } else if is_known_global(name) || compiler.allow_unknown_globals.get() {
-                            let index = string_constant(compiler, name);
-                            let _ = emit(compiler, bytecode::Instruction::GetEvalOrUndefined(index));
-                        } else {
-                            let _ = emit(compiler, bytecode::Instruction::Undefined);
-                        },
+                                }
+                            },
+                            None => if name == "arguments" && compiler.lexical_arguments {
+                                match resolve_upvalue(compiler, "$arguments") {
+                                    Some((index, _)) => {
+                                        let name_index = string_constant(compiler, name);
+                                        let depth = outer_binding_environment_depth(
+                                            compiler,
+                                            "$arguments",
+                                        );
+                                        let _ = emit(
+                                            compiler,
+                                            bytecode::Instruction::GetEvalOrUpvalue(
+                                                name_index,
+                                                index,
+                                                depth,
+                                            ),
+                                        );
+                                    },
+                                    None => {
+                                        let _ = emit(compiler, bytecode::Instruction::Undefined);
+                                    },
+                                }
+                            } else if name == "arguments" && compiler.arguments_available {
+                                let name_index = string_constant(compiler, name);
+                                let _ = emit(
+                                    compiler,
+                                    bytecode::Instruction::GetEvalOrArguments(
+                                        name_index,
+                                        current_eval_environment_depth(compiler),
+                                    ),
+                                );
+                            } else if is_known_global(name) || compiler.allow_unknown_globals.get() {
+                                let index = string_constant(compiler, name);
+                                let _ = emit(
+                                    compiler,
+                                    bytecode::Instruction::GetEvalOrUndefined(index),
+                                );
+                            } else {
+                                let _ = emit(compiler, bytecode::Instruction::Undefined);
+                            },
+                        }
                     },
                 }
             },
@@ -2816,29 +3087,61 @@ fn local_assignment_target(
 
 fn plain_identifier_assignment_target(compiler: Compiler, name: string, span: ast::Span) -> AssignmentTarget {
     match lookup_binding(compiler, name) {
-        Some(binding) => {
+        Some(binding) => if is_global_lexical_binding(compiler, binding) {
+            AssignmentTarget {
+                storage: AssignmentStorage::Eval(string_constant(compiler, name)),
+                writable: binding.kind != BindingKind::Const,
+                throws_on_write: binding.kind == BindingKind::Const,
+                source_offset: span.start,
+            }
+        } else {
             local_assignment_target(compiler, name, binding.index, binding.kind, span, false)
         },
-        None => match resolve_upvalue(compiler, name) {
-            Some((index, kind)) => {
-                local_assignment_target(compiler, name, index, kind, span, true)
-            },
-            None => if is_known_global(name) || compiler.allow_unknown_globals.get() {
-                AssignmentTarget {
-                    storage: AssignmentStorage::Eval(string_constant(compiler, name)),
-                    writable: true,
-                    throws_on_write: false,
-                    source_offset: span.start,
-                }
-            } else {
-                compile_error(compiler, "undefined assignment target `" + name + "`", span);
-                AssignmentTarget {
-                    storage: AssignmentStorage::Invalid,
-                    writable: false,
-                    throws_on_write: false,
-                    source_offset: span.start,
-                }
-            },
+        None => if has_dynamic_eval_var(compiler, name) {
+            AssignmentTarget {
+                storage: AssignmentStorage::Eval(string_constant(compiler, name)),
+                writable: true,
+                throws_on_write: false,
+                source_offset: span.start,
+            }
+        } else {
+            match resolve_upvalue(compiler, name) {
+                Some((index, kind)) => {
+                    let depth = outer_binding_environment_depth(compiler, name);
+                    if depth > 0 {
+                        let named_function = kind == BindingKind::NamedFunction;
+                        AssignmentTarget {
+                            storage: AssignmentStorage::EvalOrUpvalue {
+                                name: string_constant(compiler, name),
+                                upvalue: index,
+                                depth,
+                            },
+                            writable: kind != BindingKind::Const && !named_function,
+                            throws_on_write: kind == BindingKind::Const
+                                || named_function && compiler_is_strict(compiler),
+                            source_offset: span.start,
+                        }
+                    } else {
+                        local_assignment_target(compiler, name, index, kind, span, true)
+                    }
+                },
+                None => if is_known_global(name) || compiler.allow_unknown_globals.get() {
+                    AssignmentTarget {
+                        storage: AssignmentStorage::Eval(string_constant(compiler, name)),
+                        writable: true,
+                        throws_on_write: false,
+                        source_offset: span.start,
+                    }
+                } else {
+                    compile_error(compiler, "undefined assignment target `" + name + "`", span);
+                    AssignmentTarget {
+                        storage: AssignmentStorage::Invalid,
+                        writable: false,
+                        throws_on_write: false,
+                        source_offset: span.start,
+                    }
+                },
+            }
         },
     }
 }
@@ -3044,6 +3347,9 @@ fn load_assignment_target(compiler: Compiler, target: AssignmentTarget) -> unit 
         AssignmentStorage::Eval(index) => {
             let _ = emit(compiler, bytecode::Instruction::GetEval(index));
         },
+        AssignmentStorage::EvalOrUpvalue { name, upvalue, depth } => {
+            let _ = emit(compiler, bytecode::Instruction::GetEvalOrUpvalue(name, upvalue, depth));
+        },
         AssignmentStorage::Field { object, property } => {
             let _ = emit(compiler, bytecode::Instruction::GetLoc(object));
             let _ = emit(compiler, bytecode::Instruction::GetField(property));
@@ -3083,12 +3389,16 @@ fn load_assignment_target(compiler: Compiler, target: AssignmentTarget) -> unit 
 }
 
 fn store_assignment_target(compiler: Compiler, target: AssignmentTarget) -> unit {
-    if target.throws_on_write {
+    let conditional = match target.storage {
+        AssignmentStorage::EvalOrUpvalue { .. } => true,
+        _ => false,
+    };
+    if target.throws_on_write && !conditional {
         set_source_offset(compiler, target.source_offset);
         let _ = emit(compiler, bytecode::Instruction::ThrowTypeError);
         return
     } else {};
-    if !target.writable {
+    if !target.writable && !conditional {
         return
     } else {};
     set_source_offset(compiler, target.source_offset);
@@ -3112,6 +3422,18 @@ fn store_assignment_target(compiler: Compiler, target: AssignmentTarget) -> unit
                 let _ = emit(compiler, bytecode::Instruction::Drop);
             } else {};
             let _ = emit(compiler, bytecode::Instruction::SetEval(index));
+        },
+        AssignmentStorage::EvalOrUpvalue { name, upvalue, depth } => {
+            let _ = emit(
+                compiler,
+                bytecode::Instruction::SetEvalOrUpvalue(
+                    name,
+                    upvalue,
+                    depth,
+                    target.writable,
+                    target.throws_on_write,
+                ),
+            );
         },
         AssignmentStorage::Field { object, property } => {
             let value = new_local(compiler);
@@ -3479,6 +3801,7 @@ fn compile_nested_function(
         strict,
         generator,
         asynchronous,
+        true,
     );
     match name {
         Some(value) => validate_strict_identifier(child, value, span),
@@ -4016,10 +4339,10 @@ fn compile_function_declaration(
     let scope = compiler.scopes[compiler.scopes.len() - 1];
     let binding = match scope.bindings.get(name) {
         Some(value) => Option::Some(value),
-        None => if has_dynamic_eval_var(compiler, name)
+        None => if is_script_global_var(compiler, name) || has_dynamic_eval_var(compiler, name)
             || compiler.direct_eval.get() && !compiler_is_strict(compiler)
                 && match lookup_outer_binding(compiler, name) {
-                    Some(value) => value.kind == BindingKind::Var,
+                    Some(value) => value.declaration_target && value.kind == BindingKind::Var,
                     None => false,
                 } {
             Option::None
@@ -4049,17 +4372,19 @@ fn compile_function_declaration(
         Some(value) => {
             let _ = emit(compiler, bytecode::Instruction::PutLoc(value.index));
         },
-        None => match resolve_upvalue(compiler, name) {
-            Some((index, BindingKind::Var)) => {
-                let _ = emit(compiler, bytecode::Instruction::PutUpvalue(index));
-            },
-            _ => if has_dynamic_eval_var(compiler, name) {
-                let name_index = string_constant(compiler, name);
-                let _ = emit(compiler, bytecode::Instruction::SetEval(name_index));
-                let _ = emit(compiler, bytecode::Instruction::Drop);
-            } else {
-                let _ = emit(compiler, bytecode::Instruction::Drop);
-            },
+        None => if is_script_global_var(compiler, name) || has_dynamic_eval_var(compiler, name) {
+            let name_index = string_constant(compiler, name);
+            let _ = emit(compiler, bytecode::Instruction::SetEval(name_index));
+            let _ = emit(compiler, bytecode::Instruction::Drop);
+        } else {
+            match resolve_upvalue(compiler, name) {
+                Some((index, BindingKind::Var)) => {
+                    let _ = emit(compiler, bytecode::Instruction::PutUpvalue(index));
+                },
+                _ => {
+                    let _ = emit(compiler, bytecode::Instruction::Drop);
+                },
+            }
         },
     }
 }
@@ -4088,6 +4413,7 @@ fn compile_default_derived_constructor(parent: Compiler, name: Option[string], s
         true,
         false,
         false,
+        true,
     );
     child.source.set(parent.source.get());
     child.source_name.set(parent.source_name.get());
@@ -4141,6 +4467,7 @@ fn compile_class_field_initializer(
         true,
         false,
         false,
+        true,
     );
     child.source.set(parent.source.get());
     child.source_name.set(parent.source_name.get());
@@ -4269,6 +4596,7 @@ fn compile_class_static_initializer(
         true,
         false,
         false,
+        true,
     );
     child.source.set(parent.source.get());
     child.source_name.set(parent.source_name.get());
@@ -4357,6 +4685,7 @@ fn compile_class_private_method_initializer(
         true,
         false,
         false,
+        true,
     );
     child.source.set(parent.source.get());
     child.source_name.set(parent.source_name.get());
@@ -4713,6 +5042,25 @@ fn compile_class_declaration(
             return
         },
     };
+    if is_global_lexical_binding(compiler, binding) {
+        push_scope(compiler);
+        let class_binding = declare_current(compiler, name, BindingKind::Const, span);
+        compile_class_value(
+            compiler,
+            Option::Some(name),
+            heritage,
+            elements,
+            span,
+            match class_binding {
+                Some(value) => Option::Some(value.index),
+                None => Option::None,
+            },
+        );
+        pop_scope(compiler);
+        let name_index = string_constant(compiler, name);
+        let _ = emit(compiler, bytecode::Instruction::InitGlobalLexical(name_index));
+        return
+    } else {};
     compile_class_value(
         compiler,
         Option::Some(name),
@@ -5756,21 +6104,26 @@ fn compile_binding_initializer(
 
 fn bind_identifier(compiler: Compiler, name: string, span: ast::Span) -> unit {
     match lookup_binding(compiler, name) {
-        Some(binding) => {
+        Some(binding) => if is_global_lexical_binding(compiler, binding) {
+            let index = string_constant(compiler, name);
+            let _ = emit(compiler, bytecode::Instruction::InitGlobalLexical(index));
+        } else {
             let _ = emit(compiler, bytecode::Instruction::PutLoc(binding.index));
         },
-        None => match resolve_upvalue(compiler, name) {
-            Some((index, _)) => {
-                let _ = emit(compiler, bytecode::Instruction::PutUpvalue(index));
-            },
-            None => if has_dynamic_eval_var(compiler, name) {
-                let index = string_constant(compiler, name);
-                let _ = emit(compiler, bytecode::Instruction::SetEval(index));
-                let _ = emit(compiler, bytecode::Instruction::Drop);
-            } else {
-                compile_error(compiler, "binding has no allocated storage", span);
-                let _ = emit(compiler, bytecode::Instruction::Drop);
-            },
+        None => if is_script_global_var(compiler, name) || has_dynamic_eval_var(compiler, name) {
+            let index = string_constant(compiler, name);
+            let _ = emit(compiler, bytecode::Instruction::SetEval(index));
+            let _ = emit(compiler, bytecode::Instruction::Drop);
+        } else {
+            match resolve_upvalue(compiler, name) {
+                Some((index, _)) => {
+                    let _ = emit(compiler, bytecode::Instruction::PutUpvalue(index));
+                },
+                None => {
+                    compile_error(compiler, "binding has no allocated storage", span);
+                    let _ = emit(compiler, bytecode::Instruction::Drop);
+                },
+            }
         },
     }
 }
@@ -6162,6 +6515,7 @@ fn compiler_new(
     strict: bool,
     generator: bool,
     asynchronous: bool,
+    runtime_eval_environment: bool,
 ) -> Compiler {
     let parameter_count = parameters.len();
     let mut function_length = 0;
@@ -6212,11 +6566,16 @@ fn compiler_new(
         allow_unknown_globals: Ref::new(false),
         pending_loop_label: Ref::new(Option::None),
         direct_eval: Ref::new(false),
-        predeclaring_eval: Ref::new(false),
         dynamic_eval_vars: Vec::new(),
+        dynamic_eval_declarations: Vec::new(),
         with_bindings: Vec::new(),
         next_with_binding: Ref::new(0),
         module_mode: Ref::new(false),
+        script_mode: Ref::new(false),
+        global_lexical_indices: HashMap::new(),
+        global_var_kinds: HashMap::new(),
+        global_declaration_offsets: HashMap::new(),
+        runtime_eval_environment,
     };
     for binding in compiler.outer_bindings {
         if binding.name.starts_with("$with_environment_") {
@@ -6231,6 +6590,8 @@ fn compiler_new(
                     name,
                     source: bytecode::UpvalueSource::Closure,
                     kind: BindingKind::NamedFunction,
+                    declaration_target: false,
+                    environment_depth: 0,
                 },
             );
         },
@@ -6503,6 +6864,7 @@ fn compile_module_program_with_source(program: ast::Program, source: string, sou
         true,
         false,
         true,
+        false,
     );
     compiler.module_mode.set(true);
     compiler.source.set(source);
@@ -6564,10 +6926,51 @@ fn compile_module_program_with_source(program: ast::Program, source: string, sou
     }
 }
 
-fn compile_program_with_source(program: ast::Program, source: string, source_name: string) -> Result[
-    bytecode::Function,
-    Vec[CompileError],
-] {
+fn push_script_binding(
+    compiler: Compiler,
+    bindings: Vec[bytecode::ScriptBinding],
+    binding: bytecode::ScriptBinding,
+) -> unit {
+    let offset = compiler.global_declaration_offsets.get(binding.name).unwrap_or(-1);
+    let mut index = 0;
+    while index < bindings.len()
+        && compiler.global_declaration_offsets.get(bindings[index].name).unwrap_or(-1) <= offset {
+        index += 1;
+    }
+    bindings.insert(index, binding)
+}
+
+fn script_bindings(compiler: Compiler) -> Vec[bytecode::ScriptBinding] {
+    let bindings: Vec[bytecode::ScriptBinding] = Vec::new();
+    for (name, _) in compiler.global_lexical_indices.entries() {
+        match compiler.scopes[0].bindings.get(name) {
+            Some(binding) => push_script_binding(
+                compiler,
+                bindings,
+                bytecode::ScriptBinding {
+                    name,
+                    kind: if binding.kind == BindingKind::Const {
+                        bytecode::ScriptBindingKind::Const
+                    } else {
+                        bytecode::ScriptBindingKind::Let
+                    },
+                },
+            ),
+            None => (),
+        }
+    }
+    for (name, kind) in compiler.global_var_kinds.entries() {
+        push_script_binding(compiler, bindings, bytecode::ScriptBinding { name, kind })
+    }
+    bindings
+}
+
+fn compile_program_with_source(
+    program: ast::Program,
+    source: string,
+    source_name: string,
+    script_mode: bool,
+) -> Result[bytecode::Function, Vec[CompileError]] {
     let strict = function_body_is_strict(program.body);
     let compiler = compiler_new(
         Vec::new(),
@@ -6581,16 +6984,40 @@ fn compile_program_with_source(program: ast::Program, source: string, source_nam
         strict,
         false,
         false,
+        false,
     );
+    compiler.script_mode.set(script_mode);
     compiler.source.set(source);
     compiler.source_name.set(source_name);
     compiler.allow_unknown_globals.set(true);
     set_source_offset(compiler, program.span.start);
+    let completion = if script_mode {
+        let value = new_local(compiler);
+        compiler.completion_local.set(Option::Some(value));
+        Option::Some(value)
+    } else {
+        Option::None
+    };
     collect_var_body(compiler, program.body);
     declare_lexical_body(compiler, program.body);
     initialize_var_bindings(compiler);
+    match completion {
+        Some(value) => {
+            let _ = emit(compiler, bytecode::Instruction::Undefined);
+            let _ = emit(compiler, bytecode::Instruction::PutLoc(value));
+        },
+        None => (),
+    };
     compile_body(compiler, program.body);
-    let _ = emit(compiler, bytecode::Instruction::ReturnUndef);
+    match completion {
+        Some(value) => {
+            let _ = emit(compiler, bytecode::Instruction::GetLoc(value));
+            let _ = emit(compiler, bytecode::Instruction::Return);
+        },
+        None => {
+            let _ = emit(compiler, bytecode::Instruction::ReturnUndef);
+        },
+    };
     let eval_bindings = current_eval_bindings(compiler);
     let function = bytecode::Function::new_with_parameters_upvalues_and_handlers(
         compiler.constants,
@@ -6603,6 +7030,9 @@ fn compile_program_with_source(program: ast::Program, source: string, source_nam
     let mapped_arguments: Vec[isize] = Vec::new();
     function.set_arguments_semantics(strict, mapped_arguments);
     function.set_eval_bindings(eval_bindings);
+    if script_mode {
+        function.set_script_bindings(script_bindings(compiler))
+    } else {};
     function.set_eval_sites(compiler.eval_sites);
     function.set_source_locations(compiler.source_locations);
     function.set_source_name(js_string(compiler.source_name.get()));
@@ -6615,7 +7045,7 @@ fn compile_program_with_source(program: ast::Program, source: string, source_nam
 }
 
 pub fn compile_program(program: ast::Program) -> Result[bytecode::Function, Vec[CompileError]] {
-    compile_program_with_source(program, "", "<input>")
+    compile_program_with_source(program, "", "<input>", false)
 }
 
 pub fn compile(source: string) -> Result[bytecode::Function, Vec[CompileError]] {
@@ -6631,7 +7061,35 @@ pub fn compile_with_source_name(source: string, source_name: string) -> Result[
     for error in parsed.errors {
         errors.push(CompileError { message: error.message, span: error.span })
     }
-    match compile_program_with_source(parsed.program, source, source_name) {
+    match compile_program_with_source(parsed.program, source, source_name, false) {
+        Ok(function) => if errors.is_empty() {
+            Result::Ok(function)
+        } else {
+            Result::Err(errors)
+        },
+        Err(compile_errors) => {
+            for error in compile_errors {
+                errors.push(error)
+            }
+            Result::Err(errors)
+        },
+    }
+}
+
+pub fn compile_script(source: string) -> Result[bytecode::Function, Vec[CompileError]] {
+    compile_script_with_source_name(source, "<input>")
+}
+
+pub fn compile_script_with_source_name(source: string, source_name: string) -> Result[
+    bytecode::Function,
+    Vec[CompileError],
+] {
+    let parsed = parser::parse(source);
+    let errors: Vec[CompileError] = Vec::new();
+    for error in parsed.errors {
+        errors.push(CompileError { message: error.message, span: error.span })
+    }
+    match compile_program_with_source(parsed.program, source, source_name, true) {
         Ok(function) => if errors.is_empty() {
             Result::Ok(function)
         } else {
@@ -6825,6 +7283,7 @@ pub fn compile_dynamic_function(
         false,
         false,
         false,
+        false,
     );
     let function = compile_nested_function(
         parent,
@@ -6924,6 +7383,8 @@ fn compile_dynamic_eval(source: string, bindings: Vec[bytecode::EvalBinding]) ->
                 } else {
                     BindingKind::Const
                 },
+                declaration_target: binding.declaration_target,
+                environment_depth: binding.environment_depth,
             },
         )
     }
@@ -6938,6 +7399,7 @@ fn compile_dynamic_eval(source: string, bindings: Vec[bytecode::EvalBinding]) ->
         super_call_allowed,
         super_property_allowed,
         strict,
+        false,
         false,
         false,
     );
@@ -6956,6 +7418,7 @@ fn compile_dynamic_eval(source: string, bindings: Vec[bytecode::EvalBinding]) ->
     let _ = emit(compiler, bytecode::Instruction::GetLoc(completion));
     let _ = emit(compiler, bytecode::Instruction::Return);
     let nested_eval_bindings = current_eval_bindings(compiler);
+    let eval_declarations = dynamic_eval_declarations(compiler);
     let sources: Vec[bytecode::UpvalueSource] = Vec::new();
     for upvalue in compiler.upvalues {
         sources.push(upvalue.source)
@@ -6977,6 +7440,7 @@ fn compile_dynamic_eval(source: string, bindings: Vec[bytecode::EvalBinding]) ->
     let mapped_arguments: Vec[isize] = Vec::new();
     function.set_arguments_semantics(strict, mapped_arguments);
     function.set_eval_bindings(nested_eval_bindings);
+    function.set_eval_declarations(eval_declarations);
     function.set_eval_sites(compiler.eval_sites);
     function.set_source_locations(compiler.source_locations);
     function.set_source_name(js_string(compiler.source_name.get()));
@@ -7012,7 +7476,32 @@ fn dynamic_eval_compiler(source: string, bindings: Vec[bytecode::EvalBinding]) -
     }
 }
 
+fn dynamic_script_compiler(source: string, source_name: string) -> Result[
+    bytecode::Function,
+    bytecode::SourceError,
+] {
+    match compile_script_with_source_name(source, source_name) {
+        Ok(value) => Result::Ok(value),
+        Err(errors) => if errors.is_empty() {
+            Result::Err(
+                bytecode::SourceError {
+                    message: "invalid Script source",
+                    location: bytecode::SourceLocation { line: 1, column: 1 },
+                },
+            )
+        } else {
+            Result::Err(
+                bytecode::SourceError {
+                    message: errors[0].message,
+                    location: source_location(source, errors[0].span.start),
+                },
+            )
+        },
+    }
+}
+
 pub fn install_dynamic_function_compiler(context: vm::Context) -> unit {
     context.set_dynamic_function_compiler(dynamic_function_compiler);
-    context.set_dynamic_eval_compiler(dynamic_eval_compiler)
+    context.set_dynamic_eval_compiler(dynamic_eval_compiler);
+    context.set_dynamic_script_compiler(dynamic_script_compiler)
 }

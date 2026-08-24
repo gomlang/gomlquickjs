@@ -269,6 +269,19 @@ fn harness_runtime_failure(
     )
 }
 
+fn harness_compile_failure(variant: SourceVariant, errors: Vec[compiler::CompileError]) -> RunResult {
+    result(
+        variant,
+        RunStatus::Failed,
+        "unexpected harness compile failure: "
+            + if errors.is_empty() {
+                "invalid source"
+            } else {
+                errors[0].message
+            },
+    )
+}
+
 fn async_argument(arguments: Vec[runtime::Value]) -> runtime::Value {
     if arguments.is_empty() {
         runtime::Value::Undefined
@@ -368,7 +381,7 @@ pub fn run_variant(case: TestCase, variant: SourceVariant, loader: HarnessLoader
         Err(message) => return result(variant, RunStatus::Failed, message),
     };
     let source = variant_source(case, variant);
-    let function = match compiler::compile(source) {
+    let function = match compiler::compile_script(source) {
         Ok(value) => value,
         Err(errors) => return compile_failure(variant, case.metadata, errors),
     };
@@ -389,19 +402,11 @@ pub fn run_variant(case: TestCase, variant: SourceVariant, loader: HarnessLoader
                 }
             } else {};
             if harness.byte_len() > 0 {
-                let harness_function = match context.compile_dynamic_eval_source(
-                    harness,
-                    Vec::new(),
-                ) {
+                let harness_function = match compiler::compile_script(harness) {
                     Ok(value) => value,
-                    Err(error) => return harness_runtime_failure(
-                        context,
-                        variant,
-                        error.offset,
-                        error.kind,
-                    ),
+                    Err(errors) => return harness_compile_failure(variant, errors),
                 };
-                match context.execute(harness_function) {
+                match context.execute_script(harness_function) {
                     Ok(_) => (),
                     Err(error) => return harness_runtime_failure(
                         context,
@@ -411,7 +416,7 @@ pub fn run_variant(case: TestCase, variant: SourceVariant, loader: HarnessLoader
                     ),
                 }
             } else {};
-            match context.execute(function) {
+            match context.execute_script(function) {
                 Ok(_) => if case.metadata.asynchronous {
                     async_success(context, variant, case.metadata, completion)
                 } else {
@@ -527,16 +532,11 @@ fn run_module_file(case: TestCase, file: string, loader: HarnessLoader) -> RunRe
         }
     } else {};
     if harness.byte_len() > 0 {
-        let harness_function = match context.compile_dynamic_eval_source(harness, Vec::new()) {
+        let harness_function = match compiler::compile_script(harness) {
             Ok(value) => value,
-            Err(error) => return harness_runtime_failure(
-                context,
-                SourceVariant::Module,
-                error.offset,
-                error.kind,
-            ),
+            Err(errors) => return harness_compile_failure(SourceVariant::Module, errors),
         };
-        match context.execute(harness_function) {
+        match context.execute_script(harness_function) {
             Err(error) => return harness_runtime_failure(
                 context,
                 SourceVariant::Module,
