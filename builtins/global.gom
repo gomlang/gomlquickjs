@@ -70,7 +70,7 @@ impl Realm {
 }
 
 pub fn set_script_args(context: vm::Context, realm: Realm, arguments: Vec[string]) -> Result[
-    unit,
+    (),
     BuiltinError,
 ] {
     let values: Vec[runtime::Value] = Vec::with_capacity(arguments.len());
@@ -126,11 +126,11 @@ fn function_native_error(value: vm::NativeError) -> vm::VmError {
 }
 
 fn infinity() -> f64 {
-    num::parse_float64("Infinity").unwrap_or(0.0)
+    num::parse_float64_structured("Infinity").unwrap_or(0.0)
 }
 
 fn nan() -> f64 {
-    num::parse_float64("NaN").unwrap_or(0.0)
+    num::parse_float64_structured("NaN").unwrap_or(0.0)
 }
 
 fn js_string(value: string) -> runtime::JsString {
@@ -242,7 +242,7 @@ fn bigint_width(arguments: Vec[runtime::Value]) -> Result[isize, vm::NativeError
     if integer < 0.0 || integer > 100000000.0 {
         Result::Err(native_error("RangeError: invalid BigInt width"))
     } else {
-        Result::Ok(num::parse_int(dtoa::number_to_string(integer)).unwrap_or(-1))
+        Result::Ok(num::parse_int_structured(dtoa::number_to_string(integer)).unwrap_or(-1))
     }
 }
 
@@ -442,7 +442,7 @@ fn string_from_code_point(
             || math::trunc(value) != value {
             return Result::Err(native_error("RangeError: invalid Unicode code point"))
         } else {};
-        let point = num::parse_int(dtoa::number_to_string(value)).unwrap_or(-1);
+        let point = num::parse_int_structured(dtoa::number_to_string(value)).unwrap_or(-1);
         if point < 0 {
             return Result::Err(native_error("RangeError: invalid Unicode code point"))
         } else if point <= 0xffff {
@@ -457,7 +457,7 @@ fn string_from_code_point(
     Result::Ok(runtime::Value::String(runtime::JsString::from_code_units(units)))
 }
 
-fn string_raw_append(output: Vec[u16], value: runtime::JsString) -> unit {
+fn string_raw_append(output: Vec[u16], value: runtime::JsString) -> () {
     let mut index = 0;
     while index < value.len() {
         output.push(value.get(index));
@@ -478,7 +478,9 @@ fn string_raw_length(context: vm::Context, value: runtime::Value, depth: isize) 
     } else if number >= 9007199254740991.0 || !math::is_finite(number) {
         Result::Ok(9007199254740991)
     } else {
-        Result::Ok(num::parse_int(dtoa::number_to_string(math::floor(number))).unwrap_or(0))
+        Result::Ok(
+            num::parse_int_structured(dtoa::number_to_string(math::floor(number))).unwrap_or(0),
+        )
     }
 }
 
@@ -770,7 +772,7 @@ fn ascii_digit(value: u16) -> Option[isize] {
 }
 
 fn int_float(value: isize) -> f64 {
-    num::parse_float64(value.to_string()).unwrap_or(0.0)
+    num::parse_float64_structured(value.to_string()).unwrap_or(0.0)
 }
 
 fn to_u32(value: f64) -> u32 {
@@ -857,7 +859,7 @@ fn decimal_digit(value: u16) -> bool {
     value >= 48 && value <= 57
 }
 
-fn append_ascii_range(output: Vec[byte], value: runtime::JsString, start: isize, end: isize) -> unit {
+fn append_ascii_range(output: Vec[byte], value: runtime::JsString, start: isize, end: isize) -> () {
     let mut index = start;
     while index < end {
         output.push(value.get(index).to_u8());
@@ -1112,9 +1114,9 @@ fn global_load_script(
         },
         Err(value) => return Result::Err(function_native_error(value)),
     };
-    let source = match fs::read_file(path) {
+    let source = match fs::read_file_structured(path) {
         Ok(value) => value,
-        Err(value) => return Result::Err(function_vm_error(value)),
+        Err(value) => return Result::Err(function_vm_error(value.to_string())),
     };
     let function = context.compile_dynamic_script_source(source, path)?;
     context.execute_script(function)
@@ -1151,7 +1153,7 @@ fn install_generator(
     context: vm::Context,
     function_constructor: runtime::Value,
     iterator_constructor: runtime::Value,
-) -> Result[unit, BuiltinError] {
+) -> Result[(), BuiltinError] {
     let heap = context.heap();
     let iterator_constructor_object = function_object(iterator_constructor, "Iterator")?;
     let iterator_prototype = match builtin_own_value(heap, iterator_constructor_object, "prototype")? {
@@ -1375,7 +1377,7 @@ fn define_data(
     writable: bool,
     enumerable: bool,
     configurable: bool,
-) -> Result[unit, vm::NativeError] {
+) -> Result[(), vm::NativeError] {
     if runtime::define_own_property(
         heap,
         object,
@@ -1453,7 +1455,7 @@ fn array_constructor(
             runtime::Value::Float(value) => if math::is_finite(value) && value >= 0.0
                 && value <= 4294967295.0
                 && math::trunc(value) == value {
-                let length = num::parse_int(dtoa::number_to_string(value)).unwrap_or(-1);
+                let length = num::parse_int_structured(dtoa::number_to_string(value)).unwrap_or(-1);
                 if length >= 0 {
                     Result::Ok(runtime::Value::Object(allocate_array(heap, Vec::new(), length)?))
                 } else {
@@ -1622,7 +1624,9 @@ fn function_apply_length(context: vm::Context, value: runtime::Value, depth: isi
             },
         )
     } else {
-        Result::Ok(num::parse_int(dtoa::number_to_string(math::floor(number))).unwrap_or(0))
+        Result::Ok(
+            num::parse_int_structured(dtoa::number_to_string(math::floor(number))).unwrap_or(0),
+        )
     }
 }
 
@@ -1826,7 +1830,7 @@ fn register_dynamic_function_constructor(
     context: vm::Context,
     constructor: runtime::Value,
     kind: vm::FunctionKind,
-) -> Result[unit, BuiltinError] {
+) -> Result[(), BuiltinError] {
     match context.set_vm_constructor_callback(
         constructor,
         |object, arguments, selected_prototype, new_target, depth| {
@@ -2612,7 +2616,7 @@ fn define_property_from_object(
     target: runtime::ObjectId,
     key: runtime::PropertyKey,
     descriptor_object: runtime::ObjectId,
-) -> Result[unit, vm::NativeError] {
+) -> Result[(), vm::NativeError] {
     let current = match heap.get(target) {
         Some(value) => value.own_property(key),
         None => return Result::Err(native_error("object does not belong to this heap")),
@@ -2949,7 +2953,7 @@ fn object_group_by(
 }
 
 fn assign_source(heap: runtime::Heap, target: runtime::ObjectId, source: runtime::ObjectId) -> Result[
-    unit,
+    (),
     vm::NativeError,
 ] {
     let source_object = match heap.get(source) {
@@ -3193,7 +3197,7 @@ fn math_random(
     let sample = (value * MATH_RANDOM_MULTIPLIER) >> 11;
     Result::Ok(
         runtime::Value::Float(
-            num::parse_float64(sample.to_string()).unwrap_or(0.0) / 9007199254740992.0,
+            num::parse_float64_structured(sample.to_string()).unwrap_or(0.0) / 9007199254740992.0,
         ),
     )
 }
@@ -3209,7 +3213,9 @@ fn performance_now(
     let _ = arguments;
     Result::Ok(
         runtime::Value::Float(
-            num::parse_float64(origin.elapsed().as_nanoseconds().to_string()).unwrap_or(0.0)
+            num::parse_float64_structured(origin.elapsed().as_nanoseconds().to_string()).unwrap_or(
+                0.0,
+            )
                 / 1000000.0,
         ),
     )
@@ -3252,7 +3258,7 @@ fn math_round(heap: runtime::Heap, this_value: runtime::Value, arguments: Vec[ru
     let result = if math::is_nan(value) || math::is_infinite(value) || value == 0.0 {
         value
     } else if value < 0.0 && value >= -0.5 {
-        num::parse_float64("-0").unwrap_or(0.0)
+        num::parse_float64_structured("-0").unwrap_or(0.0)
     } else {
         math::floor(value + 0.5)
     };
@@ -3622,7 +3628,7 @@ fn define_value(
     value: runtime::Value,
     writable: bool,
     configurable: bool,
-) -> Result[unit, BuiltinError] {
+) -> Result[(), BuiltinError] {
     if runtime::define_own_property(
         heap,
         object,
@@ -3930,7 +3936,7 @@ fn define_number_function(
     callback: NativeBuiltin,
     minimum: isize,
     all: bool,
-) -> Result[unit, BuiltinError] {
+) -> Result[(), BuiltinError] {
     define_value(
         context.heap(),
         object,
@@ -4004,7 +4010,7 @@ fn define_string_function(
     callback: NativeBuiltin,
     minimum: isize,
     all: bool,
-) -> Result[unit, BuiltinError] {
+) -> Result[(), BuiltinError] {
     define_value(
         context.heap(),
         object,
@@ -4026,7 +4032,7 @@ fn define_string_function(
 }
 
 fn define_parse_int_function(context: vm::Context, object: runtime::ObjectId) -> Result[
-    unit,
+    (),
     BuiltinError,
 ] {
     define_value(
@@ -4059,7 +4065,7 @@ fn define_bigint_width_function(
     object: runtime::ObjectId,
     name: string,
     callback: NativeBuiltin,
-) -> Result[unit, BuiltinError] {
+) -> Result[(), BuiltinError] {
     define_value(
         context.heap(),
         object,
@@ -4132,7 +4138,7 @@ fn define_prototype_property_key_function(
     object: runtime::ObjectId,
     name: string,
     callback: NativeBuiltin,
-) -> Result[unit, BuiltinError] {
+) -> Result[(), BuiltinError] {
     define_value(
         context.heap(),
         object,
@@ -4162,7 +4168,7 @@ fn define_coercing_object_property_key_function(
     object: runtime::ObjectId,
     name: string,
     callback: NativeBuiltin,
-) -> Result[unit, BuiltinError] {
+) -> Result[(), BuiltinError] {
     define_value(
         context.heap(),
         object,
@@ -4193,7 +4199,7 @@ fn define_required_object_property_key_function(
     object: runtime::ObjectId,
     name: string,
     callback: NativeBuiltin,
-) -> Result[unit, BuiltinError] {
+) -> Result[(), BuiltinError] {
     define_value(
         context.heap(),
         object,
@@ -5461,7 +5467,7 @@ fn install_reflect(context: vm::Context) -> Result[runtime::ObjectId, BuiltinErr
 }
 
 fn mark_constructor(context: vm::Context, value: runtime::Value, name: string) -> Result[
-    unit,
+    (),
     BuiltinError,
 ] {
     match context.mark_native_constructor(value) {
@@ -5478,13 +5484,13 @@ fn define_function(
         runtime::Value,
         vm::NativeError,
     ],
-) -> Result[unit, BuiltinError] {
+) -> Result[(), BuiltinError] {
     let function = allocate_function(context, name, callback)?;
     define_value(context.heap(), object, name, function, true, true)
 }
 
 fn define_to_string_tag(context: vm::Context, object: runtime::ObjectId, tag: string) -> Result[
-    unit,
+    (),
     BuiltinError,
 ] {
     match context.well_known_symbol(vm::WellKnownSymbolKind::ToStringTag) {
@@ -5513,7 +5519,7 @@ fn reparent_callable_properties(
     heap: runtime::Heap,
     holder: runtime::ObjectId,
     prototype: runtime::ObjectId,
-) -> unit {
+) -> () {
     let object = match heap.get(holder) {
         Some(value) => value,
         None => return,
@@ -5671,7 +5677,7 @@ fn install_function(context: vm::Context, object_constructor: runtime::Value) ->
     Result::Ok(constructor)
 }
 
-fn install_function_has_instance(context: vm::Context) -> Result[unit, BuiltinError] {
+fn install_function_has_instance(context: vm::Context) -> Result[(), BuiltinError] {
     let prototype = match context.heap().function_prototype() {
         Some(value) => value,
         None => return Result::Err(BuiltinError { message: "Function prototype is not installed" }),
@@ -5729,7 +5735,9 @@ fn install_number(context: vm::Context) -> Result[runtime::Value, BuiltinError] 
         context.heap(),
         object,
         "MAX_VALUE",
-        runtime::Value::Float(num::parse_float64("1.7976931348623157e308").unwrap_or(0.0)),
+        runtime::Value::Float(
+            num::parse_float64_structured("1.7976931348623157e308").unwrap_or(0.0),
+        ),
         false,
         false,
     )?;
@@ -5737,7 +5745,7 @@ fn install_number(context: vm::Context) -> Result[runtime::Value, BuiltinError] 
         context.heap(),
         object,
         "MIN_VALUE",
-        runtime::Value::Float(num::parse_float64("5e-324").unwrap_or(0.0)),
+        runtime::Value::Float(num::parse_float64_structured("5e-324").unwrap_or(0.0)),
         false,
         false,
     )?;
@@ -6201,7 +6209,7 @@ fn install_string(context: vm::Context) -> Result[runtime::Value, BuiltinError] 
     Result::Ok(function)
 }
 
-fn install_math(context: vm::Context, object: runtime::ObjectId) -> Result[unit, BuiltinError] {
+fn install_math(context: vm::Context, object: runtime::ObjectId) -> Result[(), BuiltinError] {
     define_value(
         context.heap(),
         object,

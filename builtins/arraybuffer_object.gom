@@ -93,7 +93,7 @@ fn define_arraybuffer_getter(
     object: runtime::ObjectId,
     name: string,
     getter: runtime::Value,
-) -> Result[unit, BuiltinError] {
+) -> Result[(), BuiltinError] {
     if runtime::define_own_property(
         heap,
         object,
@@ -155,7 +155,7 @@ fn arraybuffer_integer(value: runtime::Value) -> Result[isize, vm::NativeError] 
     if integer < -2147483648.0 || integer > 2147483647.0 {
         Result::Err(native_error("RangeError: integer argument is out of range"))
     } else {
-        Result::Ok(num::parse_int(dtoa::number_to_string(integer)).unwrap_or(0))
+        Result::Ok(num::parse_int_structured(dtoa::number_to_string(integer)).unwrap_or(0))
     }
 }
 
@@ -199,7 +199,7 @@ fn arraybuffer_index_at_depth(context: vm::Context, value: runtime::Value, depth
     if number > 2147483647.0 {
         Result::Err(function_range_error("index is out of range"))
     } else {
-        Result::Ok(num::parse_int(dtoa::number_to_string(number)).unwrap_or(0))
+        Result::Ok(num::parse_int_structured(dtoa::number_to_string(number)).unwrap_or(0))
     }
 }
 
@@ -255,7 +255,7 @@ fn uint32_value(value: u32) -> runtime::Value {
     if value <= 2147483647 {
         runtime::Value::Int(value.to_i32())
     } else {
-        runtime::Value::Float(num::parse_float64(value.to_string()).unwrap_or(0.0))
+        runtime::Value::Float(num::parse_float64_structured(value.to_string()).unwrap_or(0.0))
     }
 }
 
@@ -265,7 +265,7 @@ fn float32_value(value: f32) -> runtime::Value {
 
 fn float32_argument(arguments: Vec[runtime::Value], index: isize) -> Result[f32, vm::NativeError] {
     let number = arraybuffer_number(argument(arguments, index))?;
-    match num::parse_float32(dtoa::number_to_string(number)) {
+    match num::parse_float32_structured(dtoa::number_to_string(number)) {
         Ok(value) => Result::Ok(value),
         Err(_) => Result::Err(native_error("cannot convert value to Float32")),
     }
@@ -300,7 +300,7 @@ fn constructor_receiver_prototype(
     receiver: runtime::ObjectId,
     selected: Option[runtime::ObjectId],
     prototype: runtime::ObjectId,
-) -> Result[unit, vm::VmError] {
+) -> Result[(), vm::VmError] {
     match selected {
         Some(_) => Result::Ok(()),
         None => if runtime::set_prototype_of(heap, receiver, Option::Some(prototype)) {
@@ -400,7 +400,7 @@ fn array_buffer_construct_vm(
         runtime::Value::Float(value) => if value > 2147483647.0 {
             return Result::Err(function_range_error("ArrayBuffer length is out of range"))
         } else {
-            num::parse_int(dtoa::number_to_string(value)).unwrap_or(0)
+            num::parse_int_structured(dtoa::number_to_string(value)).unwrap_or(0)
         },
         _ => return Result::Err(function_vm_error("invalid prepared ArrayBuffer length")),
     };
@@ -409,7 +409,7 @@ fn array_buffer_construct_vm(
         runtime::Value::Float(value) => if value > 2147483647.0 {
             return Result::Err(function_range_error("ArrayBuffer maximum is out of range"))
         } else {
-            Option::Some(num::parse_int(dtoa::number_to_string(value)).unwrap_or(0))
+            Option::Some(num::parse_int_structured(dtoa::number_to_string(value)).unwrap_or(0))
         },
         _ => return Result::Err(function_vm_error("invalid prepared ArrayBuffer maximum")),
     };
@@ -485,7 +485,7 @@ fn shared_array_buffer_construct_vm(
         runtime::Value::Float(value) => if value > 2147483647.0 {
             return Result::Err(function_range_error("SharedArrayBuffer length is out of range"))
         } else {
-            num::parse_int(dtoa::number_to_string(value)).unwrap_or(0)
+            num::parse_int_structured(dtoa::number_to_string(value)).unwrap_or(0)
         },
         _ => return Result::Err(function_vm_error("invalid prepared SharedArrayBuffer length")),
     };
@@ -494,7 +494,7 @@ fn shared_array_buffer_construct_vm(
         runtime::Value::Float(value) => if value > 2147483647.0 {
             return Result::Err(function_range_error("SharedArrayBuffer maximum is out of range"))
         } else {
-            Option::Some(num::parse_int(dtoa::number_to_string(value)).unwrap_or(0))
+            Option::Some(num::parse_int_structured(dtoa::number_to_string(value)).unwrap_or(0))
         },
         _ => return Result::Err(function_vm_error("invalid prepared SharedArrayBuffer maximum")),
     };
@@ -1481,7 +1481,7 @@ fn define_data_view_method(
     name: string,
     states: HashMap[runtime::ObjectId, DataViewInstance],
     operation: isize,
-) -> Result[unit, BuiltinError] {
+) -> Result[(), BuiltinError] {
     let function = allocate_function(
         context,
         "DataView.prototype." + name,
@@ -1841,7 +1841,7 @@ fn typed_array_collect_mapped_values(
         runtime::Value::Int(value) => value.to_isize(),
         runtime::Value::Float(value) => if math::is_finite(value) && value >= 0.0
             && value <= 2147483647.0 {
-            num::parse_int(dtoa::number_to_string(math::trunc(value))).unwrap_or(0)
+            num::parse_int_structured(dtoa::number_to_string(math::trunc(value))).unwrap_or(0)
         } else {
             return Result::Err(function_range_error("typed array source is too large"))
         },
@@ -1879,7 +1879,9 @@ fn typed_array_offset(context: vm::Context, value: runtime::Value, depth: isize)
     } else if !math::is_finite(number) || number < 0.0 || number > 2147483647.0 {
         Result::Err(function_range_error("typed array offset is out of range"))
     } else {
-        Result::Ok(num::parse_int(dtoa::number_to_string(math::trunc(number))).unwrap_or(0))
+        Result::Ok(
+            num::parse_int_structured(dtoa::number_to_string(math::trunc(number))).unwrap_or(0),
+        )
     }
 }
 
@@ -1904,7 +1906,7 @@ fn typed_array_view_detached(view: runtime::TypedArrayView) -> bool {
 }
 
 fn typed_array_view_set(view: runtime::TypedArrayView, index: isize, value: f64) -> Result[
-    unit,
+    (),
     vm::VmError,
 ] {
     let result = match view {
@@ -1970,7 +1972,7 @@ fn define_typed_array_bytes(
     constructor: runtime::ObjectId,
     prototype: runtime::ObjectId,
     size: isize,
-) -> Result[unit, BuiltinError] {
+) -> Result[(), BuiltinError] {
     let value = runtime::Value::Int(size.to_i32());
     define_value(heap, constructor, "BYTES_PER_ELEMENT", value, false, false)?;
     define_value(heap, prototype, "BYTES_PER_ELEMENT", value, false, false)
@@ -4685,7 +4687,7 @@ fn typed_array_write_value(
     index: isize,
     value: runtime::Value,
     depth: isize,
-) -> Result[unit, vm::VmError] {
+) -> Result[(), vm::VmError] {
     let object = match target {
         runtime::Value::Object(value) => value,
         _ => return Result::Err(function_vm_error("TypedArray target is not an object")),
@@ -5246,7 +5248,7 @@ fn typed_array_sort_values(
     values: Vec[runtime::Value],
     callback: runtime::Value,
     depth: isize,
-) -> Result[unit, vm::VmError] {
+) -> Result[(), vm::VmError] {
     let mut index = 1;
     while index < values.len() {
         let value = values[index];
@@ -5345,7 +5347,7 @@ fn install_typed_array_algorithms(
     context: vm::Context,
     prototype: runtime::ObjectId,
     constructors: TypedArrayConstructors,
-) -> Result[unit, BuiltinError] {
+) -> Result[(), BuiltinError] {
     for (method, operation) in Vec::from_array(
         [("indexOf", 0), ("lastIndexOf", 1), ("includes", 2)],
     ) {
@@ -5599,7 +5601,7 @@ fn normalize_concrete_typed_array(
     prototype: runtime::ObjectId,
     shared_constructor: runtime::ObjectId,
     shared_prototype: runtime::ObjectId,
-) -> Result[unit, BuiltinError] {
+) -> Result[(), BuiltinError] {
     let heap = context.heap();
     let constructor_object = function_object(constructor, "TypedArray constructor")?;
     if !runtime::set_prototype_of(heap, constructor_object, Option::Some(shared_constructor)) {
@@ -5639,7 +5641,7 @@ fn normalize_concrete_typed_array(
 }
 
 fn install_shared_typed_array(context: vm::Context, install: ArrayBufferInstall) -> Result[
-    unit,
+    (),
     BuiltinError,
 ] {
     let heap = context.heap();
@@ -6087,7 +6089,7 @@ fn install_typed_array_iterator_prototype(
     constructor: runtime::Value,
     name: string,
     constructors: TypedArrayConstructors,
-) -> Result[unit, BuiltinError] {
+) -> Result[(), BuiltinError] {
     match context.well_known_symbol(vm::WellKnownSymbolKind::Species) {
         Some(symbol) => {
             let object = function_object(constructor, name)?;
@@ -6155,7 +6157,7 @@ fn install_typed_array_iterator_prototype(
 }
 
 fn install_typed_array_iterators(context: vm::Context, install: ArrayBufferInstall) -> Result[
-    unit,
+    (),
     BuiltinError,
 ] {
     install_shared_typed_array(context, install)
@@ -6283,7 +6285,7 @@ fn atomic_bigint64(value: runtime::BigInt, signed: bool) -> Result[runtime::BigI
 }
 
 fn atomic_float(value: i64) -> f64 {
-    num::parse_float64(value.to_string()).unwrap_or(0.0)
+    num::parse_float64_structured(value.to_string()).unwrap_or(0.0)
 }
 
 fn atomic_normalize_number(view: runtime::TypedArrayView, value: f64) -> runtime::Value {
@@ -6304,7 +6306,7 @@ fn atomic_normalize_number(view: runtime::TypedArrayView, value: f64) -> runtime
                 runtime::Value::Float(atomic_float((converted & 0xffff).to_i64()))
             },
             arraybuffer::NumericArrayKind::Uint32 => runtime::Value::Float(
-                num::parse_float64(converted.to_string()).unwrap_or(0.0),
+                num::parse_float64_structured(converted.to_string()).unwrap_or(0.0),
             ),
             _ => runtime::Value::Float(0.0),
         },
@@ -6344,7 +6346,7 @@ fn atomic_write(
     index: isize,
     value: runtime::Value,
     depth: isize,
-) -> Result[unit, vm::VmError] {
+) -> Result[(), vm::VmError] {
     if context.reflect_set_at_depth(
         target.value,
         runtime::Value::Int(index.to_i32()),

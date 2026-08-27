@@ -30,7 +30,7 @@ fn std_file_error(message: string) -> vm::VmError {
 }
 
 fn std_truncated_int(value: f64) -> isize {
-    num::parse_int(dtoa::number_to_string(math::trunc(value))).unwrap_or(0)
+    num::parse_int_structured(dtoa::number_to_string(math::trunc(value))).unwrap_or(0)
 }
 
 fn std_truncated_int64(value: f64) -> i64 {
@@ -409,7 +409,7 @@ fn std_format(context: vm::Context, arguments: Vec[runtime::Value], depth: isize
     Result::Ok(output)
 }
 
-fn std_file_require_open(state: StdFileState) -> Result[unit, vm::VmError] {
+fn std_file_require_open(state: StdFileState) -> Result[(), vm::VmError] {
     if state.closed.get() {
         Result::Err(std_file_error("file is closed"))
     } else {
@@ -420,9 +420,9 @@ fn std_file_require_open(state: StdFileState) -> Result[unit, vm::VmError] {
 fn std_file_contents(state: StdFileState) -> Result[Vec[byte], vm::VmError] {
     std_file_require_open(state)?;
     if state.stream == 0 && !state.loaded.get() {
-        let contents = match io::read_stdin() {
+        let contents = match io::read_stdin_structured() {
             Ok(value) => value.to_vec(),
-            Err(value) => return Result::Err(std_file_error(value)),
+            Err(value) => return Result::Err(std_file_error(value.to_string())),
         };
         state.contents.set(contents);
         state.loaded.set(true);
@@ -430,13 +430,13 @@ fn std_file_contents(state: StdFileState) -> Result[Vec[byte], vm::VmError] {
     Result::Ok(state.contents.get())
 }
 
-fn std_file_flush(state: StdFileState) -> Result[unit, vm::VmError] {
+fn std_file_flush(state: StdFileState) -> Result[(), vm::VmError] {
     std_file_require_open(state)?;
     match state.path {
         Some(path) => if state.writable {
-            match fs::write_bytes(path, bytes::Bytes::from_vec(state.contents.get())) {
+            match fs::write_bytes_structured(path, bytes::Bytes::from_vec(state.contents.get())) {
                 Ok(()) => Result::Ok(()),
-                Err(value) => Result::Err(std_file_error(value)),
+                Err(value) => Result::Err(std_file_error(value.to_string())),
             }
         } else {
             Result::Ok(())
@@ -475,23 +475,23 @@ fn std_file_buffer(
     }
 }
 
-fn std_file_write(state: StdFileState, input: Vec[byte]) -> Result[unit, vm::VmError] {
+fn std_file_write(state: StdFileState, input: Vec[byte]) -> Result[(), vm::VmError] {
     std_file_require_open(state)?;
     if !state.writable {
         return Result::Err(std_file_error("file is not writable"))
     } else {};
     if state.stream == 1 || state.stream == 2 {
         let result = if state.stream == 1 {
-            io::write_stdout(bytes::Bytes::from_vec(input))
+            io::write_stdout_structured(bytes::Bytes::from_vec(input))
         } else {
-            io::write_stderr(bytes::Bytes::from_vec(input))
+            io::write_stderr_structured(bytes::Bytes::from_vec(input))
         };
         match result {
             Ok(()) => {
                 state.position.set(state.position.get() + input.len());
                 return Result::Ok(())
             },
-            Err(value) => return Result::Err(std_file_error(value)),
+            Err(value) => return Result::Err(std_file_error(value.to_string())),
         }
     } else {};
     let values = state.contents.get();
@@ -518,7 +518,7 @@ fn std_file_define_method(
     name: string,
     length: isize,
     callback: (runtime::Value, Vec[runtime::Value], isize) -> Result[runtime::Value, vm::VmError],
-) -> Result[unit, vm::VmError] {
+) -> Result[(), vm::VmError] {
     let function = context.new_vm_function(callback)?;
     if !initialize_builtin_function(context.heap(), function, name, length)
         || !runtime::define_own_property(
@@ -914,7 +914,7 @@ fn std_open_file(
         Some(value) => if mode == "w" || mode == "w+" {
             Vec::new()
         } else {
-            match fs::read_bytes(value) {
+            match fs::read_bytes_structured(value) {
                 Ok(value) => value.to_vec(),
                 Err(_) => if mode == "a" || mode == "a+" {
                     Vec::new()
@@ -1217,9 +1217,11 @@ fn std_url_get(
     let full = std_url_option(context, arguments, "full", depth)?;
     let output = match process::Command::new("/bin/sh").args(
         Vec::from_array(["-c", "curl -s -i -- \"$1\"", "urlGet", url]),
-    ).current_dir(os_state.directory.get()).env_clear().envs(std_environment_entries(os_state)).output() {
+    ).current_dir(os_state.directory.get()).env_clear().envs(std_environment_entries(os_state)).output_structured() {
         Ok(value) => value.stdout().to_vec(),
-        Err(value) => return Result::Err(std_file_error("could not start curl: " + value)),
+        Err(value) => {
+            return Result::Err(std_file_error("could not start curl: " + value.to_string()))
+        },
     };
     let status_end = std_url_line_end(output, 0);
     let status = if status_end < 0 {
@@ -1316,7 +1318,7 @@ pub fn install_std(
     buffer_states: HashMap[runtime::ObjectId, arraybuffer::ArrayBuffer],
     array_buffer: runtime::Value,
     os_state: OsState,
-) -> Result[unit, BuiltinError] {
+) -> Result[(), BuiltinError] {
     define_value(context.heap(), object, "SEEK_SET", runtime::Value::Int(0), false, false)?;
     define_value(context.heap(), object, "SEEK_CUR", runtime::Value::Int(1), false, false)?;
     define_value(context.heap(), object, "SEEK_END", runtime::Value::Int(2), false, false)?;
@@ -1453,11 +1455,11 @@ pub fn install_std(
                 for value in arguments {
                     let converted = string_value_at_depth(context, value, depth)?;
                     match converted {
-                        runtime::Value::String(value) => match io::write_stdout(
+                        runtime::Value::String(value) => match io::write_stdout_structured(
                             bytes::Bytes::from_vec(value.to_utf8()),
                         ) {
                             Ok(()) => (),
-                            Err(value) => return Result::Err(std_file_error(value)),
+                            Err(value) => return Result::Err(std_file_error(value.to_string())),
                         },
                         _ => return Result::Err(std_file_error("string conversion failed")),
                     }
@@ -1581,9 +1583,9 @@ pub fn install_std(
                     Vec::from_array(["-c", command]),
                 ).current_dir(os_state.directory.get()).env_clear().envs(
                     std_environment_entries(os_state),
-                ).output() {
+                ).output_structured() {
                     Ok(value) => value,
-                    Err(value) => return Result::Err(std_file_error(value)),
+                    Err(value) => return Result::Err(std_file_error(value.to_string())),
                 };
                 std_file_object(
                     context,
@@ -1738,7 +1740,7 @@ pub fn install_std(
                     os_state,
                     std_value_host_string(context, argument(arguments, 0), depth)?,
                 );
-                match fs::read_bytes(path) {
+                match fs::read_bytes_structured(path) {
                     Ok(value) => {
                         let bytes = value.to_vec();
                         Result::Ok(

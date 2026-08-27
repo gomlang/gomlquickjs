@@ -69,7 +69,7 @@ fn bjson_float_config() -> bincode::Config {
     bincode::with_little_endian(bincode::legacy())
 }
 
-fn bjson_append_leb128(output: cutils::ByteBuffer, value: u32) -> unit {
+fn bjson_append_leb128(output: cutils::ByteBuffer, value: u32) -> () {
     let mut remaining = value;
     while remaining >= 0x80 {
         output.append_byte(((remaining & 0x7f) | 0x80).to_u8());
@@ -78,7 +78,7 @@ fn bjson_append_leb128(output: cutils::ByteBuffer, value: u32) -> unit {
     output.append_byte(remaining.to_u8())
 }
 
-fn bjson_append_sleb128(output: cutils::ByteBuffer, value: i32) -> unit {
+fn bjson_append_sleb128(output: cutils::ByteBuffer, value: i32) -> () {
     let encoded = if value < 0 {
         ((-value.to_i64()) * 2 - 1).to_u32()
     } else {
@@ -87,7 +87,7 @@ fn bjson_append_sleb128(output: cutils::ByteBuffer, value: i32) -> unit {
     bjson_append_leb128(output, encoded)
 }
 
-fn bjson_write_string(output: cutils::ByteBuffer, value: runtime::JsString) -> unit {
+fn bjson_write_string(output: cutils::ByteBuffer, value: runtime::JsString) -> () {
     let mut wide = false;
     let mut index = 0;
     while index < value.len() {
@@ -128,7 +128,7 @@ fn bjson_writer_atom(writer: BjsonWriter, value: runtime::JsString) -> u32 {
     writer.atoms.len().to_u32()
 }
 
-fn bjson_write_atom(writer: BjsonWriter, value: runtime::JsString) -> unit {
+fn bjson_write_atom(writer: BjsonWriter, value: runtime::JsString) -> () {
     bjson_append_leb128(writer.data, bjson_writer_atom(writer, value) << 1)
 }
 
@@ -143,7 +143,7 @@ fn bjson_object_index(values: Vec[runtime::ObjectId], object: runtime::ObjectId)
     Option::None
 }
 
-fn bjson_write_float(writer: BjsonWriter, value: f64) -> Result[unit, vm::VmError] {
+fn bjson_write_float(writer: BjsonWriter, value: f64) -> Result[(), vm::VmError] {
     writer.data.append_byte(BJSON_TAG_FLOAT64);
     match bincode::encode_to_vec(value, bjson_float_config()) {
         Ok(bytes) => {
@@ -192,7 +192,7 @@ fn bjson_bigint_bytes(value: bigint::BigInteger) -> Vec[byte] {
     bytes
 }
 
-fn bjson_write_bigint(writer: BjsonWriter, value: runtime::BigInt) -> unit {
+fn bjson_write_bigint(writer: BjsonWriter, value: runtime::BigInt) -> () {
     writer.data.append_byte(BJSON_TAG_BIG_INT);
     let bytes = bjson_bigint_bytes(value.integer());
     bjson_append_leb128(writer.data, bytes.len().to_u32());
@@ -203,7 +203,7 @@ fn bjson_array_length(writer: BjsonWriter, object: runtime::ObjectId) -> Result[
     json_builtin_array_length(writer.context, object, writer.depth)
 }
 
-fn bjson_write_array(writer: BjsonWriter, object: runtime::ObjectId) -> Result[unit, vm::VmError] {
+fn bjson_write_array(writer: BjsonWriter, object: runtime::ObjectId) -> Result[(), vm::VmError] {
     writer.data.append_byte(BJSON_TAG_ARRAY);
     let length = bjson_array_length(writer, object)?;
     bjson_append_leb128(writer.data, length.to_u32());
@@ -263,7 +263,7 @@ fn bjson_object_entries(writer: BjsonWriter, object: runtime::ObjectId) -> Resul
 }
 
 fn bjson_write_object_properties(writer: BjsonWriter, object: runtime::ObjectId) -> Result[
-    unit,
+    (),
     vm::VmError,
 ] {
     writer.data.append_byte(BJSON_TAG_OBJECT);
@@ -311,7 +311,7 @@ fn bjson_write_typed_array(
     writer: BjsonWriter,
     object: runtime::ObjectId,
     view: runtime::TypedArrayView,
-) -> Result[unit, vm::VmError] {
+) -> Result[(), vm::VmError] {
     writer.data.append_byte(BJSON_TAG_TYPED_ARRAY);
     writer.data.append_byte(bjson_typed_array_tag(view));
     let length = match runtime::typed_array_element_length(writer.context.heap(), object) {
@@ -328,7 +328,7 @@ fn bjson_write_typed_array(
 }
 
 fn bjson_write_array_buffer(writer: BjsonWriter, value: arraybuffer::ArrayBuffer) -> Result[
-    unit,
+    (),
     vm::VmError,
 ] {
     if value.is_shared() {
@@ -353,7 +353,7 @@ fn bjson_write_array_buffer(writer: BjsonWriter, value: arraybuffer::ArrayBuffer
     Result::Ok(())
 }
 
-fn bjson_write_date(writer: BjsonWriter, object: runtime::ObjectId) -> Result[unit, vm::VmError] {
+fn bjson_write_date(writer: BjsonWriter, object: runtime::ObjectId) -> Result[(), vm::VmError] {
     let value_of = writer.context.read_property_at_depth(
         runtime::Value::Object(object),
         runtime::Value::String(js_string("valueOf")),
@@ -370,13 +370,13 @@ fn bjson_write_date(writer: BjsonWriter, object: runtime::ObjectId) -> Result[un
     bjson_write_value(writer, value)
 }
 
-fn bjson_write_object_value(writer: BjsonWriter, value: runtime::Value) -> Result[unit, vm::VmError] {
+fn bjson_write_object_value(writer: BjsonWriter, value: runtime::Value) -> Result[(), vm::VmError] {
     writer.data.append_byte(BJSON_TAG_OBJECT_VALUE);
     bjson_write_value(writer, value)
 }
 
 fn bjson_write_object_body(writer: BjsonWriter, object: runtime::ObjectId) -> Result[
-    unit,
+    (),
     vm::VmError,
 ] {
     match runtime::typed_array_view(writer.context.heap(), object) {
@@ -411,7 +411,7 @@ fn bjson_write_object_body(writer: BjsonWriter, object: runtime::ObjectId) -> Re
     }
 }
 
-fn bjson_write_object(writer: BjsonWriter, object: runtime::ObjectId) -> Result[unit, vm::VmError] {
+fn bjson_write_object(writer: BjsonWriter, object: runtime::ObjectId) -> Result[(), vm::VmError] {
     if writer.allow_reference {
         match bjson_object_index(writer.objects, object) {
             Some(index) => {
@@ -434,7 +434,7 @@ fn bjson_write_object(writer: BjsonWriter, object: runtime::ObjectId) -> Result[
     result
 }
 
-fn bjson_write_value(writer: BjsonWriter, value: runtime::Value) -> Result[unit, vm::VmError] {
+fn bjson_write_value(writer: BjsonWriter, value: runtime::Value) -> Result[(), vm::VmError] {
     match value {
         runtime::Value::Undefined => {
             writer.data.append_byte(BJSON_TAG_UNDEFINED);
@@ -637,7 +637,7 @@ fn bjson_reader_slot(reader: BjsonReader) -> Ref[Option[runtime::ObjectId]] {
     slot
 }
 
-fn bjson_finish_slot(slot: Ref[Option[runtime::ObjectId]], object: runtime::ObjectId) -> unit {
+fn bjson_finish_slot(slot: Ref[Option[runtime::ObjectId]], object: runtime::ObjectId) -> () {
     slot.set(Option::Some(object))
 }
 
@@ -646,7 +646,7 @@ fn bjson_define_data(
     object: runtime::ObjectId,
     key: runtime::PropertyKey,
     value: runtime::Value,
-) -> Result[unit, vm::VmError] {
+) -> Result[(), vm::VmError] {
     if runtime::define_own_property(
         reader.context.heap(),
         object,
@@ -870,7 +870,7 @@ fn bjson_read_value(reader: BjsonReader) -> Result[runtime::Value, vm::VmError] 
     }
 }
 
-fn bjson_read_header(reader: BjsonReader) -> Result[unit, vm::VmError] {
+fn bjson_read_header(reader: BjsonReader) -> Result[(), vm::VmError] {
     let version = bjson_read_byte(reader)?;
     if version != BJSON_VERSION {
         return Result::Err(bjson_reader_error(reader, "invalid BJSON version"))

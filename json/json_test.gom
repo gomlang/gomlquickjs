@@ -94,7 +94,7 @@ fn define(
     key: runtime::PropertyKey,
     value: runtime::Value,
     enumerable: bool,
-) -> unit {
+) -> () {
     testing::assert(
         runtime::define_own_property(
             heap,
@@ -105,11 +105,11 @@ fn define(
     )
 }
 
-fn define_name(heap: runtime::Heap, object: runtime::ObjectId, name: string, value: runtime::Value) -> unit {
+fn define_name(heap: runtime::Heap, object: runtime::ObjectId, name: string, value: runtime::Value) -> () {
     define(heap, object, runtime::string_property_key(name), value, true)
 }
 
-fn define_length(heap: runtime::Heap, object: runtime::ObjectId, length: i32) -> unit {
+fn define_length(heap: runtime::Heap, object: runtime::ObjectId, length: i32) -> () {
     testing::assert(
         runtime::define_own_property(
             heap,
@@ -120,7 +120,7 @@ fn define_length(heap: runtime::Heap, object: runtime::ObjectId, length: i32) ->
     )
 }
 
-fn assert_syntax_error(heap: runtime::Heap, value: runtime::JsString) -> unit {
+fn assert_syntax_error(heap: runtime::Heap, value: runtime::JsString) -> () {
     match parse(heap, value) {
         Err(error) => testing::assert(error.kind == JsonErrorKind::Syntax),
         Ok(_) => testing::fail("expected JSON syntax error"),
@@ -128,7 +128,7 @@ fn assert_syntax_error(heap: runtime::Heap, value: runtime::JsString) -> unit {
 }
 
 #[test]
-fn parses_json_primitives_and_number_boundaries() -> unit {
+fn parses_json_primitives_and_number_boundaries() -> () {
     let heap = runtime::Heap::new();
     match expect_parse(heap, js_string(" \t\r\nnull ")) {
         runtime::Value::Null => (),
@@ -161,7 +161,7 @@ fn parses_json_primitives_and_number_boundaries() -> unit {
 }
 
 #[test]
-fn rejects_non_json_tokens_and_whitespace() -> unit {
+fn rejects_non_json_tokens_and_whitespace() -> () {
     let heap = runtime::Heap::new();
     let invalid = [
         "",
@@ -197,7 +197,7 @@ fn rejects_non_json_tokens_and_whitespace() -> unit {
 }
 
 #[test]
-fn parses_escapes_and_preserves_utf16_code_units() -> unit {
+fn parses_escapes_and_preserves_utf16_code_units() -> () {
     let heap = runtime::Heap::new();
     let escaped = expect_parse(heap, js_string("\"A\\\"\\\\\\/\\b\\f\\n\\r\\t\\u0042\""));
     match escaped {
@@ -225,7 +225,7 @@ fn parses_escapes_and_preserves_utf16_code_units() -> unit {
 }
 
 #[test]
-fn parses_nested_values_and_keeps_last_duplicate_property() -> unit {
+fn parses_nested_values_and_keeps_last_duplicate_property() -> () {
     let heap = runtime::Heap::new();
     let root = expect_object(
         expect_parse(heap, js_string("{\"b\":1,\"2\":\"two\",\"a\":[true,null,\"x\"],\"b\":9}")),
@@ -253,7 +253,7 @@ fn parses_nested_values_and_keeps_last_duplicate_property() -> unit {
 }
 
 #[test]
-fn stringifies_quickjs_compatible_utf16_escaping() -> unit {
+fn stringifies_quickjs_compatible_utf16_escaping() -> () {
     let heap = runtime::Heap::new();
     let value = runtime::JsString::from_code_units(
         Vec::from_array(
@@ -274,17 +274,22 @@ fn stringifies_quickjs_compatible_utf16_escaping() -> unit {
 }
 
 #[test]
-fn stringifies_arrays_with_holes_and_unsupported_values_as_null() -> unit {
+fn stringifies_arrays_with_holes_and_unsupported_values_as_null() -> () {
     let heap = runtime::Heap::new();
     let array = expect_new_kind(heap, runtime::ObjectKind::Array, Option::None);
     define_length(heap, array, 6);
     define_name(heap, array, "0", runtime::Value::Undefined);
-    define_name(heap, array, "1", runtime::Value::Float(num::parse_float64("NaN").unwrap_or(0.0)));
+    define_name(
+        heap,
+        array,
+        "1",
+        runtime::Value::Float(num::parse_float64_structured("NaN").unwrap_or(0.0)),
+    );
     define_name(
         heap,
         array,
         "2",
-        runtime::Value::Float(num::parse_float64("Infinity").unwrap_or(0.0)),
+        runtime::Value::Float(num::parse_float64_structured("Infinity").unwrap_or(0.0)),
     );
     define_name(heap, array, "3", runtime::Value::Symbol(runtime::Symbol::new(1, Option::None)));
     define_name(heap, array, "4", runtime::Value::Object(expect_new_object(heap)));
@@ -295,7 +300,7 @@ fn stringifies_arrays_with_holes_and_unsupported_values_as_null() -> unit {
 }
 
 #[test]
-fn stringifies_enumerable_string_properties_in_ecmascript_order() -> unit {
+fn stringifies_enumerable_string_properties_in_ecmascript_order() -> () {
     let heap = runtime::Heap::new();
     let object = expect_new_object(heap);
     define_name(heap, object, "b", runtime::Value::Int(1));
@@ -324,7 +329,7 @@ fn stringifies_enumerable_string_properties_in_ecmascript_order() -> unit {
 }
 
 #[test]
-fn stringifies_inherited_array_elements() -> unit {
+fn stringifies_inherited_array_elements() -> () {
     let heap = runtime::Heap::new();
     let prototype = expect_new_object(heap);
     define_name(heap, prototype, "0", runtime::Value::Int(42));
@@ -334,7 +339,7 @@ fn stringifies_inherited_array_elements() -> unit {
 }
 
 #[test]
-fn detects_active_cycles_but_allows_shared_subobjects() -> unit {
+fn detects_active_cycles_but_allows_shared_subobjects() -> () {
     let heap = runtime::Heap::new();
     let child = expect_new_object(heap);
     let root = expect_new_object(heap);
@@ -352,7 +357,7 @@ fn detects_active_cycles_but_allows_shared_subobjects() -> unit {
 }
 
 #[test]
-fn reports_unsupported_top_level_and_bigint_values() -> unit {
+fn reports_unsupported_top_level_and_bigint_values() -> () {
     let heap = runtime::Heap::new();
     match stringify(heap, runtime::Value::Undefined) {
         Err(value) => testing::assert(value.kind == JsonErrorKind::UnsupportedType),
@@ -367,7 +372,7 @@ fn reports_unsupported_top_level_and_bigint_values() -> unit {
 }
 
 #[test]
-fn reports_callable_accessors_that_require_the_vm() -> unit {
+fn reports_callable_accessors_that_require_the_vm() -> () {
     let heap = runtime::Heap::new();
     let object = expect_new_object(heap);
     let getter = runtime::Value::Object(

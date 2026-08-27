@@ -36,7 +36,7 @@ fn result(variant: SourceVariant, status: RunStatus, message: string) -> RunResu
     RunResult { variant, status, message }
 }
 
-fn append_source(builder: text::StringBuilder, source: string) -> unit {
+fn append_source(builder: text::StringBuilder, source: string) -> () {
     builder.write_string(source);
     if source.byte_len() == 0 || source.byte_get(source.byte_len() - 1) != b'\n' {
         builder.write_char('\n')
@@ -294,7 +294,7 @@ fn install_async_done(
     context: vm::Context,
     global: runtime::ObjectId,
     completion: Ref[AsyncCompletion],
-) -> Result[unit, string] {
+) -> Result[(), string] {
     let callback = match context.new_vm_function(
         |_, arguments, _| {
             completion.set(
@@ -579,16 +579,20 @@ pub fn run_file(file: string, harness_directory: string) -> Result[Vec[RunResult
             ),
         )
     } else {};
-    let source = match fs::read_file(file) {
+    let source = match fs::read_file_structured(file) {
         Ok(value) => value,
-        Err(message) => return Result::Err("cannot read test `" + file + "`: " + message),
+        Err(error) => return Result::Err("cannot read test `" + file + "`: " + error.to_string()),
     };
     let case = match parse(source) {
         Ok(value) => value,
         Err(metadata_error) => return Result::Err(metadata_error.to_string()),
     };
     let loader: HarnessLoader = |name| {
-        fs::read_file(path::join(harness_directory, name))
+        fs::read_file_structured(path::join(harness_directory, name)).map_err(
+            |error| {
+                error.to_string()
+            },
+        )
     };
     let results: Vec[RunResult] = Vec::new();
     for variant in source_variants(case.metadata) {

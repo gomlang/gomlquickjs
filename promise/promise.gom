@@ -2,7 +2,7 @@ package promise;
 
 use gomlang::quickjs::runtime;
 
-pub type PromiseJob = () -> unit;
+pub type PromiseJob = () -> ();
 
 pub struct JobQueue {
     jobs_value: Vec[PromiseJob],
@@ -22,11 +22,11 @@ impl JobQueue {
         self.jobs_value.is_empty()
     }
 
-    pub fn enqueue(self: JobQueue, job: PromiseJob) -> unit {
+    pub fn enqueue(self: JobQueue, job: PromiseJob) -> () {
         self.jobs_value.push(job)
     }
 
-    pub fn set_rejection_tracker(self: JobQueue, tracker: Option[PromiseRejectionTracker]) -> unit {
+    pub fn set_rejection_tracker(self: JobQueue, tracker: Option[PromiseRejectionTracker]) -> () {
         self.rejection_tracker_value.set(tracker)
     }
 
@@ -78,7 +78,7 @@ pub type RejectHandler = (PromiseFailure) -> PromiseHandlerResult;
 
 pub type FinallyHandler = () -> PromiseHandlerResult;
 
-pub type ThenableExecutor = (PromiseCapability) -> Result[unit, PromiseFailure];
+pub type ThenableExecutor = (PromiseCapability) -> Result[(), PromiseFailure];
 
 pub enum PromiseResolution {
     Fulfillment(PromiseFulfillment),
@@ -92,7 +92,7 @@ pub enum PromiseState {
     Rejected(PromiseFailure),
 }
 
-fn push_failure_gc_values(failure: PromiseFailure, values: Vec[runtime::Value]) -> unit {
+fn push_failure_gc_values(failure: PromiseFailure, values: Vec[runtime::Value]) -> () {
     match failure {
         PromiseFailure::Rejection(value) => values.push(value),
         PromiseFailure::Aggregate(aggregate) => for error in aggregate.errors {
@@ -102,14 +102,14 @@ fn push_failure_gc_values(failure: PromiseFailure, values: Vec[runtime::Value]) 
     }
 }
 
-fn push_settlement_gc_values(settlement: PromiseSettlement, values: Vec[runtime::Value]) -> unit {
+fn push_settlement_gc_values(settlement: PromiseSettlement, values: Vec[runtime::Value]) -> () {
     match settlement {
         PromiseSettlement::Fulfilled(value) => values.push(value),
         PromiseSettlement::Rejected(failure) => push_failure_gc_values(failure, values),
     }
 }
 
-fn push_fulfillment_gc_values(fulfillment: PromiseFulfillment, values: Vec[runtime::Value]) -> unit {
+fn push_fulfillment_gc_values(fulfillment: PromiseFulfillment, values: Vec[runtime::Value]) -> () {
     match fulfillment {
         PromiseFulfillment::Value(value) => values.push(value),
         PromiseFulfillment::Values(items) => for value in items {
@@ -143,7 +143,7 @@ pub struct Promise {
     handled_value: Ref[bool],
 }
 
-pub type PromiseRejectionTracker = (Promise, PromiseFailure, bool) -> unit;
+pub type PromiseRejectionTracker = (Promise, PromiseFailure, bool) -> ();
 
 pub struct PromiseCapability {
     promise_value: Promise,
@@ -186,7 +186,7 @@ fn promise_is_pending(promise: Promise) -> bool {
     }
 }
 
-fn run_reaction(reaction: PromiseReaction, input: ReactionInput) -> unit {
+fn run_reaction(reaction: PromiseReaction, input: ReactionInput) -> () {
     match input {
         ReactionInput::Fulfilled(value) => match reaction.on_fulfilled {
             Some(handler) => match handler(value) {
@@ -217,11 +217,11 @@ fn run_reaction(reaction: PromiseReaction, input: ReactionInput) -> unit {
     }
 }
 
-fn enqueue_reaction(queue: JobQueue, reaction: PromiseReaction, input: ReactionInput) -> unit {
+fn enqueue_reaction(queue: JobQueue, reaction: PromiseReaction, input: ReactionInput) -> () {
     queue.enqueue(|| run_reaction(reaction, input))
 }
 
-fn drain_reactions(promise: Promise, input: ReactionInput) -> unit {
+fn drain_reactions(promise: Promise, input: ReactionInput) -> () {
     while !promise.reactions_value.is_empty() {
         let reaction = promise.reactions_value.remove(0);
         enqueue_reaction(promise.queue_value, reaction, input)
@@ -254,7 +254,7 @@ fn reject_internal(promise: Promise, error: PromiseFailure) -> bool {
     }
 }
 
-fn mark_handled(promise: Promise) -> unit {
+fn mark_handled(promise: Promise) -> () {
     if promise.handled_value.get() {
         return
     } else {};
@@ -268,7 +268,7 @@ fn mark_handled(promise: Promise) -> unit {
     }
 }
 
-fn adopt_promise(target: Promise, source: Promise) -> unit {
+fn adopt_promise(target: Promise, source: Promise) -> () {
     mark_handled(source);
     let capability = continuation_capability(target);
     let reaction = PromiseReaction {
@@ -288,7 +288,7 @@ fn adopt_promise(target: Promise, source: Promise) -> unit {
     }
 }
 
-fn execute_thenable(executor: ThenableExecutor, capability: PromiseCapability) -> unit {
+fn execute_thenable(executor: ThenableExecutor, capability: PromiseCapability) -> () {
     match executor(capability) {
         Ok(()) => (),
         Err(error) => {
@@ -332,7 +332,7 @@ fn begin_rejection(promise: Promise, error: PromiseFailure) -> bool {
     }
 }
 
-fn register_reaction(promise: Promise, reaction: PromiseReaction) -> unit {
+fn register_reaction(promise: Promise, reaction: PromiseReaction) -> () {
     mark_handled(promise);
     match promise.state_value.get() {
         PromiseState::Pending => promise.reactions_value.push(reaction),
@@ -435,7 +435,7 @@ impl Promise {
         self.identity_value == other.identity_value
     }
 
-    pub fn bind_host_object(self: Promise, object: runtime::ObjectId) -> unit {
+    pub fn bind_host_object(self: Promise, object: runtime::ObjectId) -> () {
         self.host_object_root_value.set(runtime::Value::Object(object))
     }
 

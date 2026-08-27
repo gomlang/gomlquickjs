@@ -13,6 +13,8 @@ use std::num;
 use std::process;
 use std::text;
 use std::time;
+use std::utf8;
+use utf8::BytesUtf8;
 
 struct OsFileState {
     contents: Ref[Vec[byte]],
@@ -59,7 +61,7 @@ fn new_os_state(buffers: HashMap[runtime::ObjectId, arraybuffer::ArrayBuffer]) -
         write_scheduled: HashMap::new(),
         environment,
         time_origin: time::Instant::now(),
-        directory: Ref::new(env::current_dir().unwrap_or(".")),
+        directory: Ref::new(env::current_dir_structured().unwrap_or(".")),
         signal_handlers: HashMap::new(),
         process_id: os_host_process_id(),
     }
@@ -68,12 +70,12 @@ fn new_os_state(buffers: HashMap[runtime::ObjectId, arraybuffer::ArrayBuffer]) -
 fn os_host_process_id() -> isize {
     let output = match process::Command::new("/bin/sh").args(
         Vec::from_array(["-c", "printf %s \"$PPID\""]),
-    ).output() {
+    ).output_structured() {
         Ok(value) => value.stdout(),
         Err(_) => return -1,
     };
-    match output.to_string() {
-        Ok(value) => num::parse_int(value).unwrap_or(-1),
+    match output.to_string_utf8() {
+        Ok(value) => num::parse_int_structured(value).unwrap_or(-1),
         Err(_) => -1,
     }
 }
@@ -91,7 +93,7 @@ fn os_set_signal_handler(
     state: OsState,
     signal: isize,
     handler: runtime::Value,
-) -> unit {
+) -> () {
     match state.signal_handlers.get(signal) {
         Some(value) => value.set(handler),
         None => {
@@ -131,7 +133,10 @@ fn os_file_flush(file: OsFileState) -> bool {
         true
     } else {
         match file.path {
-            Some(path) => match fs::write_bytes(path, bytes::Bytes::from_vec(file.contents.get())) {
+            Some(path) => match fs::write_bytes_structured(
+                path,
+                bytes::Bytes::from_vec(file.contents.get()),
+            ) {
                 Ok(()) => true,
                 Err(_) => false,
             },
@@ -166,7 +171,7 @@ fn os_offset_value(value: runtime::Value) -> Result[(isize, bool), vm::VmError] 
     match value {
         runtime::Value::BigInt(value) => {
             let text_value = value.integer().to_string();
-            match num::parse_int(text_value) {
+            match num::parse_int_structured(text_value) {
                 Ok(value) => Result::Ok((value, true)),
                 Err(_) => Result::Err(function_range_error("file offset is out of range")),
             }
@@ -183,7 +188,7 @@ fn os_seek_result(value: isize, bigint_value: bool) -> runtime::Value {
     } else if value >= -2147483648 && value <= 2147483647 {
         runtime::Value::Int(value.to_i32())
     } else {
-        runtime::Value::Float(num::parse_float64(value.to_string()).unwrap_or(0.0))
+        runtime::Value::Float(num::parse_float64_structured(value.to_string()).unwrap_or(0.0))
     }
 }
 
@@ -203,7 +208,7 @@ fn os_tty_window_size(context: vm::Context, descriptor: isize) -> Result[
 ] {
     let output = match process::Command::new("/bin/sh").args(
         Vec::from_array(["-c", "stty size <&" + descriptor.to_string()]),
-    ).output() {
+    ).output_structured() {
         Ok(value) => if value.status().success() {
             value.stdout()
         } else {
@@ -211,7 +216,7 @@ fn os_tty_window_size(context: vm::Context, descriptor: isize) -> Result[
         },
         Err(_) => return Result::Ok(runtime::Value::Null),
     };
-    let text = match output.to_string() {
+    let text = match output.to_string_utf8() {
         Ok(value) => text::trim(value),
         Err(_) => return Result::Ok(runtime::Value::Null),
     };
@@ -219,8 +224,8 @@ fn os_tty_window_size(context: vm::Context, descriptor: isize) -> Result[
     if values.len() != 2 {
         return Result::Ok(runtime::Value::Null)
     } else {};
-    let rows = num::parse_int(values[0]).unwrap_or(0);
-    let columns = num::parse_int(values[1]).unwrap_or(0);
+    let rows = num::parse_int_structured(values[0]).unwrap_or(0);
+    let columns = num::parse_int_structured(values[1]).unwrap_or(0);
     if rows < 4 || columns < 4 {
         Result::Ok(runtime::Value::Null)
     } else {
@@ -258,7 +263,7 @@ fn os_metadata_object(heap: runtime::Heap, metadata: fs::Metadata, followed: boo
     let mode = type_mode | metadata.permissions().mode().to_i32().to_isize();
     let milliseconds = metadata.modified_unix_nanoseconds() / 1000000;
     let modified = runtime::Value::Float(
-        num::parse_float64(milliseconds.to_string()).unwrap_or(0.0),
+        num::parse_float64_structured(milliseconds.to_string()).unwrap_or(0.0),
     );
     for (name, value) in Vec::from_array(
         [
@@ -397,7 +402,7 @@ fn os_handler_scheduled(state: OsState, descriptor: isize, read: bool) -> bool {
     }
 }
 
-fn os_set_handler_scheduled(state: OsState, descriptor: isize, read: bool, value: bool) -> unit {
+fn os_set_handler_scheduled(state: OsState, descriptor: isize, read: bool, value: bool) -> () {
     if read {
         if value {
             state.read_scheduled.set(descriptor, true)
@@ -412,7 +417,7 @@ fn os_set_handler_scheduled(state: OsState, descriptor: isize, read: bool, value
 }
 
 fn os_schedule_handler(context: vm::Context, state: OsState, descriptor: isize, read: bool) -> Result[
-    unit,
+    (),
     vm::VmError,
 ] {
     if os_handler_scheduled(state, descriptor, read) {
@@ -510,7 +515,7 @@ fn os_set_descriptor_handler(
 }
 
 pub fn install_os(context: vm::Context, object: runtime::ObjectId, state: OsState) -> Result[
-    unit,
+    (),
     BuiltinError,
 ] {
     for (name, value) in Vec::from_array(
@@ -591,7 +596,7 @@ pub fn install_os(context: vm::Context, object: runtime::ObjectId, state: OsStat
                 let descriptor = os_signed_file_descriptor(context, argument(arguments, 0), depth)?;
                 let _ = process::Command::new("/bin/sh").args(
                     Vec::from_array(["-c", "stty raw <&" + descriptor.to_string()]),
-                ).output();
+                ).output_structured();
                 Result::Ok(runtime::Value::Undefined)
             },
         )?,
@@ -611,7 +616,9 @@ pub fn install_os(context: vm::Context, object: runtime::ObjectId, state: OsStat
                 let _ = arguments;
                 let _ = depth;
                 let nanoseconds = state.time_origin.elapsed().as_nanoseconds();
-                let milliseconds = num::parse_float64(nanoseconds.to_string()).unwrap_or(0.0)
+                let milliseconds = num::parse_float64_structured(nanoseconds.to_string()).unwrap_or(
+                    0.0,
+                )
                     / 1000000.0;
                 Result::Ok(runtime::Value::Float(milliseconds))
             },
@@ -726,7 +733,7 @@ pub fn install_os(context: vm::Context, object: runtime::ObjectId, state: OsStat
                 let contents: Vec[byte] = if truncate && writable {
                     Vec::new()
                 } else {
-                    match fs::read_bytes(path) {
+                    match fs::read_bytes_structured(path) {
                         Ok(value) => value.to_vec(),
                         Err(_) => if create {
                             Vec::new()
@@ -736,7 +743,7 @@ pub fn install_os(context: vm::Context, object: runtime::ObjectId, state: OsStat
                     }
                 };
                 if create && !exists {
-                    match fs::write_bytes(path, bytes::Bytes::from_vec(Vec::new())) {
+                    match fs::write_bytes_structured(path, bytes::Bytes::from_vec(Vec::new())) {
                         Ok(()) => (),
                         Err(_) => return Result::Ok(runtime::Value::Int(-1)),
                     }
@@ -1151,9 +1158,9 @@ pub fn install_os(context: vm::Context, object: runtime::ObjectId, state: OsStat
                     state,
                     std_value_host_string(context, argument(arguments, 0), depth)?,
                 );
-                match process::Command::new("readlink").arg(path).output() {
+                match process::Command::new("readlink").arg(path).output_structured() {
                     Ok(value) => if value.status().success() {
-                        let target = value.stdout().to_string().unwrap_or("");
+                        let target = value.stdout().to_string_utf8().unwrap_or("");
                         os_pair(
                             context.heap(),
                             runtime::Value::String(js_string(text::trim_end(target))),
@@ -1184,11 +1191,12 @@ pub fn install_os(context: vm::Context, object: runtime::ObjectId, state: OsStat
                     std_value_host_string(context, argument(arguments, 0), depth)?,
                 );
                 let milliseconds = std_file_index(context, argument(arguments, 2), depth)?;
-                let seconds = num::parse_float64(milliseconds.to_string()).unwrap_or(0.0) / 1000.0;
+                let seconds = num::parse_float64_structured(milliseconds.to_string()).unwrap_or(0.0)
+                    / 1000.0;
                 let timestamp = dtoa::number_to_string(seconds);
                 let status = process::Command::new("touch").args(
                     Vec::from_array(["-m", "-d", "@" + timestamp, path]),
-                ).status();
+                ).status_structured();
                 Result::Ok(
                     runtime::Value::Int(
                         match status {
@@ -1354,7 +1362,7 @@ pub fn install_os(context: vm::Context, object: runtime::ObjectId, state: OsStat
                     },
                 );
                 if block {
-                    let status = match command.status() {
+                    let status = match command.status_structured() {
                         Ok(value) => value.code().unwrap_or(-1),
                         Err(_) => -1,
                     };
@@ -1366,7 +1374,7 @@ pub fn install_os(context: vm::Context, object: runtime::ObjectId, state: OsStat
                         value => Option::Some(os_file_descriptor(context, value, depth)?),
                     };
                     let raw_status = match stdout_descriptor {
-                        Some(descriptor) => match command.output() {
+                        Some(descriptor) => match command.output_structured() {
                             Ok(value) => {
                                 match state.files.get(descriptor) {
                                     Some(file) => {
@@ -1404,7 +1412,7 @@ pub fn install_os(context: vm::Context, object: runtime::ObjectId, state: OsStat
                 let descriptor = std_file_index(context, argument(arguments, 0), depth)?;
                 let status = process::Command::new("/bin/sh").args(
                     Vec::from_array(["-c", "test -t " + descriptor.to_string()]),
-                ).status();
+                ).status_structured();
                 Result::Ok(
                     runtime::Value::Bool(
                         match status {
@@ -1478,7 +1486,7 @@ pub fn install_os(context: vm::Context, object: runtime::ObjectId, state: OsStat
                                     Vec::from_array(
                                         ["-" + signal.to_string(), process_id.to_string()],
                                     ),
-                                ).status();
+                                ).status_structured();
                                 return Result::Ok(
                                     runtime::Value::Int(
                                         match status {
@@ -1500,7 +1508,7 @@ pub fn install_os(context: vm::Context, object: runtime::ObjectId, state: OsStat
                         None => {
                             let status = process::Command::new("kill").args(
                                 Vec::from_array(["-" + signal.to_string(), process_id.to_string()]),
-                            ).status();
+                            ).status_structured();
                             return Result::Ok(
                                 runtime::Value::Int(
                                     match status {
@@ -1519,7 +1527,7 @@ pub fn install_os(context: vm::Context, object: runtime::ObjectId, state: OsStat
                 } else {
                     let status = process::Command::new("kill").args(
                         Vec::from_array(["-" + signal.to_string(), process_id.to_string()]),
-                    ).status();
+                    ).status_structured();
                     Result::Ok(
                         runtime::Value::Int(
                             match status {

@@ -24,10 +24,10 @@ fn module_test_context() -> (vm::Context, runtime::ObjectId) {
     }
 }
 
-fn module_write(path: string, source: string) -> unit {
-    match fs::write_file(path, source) {
+fn module_write(path: string, source: string) -> () {
+    match fs::write_file_structured(path, source) {
         Ok(()) => (),
-        Err(message) => testing::fail(message),
+        Err(error) => testing::fail(error.to_string()),
     }
 }
 
@@ -47,17 +47,20 @@ fn module_read(context: vm::Context, namespace: runtime::Value, name: string) ->
     }
 }
 
-fn module_expect_number(value: runtime::Value, expected: i32) -> unit {
+fn module_expect_number(value: runtime::Value, expected: i32) -> () {
     match value {
         runtime::Value::Int(value) => testing::assert_eq(value, expected),
         runtime::Value::Float(value) => {
-            testing::assert_eq(value, num::parse_float64(expected.to_string()).unwrap_or(0.0))
+            testing::assert_eq(
+                value,
+                num::parse_float64_structured(expected.to_string()).unwrap_or(0.0),
+            )
         },
         _ => testing::fail("expected number"),
     }
 }
 
-fn module_expect_string(value: runtime::Value, expected: string) -> unit {
+fn module_expect_string(value: runtime::Value, expected: string) -> () {
     match value {
         runtime::Value::String(value) => match value.to_host_string() {
             Ok(value) => testing::assert_eq(value, expected),
@@ -68,7 +71,7 @@ fn module_expect_string(value: runtime::Value, expected: string) -> unit {
 }
 
 #[test]
-fn in_memory_modules_preserve_separate_source_display_names() -> unit {
+fn in_memory_modules_preserve_separate_source_display_names() -> () {
     let (context, global) = module_test_context();
     let namespace = match execute_source_with_source_name(
         context,
@@ -93,7 +96,7 @@ fn in_memory_modules_preserve_separate_source_display_names() -> unit {
 }
 
 #[test]
-fn modules_resolve_script_global_lexicals_without_leaking_module_bindings() -> unit {
+fn modules_resolve_script_global_lexicals_without_leaking_module_bindings() -> () {
     let (context, global) = module_test_context();
     let harness = match compiler::compile_script("let harnessLexical = 40;") {
         Ok(value) => value,
@@ -140,7 +143,7 @@ fn modules_resolve_script_global_lexicals_without_leaking_module_bindings() -> u
 }
 
 #[test]
-fn named_imports_aliases_and_live_bindings_execute() -> unit {
+fn named_imports_aliases_and_live_bindings_execute() -> () {
     let directory = "__gomlquickjs_modules_named_7d31__";
     let _ = fs::remove_dir_all(directory);
     let _ = fs::create_dir_all(directory);
@@ -165,7 +168,7 @@ fn named_imports_aliases_and_live_bindings_execute() -> unit {
 }
 
 #[test]
-fn cyclic_namespace_imports_observe_initialized_exports() -> unit {
+fn cyclic_namespace_imports_observe_initialized_exports() -> () {
     let directory = "__gomlquickjs_modules_cycle_62ac__";
     let _ = fs::remove_dir_all(directory);
     let _ = fs::create_dir_all(directory);
@@ -190,7 +193,7 @@ fn cyclic_namespace_imports_observe_initialized_exports() -> unit {
 }
 
 #[test]
-fn reexports_resolve_through_dependency_graph() -> unit {
+fn reexports_resolve_through_dependency_graph() -> () {
     let directory = "__gomlquickjs_modules_reexport_0e45__";
     let _ = fs::remove_dir_all(directory);
     let _ = fs::create_dir_all(directory);
@@ -213,7 +216,7 @@ fn reexports_resolve_through_dependency_graph() -> unit {
 }
 
 #[test]
-fn missing_named_exports_fail_during_instantiation() -> unit {
+fn missing_named_exports_fail_during_instantiation() -> () {
     let directory = "__gomlquickjs_modules_missing_171e__";
     let _ = fs::remove_dir_all(directory);
     let _ = fs::create_dir_all(directory);
@@ -232,7 +235,7 @@ fn missing_named_exports_fail_during_instantiation() -> unit {
 }
 
 #[test]
-fn default_exports_and_star_exports_link() -> unit {
+fn default_exports_and_star_exports_link() -> () {
     let directory = "__gomlquickjs_modules_default_e83b__";
     let _ = fs::remove_dir_all(directory);
     let _ = fs::create_dir_all(directory);
@@ -258,7 +261,7 @@ fn default_exports_and_star_exports_link() -> unit {
 }
 
 #[test]
-fn combined_imports_namespace_reexports_and_default_declarations_link() -> unit {
+fn combined_imports_namespace_reexports_and_default_declarations_link() -> () {
     let directory = "__gomlquickjs_modules_combined_89c4__";
     let _ = fs::remove_dir_all(directory);
     let _ = fs::create_dir_all(directory);
@@ -308,7 +311,7 @@ fn combined_imports_namespace_reexports_and_default_declarations_link() -> unit 
 }
 
 #[test]
-fn exported_async_functions_resume_in_their_module_realm() -> unit {
+fn exported_async_functions_resume_in_their_module_realm() -> () {
     let directory = "__gomlquickjs_modules_async_5f29__";
     let _ = fs::remove_dir_all(directory);
     let _ = fs::create_dir_all(directory);
@@ -333,7 +336,7 @@ fn exported_async_functions_resume_in_their_module_realm() -> unit {
 }
 
 #[test]
-fn top_level_await_blocks_dependents_and_dynamic_imports() -> unit {
+fn top_level_await_blocks_dependents_and_dynamic_imports() -> () {
     let directory = "__gomlquickjs_modules_tla_4ac2__";
     let _ = fs::remove_dir_all(directory);
     let _ = fs::create_dir_all(directory);
@@ -370,7 +373,7 @@ fn top_level_await_blocks_dependents_and_dynamic_imports() -> unit {
 }
 
 #[test]
-fn top_level_await_rejection_propagates_from_dependencies() -> unit {
+fn top_level_await_rejection_propagates_from_dependencies() -> () {
     let directory = "__gomlquickjs_modules_tla_reject_913b__";
     let _ = fs::remove_dir_all(directory);
     let _ = fs::create_dir_all(directory);
@@ -399,7 +402,7 @@ fn top_level_await_rejection_propagates_from_dependencies() -> unit {
 }
 
 #[test]
-fn sibling_top_level_await_modules_start_before_jobs_resume() -> unit {
+fn sibling_top_level_await_modules_start_before_jobs_resume() -> () {
     let directory = "__gomlquickjs_modules_tla_siblings_a187__";
     let _ = fs::remove_dir_all(directory);
     let _ = fs::create_dir_all(directory);
@@ -428,7 +431,7 @@ fn sibling_top_level_await_modules_start_before_jobs_resume() -> unit {
 }
 
 #[test]
-fn cyclic_top_level_await_components_resume_in_dependency_order() -> unit {
+fn cyclic_top_level_await_components_resume_in_dependency_order() -> () {
     let directory = "__gomlquickjs_modules_tla_cycle_c941__";
     let _ = fs::remove_dir_all(directory);
     let _ = fs::create_dir_all(directory);
@@ -457,7 +460,7 @@ fn cyclic_top_level_await_components_resume_in_dependency_order() -> unit {
 }
 
 #[test]
-fn cyclic_top_level_await_rejection_preserves_value_and_skips_ancestors() -> unit {
+fn cyclic_top_level_await_rejection_preserves_value_and_skips_ancestors() -> () {
     let directory = "__gomlquickjs_modules_tla_cycle_reject_851e__";
     let _ = fs::remove_dir_all(directory);
     let _ = fs::create_dir_all(directory);
@@ -487,7 +490,7 @@ fn cyclic_top_level_await_rejection_preserves_value_and_skips_ancestors() -> uni
 }
 
 #[test]
-fn bare_module_specifiers_load_from_the_process_working_directory() -> unit {
+fn bare_module_specifiers_load_from_the_process_working_directory() -> () {
     let directory = "__gomlquickjs_modules_bare_entry_f39b__";
     let dependency = "__gomlquickjs_bare_dependency_49da__.js";
     let dynamic = "__gomlquickjs_bare_dynamic_682c__.js";
@@ -521,7 +524,7 @@ fn bare_module_specifiers_load_from_the_process_working_directory() -> unit {
 }
 
 #[test]
-fn ambiguous_star_exports_fail_resolution() -> unit {
+fn ambiguous_star_exports_fail_resolution() -> () {
     let directory = "__gomlquickjs_modules_ambiguous_e621__";
     let _ = fs::remove_dir_all(directory);
     let _ = fs::create_dir_all(directory);
@@ -542,7 +545,7 @@ fn ambiguous_star_exports_fail_resolution() -> unit {
 }
 
 #[test]
-fn worker_modules_use_isolated_realms_and_share_shared_array_buffers() -> unit {
+fn worker_modules_use_isolated_realms_and_share_shared_array_buffers() -> () {
     let directory = "__gomlquickjs_modules_worker_9a4e__";
     let _ = fs::remove_dir_all(directory);
     let _ = fs::create_dir_all(directory);
@@ -567,7 +570,7 @@ fn worker_modules_use_isolated_realms_and_share_shared_array_buffers() -> unit {
 }
 
 #[test]
-fn dynamic_import_resolves_cached_namespaces_and_rejects_failures() -> unit {
+fn dynamic_import_resolves_cached_namespaces_and_rejects_failures() -> () {
     let directory = "__gomlquickjs_modules_dynamic_4d17__";
     let _ = fs::remove_dir_all(directory);
     let _ = fs::create_dir_all(directory);
@@ -610,7 +613,7 @@ fn dynamic_import_resolves_cached_namespaces_and_rejects_failures() -> unit {
 }
 
 #[test]
-fn static_and_dynamic_json_modules_share_default_exports() -> unit {
+fn static_and_dynamic_json_modules_share_default_exports() -> () {
     let directory = "__gomlquickjs_modules_json_71be__";
     let _ = fs::remove_dir_all(directory);
     let _ = fs::create_dir_all(directory);
@@ -659,7 +662,7 @@ fn static_and_dynamic_json_modules_share_default_exports() -> unit {
 }
 
 #[test]
-fn import_meta_is_stable_null_prototype_and_module_specific() -> unit {
+fn import_meta_is_stable_null_prototype_and_module_specific() -> () {
     let directory = "__gomlquickjs_modules_meta_2c81__";
     let _ = fs::remove_dir_all(directory);
     let _ = fs::create_dir_all(directory);

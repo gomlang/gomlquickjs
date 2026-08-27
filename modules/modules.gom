@@ -138,9 +138,9 @@ fn compile_messages(errors: Vec[compiler::CompileError]) -> string {
 }
 
 fn absolute_clean(module_path: string) -> Result[string, ModuleError] {
-    match path::absolute(path::clean(module_path)) {
+    match path::absolute_structured(path::clean(module_path)) {
         Ok(value) => Result::Ok(path::clean(value)),
-        Err(message) => Result::Err(module_error(module_path, message)),
+        Err(error) => Result::Err(module_error(module_path, error.to_string())),
     }
 }
 
@@ -214,9 +214,9 @@ fn load_record_with_type(loader: Loader, module_path: string, requested_type: st
     };
     let source = match loader.sources.get(canonical) {
         Some(value) => value,
-        None => match fs::read_file(canonical) {
+        None => match fs::read_file_structured(canonical) {
             Ok(value) => value,
-            Err(message) => return Result::Err(module_error(canonical, message)),
+            Err(error) => return Result::Err(module_error(canonical, error.to_string())),
         },
     };
     let mut json_value: Option[runtime::Value] = Option::None;
@@ -331,7 +331,7 @@ fn load_dependency_request(
     referrer: string,
     source: string,
     attributes: Vec[compiler::ModuleAttribute],
-) -> Result[unit, ModuleError] {
+) -> Result[(), ModuleError] {
     let requested_type = requested_module_type(referrer, attributes)?;
     if loader.context.virtual_module(source).is_some() || source == "std" || source == "os" {
         if requested_type == "javascript" {
@@ -404,7 +404,7 @@ fn dynamic_import_reject(
     capability: vm::HostPromiseCapability,
     error: vm::VmError,
     depth: isize,
-) -> Result[unit, vm::VmError] {
+) -> Result[(), vm::VmError] {
     let reason: runtime::Value = context.rejection_value(error);
     let _ = context.invoke_with_this_at_depth(
         capability.reject(),
@@ -529,7 +529,7 @@ fn dynamic_import_job(
     specifier: string,
     requested_type: string,
     depth: isize,
-) -> Result[unit, vm::VmError] {
+) -> Result[(), vm::VmError] {
     match dynamic_import_namespace(loader, referrer, specifier, requested_type) {
         Ok(namespace) => {
             let _ = loader.context.invoke_with_this_at_depth(
@@ -643,7 +643,7 @@ fn dynamic_import(
     Result::Ok(promise)
 }
 
-fn install_dynamic_module_loader(loader: Loader) -> unit {
+fn install_dynamic_module_loader(loader: Loader) -> () {
     let callback: vm::DynamicModuleLoader = |
         specifier: runtime::Value,
         options: runtime::Value,
@@ -653,7 +653,7 @@ fn install_dynamic_module_loader(loader: Loader) -> unit {
     loader.context.set_dynamic_module_loader(callback)
 }
 
-pub fn install_dynamic_import_loader(context: vm::Context, global: runtime::ObjectId) -> unit {
+pub fn install_dynamic_import_loader(context: vm::Context, global: runtime::ObjectId) -> () {
     install_dynamic_module_loader(
         Loader {
             context,
@@ -766,7 +766,7 @@ fn export_cell(record: Ref[ModuleRecord], name: string, resolving: Vec[string]) 
     }
 }
 
-fn bind_named_imports(loader: Loader, record: Ref[ModuleRecord]) -> Result[unit, ModuleError] {
+fn bind_named_imports(loader: Loader, record: Ref[ModuleRecord]) -> Result[(), ModuleError] {
     for binding in record.get().compiled.imports {
         if binding.kind != compiler::ModuleImportKind::Named {
             continue
@@ -820,7 +820,7 @@ fn string_compare(left: string, right: string) -> isize {
     }
 }
 
-fn collect_export_names(record: Ref[ModuleRecord], resolving: Vec[string], names: Vec[string]) -> unit {
+fn collect_export_names(record: Ref[ModuleRecord], resolving: Vec[string], names: Vec[string]) -> () {
     if string_vector_contains(resolving, record.get().path) {
         return
     } else {};
@@ -964,7 +964,7 @@ fn create_import_meta(loader: Loader, record: Ref[ModuleRecord]) -> Result[
     Result::Ok(object)
 }
 
-fn bind_namespace_imports(loader: Loader, record: Ref[ModuleRecord]) -> Result[unit, ModuleError] {
+fn bind_namespace_imports(loader: Loader, record: Ref[ModuleRecord]) -> Result[(), ModuleError] {
     for binding in record.get().compiled.imports {
         if binding.kind != compiler::ModuleImportKind::Namespace {
             continue
@@ -985,7 +985,7 @@ fn bind_namespace_imports(loader: Loader, record: Ref[ModuleRecord]) -> Result[u
     Result::Ok(())
 }
 
-fn instantiate_graph(loader: Loader) -> Result[unit, ModuleError] {
+fn instantiate_graph(loader: Loader) -> Result[(), ModuleError] {
     for (_, record) in loader.records.entries() {
         bind_named_imports(loader, record)?
     }
@@ -1116,7 +1116,7 @@ fn push_requested_dependency(
     record: Ref[ModuleRecord],
     source: string,
     dependencies: Vec[Ref[ModuleRecord]],
-) -> unit {
+) -> () {
     match record.get().dependencies.get(source) {
         Some(value) => if !record_vector_contains(dependencies, value) {
             dependencies.push(value)
@@ -1164,7 +1164,7 @@ fn reject_module(
     reason: runtime::Value,
     origin: string,
     module_error: Option[ModuleError],
-) -> unit {
+) -> () {
     if record.get().state.get() == ModuleState::Errored {
         return
     } else {};
@@ -1179,7 +1179,7 @@ fn reject_module(
     }
 }
 
-fn reject_module_error(record: Ref[ModuleRecord], error: ModuleError) -> unit {
+fn reject_module_error(record: Ref[ModuleRecord], error: ModuleError) -> () {
     let message = error.path + ": " + error.message;
     let bytes = message.to_bytes();
     reject_module(
@@ -1201,7 +1201,7 @@ fn reject_vm_error(loader: Loader, record: Ref[ModuleRecord], error: vm::VmError
     result
 }
 
-fn copy_module_rejection(target: Ref[ModuleRecord], source: Ref[ModuleRecord]) -> unit {
+fn copy_module_rejection(target: Ref[ModuleRecord], source: Ref[ModuleRecord]) -> () {
     if source.get().evaluation_error_set.get() {
         let origin = if source.get().evaluation_error_path.get() == "" {
             source.get().path
@@ -1274,7 +1274,7 @@ fn execute_module_body(loader: Loader, record: Ref[ModuleRecord], asynchronous: 
     }
 }
 
-fn mark_async_evaluation(loader: Loader, record: Ref[ModuleRecord]) -> unit {
+fn mark_async_evaluation(loader: Loader, record: Ref[ModuleRecord]) -> () {
     if record.get().async_evaluation.get() {
         return
     } else {};
@@ -1283,7 +1283,7 @@ fn mark_async_evaluation(loader: Loader, record: Ref[ModuleRecord]) -> unit {
     loader.next_async_timestamp.set(loader.next_async_timestamp.get() + 1)
 }
 
-fn insert_async_record(records: Vec[Ref[ModuleRecord]], record: Ref[ModuleRecord]) -> unit {
+fn insert_async_record(records: Vec[Ref[ModuleRecord]], record: Ref[ModuleRecord]) -> () {
     if record_vector_contains(records, record) {
         return
     } else {};
@@ -1295,7 +1295,7 @@ fn insert_async_record(records: Vec[Ref[ModuleRecord]], record: Ref[ModuleRecord
     records.insert(index, record)
 }
 
-fn gather_available_ancestors(module: Ref[ModuleRecord], records: Vec[Ref[ModuleRecord]]) -> unit {
+fn gather_available_ancestors(module: Ref[ModuleRecord], records: Vec[Ref[ModuleRecord]]) -> () {
     for parent in module.get().async_parents {
         if record_vector_contains(records, parent)
             || cycle_root(parent).get().state.get() == ModuleState::Errored {
@@ -1315,11 +1315,11 @@ fn gather_available_ancestors(module: Ref[ModuleRecord], records: Vec[Ref[Module
     }
 }
 
-fn async_module_rejected(record: Ref[ModuleRecord], arguments: Vec[runtime::Value]) -> unit {
+fn async_module_rejected(record: Ref[ModuleRecord], arguments: Vec[runtime::Value]) -> () {
     reject_module(record, async_module_argument(arguments), record.get().path, Option::None)
 }
 
-fn start_async_module(loader: Loader, record: Ref[ModuleRecord]) -> Result[unit, ModuleError] {
+fn start_async_module(loader: Loader, record: Ref[ModuleRecord]) -> Result[(), ModuleError] {
     let promise = execute_module_body(loader, record, true)?;
     let fulfilled = match loader.context.new_vm_function(
         |_, _, _| {
@@ -1361,7 +1361,7 @@ fn start_async_module(loader: Loader, record: Ref[ModuleRecord]) -> Result[unit,
     }
 }
 
-fn async_module_fulfilled(loader: Loader, module: Ref[ModuleRecord]) -> unit {
+fn async_module_fulfilled(loader: Loader, module: Ref[ModuleRecord]) -> () {
     if module.get().state.get() == ModuleState::Errored {
         return
     } else {};
@@ -1396,7 +1396,7 @@ fn inner_module_evaluation(
     module: Ref[ModuleRecord],
     next_index: Ref[isize],
     stack: Vec[Ref[ModuleRecord]],
-) -> Result[unit, ModuleError] {
+) -> Result[(), ModuleError] {
     match module.get().state.get() {
         ModuleState::Evaluating | ModuleState::EvaluatingAsync | ModuleState::Evaluated => {
             return Result::Ok(())
@@ -1468,7 +1468,7 @@ fn inner_module_evaluation(
     Result::Ok(())
 }
 
-fn await_graph_evaluation(loader: Loader, record: Ref[ModuleRecord]) -> Result[unit, ModuleError] {
+fn await_graph_evaluation(loader: Loader, record: Ref[ModuleRecord]) -> Result[(), ModuleError] {
     let root = cycle_root(record);
     match root.get().state.get() {
         ModuleState::Evaluated => return Result::Ok(()),
@@ -1495,7 +1495,7 @@ fn await_graph_evaluation(loader: Loader, record: Ref[ModuleRecord]) -> Result[u
     }
 }
 
-fn evaluate_record(loader: Loader, record: Ref[ModuleRecord]) -> Result[unit, ModuleError] {
+fn evaluate_record(loader: Loader, record: Ref[ModuleRecord]) -> Result[(), ModuleError] {
     match record.get().state.get() {
         ModuleState::Evaluated => return Result::Ok(()),
         ModuleState::Errored => return Result::Err(rejection_error(loader, record)),
@@ -1531,7 +1531,7 @@ fn load_worker_module(context: vm::Context, global: runtime::ObjectId, module_pa
     }
 }
 
-pub fn install_worker_module_loader(context: vm::Context) -> unit {
+pub fn install_worker_module_loader(context: vm::Context) -> () {
     context.set_worker_module_loader(load_worker_module)
 }
 
