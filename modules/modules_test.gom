@@ -193,6 +193,52 @@ fn cyclic_namespace_imports_observe_initialized_exports() -> () {
 }
 
 #[test]
+fn cyclic_dependencies_can_call_instantiated_function_exports() -> () {
+    let directory = "__gomlquickjs_modules_cycle_function_74b3__";
+    let _ = fs::remove_dir_all(directory);
+    let _ = fs::create_dir_all(directory);
+    module_write(
+        directory + "/entry.js",
+        "import './dependency.js'; export function mark() { globalThis.cycleFunction = 'ready'; } export const result = globalThis.cycleFunction;",
+    );
+    module_write(directory + "/dependency.js", "import {mark} from './entry.js'; mark();");
+    let (context, global) = module_test_context();
+    let namespace = match execute_file(context, global, directory + "/entry.js") {
+        Ok(value) => value,
+        Err(error) => {
+            testing::fail(error.path + ": " + error.message);
+            runtime::Value::Undefined
+        },
+    };
+    module_expect_string(module_read(context, namespace, "result"), "ready");
+    let _ = fs::remove_dir_all(directory);
+}
+
+#[test]
+fn self_imports_and_namespaces_observe_uninitialized_exports() -> () {
+    let directory = "__gomlquickjs_modules_tdz_7f2a__";
+    let _ = fs::remove_dir_all(directory);
+    let _ = fs::create_dir_all(directory);
+    module_write(
+        directory + "/entry.js",
+        "import {value as imported} from './entry.js'; import * as self from './entry.js'; let direct = false; try { imported; } catch (error) { direct = error.name === 'ReferenceError'; } let reflected = false; try { Object.keys(self); } catch (error) { reflected = error.name === 'ReferenceError'; } export let value = 1; export const result = direct && reflected;",
+    );
+    let (context, global) = module_test_context();
+    let namespace = match execute_file(context, global, directory + "/entry.js") {
+        Ok(value) => value,
+        Err(error) => {
+            testing::fail(error.path + ": " + error.message);
+            runtime::Value::Undefined
+        },
+    };
+    match module_read(context, namespace, "result") {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected TDZ checks to succeed"),
+    };
+    let _ = fs::remove_dir_all(directory);
+}
+
+#[test]
 fn reexports_resolve_through_dependency_graph() -> () {
     let directory = "__gomlquickjs_modules_reexport_0e45__";
     let _ = fs::remove_dir_all(directory);
@@ -213,6 +259,87 @@ fn reexports_resolve_through_dependency_graph() -> () {
     };
     module_expect_number(module_read(context, namespace, "result"), 42);
     let _ = fs::remove_dir_all(directory);
+}
+
+#[test]
+fn string_named_reexports_resolve_through_dependency_graph() -> () {
+    let directory = "__gomlquickjs_modules_string_reexport_61c8__";
+    let _ = fs::remove_dir_all(directory);
+    let _ = fs::create_dir_all(directory);
+    module_write(directory + "/source.js", "let value = 42; export {value as '☿'};");
+    module_write(directory + "/middle.js", "export {'☿' as answer} from './source.js';");
+    module_write(
+        directory + "/entry.js",
+        "import {answer} from './middle.js'; export const result = answer;",
+    );
+    let (context, global) = module_test_context();
+    let namespace = match execute_file(context, global, directory + "/entry.js") {
+        Ok(value) => value,
+        Err(error) => {
+            testing::fail(error.path + ": " + error.message);
+            runtime::Value::Undefined
+        },
+    };
+    module_expect_number(module_read(context, namespace, "result"), 42);
+    let _ = fs::remove_dir_all(directory);
+}
+
+#[test]
+fn empty_imports_and_reexports_still_instantiate_dependencies() -> () {
+    let directory = "__gomlquickjs_modules_empty_request_0f39__";
+    let _ = fs::remove_dir_all(directory);
+    let _ = fs::create_dir_all(directory);
+    module_write(directory + "/dependency.js", "export {");
+    let (context, global) = module_test_context();
+    for statement in Vec::from_array(
+        ["import {} from './dependency.js';", "export {} from './dependency.js';"],
+    ) {
+        module_write(directory + "/entry.js", statement + " export const result = 1;");
+        match execute_file(context, global, directory + "/entry.js") {
+            Err(error) => testing::assert(error.kind == ModuleErrorKind::Syntax),
+            Ok(_) => testing::fail("expected dependency instantiation error"),
+        }
+    }
+    let _ = fs::remove_dir_all(directory);
+}
+
+#[test]
+fn requested_dependencies_evaluate_in_source_order() -> () {
+    let directory = "__gomlquickjs_modules_request_order_4d81__";
+    let _ = fs::remove_dir_all(directory);
+    let _ = fs::create_dir_all(directory);
+    module_write(directory + "/first.js", "globalThis.moduleOrder = '1';");
+    module_write(directory + "/second.js", "globalThis.moduleOrder += '2';");
+    module_write(directory + "/third.js", "globalThis.moduleOrder += '3';");
+    module_write(directory + "/fourth.js", "globalThis.moduleOrder += '4';");
+    module_write(
+        directory + "/entry.js",
+        "import {} from './first.js'; export {} from './second.js'; import * as third from './third.js'; export * as fourth from './fourth.js'; export const result = globalThis.moduleOrder;",
+    );
+    let (context, global) = module_test_context();
+    let namespace = match execute_file(context, global, directory + "/entry.js") {
+        Ok(value) => value,
+        Err(error) => {
+            testing::fail(error.path + ": " + error.message);
+            runtime::Value::Undefined
+        },
+    };
+    module_expect_string(module_read(context, namespace, "result"), "1234");
+    let _ = fs::remove_dir_all(directory);
+}
+
+#[test]
+fn custom_thrown_constructor_names_are_preserved() -> () {
+    let (context, global) = module_test_context();
+    match execute_source(
+        context,
+        global,
+        "__gomlquickjs_custom_error_213f__.mjs",
+        "function ModuleFailure() {} throw new ModuleFailure();",
+    ) {
+        Err(error) => testing::assert(error.runtime_type == Option::Some("ModuleFailure")),
+        Ok(_) => testing::fail("expected custom module evaluation error"),
+    }
 }
 
 #[test]
@@ -368,6 +495,36 @@ fn top_level_await_blocks_dependents_and_dynamic_imports() -> () {
             Err(_) => testing::fail("expected dependency order string"),
         },
         _ => testing::fail("expected dependency order"),
+    };
+    let _ = fs::remove_dir_all(directory);
+}
+
+#[test]
+fn repeated_dynamic_imports_wait_and_settle_in_request_order() -> () {
+    let directory = "__gomlquickjs_modules_dynamic_wait_5e29__";
+    let _ = fs::remove_dir_all(directory);
+    let _ = fs::create_dir_all(directory);
+    module_write(directory + "/empty.js", "");
+    module_write(
+        directory + "/waiting.js",
+        "globalThis.dynamicStarted(); await globalThis.dynamicGate; export const value = 42;",
+    );
+    module_write(
+        directory + "/entry.js",
+        "let start; let release; globalThis.dynamicStart = new Promise(resolve => start = resolve); globalThis.dynamicStarted = start; globalThis.dynamicGate = new Promise(resolve => release = resolve); export let order = ''; export let done = false; let first = import('./waiting.js'); globalThis.dynamicStart.then(() => { let second = import('./waiting.js'); first.then(() => order += '1'); second.then(() => order += '2'); import('./empty.js').then(release); Promise.all([first, second]).then(() => done = true); });",
+    );
+    let (context, global) = module_test_context();
+    let namespace = match execute_file(context, global, directory + "/entry.js") {
+        Ok(value) => value,
+        Err(error) => {
+            testing::fail(error.path + ": " + error.message);
+            runtime::Value::Undefined
+        },
+    };
+    module_expect_string(module_read(context, namespace, "order"), "12");
+    match module_read(context, namespace, "done") {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected repeated imports to settle"),
     };
     let _ = fs::remove_dir_all(directory);
 }
@@ -545,6 +702,76 @@ fn ambiguous_star_exports_fail_resolution() -> () {
 }
 
 #[test]
+fn ambiguous_indirect_exports_fail_during_instantiation() -> () {
+    let directory = "__gomlquickjs_modules_ambiguous_indirect_a4d7__";
+    let _ = fs::remove_dir_all(directory);
+    let _ = fs::create_dir_all(directory);
+    module_write(directory + "/left.js", "export const value = 1;");
+    module_write(directory + "/right.js", "export const value = 2;");
+    module_write(directory + "/middle.js", "export * from './left.js'; export * from './right.js';");
+    module_write(directory + "/entry.js", "export {value as answer} from './middle.js';");
+    let (context, global) = module_test_context();
+    match execute_file(context, global, directory + "/entry.js") {
+        Err(error) => {
+            testing::assert(error.kind == ModuleErrorKind::Syntax);
+            testing::assert(error.runtime_type.is_none());
+            testing::assert(error.message.contains("ambiguous star export `value`"))
+        },
+        Ok(_) => testing::fail("expected ambiguous indirect export error"),
+    };
+    let _ = fs::remove_dir_all(directory);
+}
+
+#[test]
+fn namespace_resolution_omits_ambiguity_and_preserves_shared_namespaces() -> () {
+    let directory = "__gomlquickjs_modules_ambiguous_namespace_3bc7__";
+    let _ = fs::remove_dir_all(directory);
+    let _ = fs::create_dir_all(directory);
+    module_write(directory + "/left.js", "export const value = 1;");
+    module_write(directory + "/right.js", "export const value = 2;");
+    module_write(
+        directory + "/ambiguous.js",
+        "export * from './left.js'; export * from './right.js';",
+    );
+    module_write(
+        directory + "/omitted.js",
+        "import * as namespace from './ambiguous.js'; export const result = !('value' in namespace);",
+    );
+    module_write(directory + "/source.js", "export const item = 42;");
+    module_write(directory + "/first.js", "export * as shared from './source.js';");
+    module_write(directory + "/second.js", "export * as shared from './source.js';");
+    module_write(
+        directory + "/combined.js",
+        "export * from './first.js'; export * from './second.js';",
+    );
+    module_write(
+        directory + "/shared.js",
+        "import {shared} from './combined.js'; export const result = shared.item;",
+    );
+    let (context, global) = module_test_context();
+    let omitted = match execute_file(context, global, directory + "/omitted.js") {
+        Ok(value) => value,
+        Err(error) => {
+            testing::fail(error.path + ": " + error.message);
+            runtime::Value::Undefined
+        },
+    };
+    match module_read(context, omitted, "result") {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected ambiguous export omission"),
+    };
+    let shared = match execute_file(context, global, directory + "/shared.js") {
+        Ok(value) => value,
+        Err(error) => {
+            testing::fail(error.path + ": " + error.message);
+            runtime::Value::Undefined
+        },
+    };
+    module_expect_number(module_read(context, shared, "result"), 42);
+    let _ = fs::remove_dir_all(directory);
+}
+
+#[test]
 fn worker_modules_use_isolated_realms_and_share_shared_array_buffers() -> () {
     let directory = "__gomlquickjs_modules_worker_9a4e__";
     let _ = fs::remove_dir_all(directory);
@@ -621,7 +848,7 @@ fn static_and_dynamic_json_modules_share_default_exports() -> () {
     module_write(directory + "/other.json", "{\"name\":\"other\"}");
     module_write(
         directory + "/entry.js",
-        "import data from './data.json' with {type: 'json'}; export {default as other} from './other.json' with {type: 'json'}; export const answer = data.answer; export let dynamicAnswer = 0; export let same = false; export let wrongTypeRejected = false; export let unknownRejected = false; import('./data.json', {with: {type: 'json'}}).then(function(namespace) { dynamicAnswer = namespace.default.answer; same = namespace.default === data; }); import('./data.json').catch(function(error) { wrongTypeRejected = error instanceof TypeError; }); import('./data.json', {with: {unknown: 'x'}}).catch(function(error) { unknownRejected = error instanceof TypeError; });",
+        "import data from './data.json' with {type: 'json'}; export {default as other} from './other.json' with {type: 'json'}; export const answer = data.answer; export let dynamicAnswer = 0; export let proxyAnswer = 0; export let proxyReads = 0; export let proxyRejected = false; export let same = false; export let wrongTypeRejected = false; export let unknownRejected = false; import('./data.json', {with: {type: 'json'}}).then(function(namespace) { dynamicAnswer = namespace.default.answer; same = namespace.default === data; }); let attributes = new Proxy({}, {ownKeys() { return ['type']; }, getOwnPropertyDescriptor() { return {configurable: true, enumerable: true}; }, get() { proxyReads += 1; return 'json'; }}); import('./data.json', {with: attributes}).then(function(namespace) { proxyAnswer = namespace.default.answer; }); let marker = {}; import('./data.json', {with: new Proxy({}, {ownKeys() { throw marker; }})}).catch(function(error) { proxyRejected = error === marker; }); import('./data.json').catch(function(error) { wrongTypeRejected = error instanceof TypeError; }); import('./data.json', {with: {unknown: 'x'}}).catch(function(error) { unknownRejected = error instanceof TypeError; });",
     );
     let (context, global) = module_test_context();
     let namespace = match execute_file(context, global, directory + "/entry.js") {
@@ -633,7 +860,9 @@ fn static_and_dynamic_json_modules_share_default_exports() -> () {
     };
     module_expect_number(module_read(context, namespace, "answer"), 42);
     module_expect_number(module_read(context, namespace, "dynamicAnswer"), 42);
-    for name in Vec::from_array(["same", "wrongTypeRejected", "unknownRejected"]) {
+    module_expect_number(module_read(context, namespace, "proxyAnswer"), 42);
+    module_expect_number(module_read(context, namespace, "proxyReads"), 1);
+    for name in Vec::from_array(["same", "proxyRejected", "wrongTypeRejected", "unknownRejected"]) {
         match module_read(context, namespace, name) {
             runtime::Value::Bool(value) => testing::assert(value),
             _ => testing::fail("expected JSON module status"),
@@ -653,7 +882,7 @@ fn static_and_dynamic_json_modules_share_default_exports() -> () {
     );
     match execute_file(context, global, directory + "/invalid.js") {
         Err(error) => {
-            testing::assert(error.kind == ModuleErrorKind::Type);
+            testing::assert(error.kind == ModuleErrorKind::Syntax);
             testing::assert(error.message.contains("not supported"))
         },
         Ok(_) => testing::fail("expected unsupported static import attribute"),
@@ -672,7 +901,7 @@ fn import_meta_is_stable_null_prototype_and_module_specific() -> () {
     );
     module_write(
         directory + "/entry.js",
-        "import {meta as dependencyMeta, readMeta} from './dependency.js'; import * as dependencyNamespace from './dependency.js'; export {readMeta}; export const meta = import.meta; export const dependency = dependencyMeta; export const dependencyStable = dependencyMeta === readMeta(); export const namespaceTag = Object.prototype.toString.call(dependencyNamespace); export const namespaceExtensible = Object.isExtensible(dependencyNamespace); export let evalRejected = false; try { eval('import.meta'); } catch (error) { evalRejected = error instanceof SyntaxError; }",
+        "import {meta as dependencyMeta, readMeta} from './dependency.js'; import * as dependencyNamespace from './dependency.js'; export {readMeta}; export const meta = import.meta; export const dependency = dependencyMeta; export const dependencyStable = dependencyMeta === readMeta(); export const namespaceTag = Object.prototype.toString.call(dependencyNamespace); export const namespaceExtensible = Object.isExtensible(dependencyNamespace); let descriptor = Object.getOwnPropertyDescriptor(dependencyNamespace, 'meta'); export const namespaceDescriptor = descriptor.value === dependencyMeta && descriptor.writable && descriptor.enumerable && !descriptor.configurable; export const namespaceDefine = Reflect.defineProperty(dependencyNamespace, 'meta', {}) && !Reflect.defineProperty(dependencyNamespace, 'meta', {value: null}); export const namespaceSet = !Reflect.set(dependencyNamespace, 'meta', dependencyMeta); export let evalRejected = false; try { eval('import.meta'); } catch (error) { evalRejected = error instanceof SyntaxError; }",
     );
     let (context, global) = module_test_context();
     let namespace = match execute_file(context, global, directory + "/entry.js") {
@@ -704,6 +933,12 @@ fn import_meta_is_stable_null_prototype_and_module_specific() -> () {
         runtime::Value::Bool(value) => testing::assert(!value),
         _ => testing::fail("expected non-extensible module namespace"),
     };
+    for name in Vec::from_array(["namespaceDescriptor", "namespaceDefine", "namespaceSet"]) {
+        match module_read(context, namespace, name) {
+            runtime::Value::Bool(value) => testing::assert(value),
+            _ => testing::fail("expected module namespace property semantics"),
+        }
+    }
     let read_meta = module_read(context, namespace, "readMeta");
     let arguments: Vec[runtime::Value] = Vec::new();
     match context.invoke_with_this_at_depth(read_meta, arguments, runtime::Value::Undefined, 0) {

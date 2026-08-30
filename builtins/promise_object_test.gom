@@ -15,6 +15,16 @@ fn promise_builtin_expect_install(value: Result[runtime::Value, BuiltinError]) -
     }
 }
 
+fn promise_builtin_install_realm_promise(context: vm::Context) -> runtime::Value {
+    match install(context) {
+        Ok(realm) => promise_builtin_property(context.heap(), realm.global_object(), "Promise"),
+        Err(error) => {
+            testing::fail(error.message);
+            runtime::Value::Undefined
+        },
+    }
+}
+
 fn promise_builtin_expect_value(value: Result[runtime::Value, vm::VmError]) -> runtime::Value {
     match value {
         Ok(value) => value,
@@ -98,6 +108,27 @@ fn promise_builtin_invoke_method(
     context.execute_with_locals(bytecode::Function::new(Vec::new(), code, locals.len()), locals)
 }
 
+fn promise_builtin_construct(
+    context: vm::Context,
+    constructor: runtime::Value,
+    arguments: Vec[runtime::Value],
+) -> Result[runtime::Value, vm::VmError] {
+    let code: Vec[bytecode::Instruction] = Vec::from_array([bytecode::Instruction::GetLoc(0)]);
+    let mut index = 0;
+    while index < arguments.len() {
+        code.push(bytecode::Instruction::GetLoc(index + 1));
+        index += 1;
+    }
+    code.push(bytecode::Instruction::Construct(arguments.len()));
+    code.push(bytecode::Instruction::Return);
+    let locals: Vec[runtime::Value] = Vec::with_capacity(arguments.len() + 1);
+    locals.push(constructor);
+    for value in arguments {
+        locals.push(value)
+    }
+    context.execute_with_locals(bytecode::Function::new(Vec::new(), code, locals.len()), locals)
+}
+
 fn promise_builtin_static(
     context: vm::Context,
     constructor: runtime::Value,
@@ -106,8 +137,9 @@ fn promise_builtin_static(
 ) -> runtime::Value {
     let object = promise_builtin_expect_object(constructor);
     promise_builtin_expect_value(
-        promise_builtin_invoke(
+        promise_builtin_invoke_method(
             context,
+            constructor,
             promise_builtin_property(context.heap(), object, name),
             arguments,
         ),
@@ -204,7 +236,7 @@ fn promise_constructor_runs_executor_and_then_is_asynchronous() -> () {
         },
     );
     let instance = promise_builtin_expect_value(
-        promise_builtin_invoke(context, constructor, Vec::from_array([executor])),
+        promise_builtin_construct(context, constructor, Vec::from_array([executor])),
     );
     testing::assert(executor_called.get());
     let observed = Ref::new(runtime::Value::Undefined);
@@ -383,7 +415,7 @@ fn promise_handler_throw_becomes_child_rejection() -> () {
 #[test]
 fn promise_all_and_all_settled_return_ecmascript_shaped_arrays() -> () {
     let context = vm::Context::new(runtime::Heap::new());
-    let constructor = promise_builtin_expect_install(install_promise(context));
+    let constructor = promise_builtin_install_realm_promise(context);
     let rejected = promise_builtin_static(
         context,
         constructor,
@@ -469,7 +501,7 @@ fn promise_all_and_all_settled_return_ecmascript_shaped_arrays() -> () {
 #[test]
 fn promise_race_any_and_aggregate_failure_are_exposed() -> () {
     let context = vm::Context::new(runtime::Heap::new());
-    let constructor = promise_builtin_expect_install(install_promise(context));
+    let constructor = promise_builtin_install_realm_promise(context);
     let rejected_first = promise_builtin_static(
         context,
         constructor,
@@ -557,9 +589,9 @@ fn promise_race_any_and_aggregate_failure_are_exposed() -> () {
 }
 
 #[test]
-fn promise_combinator_array_limit_rejects_instead_of_throwing() -> () {
+fn promise_combinator_non_iterable_rejects_instead_of_throwing() -> () {
     let context = vm::Context::new(runtime::Heap::new());
-    let constructor = promise_builtin_expect_install(install_promise(context));
+    let constructor = promise_builtin_install_realm_promise(context);
     let result = promise_builtin_static(
         context,
         constructor,
@@ -580,17 +612,13 @@ fn promise_combinator_array_limit_rejects_instead_of_throwing() -> () {
     promise_builtin_assert_same(
         promise_builtin_property(context.heap(), error, "name"),
         runtime::Value::String(js_string("TypeError")),
-    );
-    promise_builtin_assert_same(
-        promise_builtin_property(context.heap(), error, "message"),
-        runtime::Value::String(js_string("Promise combinators currently require an Array")),
     )
 }
 
 #[test]
 fn nested_promise_combinators_keep_array_values_scalar() -> () {
     let context = vm::Context::new(runtime::Heap::new());
-    let constructor = promise_builtin_expect_install(install_promise(context));
+    let constructor = promise_builtin_install_realm_promise(context);
     let inner = promise_builtin_static(
         context,
         constructor,

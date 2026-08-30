@@ -43,6 +43,16 @@ fn throwing_harness(name: string) -> Result[string, string] {
     }
 }
 
+fn test262_error_harness(name: string) -> Result[string, string] {
+    if name == "assert.js" {
+        Result::Ok("")
+    } else if name == "sta.js" {
+        Result::Ok("function Test262Error() {}")
+    } else {
+        Result::Err("missing")
+    }
+}
+
 fn lexical_harness(name: string) -> Result[string, string] {
     if name == "assert.js" {
         Result::Ok("let harness_lexical = 40; const harness_constant = 2;")
@@ -168,6 +178,10 @@ fn skips_unsupported_features_and_blocking_hosts() -> () {
         empty_harness,
     );
     testing::assert_eq(cannot_block[0].status, RunStatus::Skipped);
+    let agents = run(case_from("/*---\nincludes: [atomicsHelper.js]\n---*/\n0;"), empty_harness);
+    testing::assert_eq(agents[0].status, RunStatus::Skipped);
+    let realms = run(case_from("/*---\nflags: [raw]\n---*/\n$262.createRealm();"), empty_harness);
+    testing::assert_eq(realms[0].status, RunStatus::Skipped);
     let supported = run(
         case_from("/*---\nflags: [raw, CanBlockIsFalse]\nfeatures: [BigInt]\n---*/\n1n;"),
         empty_harness,
@@ -200,14 +214,14 @@ fn skips_unsupported_features_and_blocking_hosts() -> () {
 fn matches_runtime_type_errors_and_rejects_wrong_types() -> () {
     let matching = run(
         case_from(
-            "/*---\nflags: [raw]\nnegative:\n  phase: runtime\n  type: TypeError\n---*/\nreturn ({ value: 1 }).missing();",
+            "/*---\nflags: [raw]\nnegative:\n  phase: runtime\n  type: TypeError\n---*/\n({ value: 1 }).missing();",
         ),
         empty_harness,
     );
     testing::assert_eq(matching[0].status, RunStatus::Passed);
     let wrong = run(
         case_from(
-            "/*---\nflags: [raw]\nnegative:\n  phase: runtime\n  type: RangeError\n---*/\nreturn ({ value: 1 }).missing();",
+            "/*---\nflags: [raw]\nnegative:\n  phase: runtime\n  type: RangeError\n---*/\n({ value: 1 }).missing();",
         ),
         empty_harness,
     );
@@ -263,6 +277,50 @@ fn matches_runtime_type_errors_and_rejects_wrong_types() -> () {
         empty_harness,
     );
     testing::assert_eq(constructor_renamed[0].status, RunStatus::Passed)
+}
+
+#[test]
+fn recognizes_harness_test262_error_runtime_negatives() -> () {
+    let results = run(
+        case_from(
+            "/*---\nflags: [noStrict]\nnegative:\n  phase: runtime\n  type: Test262Error\n---*/\nthrow new Test262Error();",
+        ),
+        test262_error_harness,
+    );
+    testing::assert_eq(results[0].status, RunStatus::Passed)
+}
+
+#[test]
+fn installs_test262_eval_script_in_the_current_realm() -> () {
+    let results = run(
+        case_from(
+            "/*---\nflags: [noStrict]\n---*/\n$262.evalScript('function introduced() { return 42; }'); if ($262.global !== globalThis || introduced() !== 42) throw 'wrong realm';",
+        ),
+        empty_harness,
+    );
+    testing::assert_eq(results[0].status, RunStatus::Passed)
+}
+
+#[test]
+fn installs_test262_array_buffer_detachment() -> () {
+    let results = run(
+        case_from(
+            "/*---\nflags: [noStrict]\n---*/\nlet buffer = new ArrayBuffer(4); $262.detachArrayBuffer(buffer); if (!buffer.detached || buffer.byteLength !== 0) throw 'not detached';",
+        ),
+        empty_harness,
+    );
+    testing::assert_eq(results[0].status, RunStatus::Passed)
+}
+
+#[test]
+fn installs_test262_code_point_range_builder() -> () {
+    let results = run(
+        case_from(
+            "/*---\nflags: [noStrict]\n---*/\nlet bmp = $262.codePointRange(0xD7FF, 0xE001); let astral = $262.codePointRange(0x1F600, 0x1F602); if (bmp.length !== 2050 || bmp.charCodeAt(0) !== 0xD7FF || bmp.charCodeAt(1) !== 0xD800 || bmp.charCodeAt(2048) !== 0xDFFF || bmp.charCodeAt(2049) !== 0xE000 || astral.length !== 4 || astral.codePointAt(0) !== 0x1F600 || astral.codePointAt(2) !== 0x1F601) throw 'wrong range';",
+        ),
+        empty_harness,
+    );
+    testing::assert_eq(results[0].status, RunStatus::Passed)
 }
 
 #[test]
@@ -441,6 +499,26 @@ fn run_file_executes_module_graphs_and_resolution_negatives() -> () {
     );
     match run_file(directory + "/harness_negative.js", harness) {
         Ok(results) => runner_expect_status(results, RunStatus::Failed),
+        Err(message) => testing::fail(message.to_string()),
+    };
+    let _ = fs::remove_dir_all(directory);
+}
+
+#[test]
+fn run_file_resolves_dynamic_imports_from_script_files() -> () {
+    let directory = "__gomlquickjs_test262_dynamic_import_271e__";
+    let harness = directory + "/harness";
+    let _ = fs::remove_dir_all(directory);
+    let _ = fs::create_dir_all(harness);
+    runner_write(harness + "/sta.js", "");
+    runner_write(harness + "/assert.js", "");
+    runner_write(directory + "/dependency.js", "export default 42;");
+    runner_write(
+        directory + "/dynamic.js",
+        "/*---\nflags: [async, noStrict]\n---*/\nimport('./dependency.js').then(function(namespace) { $DONE(namespace.default === 42 ? undefined : 'wrong value'); }, $DONE);",
+    );
+    match run_file(directory + "/dynamic.js", harness) {
+        Ok(results) => runner_expect_status(results, RunStatus::Passed),
         Err(message) => testing::fail(message.to_string()),
     };
     let _ = fs::remove_dir_all(directory);

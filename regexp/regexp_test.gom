@@ -64,7 +64,8 @@ fn anchors_and_dot_use_ecmascript_line_terminators() -> () {
     testing::assert(!anchored.is_match(js_string("zab")));
     testing::assert(!anchored.is_match(js_string("a\n")));
     testing::assert(expect_regex(compile_utf8("$")).is_match(js_string("anything")));
-    testing::assert(expect_regex(compile_utf8("x$")).is_match(js_string("x\r\n")))
+    testing::assert(!expect_regex(compile_utf8("x$")).is_match(js_string("x\r\n")));
+    testing::assert(expect_regex(compile_utf8_with_flags("x$", "m")).is_match(js_string("x\r\n")))
 }
 
 #[test]
@@ -85,7 +86,23 @@ fn greedy_and_non_greedy_quantifiers_choose_ordered_results() -> () {
     assert_match_range(greedy.search(js_string("aaab")), 0, 3);
     assert_match_range(lazy.search(js_string("aaab")), 0, 1);
     testing::assert(expect_regex(compile_utf8("^ab?$")).is_match(js_string("a")));
-    testing::assert(expect_regex(compile_utf8("^ab*$")).is_match(js_string("abbb")))
+    testing::assert(expect_regex(compile_utf8("^ab*$")).is_match(js_string("abbb")));
+    testing::assert(expect_regex(compile_utf8("^a+a$")).is_match(js_string("aaaa")));
+    testing::assert(expect_regex(compile_utf8("^a+?a$")).is_match(js_string("aaaa")));
+    testing::assert(expect_regex(compile_utf8_with_flags("^.+😀$", "u")).is_match(js_string("x😀")))
+}
+
+#[test]
+fn unicode_property_repeats_match_complete_inputs() -> () {
+    testing::assert(
+        expect_regex(compile_utf8_with_flags("^\\p{ASCII}+$", "u")).is_match(js_string("GoML42")),
+    );
+    testing::assert(
+        expect_regex(compile_utf8_with_flags("^\\P{ASCII}+$", "u")).is_match(js_string("世界😀")),
+    );
+    testing::assert(
+        !expect_regex(compile_utf8_with_flags("^\\p{ASCII}+$", "u")).is_match(js_string("Go世界")),
+    )
 }
 
 #[test]
@@ -163,6 +180,8 @@ fn word_boundaries_and_flags_affect_matching() -> () {
         expect_regex(compile_utf8_with_flags("^cat$", "im")).is_match(js_string("DOG\nCAT\n")),
     );
     testing::assert(expect_regex(compile_utf8_with_flags("^.$", "s")).is_match(js_string("\n")));
+    testing::assert(!expect_regex(compile_utf8("^z$")).is_match(js_string("z\n")));
+    testing::assert(expect_regex(compile_utf8_with_flags("^z$", "m")).is_match(js_string("z\n")));
     testing::assert(!expect_regex(compile_utf8_with_flags("cat", "y")).is_match(js_string("a cat")))
 }
 
@@ -173,6 +192,48 @@ fn flags_and_invalid_backreferences_report_errors() -> () {
     testing::assert(compile_utf8_with_flags("\\a", "u").is_err());
     testing::assert(compile_utf8_with_flags("\\1", "u").is_err());
     testing::assert(compile_utf8_with_flags("(a)\\2", "u").is_err())
+}
+
+#[test]
+fn unicode_identity_escapes_only_allow_grammar_punctuators() -> () {
+    for pattern in Vec::from_array(["\\_", "\\!", "\\ ", "[\\_]", "[\\!]"]) {
+        testing::assert(compile_utf8_with_flags(pattern, "u").is_err())
+    }
+    for pattern in Vec::from_array(["\\^", "\\/", "[\\-]"]) {
+        testing::assert(compile_utf8_with_flags(pattern, "u").is_ok())
+    }
+    testing::assert(compile_utf8_with_flags("[\\!\\#]", "v").is_ok())
+}
+
+#[test]
+fn quantifiers_accept_maximum_safe_integer_bounds() -> () {
+    for pattern in Vec::from_array(
+        ["b{9007199254740991}", "b{9007199254740991,}?", "b{9007199254740991,9007199254740991}"],
+    ) {
+        let regex = expect_regex(compile_utf8(pattern));
+        testing::assert(!regex.is_match(js_string("b")))
+    }
+}
+
+#[test]
+fn unicode_sets_reject_unescaped_reserved_punctuators() -> () {
+    for pattern in Vec::from_array(
+        ["[(]", "[)]", "[{]", "[}]", "[/]", "[-]", "[|]", "[!!]", "[##]", "[^^^]", "[_^^]"],
+    ) {
+        if compile_utf8_with_flags(pattern, "v").is_ok() {
+            testing::fail("accepted reserved Unicode set punctuator in " + pattern)
+        } else {}
+    }
+    let escaped = match compile_utf8_with_flags("^[\\(\\)\\{\\}\\/\\-\\|\\!\\#\\^]+$", "v") {
+        Ok(value) => value,
+        Err(value) => {
+            testing::fail(value.message);
+            expect_regex(compile_utf8("never"))
+        },
+    };
+    if !escaped.is_match(js_string("(){}/-|!#^")) {
+        testing::fail("escaped Unicode set punctuators did not match")
+    } else {}
 }
 
 #[test]
@@ -676,6 +737,17 @@ fn annex_b_decimal_escapes_fall_back_to_octal_or_identity() -> () {
 }
 
 #[test]
+fn annex_b_incomplete_hex_escapes_fall_back_to_identity() -> () {
+    testing::assert(expect_regex(compile_utf8("^\\x$")).is_match(js_string("x")));
+    testing::assert(expect_regex(compile_utf8("^\\xA$")).is_match(js_string("xA")));
+    testing::assert(expect_regex(compile_utf8("^\\u$")).is_match(js_string("u")));
+    testing::assert(expect_regex(compile_utf8("^\\u0$")).is_match(js_string("u0")));
+    for pattern in Vec::from_array(["\\x", "\\xA", "\\u", "\\u0"]) {
+        testing::assert(compile_utf8_with_flags(pattern, "u").is_err())
+    }
+}
+
+#[test]
 fn annex_b_control_and_counted_quantifier_fallbacks_are_literals() -> () {
     testing::assert(
         expect_regex(compile_utf8("^\\ca$")).is_match(
@@ -733,7 +805,18 @@ fn invalid_named_capture_forms_report_the_group_name_offset() -> () {
     match compile_utf8_with_flags("\\k<missing>", "u") {
         Result::Err(error) => testing::assert_eq(error.message, "group name is not defined"),
         Result::Ok(_) => testing::fail("expected unicode named backreference error"),
-    }
+    };
+    testing::assert(compile_utf8("(?<present>a)\\k").is_err());
+    testing::assert(compile_utf8("\\k(?<present>a)").is_err())
+}
+
+#[test]
+fn unicode_character_class_sets_cannot_bound_ranges() -> () {
+    testing::assert(compile_utf8_with_flags("[\\d-a]", "u").is_err());
+    testing::assert(compile_utf8_with_flags("[\\s-\\d]", "u").is_err());
+    testing::assert(compile_utf8_with_flags("[\\d-]", "u").is_ok());
+    testing::assert(compile_utf8("[\\d-a]").is_ok());
+    testing::assert(compile_utf8("[\\s-\\d]").is_ok())
 }
 
 #[test]

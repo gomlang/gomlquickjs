@@ -399,6 +399,36 @@ fn resizable_buffer_views_track_lengths_and_fixed_views_recover() -> () {
 }
 
 #[test]
+fn length_tracking_views_allow_partial_trailing_elements() -> () {
+    let buffer = expect_buffer(ArrayBuffer::new_resizable(10, 20));
+    let integers = expect_int32_array(Int32Array::from_buffer(buffer, 0, Option::None));
+    let bigints = expect_bigint_array(
+        BigIntArray::from_buffer(BigIntArrayKind::Signed, buffer, 0, Option::None),
+    );
+    testing::assert(integers.is_length_tracking());
+    testing::assert(bigints.is_length_tracking());
+    testing::assert_eq(integers.length(), 2);
+    testing::assert_eq(integers.byte_length(), 8);
+    testing::assert_eq(bigints.length(), 1);
+    expect_unit(buffer.resize(12));
+    testing::assert_eq(integers.length(), 3);
+    testing::assert_eq(bigints.length(), 1);
+    let shared = expect_buffer(ArrayBuffer::new_growable_shared(10, 20));
+    let shared_values = expect_numeric_array(
+        NumericArray::from_buffer(NumericArrayKind::Uint32, shared, 0, Option::None),
+    );
+    testing::assert_eq(shared_values.length(), 2);
+    expect_unit(shared.grow(12));
+    testing::assert_eq(shared_values.length(), 3);
+    let fixed = expect_buffer(ArrayBuffer::new(10));
+    let _ = expect_error(
+        Int32Array::from_buffer(fixed, 0, Option::None),
+        BufferErrorClass::RangeError,
+        BufferErrorReason::LengthOutOfRange,
+    );
+}
+
+#[test]
 fn explicit_detach_updates_aliases_and_rejects_repeated_detach() -> () {
     let buffer = expect_buffer(ArrayBuffer::new(2));
     let alias = buffer;
@@ -761,6 +791,16 @@ fn numeric_array_kinds_apply_ecmascript_conversions_and_alias_buffers() -> () {
         expect_float64(single_precision.get(0)),
         widen_float32(expect_float32(view.get_float32(0, Option::Some(true)))),
     )
+}
+
+#[test]
+fn explicit_detach_preserves_resizable_metadata() -> () {
+    let buffer = expect_buffer(ArrayBuffer::new_resizable(2, 8));
+    expect_unit(buffer.detach());
+    testing::assert(buffer.is_detached());
+    testing::assert(buffer.is_resizable());
+    testing::assert_eq(buffer.byte_length(), 0);
+    testing::assert_eq(buffer.max_byte_length(), 0)
 }
 
 #[test]

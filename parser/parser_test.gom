@@ -429,7 +429,7 @@ fn parses_declarations_and_control_flow() -> () {
 
 #[test]
 fn recovers_at_delimiters_and_statement_boundaries() -> () {
-    let result = parse("let = ; const value; if (value { return 1; } broken(,); let tail = 3;");
+    let result = parse("const = ; const value; if (value { return 1; } broken(,); let tail = 3;");
     testing::assert(result.errors.len() >= 5);
     testing::assert_eq(result.program.body.len(), 5);
     match result.program.body[4] {
@@ -502,6 +502,25 @@ fn parses_for_do_while_break_and_continue() -> () {
 }
 
 #[test]
+fn inserts_do_while_terminators_without_line_breaks() -> () {
+    let result = parse("do break; while (false) value = 1;");
+    testing::assert(result.errors.is_empty());
+    testing::assert_eq(result.program.body.len(), 2)
+}
+
+#[test]
+fn strict_future_reserved_words_are_identifiers_only_in_sloppy_code() -> () {
+    let sloppy = parse(
+        "var implements = 1; var interface = 2; var package = 3; var private = 4; var protected = 5; var public = 6; var static = 7; implements + interface + package + private + protected + public + static;",
+    );
+    testing::assert(sloppy.errors.is_empty());
+    let strict = parse("'use strict'; var public = 1;");
+    testing::assert(!strict.errors.is_empty());
+    let escaped = parse("'use strict'; var l\\u0065t = 1;");
+    testing::assert(!escaped.errors.is_empty())
+}
+
+#[test]
 fn parses_labelled_statements_and_jump_targets() -> () {
     let result = parse("outer: for (;;) { if (true) break outer; continue outer; }");
     testing::assert_eq(result.errors.len(), 0);
@@ -537,6 +556,26 @@ fn parses_labelled_statements_and_jump_targets() -> () {
 }
 
 #[test]
+fn validates_labelled_items_and_script_returns() -> () {
+    let valid = parse("label: function declaration() {} label: let\n{}");
+    testing::assert_eq(valid.errors.len(), 0);
+    let invalid = parse(
+        "label: let value; label: const value = 1; label: class Value {} label: function* generator() {} label: async function asynchronous() {}",
+    );
+    testing::assert_eq(invalid.errors.len(), 5);
+    let strict = parse("'use strict'; label: function declaration() {}");
+    testing::assert_eq(strict.errors.len(), 1);
+    let array = parse("label: let\n[value] = source;");
+    testing::assert_eq(array.errors.len(), 1);
+    testing::assert_eq(parse_script("return 1;").errors.len(), 1);
+    testing::assert_eq(parse("return 1;").errors.len(), 0);
+    testing::assert_eq(parse_module("await Promise.resolve(1);").errors.len(), 0);
+    testing::assert_eq(parse_module("return 1;").errors.len(), 1);
+    testing::assert_eq(parse_module("{ return 1; }").errors.len(), 1);
+    testing::assert_eq(parse_module("function nested() { return 1; }").errors.len(), 0)
+}
+
+#[test]
 fn parses_with_statement_around_labelled_body() -> () {
     let result = parse("with ({}) label: { break label; }");
     testing::assert_eq(result.errors.len(), 0);
@@ -547,6 +586,17 @@ fn parses_with_statement_around_labelled_body() -> () {
         },
         _ => testing::fail("expected with statement"),
     }
+}
+
+#[test]
+fn validates_with_statement_bodies_and_sloppy_let_asi() -> () {
+    let invalid = parse(
+        "with ({}) function first() {} with ({}) function* second() {} with ({}) async function third() {} with ({}) label: function fourth() {}",
+    );
+    testing::assert_eq(invalid.errors.len(), 4);
+    let valid = parse("with ({}) let\nvalue = 1; with ({}) let\n{}");
+    testing::assert_eq(valid.errors.len(), 0);
+    testing::assert_eq(valid.program.body.len(), 4)
 }
 
 #[test]
@@ -582,12 +632,62 @@ fn parses_for_of_variable_declarations() -> () {
 }
 
 #[test]
+fn parses_object_literal_loop_conditions() -> () {
+    let result = parse("while ({}) { break; } do { break; } while ({});");
+    testing::assert_eq(result.errors.len(), 0);
+    testing::assert_eq(result.program.body.len(), 2);
+    match result.program.body[0] {
+        ast::Stmt::While { test, .. } => match test.get() {
+            ast::Expr::Object { properties, .. } => testing::assert(properties.is_empty()),
+            _ => testing::fail("expected object literal while condition"),
+        },
+        _ => testing::fail("expected while statement"),
+    };
+    match result.program.body[1] {
+        ast::Stmt::DoWhile { test, .. } => match test.get() {
+            ast::Expr::Object { properties, .. } => testing::assert(properties.is_empty()),
+            _ => testing::fail("expected object literal do-while condition"),
+        },
+        _ => testing::fail("expected do-while statement"),
+    }
+}
+
+#[test]
+fn validates_if_branch_function_declarations_and_sloppy_let_asi() -> () {
+    let allowed = parse("if (true) function first() {} else function second() {}");
+    testing::assert_eq(allowed.errors.len(), 0);
+    let invalid = parse(
+        "if (true) async function first() {} if (true) function* second() {} if (true) label: function third() {}",
+    );
+    testing::assert_eq(invalid.errors.len(), 3);
+    let strict = parse("'use strict'; if (true) function first() {}");
+    testing::assert_eq(strict.errors.len(), 1);
+    let asi = parse("if (false) let\nvalue = 1; if (false) let\n{}");
+    testing::assert_eq(asi.errors.len(), 0);
+    testing::assert_eq(asi.program.body.len(), 4);
+    let array = parse("if (false) let\n[value] = source;");
+    testing::assert(!array.errors.is_empty())
+}
+
+#[test]
+fn rejects_switch_lexical_redeclarations_and_var_conflicts() -> () {
+    let var_conflict = parse("switch (0) { case 0: var value; default: let value; }");
+    testing::assert(!var_conflict.errors.is_empty());
+    let duplicate = parse(
+        "switch (0) { case 0: function value() {} default: async function value() {} }",
+    );
+    testing::assert(!duplicate.errors.is_empty());
+    let valid = parse("switch (0) { case 0: let first; break; default: const second = 2; }");
+    testing::assert_eq(valid.errors.len(), 0)
+}
+
+#[test]
 fn parses_for_await_of_declarations_targets_and_patterns() -> () {
     let result = parse(
-        "for await (let value of values) {} for\nawait (const [key, item] of entries) {} for await (target[index()] of values) {} for await ([first, ...rest] of values) {} for await ({value: renamed, other} of values) {}",
+        "for await (let value of values) {} for\nawait (const [key, item] of entries) {} for await (target[index()] of values) {} for await ([first, ...rest] of values) {} for await ({value: renamed, other} of values) {} for await (async of values) {}",
     );
     testing::assert_eq(result.errors.len(), 0);
-    testing::assert_eq(result.program.body.len(), 5);
+    testing::assert_eq(result.program.body.len(), 6);
     match result.program.body[0] {
         ast::Stmt::ForOf { kind, name, target, assignment_pattern, asynchronous, .. } => {
             testing::assert_eq(kind, ast::VariableKind::Let);
@@ -645,6 +745,13 @@ fn parses_for_await_of_declarations_targets_and_patterns() -> () {
             }
         },
         _ => testing::fail("expected async object-assignment for-of statement"),
+    };
+    match result.program.body[5] {
+        ast::Stmt::ForOf { target: Some(target), asynchronous, .. } => {
+            testing::assert(asynchronous);
+            assert_identifier(target.get(), "async")
+        },
+        _ => testing::fail("expected async identifier assignment-target for-of statement"),
     }
 }
 
@@ -719,6 +826,140 @@ fn parses_for_in_assignment_targets() -> () {
         },
         _ => testing::fail("expected initialized var for-in statement"),
     }
+}
+
+#[test]
+fn parses_sloppy_let_identifier_for_in_targets() -> () {
+    let result = parse(
+        "var object = {}; var let; for (let in object) {} for ([let][1] in object) {}",
+    );
+    testing::assert_eq(result.errors.len(), 0);
+    testing::assert_eq(result.program.body.len(), 4);
+    match result.program.body[2] {
+        ast::Stmt::ForIn { target: Some(target), .. } => {
+            assert_identifier(target.get(), "let")
+        },
+        _ => testing::fail("expected let identifier for-in target"),
+    };
+    match result.program.body[3] {
+        ast::Stmt::ForIn { target: Some(target), .. } => match target.get() {
+            ast::Expr::Member { computed: true, .. } => (),
+            _ => testing::fail("expected computed for-in target"),
+        },
+        _ => testing::fail("expected computed let for-in target"),
+    };
+    let strict = parse("\"use strict\"; let;");
+    testing::assert(!strict.errors.is_empty())
+}
+
+#[test]
+fn validates_iteration_statement_bodies_and_lexical_heads() -> () {
+    let invalid = parse(
+        "for (var x in {}) function direct() {} for (var x in {}) first: second: function labelled() {} for (let x in {}) { var x; } for (const let in {}) {} for (let y = 0; false; ) { var y; }",
+    );
+    testing::assert_eq(invalid.errors.len(), 5);
+    let valid = parse(
+        "var let; let = 1; for (let; false; ) {} for (var x in null) let\n{} for (; false; ) let\nx = 1;",
+    );
+    testing::assert_eq(valid.errors.len(), 0);
+    testing::assert_eq(valid.program.body.len(), 7);
+    match valid.program.body[3] {
+        ast::Stmt::ForIn { body, .. } => match body.get() {
+            ast::Stmt::Expression { expression, .. } => {
+                assert_identifier(expression.get(), "let")
+            },
+            _ => testing::fail("expected sloppy let expression body"),
+        },
+        _ => testing::fail("expected for-in statement"),
+    };
+    match valid.program.body[5] {
+        ast::Stmt::For { body, .. } => match body.get() {
+            ast::Stmt::Expression { expression, .. } => {
+                assert_identifier(expression.get(), "let")
+            },
+            _ => testing::fail("expected sloppy let expression body"),
+        },
+        _ => testing::fail("expected for statement"),
+    };
+    let strict = parse(
+        "\"use strict\"; for (var eval in {}) {} function nested() { for (var arguments = 42 in null) {} }",
+    );
+    testing::assert_eq(strict.errors.len(), 2);
+    let sloppy = parse("for (var eval in {}) {} for (var arguments = 42 in null) {}");
+    testing::assert_eq(sloppy.errors.len(), 0)
+}
+
+#[test]
+fn separates_for_in_targets_from_complete_rhs_expressions() -> () {
+    let result = parse(
+        "for (key in null, {key: 0}) {} for (var name = true ? 'x' in {} : 'seed' in false || {next: 0}) {}",
+    );
+    testing::assert_eq(result.errors.len(), 0);
+    match result.program.body[0] {
+        ast::Stmt::ForIn { target: Some(target), object, .. } => {
+            assert_identifier(target.get(), "key");
+            match object.get() {
+                ast::Expr::Sequence { expressions, .. } => {
+                    testing::assert_eq(expressions.len(), 2)
+                },
+                _ => testing::fail("expected sequence for-in object"),
+            }
+        },
+        _ => testing::fail("expected expression for-in statement"),
+    };
+    match result.program.body[1] {
+        ast::Stmt::ForIn { name, initializer: Some(initializer), object, .. } => {
+            testing::assert_eq(name, "name");
+            match initializer.get() {
+                ast::Expr::Conditional { .. } => (),
+                _ => testing::fail("expected conditional for-in initializer"),
+            };
+            match object.get() {
+                ast::Expr::Binary { operator: ast::BinaryOperator::LogicalOr, .. } => (),
+                _ => testing::fail("expected logical for-in object"),
+            }
+        },
+        _ => testing::fail("expected initialized for-in statement"),
+    }
+}
+
+#[test]
+fn rejects_invalid_for_of_heads() -> () {
+    let result = parse(
+        "for (let x of [], []) {} for (x of [], []) {} for (async of [1]) {} for (var x = 1 of []) {} for (var x of [], []) {}",
+    );
+    testing::assert(result.errors.len() >= 5);
+    let strict = parse("\"use strict\"; for ([arguments] of [[]]) {}");
+    testing::assert(!strict.errors.is_empty())
+}
+
+#[test]
+fn parses_literal_member_targets_in_for_of_assignment_patterns() -> () {
+    let result = parse("for ([{}.value, [0].value] of source) {} for ({x: {}.value} of source) {}");
+    testing::assert_eq(result.errors.len(), 0);
+    testing::assert_eq(result.program.body.len(), 2);
+    match result.program.body[0] {
+        ast::Stmt::ForOf { assignment_pattern: Some(_), .. } => (),
+        _ => testing::fail("expected array assignment pattern"),
+    };
+    match result.program.body[1] {
+        ast::Stmt::ForOf { assignment_pattern: Some(_), .. } => (),
+        _ => testing::fail("expected object assignment pattern"),
+    }
+}
+
+#[test]
+fn enforces_expression_no_in_in_classic_for_initializers() -> () {
+    let invalid_alternate = parse("for (true ? 0 : 0 in {}; false; ) {}");
+    testing::assert(!invalid_alternate.errors.is_empty());
+    let invalid_test = parse("for ('' in {} ? 0 : 0; false; ) {}");
+    testing::assert(!invalid_test.errors.is_empty());
+    let invalid_declaration = parse("for (let value = true ? 0 : 0 in {}; false; ) {}");
+    testing::assert(!invalid_declaration.errors.is_empty());
+    let valid = parse(
+        "for (true ? '' in {} : 0; false; ) {} for ((0 in {}); false; ) {} for (call(0 in {}); false; ) {}",
+    );
+    testing::assert_eq(valid.errors.len(), 0)
 }
 
 #[test]
@@ -818,13 +1059,25 @@ fn parses_combined_imports_string_names_and_namespace_reexports() -> () {
 }
 
 #[test]
-fn rejects_unbound_string_imports_and_string_reexport_sources() -> () {
+fn rejects_unbound_string_imports_and_accepts_string_reexport_sources() -> () {
     let result = parse(
         "import {'string-name'} from './source.js'; export {'string-name' as alias} from './source.js';",
     );
-    testing::assert_eq(result.errors.len(), 2);
-    testing::assert_eq(result.errors[0].message, "string import name requires a local binding");
-    testing::assert_eq(result.errors[1].message, "reexport source name must be an identifier")
+    testing::assert_eq(result.errors.len(), 1);
+    testing::assert_eq(result.errors[0].message, "string import name requires a local binding")
+}
+
+#[test]
+fn rejects_local_string_exports_and_unpaired_surrogate_export_names() -> () {
+    let local = parse("export {'string-name' as alias};");
+    testing::assert_eq(local.errors.len(), 1);
+    testing::assert_eq(local.errors[0].message, "local export name must be an identifier");
+    let exported = parse("export {value as '\\uD83D'};");
+    testing::assert_eq(exported.errors.len(), 1);
+    testing::assert_eq(exported.errors[0].message, "module export name must be well-formed Unicode");
+    let imported = parse("import {'\\uD83D' as value} from './source.js';");
+    testing::assert_eq(imported.errors.len(), 1);
+    testing::assert_eq(imported.errors[0].message, "module export name must be well-formed Unicode")
 }
 
 #[test]
@@ -969,7 +1222,10 @@ fn recovers_from_malformed_for_and_do_while() -> () {
 fn rejects_escaped_reserved_words_in_binding_and_reference_positions() -> () {
     let result = parse("let \\u0069f = 1; \\u0072eturn; object.\\u0069f;");
     testing::assert_eq(result.errors.len(), 2);
-    testing::assert_eq(result.errors[0].message, "reserved word cannot be used as a variable name");
+    testing::assert_eq(
+        result.errors[0].message,
+        "reserved word `if` cannot be used as a variable name",
+    );
     testing::assert_eq(result.errors[1].message, "reserved word cannot be used as an identifier")
 }
 
@@ -1095,6 +1351,34 @@ fn parses_generator_functions_yield_and_delegation() -> () {
         },
         _ => testing::fail("expected generator declaration"),
     }
+}
+
+#[test]
+fn validates_yield_delegation_line_terminators() -> () {
+    let valid = parse("function* values() { yield *\nother(); }");
+    testing::assert(valid.errors.is_empty());
+    let invalid = parse("function* values() { yield\n* other(); }");
+    testing::assert(!invalid.errors.is_empty())
+}
+
+#[test]
+fn parses_yield_before_template_middle_and_tail_tokens() -> () {
+    let result = parse("function* values() { let value = `1${yield}3${4}5`; return value; }");
+    testing::assert(result.errors.is_empty())
+}
+
+#[test]
+fn parses_dynamic_import_where_an_assignment_expression_can_begin() -> () {
+    let result = parse_script(
+        "let load = () => import('a'); let promise; promise = import('b'); function* values() { yield import('c'); return import('d', yield); } new (function() {}, import('e'));",
+    );
+    testing::assert(result.errors.is_empty())
+}
+
+#[test]
+fn rejects_strict_reserved_class_expression_names() -> () {
+    testing::assert(!parse_script("let C = class static {};").errors.is_empty());
+    testing::assert(!parse_script("let C = class st\\u0061tic {};").errors.is_empty())
 }
 
 #[test]
@@ -1572,6 +1856,119 @@ fn rejects_duplicate_private_class_elements() -> () {
 }
 
 #[test]
+fn parses_literal_class_accessor_names() -> () {
+    let result = parse("class Values { get 0x1() {} set 'value'(next) {} static get 0b10() {} }");
+    testing::assert_eq(result.errors.len(), 0)
+}
+
+#[test]
+fn rejects_reserved_class_element_names() -> () {
+    testing::assert(!parse("class C { #constructor; }").errors.is_empty());
+    testing::assert(!parse("class C { static prototype() {} }").errors.is_empty());
+    testing::assert(!parse("class C { static constructor; }").errors.is_empty());
+    testing::assert(!parse("class C { get constructor() {} }").errors.is_empty())
+}
+
+#[test]
+fn rejects_arguments_references_in_class_initializers_and_static_blocks() -> () {
+    testing::assert(!parse("class C { value = arguments; }").errors.is_empty());
+    testing::assert(!parse("class C { value = () => arguments; }").errors.is_empty());
+    testing::assert(!parse("class C { static { class D { [arguments]() {} } } }").errors.is_empty());
+    testing::assert(
+        parse("class C { value = function () { return arguments; }; }").errors.is_empty(),
+    )
+}
+
+#[test]
+fn parses_eval_with_field_initializer_context() -> () {
+    testing::assert(!parse_eval("arguments", true, true, false).errors.is_empty());
+    testing::assert(!parse_eval("() => arguments", true, true, false).errors.is_empty());
+    testing::assert(
+        parse_eval("function f() { return arguments; }", true, true, false).errors.is_empty(),
+    );
+    testing::assert(!parse_eval("new.target", false, false, false).errors.is_empty());
+    testing::assert(!parse_eval("() => new.target", false, false, false).errors.is_empty());
+    testing::assert(parse_eval("new.target", false, true, false).errors.is_empty());
+    testing::assert(parse_eval("() => new.target", false, true, false).errors.is_empty());
+    testing::assert(!parse_eval("return;", false, true, false).errors.is_empty())
+}
+
+#[test]
+fn applies_strict_mode_during_directive_prologue_parsing() -> () {
+    testing::assert(!parse("function f() { 'other'; 'use strict'; var public; }").errors.is_empty());
+    testing::assert(parse("let public = 1;").errors.is_empty());
+    testing::assert(parse_eval("var public;", false, false, false).errors.is_empty());
+    testing::assert(!parse_eval("var public;", false, false, true).errors.is_empty())
+}
+
+#[test]
+fn rejects_escaped_module_contextual_keywords() -> () {
+    testing::assert(!parse_module("export {value \\u0061s alias};").errors.is_empty());
+    testing::assert(!parse_module("export {} \\u0066rom 'source';").errors.is_empty())
+}
+
+#[test]
+fn restricts_static_module_declarations_to_module_items() -> () {
+    testing::assert(parse_module("import './value.js'; export default 1;").errors.is_empty());
+    testing::assert(!parse_module("{ import './value.js'; }").errors.is_empty());
+    testing::assert(!parse_module("if (false) export default 1;").errors.is_empty());
+    testing::assert(!parse_module("function nested() { import './value.js'; }").errors.is_empty());
+    testing::assert(parse_module("{ import('./value.js'); }").errors.is_empty());
+    testing::assert(!parse_script("import './value.js';").errors.is_empty())
+}
+
+#[test]
+fn rejects_duplicate_labels_at_program_and_function_boundaries() -> () {
+    testing::assert(!parse_module("outer: { outer: 0; }").errors.is_empty());
+    testing::assert(!parse_script("function nested() { outer: { outer: 0; } }").errors.is_empty())
+}
+
+#[test]
+fn parses_anonymous_default_functions_as_declarations() -> () {
+    testing::assert(parse_module("export default function() {}").errors.is_empty());
+    testing::assert(parse_module("export default function*() {}").errors.is_empty());
+    testing::assert(!parse_module("export default function() {}()").errors.is_empty());
+    testing::assert(!parse_module("export default function*() {}()").errors.is_empty())
+}
+
+#[test]
+fn rejects_block_function_and_var_redeclarations() -> () {
+    testing::assert(!parse_script("{ function f() {} var f; }").errors.is_empty());
+    testing::assert(!parse_script("{ async function f() {} function f() {} }").errors.is_empty());
+    testing::assert(parse_script("{ function f() {} function f() {} }").errors.is_empty());
+    testing::assert(
+        !parse_script("'use strict'; { function f() {} function f() {} }").errors.is_empty(),
+    );
+    testing::assert(parse_script("function outer() { var f; function f() {} }").errors.is_empty());
+    testing::assert(
+        parse_script("function outer() { 'use strict'; function f() {} function f() {} }").errors.is_empty(),
+    )
+}
+
+#[test]
+fn rejects_legacy_numeric_literals_in_strict_code() -> () {
+    testing::assert(parse_script("01; 08;").errors.is_empty());
+    testing::assert(!parse_script("'use strict'; 01;").errors.is_empty());
+    testing::assert(!parse_script("'use strict'; 08;").errors.is_empty());
+    testing::assert(!parse_module("01;").errors.is_empty());
+    testing::assert(parse_script("'use strict'; 0.1; 0e1; 0x1;").errors.is_empty())
+}
+
+#[test]
+fn rejects_legacy_string_escapes_throughout_strict_function_bodies() -> () {
+    testing::assert(parse_script("'\\1'; '\\8';").errors.is_empty());
+    testing::assert(!parse_script("'use strict'; '\\1';").errors.is_empty());
+    testing::assert(!parse_script("'use strict'; '\\8';").errors.is_empty());
+    testing::assert(!parse_script("function invalid() { '\\1'; 'use strict'; }").errors.is_empty());
+    testing::assert(parse_script("'use strict'; '\\0';").errors.is_empty())
+}
+
+#[test]
+fn rejects_duplicate_labels_in_class_static_blocks() -> () {
+    testing::assert(!parse("class C { static { outer: outer: 0; } }").errors.is_empty())
+}
+
+#[test]
 fn parses_class_heritage_and_super_expressions() -> () {
     let result = parse(
         "class Derived extends namespace.Base { constructor(value) { super(value); } method() { return super.method(); } computed() { return super['value']; } }",
@@ -1617,6 +2014,13 @@ fn parses_class_heritage_and_super_expressions() -> () {
     };
     let malformed = parse("class Missing extends");
     testing::assert(!malformed.errors.is_empty())
+}
+
+#[test]
+fn enforces_class_heritage_expression_grammar() -> () {
+    testing::assert(!parse("class C extends () => {} {}").errors.is_empty());
+    testing::assert(!parse("class C extends async () => {} {}").errors.is_empty());
+    testing::assert(parse("class C extends (condition ? A : B) {}").errors.is_empty())
 }
 
 #[test]
@@ -2027,6 +2431,12 @@ fn parses_new_target_meta_property() -> () {
 }
 
 #[test]
+fn rejects_escaped_new_target_meta_property() -> () {
+    let result = parse("function value() { return new.t\\u0061rget; }");
+    testing::assert(!result.errors.is_empty())
+}
+
+#[test]
 fn parses_debugger_as_an_empty_effect_statement() -> () {
     let result = parse("debugger; debugger\nlet value = 1;");
     testing::assert_eq(result.errors.len(), 0);
@@ -2039,4 +2449,81 @@ fn parses_debugger_as_an_empty_effect_statement() -> () {
         ast::Stmt::Debugger { .. } => (),
         _ => testing::fail("expected debugger statement before ASI"),
     }
+}
+
+#[test]
+fn validates_block_declaration_conflicts_and_lexical_let_bindings() -> () {
+    testing::assert(
+        !parse_script("(function() { 'use strict'; { let value; var value; } })").errors.is_empty(),
+    );
+    testing::assert(!parse_script("let\nlet;").errors.is_empty());
+    testing::assert(!parse_script("const\nlet = 1;").errors.is_empty())
+}
+
+#[test]
+fn parses_escaped_let_as_an_identifier() -> () {
+    let result = parse_script("this.let = 0; l\\u0065t\nvalue; var value;");
+    testing::assert_eq(result.errors.len(), 0);
+    match result.program.body[1] {
+        ast::Stmt::Expression { expression, .. } => match expression.get() {
+            ast::Expr::Identifier { name, .. } => testing::assert_eq(name, "let"),
+            _ => testing::fail("expected escaped let identifier"),
+        },
+        _ => testing::fail("expected escaped let expression"),
+    }
+}
+
+#[test]
+fn rejects_an_arrow_as_the_right_operand_of_private_in() -> () {
+    let result = parse_script("class C { #field; method() { #field in () => {}; } }");
+    testing::assert(!result.errors.is_empty())
+}
+
+#[test]
+fn rejects_escaped_object_and_class_accessor_modifiers() -> () {
+    testing::assert(!parse_script("({g\\u0065t value() {}});").errors.is_empty());
+    testing::assert(!parse_script("class C { s\\u0065t value(input) {} }").errors.is_empty())
+}
+
+#[test]
+fn rejects_duplicate_object_proto_definitions() -> () {
+    testing::assert(
+        !parse_script("({__proto__: null, other: null, '__proto__': null});").errors.is_empty(),
+    );
+    testing::assert_eq(
+        parse_script("({__proto__: null, ['__proto__']: null, __proto__() {}});").errors.len(),
+        0,
+    )
+}
+
+#[test]
+fn rejects_new_dynamic_import() -> () {
+    testing::assert(!parse_script("new import('value');").errors.is_empty())
+}
+
+#[test]
+fn tagged_template_application_precedes_new_construction() -> () {
+    let result = parse_script("new tag`value`('argument');");
+    testing::assert_eq(result.errors.len(), 0);
+    match result.program.body[0] {
+        ast::Stmt::Expression { expression, .. } => match expression.get() {
+            ast::Expr::New { callee, arguments, .. } => {
+                testing::assert_eq(arguments.len(), 1);
+                match callee.get() {
+                    ast::Expr::TaggedTemplate { .. } => (),
+                    _ => testing::fail("expected tagged template constructor"),
+                }
+            },
+            _ => testing::fail("expected constructor expression"),
+        },
+        _ => testing::fail("expected expression statement"),
+    }
+}
+
+#[test]
+fn rejects_in_inside_a_yield_operand_in_for_initializers() -> () {
+    testing::assert(!parse_script("function* g() { for (yield '' in {}; ; ) ; }").errors.is_empty());
+    testing::assert(
+        !parse_script("function* g() { for (yield * '' in {}; ; ) ; }").errors.is_empty(),
+    )
 }

@@ -131,6 +131,13 @@ fn expect_int(value: runtime::Value, expected: i32) -> () {
     }
 }
 
+fn expect_bool(value: runtime::Value, expected: bool) -> () {
+    match value {
+        runtime::Value::Bool(actual) => testing::assert_eq(actual, expected),
+        _ => testing::fail("expected boolean"),
+    }
+}
+
 fn has_message(errors: Vec[CompileError], expected: string) -> bool {
     for error in errors {
         if text::find(error.message, expected).is_some() {
@@ -194,6 +201,26 @@ fn compiles_numeric_and_bitwise_compound_assignments() -> () {
         ),
         14,
     )
+}
+
+#[test]
+fn numeric_literals_use_ecmascript_binary64_rounding() -> () {
+    match execute_source(
+        "return 1.797693134862315708145274237317e+308 < 1.797693134862315808e+308 && 1.797693134862315808e+308 === 1e309 && 4.9406564584124654417656879286822e-324 !== 0 && 2e-324 === 0;",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected numeric literal result"),
+    }
+}
+
+#[test]
+fn typeof_parenthesized_unresolved_reference_is_undefined() -> () {
+    match execute_source_with_builtins(
+        "return typeof missing === 'undefined' && typeof(missing) === 'undefined' && typeof(((missing))) === 'undefined';",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected typeof result"),
+    }
 }
 
 #[test]
@@ -309,7 +336,7 @@ fn bound_functions_forward_construction_new_target_and_instanceof() -> () {
 #[test]
 fn function_bind_reads_length_getters_and_preserves_abrupt_completion() -> () {
     match execute_source_with_builtins(
-        "let hits = 0; function target(first, second, third) {} Object.defineProperty(target, 'length', {configurable: true, get() { hits += 1; return 3.9; }}); let bound = target.bind(null, 1); function infinite() {} Object.defineProperty(infinite, 'length', {configurable: true, get() { return Infinity; }}); let infiniteBound = infinite.bind(null, 1); let token = {}; function fail() {} Object.defineProperty(fail, 'length', {configurable: true, get() { throw token; }}); let preserved = false; try { fail.bind(null); } catch (error) { preserved = error === token; } return bound.length === 2 && hits === 1 && infiniteBound.length === Infinity && preserved;",
+        "let hits = 0; function target(first, second, third) {} Object.defineProperty(target, 'length', {configurable: true, get() { hits += 1; return 3.9; }}); let bound = target.bind(null, 1); function infinite() {} Object.defineProperty(infinite, 'length', {configurable: true, get() { return Infinity; }}); let infiniteBound = infinite.bind(null, 1); let token = {}; function fail() {} Object.defineProperty(fail, 'length', {configurable: true, get() { throw token; }}); let preserved = false; try { fail.bind(null); } catch (error) { preserved = error === token; } function inherited() {} delete inherited.length; Object.setPrototypeOf(inherited, {length: 42}); function nonNumber() {} Object.defineProperty(nonNumber, 'length', {value: '3'}); return bound.length === 2 && hits === 1 && infiniteBound.length === Infinity && preserved && Function.prototype.bind.call(inherited, null, 1).length === 0 && nonNumber.bind(null, 1).length === 0;",
     ) {
         runtime::Value::Bool(value) => testing::assert(value),
         _ => testing::fail("expected Function.bind length result"),
@@ -322,7 +349,13 @@ fn function_to_string_preserves_source_and_formats_native_callables() -> () {
         execute_source_with_builtins(
             "function ordinary(a){return a+1;} let arrow=x=>x; let object={m(a){return a;}}; class C{constructor(a){this.a=a;} static s(){} get x(){return 1;}} let getter=Object.getOwnPropertyDescriptor(C.prototype,'x').get; return [ordinary.toString(),arrow.toString(),object.m.toString(),C.toString(),C.s.toString(),getter.toString(),Function('a','return a + 1;').toString(),ordinary.bind(null).toString(),Math.max.toString(),Function.prototype.toString()].join('|');",
         ),
-        "function ordinary(a){return a+1;}|x=>x|m(a){return a;}|class C{constructor(a){this.a=a;} static s(){} get x(){return 1;}}|s(){}|get x(){return 1;}|function anonymous(a\n) {\nreturn a + 1;\n}|function bound ordinary() {\n    [native code]\n}|function max() {\n    [native code]\n}|function () {\n    [native code]\n}",
+        "function ordinary(a){return a+1;}|x=>x|m(a){return a;}|class C{constructor(a){this.a=a;} static s(){} get x(){return 1;}}|s(){}|get x(){return 1;}|function anonymous(a\n) {\nreturn a + 1;\n}|function () {\n    [native code]\n}|function () {\n    [native code]\n}|function () {\n    [native code]\n}",
+    );
+    expect_string(
+        execute_source_with_builtins(
+            "async /*before*/ function /*middle*/ value() {} return value.toString();",
+        ),
+        "async /*before*/ function /*middle*/ value() {}",
     );
     expect_string(
         execute_source_with_builtins(
@@ -339,6 +372,16 @@ fn function_to_string_preserves_source_and_formats_native_callables() -> () {
     ) {
         runtime::Value::Bool(value) => testing::assert(value),
         _ => testing::fail("expected Function toString validation"),
+    }
+}
+
+#[test]
+fn early_builtin_accessors_inherit_function_string_coercion() -> () {
+    match execute_source_with_builtins(
+        "let descriptor = Object.getOwnPropertyDescriptor(Object.prototype, '__proto__'); return String(descriptor.get) === descriptor.get.toString() && String(descriptor.set) === descriptor.set.toString() && String(descriptor.get).includes('[native code]') && String(descriptor.set).includes('[native code]');",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected native accessor string coercion"),
     }
 }
 
@@ -386,7 +429,7 @@ fn builtin_metadata_batch_matches_quickjs_descriptors() -> () {
 #[test]
 fn dynamic_function_constructor_compiles_parameters_body_and_construction() -> () {
     match execute_source_with_builtins(
-        "globalThis.offset = 3; let order = ''; let first = {toString() { order += 'p'; return 'left'; }}; let body = {toString() { order += 'b'; return 'return left * right + globalThis.offset;'; }}; let multiply = Function(first, 'right = 2', body); let Constructor = new Function('value', 'this.value = value;'); let instance = new Constructor(9); let recursive = Function('value', 'return value < 2 ? 1 : value * anonymous(value - 1);'); let parameterSyntax = false; try { Function(') {}; return function escaped('); } catch (error) { parameterSyntax = error instanceof SyntaxError; } let bodySyntax = false; try { Function('return )'); } catch (error) { bodySyntax = error instanceof SyntaxError; } let symbolFailed = false; try { Function(Symbol('bad')); } catch (error) { symbolFailed = error instanceof TypeError; } return multiply(4) === 11 && multiply.length === 1 && multiply.name === 'anonymous' && order === 'pb' && instance.value === 9 && instance instanceof Constructor && recursive(5) === 120 && parameterSyntax && bodySyntax && symbolFailed;",
+        "globalThis.offset = 3; let order = ''; let first = {toString() { order += 'p'; return 'left'; }}; let body = {toString() { order += 'b'; return 'return left * right + globalThis.offset;'; }}; let multiply = Function(first, 'right = 2', body); let Constructor = new Function('value', 'this.value = value;'); let instance = new Constructor(9); let recursive = Function('value', 'return value < 2 ? 1 : value * anonymous(value - 1);'); let globalLookup = Function('return externalDynamicName;'); globalThis.externalDynamicName = 17; let parameterSyntax = false; try { Function(') {}; return function escaped('); } catch (error) { parameterSyntax = error instanceof SyntaxError; } let bodySyntax = false; try { Function('return )'); } catch (error) { bodySyntax = error instanceof SyntaxError; } let symbolFailed = false; try { Function(Symbol('bad')); } catch (error) { symbolFailed = error instanceof TypeError; } return multiply(4) === 11 && multiply.length === 1 && multiply.name === 'anonymous' && order === 'pb' && instance.value === 9 && instance instanceof Constructor && recursive(5) === 120 && globalLookup() === 17 && parameterSyntax && bodySyntax && symbolFailed;",
     ) {
         runtime::Value::Bool(value) => testing::assert(value),
         _ => testing::fail("expected dynamic Function result"),
@@ -430,6 +473,16 @@ fn object_boxes_all_primitive_kinds_with_their_prototypes() -> () {
     ) {
         runtime::Value::Bool(value) => testing::assert(value),
         _ => testing::fail("expected Object primitive boxing result"),
+    }
+}
+
+#[test]
+fn primitive_property_writes_dispatch_through_prototype_setters() -> () {
+    match execute_source_with_builtins(
+        "let number = 0; let string = 0; let boolean = 0; let bigint = 0; let symbol = 0; Object.setPrototypeOf(Number.prototype, new Proxy({}, {set() { number += 1; return true; }})); Object.setPrototypeOf(String.prototype, new Proxy({}, {set() { string += 1; return true; }})); Object.setPrototypeOf(Boolean.prototype, new Proxy({}, {set() { boolean += 1; return true; }})); Object.setPrototypeOf(BigInt.prototype, new Proxy({}, {set() { bigint += 1; return true; }})); Object.setPrototypeOf(Symbol.prototype, new Proxy({}, {set() { symbol += 1; return true; }})); (0).tracked = null; ''.tracked = null; true.tracked = null; (1n).tracked = null; Symbol().tracked = null; function rejects_string_index() { 'use strict'; try { 'x'[0] = 'y'; } catch (error) { return error instanceof TypeError; } return false; } return number === 1 && string === 1 && boolean === 1 && bigint === 1 && symbol === 1 && rejects_string_index() && 'x'[0] === 'x';",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected primitive property write result"),
     }
 }
 
@@ -584,6 +637,16 @@ fn intrinsic_reflection_surfaces_match_quickjs() -> () {
 }
 
 #[test]
+fn error_operations_use_observable_conversion_and_property_access() -> () {
+    match execute_source_with_builtins(
+        "let order = ''; let created = new Error({toString() { order += 'message,'; return 'broken'; }}, {get cause() { order += 'cause,'; return 42; }}); let hasToken = {}; let hasPreserved = false; try { new TypeError('x', new Proxy({}, {has() { throw hasToken; }})); } catch (error) { hasPreserved = error === hasToken; } let getToken = {}; let getPreserved = false; try { new RangeError('x', {get cause() { throw getToken; }}); } catch (error) { getPreserved = error === getToken; } let nameToken = {}; let namePreserved = false; try { Error.prototype.toString.call({get name() { throw nameToken; }}); } catch (error) { namePreserved = error === nameToken; } let symbolErrors = 0; for (let Constructor of [Error, EvalError, RangeError, ReferenceError, SyntaxError, TypeError, URIError]) { try { Constructor(Symbol()); } catch (error) { if (error instanceof TypeError) symbolErrors += 1; } } let booleanPrototype = Boolean.prototype; delete booleanPrototype.toString; return created.message === 'broken' && created.cause === 42 && order === 'message,cause,' && hasPreserved && getPreserved && namePreserved && symbolErrors === 7 && booleanPrototype == false && booleanPrototype.toString() === '[object Boolean]';",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected observable Error operations"),
+    }
+}
+
+#[test]
 fn object_spread_copies_enumerable_values_symbols_and_string_indices() -> () {
     match execute_source_with_builtins(
         "let hits = 0; let symbol = Symbol('key'); let source = {2: 'two', a: 1, [symbol]: 9}; Object.defineProperty(source, 'computed', {enumerable: true, get: function() { hits += 1; return 7; }}); Object.defineProperty(source, 'hidden', {enumerable: false, value: 8}); let result = {a: 0, ...source, a: 3, ...null, ...undefined, ...'xy'}; return hits === 1 && result.a === 3 && result[2] === 'two' && result.computed === 7 && result.hidden === undefined && result[symbol] === 9 && result[0] === 'x' && result[1] === 'y' && Object.keys(result).join(',') === '0,1,2,a,computed';",
@@ -672,6 +735,176 @@ fn array_from_closes_iterator_when_mapping_abruptly_completes() -> () {
     ) {
         runtime::Value::Bool(value) => testing::assert(value),
         _ => testing::fail("expected Array.from iterator close result"),
+    }
+}
+
+#[test]
+fn array_from_constructs_and_populates_custom_results() -> () {
+    match execute_source_with_builtins(
+        "let arrayLikeLength = -1; function ArrayLikeResult(length) { arrayLikeLength = arguments.length === 1 ? length : -2; } let arrayLike = Array.from.call(ArrayLikeResult, {0: 'x', length: 1}); let iterableArgs = -1; function IterableResult() { iterableArgs = arguments.length; } let iterable = Array.from.call(IterableResult, [2, 3]); let closes = 0; function FixedResult() { Object.defineProperty(this, '0', {configurable: false}); } let failed = false; try { Array.from.call(FixedResult, {[Symbol.iterator]() { let ready = false; return {next() { if (ready) return {done: true}; ready = true; return {value: 1, done: false}; }, return() { closes += 1; return {}; }}; }}); } catch (error) { failed = error instanceof TypeError; } let ofLength = -1; function OfResult(length) { ofLength = length; } let of = Array.of.call(OfResult, 4, 5); return arrayLike instanceof ArrayLikeResult && arrayLikeLength === 1 && arrayLike[0] === 'x' && arrayLike.length === 1 && iterable instanceof IterableResult && iterableArgs === 0 && iterable[0] === 2 && iterable[1] === 3 && iterable.length === 2 && failed && closes === 1 && of instanceof OfResult && ofLength === 2 && of[0] === 4 && of[1] === 5 && of.length === 2;",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected custom Array.from result"),
+    }
+}
+
+#[test]
+fn array_at_captures_length_before_coercing_the_index() -> () {
+    match execute_source_with_builtins(
+        "let object = {0: 'a', 1: 'b', length: 2}; let calls = 0; let index = {valueOf() { calls += 1; object.length = 1; return -1; }}; return Array.prototype.at.call(object, index) === 'b' && calls === 1 && [0, 1, 2].at({valueOf() { return 1; }}) === 1;",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected Array.prototype.at coercion order"),
+    }
+}
+
+#[test]
+fn array_concat_preserves_holes_and_large_length_order() -> () {
+    match execute_source_with_builtins(
+        "let sparse = {length: 5}; sparse[Symbol.isConcatSpreadable] = true; let result = [].concat(sparse); let marker = {}; let large = {length: Number.MAX_SAFE_INTEGER, get 0() { throw marker; }}; large[Symbol.isConcatSpreadable] = true; let observed = false; try { [].concat(large); } catch (error) { observed = error === marker; } let typed = new Uint8Array([7]); Object.defineProperty(typed, 'length', {value: 3}); typed[Symbol.isConcatSpreadable] = true; let typedResult = [].concat(typed); return result.length === 5 && !(0 in result) && !(4 in result) && observed && typedResult.length === 3 && typedResult[0] === 7 && !(1 in typedResult);",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected Array.concat hole and large length semantics"),
+    }
+}
+
+#[test]
+fn array_slice_uses_species_and_maximum_safe_indices() -> () {
+    match execute_source_with_builtins(
+        "let calls = 0; function Result(length) { calls += 1; this.received = length; } let source = [, 2, 3]; source.constructor = {}; source.constructor[Symbol.species] = Result; let sliced = source.slice(0, 2); let proxied = Array.prototype.slice.call(new Proxy(source, {}), 1, 3); let large = {length: Number.MAX_SAFE_INTEGER}; large[9007199254740990] = 'last'; let tail = Array.prototype.slice.call(large, -1); let range = false; try { Array.prototype.slice.call({length: 4294967296}); } catch (error) { range = error instanceof RangeError; } return sliced instanceof Result && sliced.received === 2 && sliced.length === 2 && !(0 in sliced) && sliced[1] === 2 && proxied instanceof Result && proxied.length === 2 && proxied[0] === 2 && calls === 2 && tail.length === 1 && tail[0] === 'last' && Array.prototype.slice.call(true).length === 0 && range;",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected Array.slice species and maximum safe index semantics"),
+    }
+}
+
+#[test]
+fn array_length_uses_range_errors_and_observable_coercion() -> () {
+    match execute_source_with_builtins(
+        "let constructorRange = false; let assignmentRange = false; try { new Array(-1); } catch (error) { constructorRange = error instanceof RangeError; } try { [].length = 4294967296; } catch (error) { assignmentRange = error instanceof RangeError; } let array = [1, 2]; let calls = 0; let length = {valueOf() { calls += 1; if (calls === 2) Object.defineProperty(array, 'length', {writable: false}); return 2; }}; let validation = false; try { Object.defineProperty(array, 'length', {value: length, writable: true}); } catch (error) { validation = error instanceof TypeError; } let reflected = Reflect.defineProperty([], 'length', {value: new Number(1)}); return constructorRange && assignmentRange && validation && calls === 2 && reflected;",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected Array length coercion semantics"),
+    }
+}
+
+#[test]
+fn array_reverse_is_generic_and_observes_endpoint_mutation() -> () {
+    match execute_source_with_builtins(
+        "let object = {0: 'a', 2: 'c', length: 3}; let same = Array.prototype.reverse.call(object) === object; let sparse = same && object[0] === 'c' && object[2] === 'a' && !(1 in object); let array = ['first', 'second']; Object.defineProperty(array, '0', {get() { array.length = 0; return 'first'; }}); array.reverse(); let mutation = !(0 in array) && (1 in array) && array[1] === 'first'; let marker = {}; let large = {length: Number.MAX_SAFE_INTEGER}; Object.defineProperty(large, '9007199254740990', {get() { throw marker; }}); let observed = false; try { Array.prototype.reverse.call(large); } catch (error) { observed = error === marker; } return sparse && mutation && observed;",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected generic Array.reverse result"),
+    }
+}
+
+#[test]
+fn array_index_of_is_generic_and_observes_property_order() -> () {
+    match execute_source_with_builtins(
+        "let log = []; let target = {1: 'needle', length: 3}; let proxy = new Proxy(target, {get(object, key, receiver) { log.push('get:' + String(key)); return Reflect.get(object, key, receiver); }, has(object, key) { log.push('has:' + String(key)); return Reflect.has(object, key); }}); let found = Array.prototype.indexOf.call(proxy, 'needle', {valueOf() { log.push('from'); return 0; }}); let calls = 0; let empty = Array.prototype.indexOf.call({length: 0}, 'missing', {valueOf() { calls += 1; return 0; }}); let marker = {valueOf() { throw new Error('coerced'); }}; let identical = Array.prototype.indexOf.call({0: marker, length: 1}, marker) === 0; let large = {length: Number.MAX_SAFE_INTEGER}; large[Number.MAX_SAFE_INTEGER - 1] = marker; let nearLimit = Array.prototype.indexOf.call(large, marker, Number.MAX_SAFE_INTEGER - 3); return found === 1 && log.join(',') === 'get:length,from,has:0,has:1,get:1' && empty === -1 && calls === 0 && identical && nearLimit === Number.MAX_SAFE_INTEGER - 1;",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected generic Array.indexOf result"),
+    }
+}
+
+#[test]
+fn array_last_index_of_distinguishes_omitted_and_undefined_positions() -> () {
+    match execute_source_with_builtins(
+        "let log = []; let target = {0: 'first', 2: 'needle', length: 3}; let proxy = new Proxy(target, {get(object, key, receiver) { log.push('get:' + String(key)); return Reflect.get(object, key, receiver); }, has(object, key) { log.push('has:' + String(key)); return Reflect.has(object, key); }}); let found = Array.prototype.lastIndexOf.call(proxy, 'needle'); let values = {0: 'same', 2: 'same', length: 3}; let omitted = Array.prototype.lastIndexOf.call(values, 'same'); let explicit = Array.prototype.lastIndexOf.call(values, 'same', undefined); let calls = 0; let empty = Array.prototype.lastIndexOf.call({length: 0}, 'missing', {valueOf() { calls += 1; return 0; }}); let marker = {}; let large = {length: Number.MAX_SAFE_INTEGER}; large[Number.MAX_SAFE_INTEGER - 3] = marker; let nearLimit = Array.prototype.lastIndexOf.call(large, marker, Number.MAX_SAFE_INTEGER - 1); let negativeInfinity = Array.prototype.lastIndexOf.call({0: marker, length: Number.MAX_SAFE_INTEGER}, marker, -Infinity); return found === 2 && log.join(',') === 'get:length,has:2,get:2' && omitted === 2 && explicit === 0 && empty === -1 && calls === 0 && nearLimit === Number.MAX_SAFE_INTEGER - 3 && negativeInfinity === -1;",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected generic Array.lastIndexOf result"),
+    }
+}
+
+#[test]
+fn array_includes_reads_holes_and_uses_same_value_zero() -> () {
+    match execute_source_with_builtins(
+        "let log = []; let target = {1: NaN, length: 3}; let proxy = new Proxy(target, {get(object, key, receiver) { log.push('get:' + String(key)); return Reflect.get(object, key, receiver); }, has() { throw new Error('unexpected has'); }}); let found = Array.prototype.includes.call(proxy, NaN); let sparse = [, ,].includes(undefined); let calls = 0; let empty = Array.prototype.includes.call({length: 0}, 'missing', {valueOf() { calls += 1; return 0; }}); let large = {length: Number.MAX_SAFE_INTEGER}; large[Number.MAX_SAFE_INTEGER - 1] = 'last'; let nearLimit = Array.prototype.includes.call(large, 'last', Number.MAX_SAFE_INTEGER - 2); return found && log.join(',') === 'get:length,get:0,get:1' && sparse && !empty && calls === 0 && nearLimit && [0].includes(-0);",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected generic Array.includes result"),
+    }
+}
+
+#[test]
+fn array_push_is_generic_and_preserves_partial_writes() -> () {
+    match execute_source_with_builtins(
+        "let log = []; let target = {0: 'old', length: 1}; let proxy = new Proxy(target, {get(object, key, receiver) { log.push('get:' + String(key)); return Reflect.get(object, key, receiver); }, set(object, key, value, receiver) { log.push('set:' + String(key)); return Reflect.set(object, key, value, receiver); }}); let length = Array.prototype.push.call(proxy, 'a', 'b'); let partial = {length: 0}; Object.defineProperty(partial, '1', {value: 'fixed', writable: false}); let partialFailed = false; try { Array.prototype.push.call(partial, 'first', 'second'); } catch (error) { partialFailed = error instanceof TypeError; } let overflow = {length: Number.MAX_SAFE_INTEGER}; let overflowFailed = false; try { Array.prototype.push.call(overflow, 'value'); } catch (error) { overflowFailed = error instanceof TypeError; } let frozenFailed = false; let frozen = Object.freeze([]); try { frozen.push(); } catch (error) { frozenFailed = error instanceof TypeError; } return length === 3 && target[1] === 'a' && target[2] === 'b' && target.length === 3 && log.join(',') === 'get:length,set:1,set:2,set:length' && partialFailed && partial[0] === 'first' && partial[1] === 'fixed' && partial.length === 0 && overflowFailed && !(Number.MAX_SAFE_INTEGER in overflow) && overflow.length === Number.MAX_SAFE_INTEGER && frozenFailed;",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected generic Array.push result"),
+    }
+}
+
+#[test]
+fn array_pop_is_generic_and_observes_delete_before_length() -> () {
+    match execute_source_with_builtins(
+        "let log = []; let target = {0: 'a', 2: 'c', length: 3}; let proxy = new Proxy(target, {get(object, key, receiver) { log.push('get:' + String(key)); return Reflect.get(object, key, receiver); }, deleteProperty(object, key) { log.push('delete:' + String(key)); return Reflect.deleteProperty(object, key); }, set(object, key, value, receiver) { log.push('set:' + String(key)); return Reflect.set(object, key, value, receiver); }}); let value = Array.prototype.pop.call(proxy); let zeroLog = []; let zero = {get length() { zeroLog.push('get'); return 0; }, set length(value) { zeroLog.push('set:' + value); }}; let empty = Array.prototype.pop.call(zero); let fixed = {2: 'fixed', length: 3}; Object.defineProperty(fixed, '2', {configurable: false}); let fixedFailed = false; try { Array.prototype.pop.call(fixed); } catch (error) { fixedFailed = error instanceof TypeError; } let large = {length: Number.MAX_SAFE_INTEGER}; large[Number.MAX_SAFE_INTEGER - 1] = 'last'; let largeValue = Array.prototype.pop.call(large); return value === 'c' && target.length === 2 && !(2 in target) && log.join(',') === 'get:length,get:2,delete:2,set:length' && empty === undefined && zeroLog.join(',') === 'get,set:0' && fixedFailed && fixed.length === 3 && fixed[2] === 'fixed' && largeValue === 'last' && large.length === Number.MAX_SAFE_INTEGER - 1 && !(Number.MAX_SAFE_INTEGER - 1 in large) && Array.prototype.pop.call(true) === undefined;",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected generic Array.pop result"),
+    }
+}
+
+#[test]
+fn array_shift_moves_sparse_properties_in_observable_order() -> () {
+    match execute_source_with_builtins(
+        "let log = []; let target = {0: 'a', 2: 'c', length: 4}; let proxy = new Proxy(target, {get(object, key, receiver) { log.push('get:' + String(key)); return Reflect.get(object, key, receiver); }, has(object, key) { log.push('has:' + String(key)); return Reflect.has(object, key); }, deleteProperty(object, key) { log.push('delete:' + String(key)); return Reflect.deleteProperty(object, key); }, set(object, key, value, receiver) { log.push('set:' + String(key)); return Reflect.set(object, key, value, receiver); }}); let first = Array.prototype.shift.call(proxy); let blocked = {0: 'fixed', length: 2}; Object.defineProperty(blocked, '0', {configurable: false}); let blockedFailed = false; try { Array.prototype.shift.call(blocked); } catch (error) { blockedFailed = error instanceof TypeError; } let zeroLog = []; let zero = {get length() { zeroLog.push('get'); return 0; }, set length(value) { zeroLog.push('set:' + value); }}; let empty = Array.prototype.shift.call(zero); return first === 'a' && target.length === 3 && !(0 in target) && target[1] === 'c' && !(2 in target) && !(3 in target) && log.join(',') === 'get:length,get:0,has:1,delete:0,has:2,get:2,set:1,has:3,delete:2,delete:3,set:length' && blockedFailed && blocked[0] === 'fixed' && blocked.length === 2 && empty === undefined && zeroLog.join(',') === 'get,set:0' && Array.prototype.shift.call(false) === undefined;",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected generic Array.shift result"),
+    }
+}
+
+#[test]
+fn array_unshift_moves_sparse_properties_from_the_end() -> () {
+    match execute_source_with_builtins(
+        "let log = []; let target = {0: 'a', 2: 'c', length: 3}; let proxy = new Proxy(target, {get(object, key, receiver) { log.push('get:' + String(key)); return Reflect.get(object, key, receiver); }, has(object, key) { log.push('has:' + String(key)); return Reflect.has(object, key); }, deleteProperty(object, key) { log.push('delete:' + String(key)); return Reflect.deleteProperty(object, key); }, set(object, key, value, receiver) { log.push('set:' + String(key)); return Reflect.set(object, key, value, receiver); }}); let length = Array.prototype.unshift.call(proxy, 'x', 'y'); let partial = {0: 'first', 1: 'fixed', length: 2}; Object.defineProperty(partial, '1', {writable: false}); let partialFailed = false; try { Array.prototype.unshift.call(partial, 'new'); } catch (error) { partialFailed = error instanceof TypeError; } let overflow = {length: Number.MAX_SAFE_INTEGER}; let overflowFailed = false; try { Array.prototype.unshift.call(overflow, 'value'); } catch (error) { overflowFailed = error instanceof TypeError; } let frozenFailed = false; try { Array.prototype.unshift.call(Object.freeze([])); } catch (error) { frozenFailed = error instanceof TypeError; } return length === 5 && target[0] === 'x' && target[1] === 'y' && target[2] === 'a' && !(3 in target) && target[4] === 'c' && target.length === 5 && log.join(',') === 'get:length,has:2,get:2,set:4,has:1,delete:3,has:0,get:0,set:2,set:0,set:1,set:length' && partialFailed && partial[0] === 'first' && partial[1] === 'fixed' && partial[2] === 'fixed' && partial.length === 2 && overflowFailed && overflow.length === Number.MAX_SAFE_INTEGER && frozenFailed && Array.prototype.unshift.call(true) === 0;",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected generic Array.unshift result"),
+    }
+}
+
+#[test]
+fn array_splice_is_generic_and_uses_species_for_removed_values() -> () {
+    match execute_source_with_builtins(
+        "let target = {0: 'a', 2: 'c', 3: 'd', length: 4}; let removed = Array.prototype.splice.call(target, 1, 2, 'x', 'y', 'z'); let generic = Array.isArray(removed) && removed.length === 2 && !(0 in removed) && removed[1] === 'c' && target.length === 5 && target[0] === 'a' && target[1] === 'x' && target[2] === 'y' && target[3] === 'z' && target[4] === 'd'; let calls = 0; function Result(length) { calls += 1; this.received = length; } let source = [, 2, 3]; source.constructor = {}; source.constructor[Symbol.species] = Result; let selected = source.splice(0, 2); let species = selected instanceof Result && selected.received === 2 && selected.length === 2 && !(0 in selected) && selected[1] === 2 && calls === 1 && source.length === 1 && source[0] === 3; let lengthSets = 0; let noArguments = {get length() { return 0; }, set length(value) { lengthSets += value + 1; }}; let empty = Array.prototype.splice.call(noArguments); return generic && species && empty.length === 0 && lengthSets === 1;",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected generic Array.splice and species result"),
+    }
+}
+
+#[test]
+fn array_join_is_generic_and_observes_conversion_order() -> () {
+    match execute_source_with_builtins(
+        "let log = []; let target = {0: 'a', 2: null, length: 3}; let proxy = new Proxy(target, {get(object, key, receiver) { log.push('get:' + String(key)); return Reflect.get(object, key, receiver); }}); let separator = {toString() { log.push('separator'); target[1] = {toString() { log.push('value'); return 'b'; }}; target.length = 1; return '|'; }}; let result = Array.prototype.join.call(proxy, separator); return result === 'a|b|' && log.join(',') === 'get:length,separator,get:0,get:1,value,get:2' && Array.prototype.join.call(true) === '' && [undefined, null].join() === ',';",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected generic Array.join and conversion order"),
+    }
+}
+
+#[test]
+fn array_to_spliced_checks_safe_length_before_allocation_limit() -> () {
+    match execute_source_with_builtins(
+        "let touched = false; let source = {get 0() { touched = true; throw new Error('unexpected'); }, length: Number.MAX_SAFE_INTEGER}; let typeFailed = false; try { Array.prototype.toSpliced.call(source, 0, 0, 1); } catch (error) { typeFailed = error instanceof TypeError; } source.length = 4294967296; let rangeFailed = false; try { Array.prototype.toSpliced.call(source, 0, 0); } catch (error) { rangeFailed = error instanceof RangeError; } return typeFailed && rangeFailed && !touched;",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected Array.toSpliced length error order"),
+    }
+}
+
+#[test]
+fn array_reduce_right_preserves_maximum_safe_indices() -> () {
+    match execute_source_with_builtins(
+        "let source = {length: Number.MAX_SAFE_INTEGER}; source[Number.MAX_SAFE_INTEGER - 1] = 1; source[Number.MAX_SAFE_INTEGER - 3] = 3; let correct = false; try { Array.prototype.reduceRight.call(source, function(values, value, index) { values.push([value, index]); if (value === 3) throw values; return values; }, []); } catch (values) { correct = values.length === 2 && values[0][0] === 1 && values[0][1] === Number.MAX_SAFE_INTEGER - 1 && values[1][0] === 3 && values[1][1] === Number.MAX_SAFE_INTEGER - 3; } return correct;",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected Array.reduceRight maximum safe indices"),
     }
 }
 
@@ -1030,6 +1263,76 @@ fn eval_errors_expose_runtime_and_parse_source_positions() -> () {
 }
 
 #[test]
+fn eval_accepts_unpaired_surrogates_inside_comments() -> () {
+    match execute_source_with_builtins(
+        "let value = 0; eval('//comment' + String.fromCharCode(0xd800) + '\\nvalue = 1'); eval('/*comment' + String.fromCharCode(0xdc00) + '*/'); return value;",
+    ) {
+        runtime::Value::Int(value) => testing::assert_eq(value, 1),
+        _ => testing::fail("expected eval comment result"),
+    }
+}
+
+#[test]
+fn direct_eval_accepts_spread_arguments_and_with_calls_preserve_the_base_object() -> () {
+    match execute_source_with_builtins(
+        "function direct() { var value = 'local'; eval(...['value = 1']); return value; } let receiver; let object = { eval: function() { receiver = this; return 9; }, method: function() { receiver = this; } }; let result; with (object) { result = eval(...[]); method(); } return direct() === 1 && result === 9 && receiver === object;",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected eval spread and with call result"),
+    }
+}
+
+#[test]
+fn assignment_and_computed_property_names_follow_named_evaluation() -> () {
+    match execute_source_with_builtins(
+        "let identifier; identifier ??= function() {}; let member = {}; member.value = function() {}; let described = Symbol('named'); let anonymousClass = Symbol(); let anonymousAccessor = Symbol(); let object = {[described]: function() {}, [anonymousClass]: class {}, *[described]() {}, get [anonymousAccessor]() { return 1; }}; let descriptor = Object.getOwnPropertyDescriptor(object, anonymousAccessor); return identifier.name === 'identifier' && member.value.name === '' && object[described].name === '[named]' && object[anonymousClass].name === '' && descriptor.get.name === 'get ';",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected named evaluation result"),
+    }
+}
+
+#[test]
+fn assignments_preserve_the_reference_selected_before_direct_eval() -> () {
+    match execute_source_with_builtins(
+        "function run() { var value = 3; var inner = (function() { value *= (eval('var value = 2;'), 4); return value; })(); return inner === 2 && value === 12; } function assign() { var value = 0; var inner = (function() { value = (eval('var value;'), 1); return value; })(); return inner === undefined && value === 1; } return run() && assign();",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected captured assignment references"),
+    }
+}
+
+#[test]
+fn simple_computed_assignment_defers_reference_validation_until_after_the_rhs() -> () {
+    match execute_source_with_builtins(
+        "let token = {}; let first = false; let second = false; try { let base = null; base[(() => { throw token; })()] = (() => { throw 1; })(); } catch (error) { first = error === token; } try { let base = null; let key = {toString() { throw 1; }}; base[key] = (() => { throw token; })(); } catch (error) { second = error === token; } return first && second;",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected deferred computed assignment validation"),
+    }
+}
+
+#[test]
+fn super_references_capture_the_base_and_respect_write_strictness() -> () {
+    match execute_source_with_builtins(
+        "let result = ''; let first = {set value(_) { result = 'first'; }}; let second = {set value(_) { result = 'second'; }}; let object = {__proto__: first, method() { super[key] = 1; }}; let key = {toString() { Object.setPrototypeOf(object, second); return 'value'; }}; object.method(); let sloppy = {method() { super.blocked = 1; }}; Object.freeze(sloppy); sloppy.method(); let nullError = false; let empty = {method() { try { super.missing; } catch (error) { nullError = error instanceof TypeError; } }}; Object.setPrototypeOf(empty, null); empty.method(); return result === 'first' && !Object.hasOwn(sloppy, 'blocked') && nullError;",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected captured super reference result"),
+    }
+}
+
+#[test]
+fn super_assignment_validates_a_null_base_after_evaluating_the_rhs() -> () {
+    match execute_source_with_builtins(
+        "let count = 0; class C { static identifier() { try { super.value = count += 1; } catch (error) { if (!(error instanceof TypeError)) throw error; } } static computed() { try { super[0] = count += 1; } catch (error) { if (!(error instanceof TypeError)) throw error; } } } Object.setPrototypeOf(C, null); C.identifier(); C.computed(); return count === 2;",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected deferred null super assignment validation"),
+    }
+}
+
+#[test]
 fn const_compound_assignment_and_update_throw_at_runtime() -> () {
     expect_int(
         execute_source_with_builtins(
@@ -1041,7 +1344,7 @@ fn const_compound_assignment_and_update_throw_at_runtime() -> () {
 
 #[test]
 fn reports_parser_and_invalid_target_errors_together() -> () {
-    match compile("let = ; (1 + 2) = 3; tail;") {
+    match compile("const = ; (1 + 2) = 3; tail;") {
         Err(errors) => {
             testing::assert(errors.len() >= 3);
             testing::assert(has_message(errors, "expected variable name"));
@@ -1103,7 +1406,9 @@ fn direct_eval_inherits_new_target_and_super_context() -> () {
 #[test]
 fn dynamic_eval_declarations_preserve_source_order_and_kind() -> () {
     let function = match compile_dynamic_eval(
-        "function first() {} if (true) { var second; } var repeated; function repeated() {}",
+        js_string(
+            "function first() {} if (true) { var second; } var repeated; function repeated() {}",
+        ),
         Vec::new(),
     ) {
         Ok(value) => value,
@@ -1127,7 +1432,7 @@ fn dynamic_eval_declarations_preserve_source_order_and_kind() -> () {
     testing::assert_eq(declarations[3].name, "repeated");
     testing::assert_eq(declarations[3].kind, bytecode::EvalDeclarationKind::Function);
     let strict = match compile_dynamic_eval(
-        "'use strict'; var local; function localFunction() {}",
+        js_string("'use strict'; var local; function localFunction() {}"),
         Vec::new(),
     ) {
         Ok(value) => value,
@@ -1176,9 +1481,19 @@ fn direct_eval_and_default_parameters_use_separate_linked_environments() -> () {
     ) {
         runtime::Value::String(value) => testing::assert_eq(
             value.to_host_string().unwrap_or("invalid"),
-            "true|2:1|2:1|1:1:1|1:global:global|1|global",
+            "true|2:1|!SyntaxError|1:1:1|1:global:global|1|global",
         ),
         _ => testing::fail("expected linked eval and parameter environments"),
+    }
+}
+
+#[test]
+fn direct_eval_arguments_declarations_follow_parameter_environment_bindings() -> () {
+    match execute_source_with_builtins(
+        "let allowed = (p = eval('var arguments = 3')) => arguments; let blocked = (arguments, p = eval('var arguments')) => {}; let rejected = false; try { blocked(); } catch (error) { rejected = error instanceof SyntaxError; } return allowed() === 3 && rejected;",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected parameter environment arguments declaration rules"),
     }
 }
 
@@ -1209,6 +1524,29 @@ fn runtime_computed_eval_rejects_lexical_conflicts_and_shadows_known_globals() -
     ) {
         runtime::Value::Bool(value) => testing::assert(value),
         _ => testing::fail("expected computed eval conflict and shadowing semantics"),
+    }
+}
+
+#[test]
+fn dynamic_eval_compilation_periodically_collects_unreachable_objects() -> () {
+    let context = script_test_context();
+    match execute_script_source(
+        context,
+        "var index = 0; while (index < 6000) { var pattern = eval('/a/'); if (!pattern.test('a')) throw new Error('invalid pattern'); index += 1; }",
+    ) {
+        Ok(_) => (),
+        Err(value) => testing::fail(value.kind.debug()),
+    };
+    testing::assert(context.heap().live_count() < 4096)
+}
+
+#[test]
+fn dynamic_eval_regexp_literals_preserve_lone_surrogates() -> () {
+    match execute_source_with_builtins(
+        "let lone = String.fromCharCode(0xd800); let pattern = eval('/a\\\\' + lone + '/'); return pattern.source === 'a\\\\' + lone;",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected eval RegExp source to preserve lone surrogate"),
     }
 }
 
@@ -1542,6 +1880,16 @@ fn materializes_stable_arguments_objects_with_extra_values_and_iteration() -> ()
 }
 
 #[test]
+fn array_slice_accepts_arguments_objects() -> () {
+    expect_bool(
+        execute_source_with_builtins(
+            "function collect() { return Array.prototype.slice.call(arguments, 1, -1); } let values = collect(0, 1, 2, 3); return Array.isArray(values) && values.join(',') === '1,2';",
+        ),
+        true,
+    )
+}
+
+#[test]
 fn materializes_source_function_length_with_standard_descriptor() -> () {
     match execute_source_with_builtins(
         "function declared(first, second, third) {} let expression = function(left, right) {}; let descriptor = Object.getOwnPropertyDescriptor(declared, 'length'); declared.length = 9; return declared.length === 3 && expression.length === 2 && descriptor.value === 3 && descriptor.writable === false && descriptor.enumerable === false && descriptor.configurable === true && Object.keys(declared).length === 0;",
@@ -1554,10 +1902,20 @@ fn materializes_source_function_length_with_standard_descriptor() -> () {
 #[test]
 fn named_source_functions_expose_names_and_bind_prefixes() -> () {
     match execute_source_with_builtins(
-        "function declared(first, second) {} function defaults(callback = function() {}) { return callback.name; } let expression = function internal() {}; let inferred = function() {}; let arrow = () => 1; let Box = class {}; let assigned; assigned = function() {}; let holder = {}; holder.task = () => 1; let object = {method() {}, get value() { return 1; }, set value(input) {}}; class Methods { method() {} get value() { return 1; } set value(input) {} static make() {} } let objectValue = Object.getOwnPropertyDescriptor(object, 'value'); let classValue = Object.getOwnPropertyDescriptor(Methods.prototype, 'value'); let bound = declared.bind(null, 1); let descriptor = Object.getOwnPropertyDescriptor(declared, 'name'); return declared.name === 'declared' && expression.name === 'internal' && inferred.name === 'inferred' && arrow.name === 'arrow' && Box.name === 'Box' && assigned.name === 'assigned' && holder.task.name === 'task' && defaults() === 'callback' && object.method.name === 'method' && objectValue.get.name === 'get value' && objectValue.set.name === 'set value' && Methods.name === 'Methods' && Methods.prototype.method.name === 'method' && classValue.get.name === 'get value' && classValue.set.name === 'set value' && Methods.make.name === 'make' && bound.name === 'bound declared' && bound.length === 1 && descriptor.value === 'declared' && !descriptor.writable && !descriptor.enumerable && descriptor.configurable;",
+        "function declared(first, second) {} function defaults(callback = function() {}) { return callback.name; } let expression = function internal() {}; let inferred = function() {}; let arrow = () => 1; let Box = class {}; let assigned; assigned = function() {}; let holder = {}; holder.task = () => 1; let object = {method() {}, get value() { return 1; }, set value(input) {}}; class Methods { method() {} get value() { return 1; } set value(input) {} static make() {} } let objectValue = Object.getOwnPropertyDescriptor(object, 'value'); let classValue = Object.getOwnPropertyDescriptor(Methods.prototype, 'value'); let bound = declared.bind(null, 1); let descriptor = Object.getOwnPropertyDescriptor(declared, 'name'); return declared.name === 'declared' && expression.name === 'internal' && inferred.name === 'inferred' && arrow.name === 'arrow' && Box.name === 'Box' && assigned.name === 'assigned' && holder.task.name === '' && defaults() === 'callback' && object.method.name === 'method' && objectValue.get.name === 'get value' && objectValue.set.name === 'set value' && Methods.name === 'Methods' && Methods.prototype.method.name === 'method' && classValue.get.name === 'get value' && classValue.set.name === 'set value' && Methods.make.name === 'make' && bound.name === 'bound declared' && bound.length === 1 && descriptor.value === 'declared' && !descriptor.writable && !descriptor.enumerable && descriptor.configurable;",
     ) {
         runtime::Value::Bool(value) => testing::assert(value),
         _ => testing::fail("expected named source function metadata result"),
+    }
+}
+
+#[test]
+fn infers_names_through_parenthesized_destructuring_defaults() -> () {
+    match execute_source_with_builtins(
+        "let [arrayCover = (function() {}), arraySequence = (0, function() {})] = []; let {objectCover = (function() {}), objectSequence = (0, function() {})} = {}; return arrayCover.name === 'arrayCover' && arraySequence.name !== 'arraySequence' && objectCover.name === 'objectCover' && objectSequence.name !== 'objectSequence';",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected destructuring default inferred names"),
     }
 }
 
@@ -1666,12 +2024,62 @@ fn executes_object_destructuring_assignment_with_computed_keys_and_rest() -> () 
 }
 
 #[test]
+fn prepares_object_destructuring_targets_before_reading_source_properties() -> () {
+    match execute_source_with_builtins(
+        "let reads = 0; let reference = false; class Derived extends Object { #field; constructor() { let source = {get value() { reads += 1; return 1; }}; try { ({value: this.#field} = source); } catch (error) { reference = error instanceof ReferenceError; } super(); } } new Derived(); return reference && reads === 0;",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected object assignment target ordering result"),
+    }
+}
+
+#[test]
+fn resolves_with_var_binding_before_reading_destructured_property() -> () {
+    match execute_source_with_builtins(
+        "let log = []; var key = {toString() { log.push('key'); return 'value'; }}; var source = {get value() { log.push('get'); return undefined; }}; var environment = new Proxy({}, {has(target, name) { log.push('binding:' + name); return false; }}); var fallback = 1; var result; with (environment) { var {[key]: result = fallback} = source; } return log.join(',') === 'binding:source,binding:key,key,binding:result,get,binding:fallback' && result === 1;",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected with binding destructuring order"),
+    }
+}
+
+#[test]
 fn closes_destructuring_assignment_iterator_on_setter_failure() -> () {
     match execute_source_with_builtins(
-        "let closes = 0; let order = ''; let token = {}; let iterable = {[Symbol.iterator]() { order += 'i'; return {next() { order += 'n'; return {done: false, value: 4}; }, return() { order += 'c'; closes += 1; return {done: true}; }}; }}; let receiver = {set value(input) { order += 's'; throw token; }}; function target() { order += 't'; return receiver; } let preserved = false; try { [target().value] = iterable; } catch (error) { preserved = error === token; } return preserved && closes === 1 && order === 'intsc';",
+        "let closes = 0; let order = ''; let token = {}; let iterable = {[Symbol.iterator]() { order += 'i'; return {next() { order += 'n'; return {done: false, value: 4}; }, return() { order += 'c'; closes += 1; return {done: true}; }}; }}; let receiver = {set value(input) { order += 's'; throw token; }}; function target() { order += 't'; return receiver; } let preserved = false; try { [target().value] = iterable; } catch (error) { preserved = error === token; } return preserved && closes === 1 && order === 'itnsc';",
     ) {
         runtime::Value::Bool(value) => testing::assert(value),
         _ => testing::fail("expected destructuring assignment close result"),
+    }
+}
+
+#[test]
+fn skips_destructuring_iterator_close_for_next_errors_and_completed_iterators() -> () {
+    match execute_source_with_builtins(
+        "let nextError = {}; let nextCalls = 0; let nextCloses = 0; let nextIterable = {[Symbol.iterator]() { return {next() { nextCalls += 1; throw nextError; }, return() { nextCloses += 1; return {done: true}; }}; }}; let nextPreserved = false; try { [nextValue] = nextIterable; } catch (error) { nextPreserved = error === nextError; } let defaultError = {}; let doneCalls = 0; let doneCloses = 0; let doneIterable = {[Symbol.iterator]() { return {next() { doneCalls += 1; return {done: true}; }, return() { doneCloses += 1; return {done: true}; }}; }}; function failDefault() { throw defaultError; } let defaultPreserved = false; try { [doneValue = failDefault()] = doneIterable; } catch (error) { defaultPreserved = error === defaultError; } return nextPreserved && nextCalls === 1 && nextCloses === 0 && defaultPreserved && doneCalls === 1 && doneCloses === 0;",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected destructuring iterator close boundaries"),
+    }
+}
+
+#[test]
+fn prepares_destructuring_assignment_targets_before_iterator_steps() -> () {
+    match execute_source_with_builtins(
+        "let elementError = {}; let elementTargets = 0; let elementNext = 0; let elementCloses = 0; let elementIterable = {[Symbol.iterator]() { return {next() { elementNext += 1; return {done: true}; }, return() { elementCloses += 1; return {done: true}; }}; }}; function elementTarget() { elementTargets += 1; throw elementError; } let elementPreserved = false; try { [elementTarget().value] = elementIterable; } catch (error) { elementPreserved = error === elementError; } let restError = {}; let restTargets = 0; let restNext = 0; let restCloses = 0; let restIterable = {[Symbol.iterator]() { return {next() { restNext += 1; return {done: true}; }, return() { restCloses += 1; return {done: true}; }}; }}; function restTarget() { restTargets += 1; throw restError; } let restPreserved = false; try { [...restTarget().value] = restIterable; } catch (error) { restPreserved = error === restError; } return elementPreserved && elementTargets === 1 && elementNext === 0 && elementCloses === 1 && restPreserved && restTargets === 1 && restNext === 0 && restCloses === 1;",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected assignment targets before iterator steps"),
+    }
+}
+
+#[test]
+fn defers_iterator_next_validation_until_advancement() -> () {
+    match execute_source_with_builtins(
+        "let closeError = {}; let closes = 0; let iterator = {return() { closes += 1; throw closeError; }}; let iterable = {[Symbol.iterator]() { return iterator; }}; function* suspendBeforeNext() { for ([{}[yield]] of [iterable]) {} } let generator = suspendBeforeNext(); let first = generator.next(); let closePreserved = false; try { generator.return(); } catch (error) { closePreserved = error === closeError; } let missingNextRejected = false; let invalid = {[Symbol.iterator]() { return {}; }}; try { for (let value of invalid) {} } catch (error) { missingNextRejected = error instanceof TypeError; } return !first.done && first.value === undefined && closePreserved && closes === 1 && missingNextRejected;",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected deferred iterator next validation"),
     }
 }
 
@@ -1756,6 +2164,26 @@ fn executes_class_inheritance_and_super_properties() -> () {
 }
 
 #[test]
+fn constructor_super_properties_use_the_instance_prototype_home() -> () {
+    match execute_source_with_builtins(
+        "let observed = null; class Parent { get attr() { observed = new.target; } } class Child extends Parent { constructor() { super(); super.attr; } } class Base { constructor() { this.correct = super.toString === Object.prototype.toString; } } let child = new Child(); let base = new Base(); let descriptor = Object.getOwnPropertyDescriptor(Child, 'prototype'); return child instanceof Child && observed === undefined && base.correct && !descriptor.writable && !descriptor.enumerable && !descriptor.configurable;",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected constructor super property result"),
+    }
+}
+
+#[test]
+fn computed_super_properties_check_this_before_the_property_expression() -> () {
+    match execute_source_with_builtins(
+        "let evaluations = 0; let reference = false; class Derived extends Object { constructor() { try { super[(evaluations += 1, 'value')]; } catch (error) { reference = error instanceof ReferenceError; } super(); } } new Derived(); return reference && evaluations === 0;",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected computed super property ordering result"),
+    }
+}
+
+#[test]
 fn executes_default_derived_constructors_and_lexical_super_in_arrows() -> () {
     match execute_source_with_builtins(
         "class Base { constructor(value) { this.value = value; } read() { return this.value; } } class DefaultDerived extends Base {} class ArrowDerived extends Base { constructor(value) { let initialize = () => super(value + 1); initialize(); } read() { let invoke = () => super.read(); return invoke() + 1; } } let plain = new DefaultDerived(8); let arrow = new ArrowDerived(9); return plain.value === 8 && plain instanceof DefaultDerived && plain instanceof Base && arrow.value === 10 && arrow.read() === 11;",
@@ -1776,12 +2204,42 @@ fn enforces_derived_constructor_initialization_and_return_rules() -> () {
 }
 
 #[test]
+fn repeated_super_calls_construct_before_rejecting_this_rebinding() -> () {
+    match execute_source_with_builtins(
+        "let baseCalls = 0; let argumentCalls = 0; class Base { constructor() { baseCalls += 1; } } function argument() { argumentCalls += 1; return 1; } class Derived extends Base { constructor() { super(); let original = this; let direct = false; baseCalls = 0; argumentCalls = 0; try { super(argument()); } catch (error) { direct = error instanceof ReferenceError && baseCalls === 1 && argumentCalls === 1 && this === original; } let nested = false; baseCalls = 0; argumentCalls = 0; try { super(super(), argument()); } catch (error) { nested = error instanceof ReferenceError && baseCalls === 1 && argumentCalls === 0 && this === original; } this.valid = direct && nested; } } return new Derived().valid;",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected repeated super call ordering result"),
+    }
+}
+
+#[test]
 fn evaluates_class_heritage_once_and_creates_fresh_anonymous_classes() -> () {
     match execute_source_with_builtins(
         "class Base { constructor(left, right) { this.total = left + right; } sum(left, right) { return this.total + left + right; } } Base.prototype.count = 2; let evaluations = 0; function heritage() { evaluations += 1; return Base; } class Derived extends heritage() { constructor(...values) { super(...values); } sum(...values) { return super.sum(...values); } increment() { return ++super['count']; } } function makeClass() { return class {}; } let First = makeClass(); let Second = makeClass(); let item = new Derived(3, 4); return evaluations === 1 && item.sum(5, 6) === 18 && item.increment() === 3 && item.count === 3 && Base.prototype.count === 2 && First !== Second && new First() instanceof First && !(new First() instanceof Second);",
     ) {
         runtime::Value::Bool(value) => testing::assert(value),
         _ => testing::fail("expected class heritage evaluation result"),
+    }
+}
+
+#[test]
+fn class_heritage_does_not_see_private_names_declared_by_the_class_body() -> () {
+    match compile("class C extends class { value = this.#missing; } { #missing; }") {
+        Ok(_) => testing::fail("expected undeclared private name error"),
+        Err(errors) => testing::assert(
+            has_message(errors, "private name `#missing` is not declared"),
+        ),
+    }
+}
+
+#[test]
+fn class_names_have_tdz_and_immutable_inner_bindings() -> () {
+    match execute_source_with_builtins(
+        "let heritage = false; try { class C extends C {} } catch (error) { heritage = error instanceof ReferenceError; } class D { method() { D = 1; } } let immutable = false; try { new D().method(); } catch (error) { immutable = error instanceof TypeError; } return heritage && immutable;",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected class name binding result"),
     }
 }
 
@@ -1802,6 +2260,56 @@ fn initializes_derived_fields_after_super_and_bypasses_inherited_setters() -> ()
     ) {
         runtime::Value::Bool(value) => testing::assert(value),
         _ => testing::fail("expected derived class field result"),
+    }
+}
+
+#[test]
+fn initializes_public_class_fields_through_proxy_define_property() -> () {
+    match execute_source_with_builtins(
+        "let keys = []; function Base() { return new Proxy(this, { defineProperty(target, key, descriptor) { keys.push(key); return Reflect.defineProperty(target, key, descriptor); } }); } class Derived extends Base { first = 1; second = 2; } let value = new Derived(); return keys.join(',') === 'first,second' && value.first === 1 && value.second === 2;",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected proxied class fields"),
+    }
+}
+
+#[test]
+fn reading_private_accessors_without_getters_throws() -> () {
+    match execute_source_with_builtins(
+        "class Outer { get #value() { return 1; } Inner = class { set #value(next) {} read() { return this.#value; } } } let Constructor = new Outer().Inner; try { new Constructor().read(); } catch (error) { return error instanceof TypeError; } return false;",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected missing private getter error"),
+    }
+}
+
+#[test]
+fn infers_names_for_literal_class_field_initializers() -> () {
+    match execute_source_with_builtins(
+        "class C { static #private = () => 1; static visible = function () {}; static privateName() { return this.#private.name; } } return C.visible.name === 'visible' && C.privateName() === '#private';",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected class field function names"),
+    }
+}
+
+#[test]
+fn dynamic_eval_preserves_class_field_initializer_early_error_context() -> () {
+    match execute_source_with_builtins(
+        "let argumentsError = false; class C { value = eval('arguments'); } try { new C(); } catch (error) { argumentsError = error instanceof SyntaxError; } class D { value = eval('new.target'); } let directNewTarget = new D().value === undefined; let indirectError = false; try { (0, eval)('new.target'); } catch (error) { indirectError = error instanceof SyntaxError; } return argumentsError && directNewTarget && indirectError;",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected class field eval context"),
+    }
+}
+
+#[test]
+fn converts_computed_class_field_names_during_class_evaluation() -> () {
+    match execute_source_with_builtins(
+        "let calls = 0; let key = { [Symbol.toPrimitive]() { calls++; return 'value'; } }; class C { [key] = 1; } let afterClass = calls; let instance = new C(); return afterClass === 1 && calls === 1 && instance.value === 1;",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected computed class field key conversion"),
     }
 }
 
@@ -1872,6 +2380,16 @@ fn dispatches_string_pattern_methods_through_regexp_state() -> () {
     ) {
         runtime::Value::Bool(value) => testing::assert(value),
         _ => testing::fail("expected String RegExp dispatch result"),
+    }
+}
+
+#[test]
+fn regexp_replace_fast_path_preserves_exec_overrides() -> () {
+    match execute_source_with_builtins(
+        "let direct = 'aba'.replace(/a/g, 'x'); let own = /a/g; let original = RegExp.prototype.exec; let ownCalls = 0; own.exec = function(input) { ownCalls += 1; return original.call(this, input); }; let ownResult = 'aba'.replace(own, 'y'); let prototypeCalls = 0; RegExp.prototype.exec = function(input) { prototypeCalls += 1; return original.call(this, input); }; let prototypeResult = 'aba'.replace(/a/g, 'z'); RegExp.prototype.exec = original; return direct === 'xbx' && ownResult === 'yby' && ownCalls === 3 && prototypeResult === 'zbz' && prototypeCalls === 3;",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected regexp replace fast path result"),
     }
 }
 
@@ -1962,6 +2480,26 @@ fn dispatches_string_and_regexp_well_known_symbol_protocols() -> () {
     ) {
         runtime::Value::Bool(value) => testing::assert(value),
         _ => testing::fail("expected well-known String and RegExp protocol result"),
+    }
+}
+
+#[test]
+fn string_protocol_fallbacks_preserve_primitive_and_string_object_semantics() -> () {
+    match execute_source_with_builtins(
+        "let primitiveReads = 0; Object.defineProperty(Number.prototype, Symbol.match, {configurable: true, get() { primitiveReads += 1; return function() { return 'bad'; }; }}); let primitiveMatch = 'a1'.match(1); delete Number.prototype[Symbol.match]; let originalMatch = RegExp.prototype[Symbol.match]; let fallbackCalls = 0; RegExp.prototype[Symbol.match] = function(value) { fallbackCalls += 1; return this.source + ':' + value; }; let fallbackMatch = 'abc'.match('b'); RegExp.prototype[Symbol.match] = originalMatch; let regexp = /./g; Object.defineProperty(regexp, Symbol.replace, {value: undefined}); let replaced = 'x /./g x'.replaceAll(regexp, '$1'); let raw = String.raw({raw: ['a', null, undefined, 3]}, 'b'); return primitiveReads === 0 && primitiveMatch[0] === '1' && fallbackCalls === 1 && fallbackMatch === 'b:abc' && replaced === 'x $1 x' && raw === 'abnullundefined3' && String.prototype == '' && Object.prototype.toString.call(String.prototype) === '[object String]' && Object.prototype.isPrototypeOf(String.prototype);",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected String protocol fallback result"),
+    }
+}
+
+#[test]
+fn numeric_property_keys_preserve_fast_integer_and_general_number_strings() -> () {
+    match execute_source_with_builtins(
+        "let object = {}; let index = 0; index += 1; object[index] = 'one'; object[-0] = 'zero'; object[4294967295] = 'maximum'; object[4294967296] = 'wide'; object[1.5] = 'fraction'; object[NaN] = 'nan'; return object['1'] === 'one' && object['0'] === 'zero' && object['4294967295'] === 'maximum' && object['4294967296'] === 'wide' && object['1.5'] === 'fraction' && object['NaN'] === 'nan';",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected numeric property key result"),
     }
 }
 
@@ -2067,7 +2605,16 @@ fn executes_regexp_literals_and_preserves_division_contexts() -> () {
 
 #[test]
 fn rejects_invalid_regexp_literals_as_early_errors() -> () {
-    for source in Vec::from_array(["return /a/gg;", "return /(/;"]) {
+    for source in Vec::from_array(
+        [
+            "return /a/gg;",
+            "return /(/;",
+            "return /(?<present>a)\\k/;",
+            "return /\\k(?<present>a)/;",
+            "return /[\\d-a]/u;",
+            "return /[\\s-\\d]/u;",
+        ],
+    ) {
         match compile(source) {
             Err(errors) => {
                 testing::assert(!errors.is_empty());
@@ -2165,12 +2712,74 @@ fn creates_per_iteration_bindings_for_loop_closures_and_direct_eval() -> () {
 }
 
 #[test]
+fn preserves_loop_head_tdz_and_initial_iteration_environments() -> () {
+    match execute_source_with_builtins(
+        "var probeBefore, probeTest, probeIncr, probeBody; var run = true; for (let x = 'outside', _ = probeBefore = function() { return x; }; run && (x = 'inside', probeTest = function() { return x; }); probeIncr = function() { return x; }) probeBody = function() { return x; }, run = false; let direct = false; try { let x = 1; for (let x in {x}) {} } catch (error) { direct = error instanceof ReferenceError; } let probeExpr; for (let x in {i: probeExpr = function() { typeof x; }}) {} let captured = false; try { probeExpr(); } catch (error) { captured = error instanceof ReferenceError; } let probeDecl, probeLoop; for (let [x, _ = probeDecl = function() { return x; }] in {i: 0}) probeLoop = function() { return x; }; return probeBefore() === 'outside' && probeTest() === 'inside' && probeBody() === 'inside' && probeIncr() === 'inside' && direct && captured && probeDecl() === 'i' && probeLoop() === 'i';",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected loop lexical environment result"),
+    }
+}
+
+#[test]
 fn assignment_to_captured_const_throws_at_runtime() -> () {
     match execute_source_with_builtins(
         "const fixed = 1; let change = function() { fixed = 2; }; try { change(); } catch (error) { return error instanceof TypeError && fixed === 1; } return false;",
     ) {
         runtime::Value::Bool(value) => testing::assert(value),
         _ => testing::fail("expected captured const assignment error"),
+    }
+}
+
+#[test]
+fn captured_lexical_writes_observe_tdz() -> () {
+    let function = expect_function(
+        compile("function outer() { function write() { value = 1; } write(); let value; } outer();"),
+    );
+    let outer = match function.constant(0) {
+        Some(bytecode::Constant::Function(value)) => value.get(),
+        _ => {
+            testing::fail("expected outer function");
+            bytecode::Function::new(
+                Vec::new(),
+                Vec::from_array([bytecode::Instruction::ReturnUndef]),
+                0,
+            )
+        },
+    };
+    let write = match outer.constant(0) {
+        Some(bytecode::Constant::Function(value)) => value.get(),
+        _ => {
+            testing::fail("expected nested writer");
+            bytecode::Function::new(
+                Vec::new(),
+                Vec::from_array([bytecode::Instruction::ReturnUndef]),
+                0,
+            )
+        },
+    };
+    let mut emits_tdz_write = false;
+    let mut offset = 0;
+    while offset < write.code_len() {
+        match write.instruction(offset) {
+            Some(bytecode::Instruction::SetTdzUpvalue(_, _)) => {
+                emits_tdz_write = true;
+            },
+            _ => (),
+        };
+        offset += 1;
+    }
+    testing::assert(emits_tdz_write);
+    match write.upvalue_source(0) {
+        Some(bytecode::UpvalueSource::Local(index)) => testing::assert_eq(index, 1),
+        Some(value) => testing::fail(value.debug()),
+        None => testing::fail("expected captured lexical upvalue"),
+    };
+    match execute_source_with_builtins(
+        "function outer() { function write() { value = 1; } write(); let value; } try { outer(); } catch (error) { return error instanceof ReferenceError; } return false;",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected lexical TDZ result"),
     }
 }
 
@@ -2299,6 +2908,16 @@ fn iterator_helpers_are_lazy_close_sources_and_preserve_errors() -> () {
 }
 
 #[test]
+fn iterator_from_uses_a_shared_wrapper_and_flat_map_does_not_reclose_completed_inputs() -> () {
+    match execute_source_with_builtins(
+        "let source = {next() { return {done: true}; }}; let wrapped = Iterator.from(source); let wrapperPrototype = Object.getPrototypeOf(wrapped); class DerivedIterator extends Iterator {} let derived = DerivedIterator.from(source); function* values() { yield 0; } let generator = values(); let closed = values(); closed.return(); let closeCalls = 0; closed.return = function() { closeCalls += 1; throw new Error('closed'); }; let result = values().flatMap(function() { return closed; }).next(); return Object.getPrototypeOf(wrapperPrototype) === Iterator.prototype && Object.getPrototypeOf(derived) === wrapperPrototype && Iterator.from(generator) === generator && result.value === undefined && result.done && closeCalls === 0;",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected Iterator wrapper and flatMap completion result"),
+    }
+}
+
+#[test]
 fn iterator_helpers_match_quickjs_validation_return_and_descriptor_edges() -> () {
     match execute_source_with_builtins(
         "let delayed = Iterator.prototype.map.call({next: 1}, function(value) { return value; }); let delayedError = false; try { delayed.next(); } catch (error) { delayedError = error instanceof TypeError; } let closed = 0; function direct() { return {next() { return {value: 1, done: false}; }, return() { closed += 1; return {value: 42, done: false}; }, [Symbol.iterator]() { return this; }}; } let callbackError = false; try { Iterator.from(direct()).map(1); } catch (error) { callbackError = error instanceof TypeError; } let limitError = false; try { Iterator.from(direct()).take(NaN); } catch (error) { limitError = error instanceof RangeError; } let returned = Iterator.from(direct()).map(function(value) { return value; }).return(); let concatenated = Iterator.concat(direct()); concatenated.next(); let concatReturn = concatenated.return(); let fractionalTake = Iterator.from([7]).take(-0.5).next(); let fractionalDrop = Iterator.from([7]).drop(-0.5).next(); let hugeTake = Iterator.from([7]).take(1e20).next(); let constructorDescriptor = Object.getOwnPropertyDescriptor(Iterator.prototype, 'constructor'); let tagDescriptor = Object.getOwnPropertyDescriptor(Iterator.prototype, Symbol.toStringTag); let child = Object.create(Iterator.prototype); child[Symbol.toStringTag] = 'Custom'; let tagError = false; try { Iterator.prototype[Symbol.toStringTag] = 'Broken'; } catch (error) { tagError = error instanceof TypeError; } return delayedError && callbackError && limitError && closed === 4 && returned.value === 42 && returned.done === false && concatReturn.value === 42 && concatReturn.done === false && fractionalTake.done && fractionalDrop.value === 7 && hugeTake.value === 7 && constructorDescriptor.get instanceof Function && constructorDescriptor.set instanceof Function && !constructorDescriptor.enumerable && constructorDescriptor.configurable && tagDescriptor.get instanceof Function && tagDescriptor.set instanceof Function && Object.prototype.toString.call(child) === '[object Custom]' && tagError;",
@@ -2355,6 +2974,16 @@ fn array_concat_spreadability_unscopables_and_exotic_length_match_quickjs() -> (
     ) {
         runtime::Value::Bool(value) => testing::assert(value),
         _ => testing::fail("expected Array concat and exotic result"),
+    }
+}
+
+#[test]
+fn array_unscopables_entries_are_enumerable_data_properties() -> () {
+    match execute_source_with_builtins(
+        "let unscopables = Array.prototype[Symbol.unscopables]; let names = ['at', 'copyWithin', 'entries', 'fill', 'find', 'findIndex', 'findLast', 'findLastIndex', 'flat', 'flatMap', 'includes', 'keys', 'toReversed', 'toSorted', 'toSpliced', 'values']; return Object.getPrototypeOf(unscopables) === null && names.every(function(name) { let descriptor = Object.getOwnPropertyDescriptor(unscopables, name); return descriptor.value === true && descriptor.writable && descriptor.enumerable && descriptor.configurable; });",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected enumerable Array unscopables entries"),
     }
 }
 
@@ -2449,6 +3078,26 @@ fn date_setters_normalize_components_ignore_extra_arguments_and_handle_invalid_d
 }
 
 #[test]
+fn date_setters_read_the_date_value_before_converting_arguments() -> () {
+    match execute_source_with_builtins(
+        "let valid = new Date(0); let validResult = valid.setUTCHours({valueOf() { valid.setTime(NaN); return 1; }}); let invalid = new Date(NaN); let invalidResult = invalid.setUTCMonth({valueOf() { invalid.setTime(0); return 1; }}); return !Number.isNaN(validResult) && valid.getUTCHours() === 1 && Number.isNaN(invalidResult) && invalid.getTime() === 0;",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected Date setter conversion ordering"),
+    }
+}
+
+#[test]
+fn date_prototype_parsing_recovery_and_time_clip_boundaries_match_ecmascript() -> () {
+    match execute_source_with_builtins(
+        "let brand = false; try { Date.prototype.getTime(); } catch (error) { brand = error instanceof TypeError; } let zero = new Date(0); let invalid = new Date(NaN); let recovered = invalid.setFullYear(2016); let expected = new Date(2016, 0).getTime(); let timeZoneMinutes = new Date(0).getTimezoneOffset() * -1; let edge = new Date(1970, 0, 100000001, 0, timeZoneMinutes - 60, 0, 0); return brand && Object.prototype.toString.call(Date.prototype) === '[object Object]' && Date.parse(zero.toUTCString()) === 0 && recovered === expected && invalid.getTime() === expected && edge.toISOString().endsWith('Z');",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected Date prototype and boundary behavior"),
+    }
+}
+
+#[test]
 fn date_local_construction_parsing_and_setters_share_timezone_conversion() -> () {
     match execute_source_with_builtins(
         "let date = new Date(2021, 0, 15, 12, 34, 56, 789); let constructed = date.getFullYear() === 2021 && date.getMonth() === 0 && date.getDate() === 15 && date.getHours() === 12 && date.getMinutes() === 34 && date.getSeconds() === 56 && date.getMilliseconds() === 789; date.setFullYear(2022, 1, 30); let year = date.getFullYear() === 2022 && date.getMonth() === 2 && date.getDate() === 2; date.setMonth(5, 31); let month = date.getMonth() === 6 && date.getDate() === 1; date.setDate(15); date.setHours(1, 2, 3, 4); date.setMinutes(5, 6, 7); date.setSeconds(8, 9); date.setMilliseconds(10); let setters = date.getDate() === 15 && date.getHours() === 1 && date.getMinutes() === 5 && date.getSeconds() === 8 && date.getMilliseconds() === 10; let naive = Date.UTC(2021, 0, 15, 12); let expected = naive + new Date(naive).getTimezoneOffset() * 60000; let parsedIso = Date.parse('2021-01-15T12:00:00'); let parsedLegacy = Date.parse('Jan 15 2021 12:00:00'); let legacy = new Date(0); legacy.setYear(99); return constructed && year && month && setters && parsedIso === expected && parsedLegacy === expected && legacy.getFullYear() === 1999;",
@@ -2465,6 +3114,16 @@ fn maps_non_strict_arguments_to_simple_parameters() -> () {
     ) {
         runtime::Value::Bool(value) => testing::assert(value),
         _ => testing::fail("expected mapped arguments result"),
+    }
+}
+
+#[test]
+fn hides_unsupported_legacy_caller_properties_on_non_strict_functions() -> () {
+    match execute_source_with_builtins(
+        "function outer(flag) { if (flag) return true; return inner(); } function inner() { let direct = arguments.callee.caller; let indirect = arguments.callee.arguments; return direct === undefined && indirect === undefined && Object.getOwnPropertyDescriptor(arguments.callee, 'caller') === undefined; } return outer(false);",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected unsupported legacy function properties to be hidden"),
     }
 }
 
@@ -2495,6 +3154,16 @@ fn keeps_strict_and_non_simple_arguments_unmapped() -> () {
     ) {
         runtime::Value::Bool(value) => testing::assert(value),
         _ => testing::fail("expected unmapped arguments result"),
+    }
+}
+
+#[test]
+fn uses_one_frozen_throw_type_error_intrinsic_per_realm() -> () {
+    match execute_source_with_builtins(
+        "let strict = function() { 'use strict'; return arguments; }(); let nonSimple = function(value = 0) { return arguments; }(); let strictDescriptor = Object.getOwnPropertyDescriptor(strict, 'callee'); let nonSimpleDescriptor = Object.getOwnPropertyDescriptor(nonSimple, 'callee'); let callerDescriptor = Object.getOwnPropertyDescriptor(Function.prototype, 'caller'); let argumentsDescriptor = Object.getOwnPropertyDescriptor(Function.prototype, 'arguments'); let thrower = strictDescriptor.get; let length = Object.getOwnPropertyDescriptor(thrower, 'length'); let name = Object.getOwnPropertyDescriptor(thrower, 'name'); return thrower === strictDescriptor.set && thrower === nonSimpleDescriptor.get && thrower === nonSimpleDescriptor.set && thrower === callerDescriptor.get && thrower === callerDescriptor.set && thrower === argumentsDescriptor.get && thrower === argumentsDescriptor.set && Object.isFrozen(thrower) && length.value === 0 && !length.writable && !length.enumerable && !length.configurable && name.value === '' && !name.writable && !name.enumerable && !name.configurable;",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected one frozen ThrowTypeError intrinsic"),
     }
 }
 
@@ -2599,12 +3268,112 @@ fn uint8_array_base64_and_hex_codecs_match_quickjs() -> () {
 }
 
 #[test]
+fn uint8_array_codecs_observe_options_before_buffer_validation_and_encoding() -> () {
+    match execute_source_with_builtins(
+        "let array = new Uint8Array([0]); let encoded = array.toBase64({get alphabet() { array[0] = 255; return 'base64'; }}); let detached = new Uint8Array(1); detached.buffer.transfer(); let accesses = 0; let detachedError = false; try { detached.toBase64({get alphabet() { accesses += 1; return 'base64'; }}); } catch (error) { detachedError = error instanceof TypeError; } let target = new Uint8Array([255, 255, 255, 255, 255]); let partialError = false; try { target.setFromBase64('MjYyZg==='); } catch (error) { partialError = error instanceof SyntaxError; } return encoded === '/w==' && accesses === 1 && detachedError && partialError && target[0] === 50 && target[1] === 54 && target[2] === 50 && target[3] === 255 && target[4] === 255;",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected Uint8Array codec ordering result"),
+    }
+}
+
+#[test]
 fn typed_array_construction_iteration_static_factories_and_bulk_set_match_quickjs() -> () {
     match execute_source_with_builtins(
         "let bytes = new Uint8Array([1, 258, 3]); let mapped = Uint8Array.from(new Set([1, 2]), function(value, index) { return value + index; }); let integers = Int32Array.of(4294967295, 2); let floats = Float64Array.from([1.5, 2.5]); let target = new Uint8Array(4); target.set([1, 258], 1); target.set(target.subarray(1, 3), 0); let entry = bytes.entries().next().value; class Derived extends Uint8Array {} let derived = new Derived([7]); let direct = false; try { Uint8Array(1); } catch (error) { direct = error instanceof TypeError; } let range = false; try { target.set([1, 2, 3], 2); } catch (error) { range = error instanceof RangeError; } return Array.from(bytes).join(',') === '1,2,3' && [...bytes].join(',') === '1,2,3' && Array.from(mapped).join(',') === '1,3' && Array.from(integers).join(',') === '-1,2' && Array.from(floats).join(',') === '1.5,2.5' && Array.from(target).join(',') === '1,2,2,0' && bytes.keys().next().value === 0 && bytes.values().next().value === 1 && entry[0] === 0 && entry[1] === 1 && bytes[Symbol.iterator] === bytes.values && Uint8Array.from.length === 1 && Uint8Array.of.length === 0 && derived instanceof Derived && derived instanceof Uint8Array && derived[0] === 7 && direct && range;",
     ) {
         runtime::Value::Bool(value) => testing::assert(value),
         _ => testing::fail("expected typed array construction result"),
+    }
+}
+
+#[test]
+fn typed_array_from_maps_and_converts_each_value_before_advancing() -> () {
+    match execute_source_with_builtins(
+        "let marker = {}; let value = {valueOf() { throw marker; }}; let numericSeen; let numericError = false; try { Uint8Array.from([1, value, 3], item => { numericSeen = item; return item; }); } catch (error) { numericError = error === marker; } let bigintSeen; let bigintError = false; try { BigInt64Array.from([1n, value, 3n], item => { bigintSeen = item; return item; }); } catch (error) { bigintError = error === marker; } let iteratorReads = 0; let source = Object.defineProperty({}, Symbol.iterator, {get() { iteratorReads += 1; }}); let mapperError = false; try { Uint8Array.from(source, null); } catch (error) { mapperError = error instanceof TypeError; } return numericError && numericSeen === value && bigintError && bigintSeen === value && mapperError && iteratorReads === 0;",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected TypedArray.from interleaved conversion result"),
+    }
+}
+
+#[test]
+fn typed_array_factories_ignore_invalid_writes_after_conversion() -> () {
+    match execute_source_with_builtins(
+        "let ofBuffer = new ArrayBuffer(3, {maxByteLength: 4}); let ofTarget = new Int8Array(ofBuffer); let ofResult = Int8Array.of.call(function() { return ofTarget; }, {valueOf() { ofBuffer.resize(0); return 1; }}, {valueOf() { ofBuffer.resize(4); return 2; }}, 3); let fromBuffer = new ArrayBuffer(3, {maxByteLength: 5}); let fromTarget = new Int8Array(fromBuffer); let fromResult = Int32Array.from.call(function() { return fromTarget; }, [0, 1, 2], value => { if (value === 1) fromBuffer.resize(1); return value + 10; }); let detachedBuffer = new ArrayBuffer(3); let detachedTarget = new Int8Array(detachedBuffer); let calls = 0; let detachedResult = Int32Array.from.call(function() { return detachedTarget; }, [0, 1, 2], value => { calls += 1; if (value === 1) detachedBuffer.transfer(); return value; }); let marker = {}; let throwingBuffer = new ArrayBuffer(2); let throwingTarget = new Int8Array(throwingBuffer); let conversionFailed = false; try { Int8Array.of.call(function() { return throwingTarget; }, {valueOf() { throwingBuffer.transfer(); return 1; }}, {valueOf() { throw marker; }}); } catch (error) { conversionFailed = error === marker; } return ofResult === ofTarget && ofTarget.join() === '0,2,3,0' && fromResult === fromTarget && fromTarget.join() === '10' && detachedResult === detachedTarget && detachedTarget.length === 0 && calls === 3 && conversionFailed;",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected TypedArray factory invalid-write semantics"),
+    }
+}
+
+#[test]
+fn typed_array_integer_index_writes_convert_only_for_typed_receivers() -> () {
+    match execute_source_with_builtins(
+        "let calls = 0; let value = {valueOf() { calls += 1; return 258; }}; let target = new Uint8Array([0]); let ordinary = {}; let ordinarySet = Reflect.set(target, 0, value, ordinary); let receiver = new Uint8Array([0]); let typedSet = Reflect.set(target, 0, value, receiver); let detached = new Uint8Array([17]); let detachedDefine = Reflect.defineProperty(detached, 0, {value: {valueOf() { detached.buffer.transfer(); return 42; }}}); return ordinarySet && ordinary[0] === value && typedSet && receiver[0] === 2 && calls === 1 && detachedDefine && detached[0] === undefined;",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected TypedArray integer index receiver result"),
+    }
+}
+
+#[test]
+fn array_iterators_share_an_observable_prototype_next_method() -> () {
+    match execute_source_with_builtins(
+        "let prototype = Object.getPrototypeOf([].values()); let original = prototype.next; let values = [1, 2, 3, 4]; prototype.next = function() { let done = values.length === 0; return {value: values.pop(), done}; }; let array = new Uint8Array([0]); prototype.next = original; let descriptor = Object.getOwnPropertyDescriptor(prototype, Symbol.toStringTag); return Array.from(array).join(',') === '4,3,2,1' && original.name === 'next' && original.length === 0 && descriptor.value === 'Array Iterator' && !descriptor.writable && !descriptor.enumerable && descriptor.configurable;",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected shared Array Iterator prototype result"),
+    }
+}
+
+#[test]
+fn array_iterators_revalidate_resizable_typed_array_views_on_each_step() -> () {
+    match execute_source_with_builtins(
+        "let fixedBuffer = new ArrayBuffer(4, {maxByteLength: 8}); let fixed = new Uint8Array(fixedBuffer, 0, 4); let fixedIterator = Array.prototype.values.call(fixed); fixedBuffer.resize(3); let fixedFailed = false; try { fixedIterator.next(); } catch (error) { fixedFailed = error instanceof TypeError; } let lateIterator = Array.prototype.entries.call(fixed); let lateFailed = false; try { lateIterator.next(); } catch (error) { lateFailed = error instanceof TypeError; } let trackingBuffer = new ArrayBuffer(4, {maxByteLength: 8}); let tracking = new Uint8Array(trackingBuffer); tracking[0] = 2; tracking[1] = 4; tracking[2] = 6; tracking[3] = 8; let trackingIterator = Array.prototype.values.call(tracking); let first = trackingIterator.next(); trackingBuffer.resize(2); let second = trackingIterator.next(); let done = trackingIterator.next(); return fixedFailed && lateFailed && first.value === 2 && !first.done && second.value === 4 && !second.done && done.value === undefined && done.done;",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected resizable typed array iterator revalidation"),
+    }
+}
+
+#[test]
+fn typed_array_iterators_require_typed_array_receivers() -> () {
+    match execute_source_with_builtins(
+        "let receivers = [{}, [], new ArrayBuffer(1), new DataView(new ArrayBuffer(1))]; let prototype = Object.getPrototypeOf(Uint8Array.prototype); let methods = [prototype.entries, prototype.keys, prototype.values]; let failures = 0; for (let method of methods) { for (let receiver of receivers) { try { method.call(receiver); } catch (error) { if (error instanceof TypeError) failures += 1; } } } let valid = Uint8Array.of(3, 4); return failures === 12 && valid.keys().next().value === 0 && valid.values().next().value === 3 && valid.entries().next().value.join(',') === '0,3';",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected TypedArray iterator receiver validation"),
+    }
+}
+
+#[test]
+fn string_iterators_share_a_branded_prototype_next_method() -> () {
+    match execute_source_with_builtins(
+        "let iterator = 'A𝄞'[Symbol.iterator](); let prototype = Object.getPrototypeOf(iterator); let invalid = false; try { prototype.next.call({}); } catch (error) { invalid = error instanceof TypeError; } let first = prototype.next.call(iterator); let second = prototype.next.call(iterator); let done = prototype.next.call(iterator); let descriptor = Object.getOwnPropertyDescriptor(prototype, Symbol.toStringTag); return invalid && !Object.hasOwn(iterator, 'next') && Object.getPrototypeOf(prototype) === Iterator.prototype && first.value === 'A' && !first.done && second.value === '𝄞' && !second.done && done.value === undefined && done.done && prototype.next.name === 'next' && prototype.next.length === 0 && descriptor.value === 'String Iterator' && !descriptor.writable && !descriptor.enumerable && descriptor.configurable;",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected shared String Iterator prototype result"),
+    }
+}
+
+#[test]
+fn map_and_set_iterators_share_branded_prototype_next_methods() -> () {
+    match execute_source_with_builtins(
+        "let mapPrototype = Object.getPrototypeOf(new Map([[1, 2]]).entries()); let setPrototype = Object.getPrototypeOf(new Set([3]).values()); let mapInvalid = false; let setInvalid = false; try { mapPrototype.next.call({}); } catch (error) { mapInvalid = error instanceof TypeError; } try { setPrototype.next.call({}); } catch (error) { setInvalid = error instanceof TypeError; } let mapDescriptor = Object.getOwnPropertyDescriptor(mapPrototype, Symbol.toStringTag); let setDescriptor = Object.getOwnPropertyDescriptor(setPrototype, Symbol.toStringTag); return mapInvalid && setInvalid && mapPrototype.next.call(new Map([[1, 2]]).entries()).value.join(',') === '1,2' && setPrototype.next.call(new Set([3]).values()).value === 3 && mapPrototype.next.name === 'next' && mapPrototype.next.length === 0 && setPrototype.next.name === 'next' && setPrototype.next.length === 0 && mapDescriptor.value === 'Map Iterator' && setDescriptor.value === 'Set Iterator' && !mapDescriptor.writable && !setDescriptor.writable;",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected branded collection iterator prototypes"),
+    }
+}
+
+#[test]
+fn map_and_set_iterators_retain_source_collections_through_gc() -> () {
+    match execute_source_with_builtins(
+        "let mapIterator = (() => { let key = {name: 'key'}; let value = {answer: 42}; return new Map([[key, value]]).entries(); })(); let setIterator = (() => { let value = {answer: 43}; return new Set([value]).values(); })(); std.gc(); let entry = mapIterator.next().value; let setValue = setIterator.next().value; return entry[0].name === 'key' && entry[1].answer === 42 && setValue.answer === 43 && mapIterator.next().done && setIterator.next().done;",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected collection iterators to retain their sources"),
     }
 }
 
@@ -2629,6 +3398,46 @@ fn array_buffer_and_data_view_require_construction_and_preserve_derived_prototyp
 }
 
 #[test]
+fn data_view_conversions_run_before_range_and_detachment_checks() -> () {
+    match execute_source_with_builtins(
+        "let buffer = new ArrayBuffer(4); let view = new DataView(buffer); view.setUint8(0, 7); let indexCalls = 0; let read = view.getUint8({valueOf() { indexCalls += 1; return 0; }}); view.setFloat32(0, -0); let negativeZero = 1 / view.getFloat32(0) === -Infinity; let marker = {}; let rangeAbrupt = false; try { view.setInt8(100, {valueOf() { throw marker; }}); } catch (error) { rangeAbrupt = error === marker; } buffer.transfer(); let detachedAbrupt = false; try { view.setInt8(0, {valueOf() { throw marker; }}); } catch (error) { detachedAbrupt = error === marker; } let detached = new ArrayBuffer(1); detached.transfer(); let offsetCalls = 0; let constructorError = false; try { new DataView(detached, {valueOf() { offsetCalls += 1; return 0; }}); } catch (error) { constructorError = error instanceof TypeError; } return read === 7 && indexCalls === 1 && negativeZero && rangeAbrupt && detachedAbrupt && offsetCalls === 1 && constructorError;",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected DataView conversion ordering result"),
+    }
+}
+
+#[test]
+fn array_like_and_typed_array_lengths_propagate_conversion_errors() -> () {
+    match execute_source_with_builtins(
+        "let marker = {}; let abrupt = false; try { Array.from({length: {valueOf() { throw marker; }}}); } catch (error) { abrupt = error === marker; } let excessive = false; try { new Uint8Array({length: 2 ** 53}); } catch (error) { excessive = error instanceof RangeError; } let buffer = new ArrayBuffer(2); let detached = false; try { new Uint8Array(buffer, 0, {valueOf() { buffer.transfer(); return 1; }}); } catch (error) { detached = error instanceof TypeError; } return abrupt && excessive && detached;",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected array-like length conversion result"),
+    }
+}
+
+#[test]
+fn native_builtin_constructors_preserve_derived_prototypes() -> () {
+    match execute_source_with_builtins(
+        "class DerivedArray extends Array {} class DerivedObject extends Object {} class DerivedError extends Error {} class DerivedPromise extends Promise {} let array = new DerivedArray(); let object = new DerivedObject({ignored: true}); let error = new DerivedError('message'); let promise = new DerivedPromise(() => {}); return array instanceof DerivedArray && array instanceof Array && Array.isArray(array) && object instanceof DerivedObject && object.ignored === undefined && error instanceof DerivedError && error instanceof Error && error.message === 'message' && promise instanceof DerivedPromise && promise instanceof Promise;",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected native builtin subclass result"),
+    }
+}
+
+#[test]
+fn symbol_is_valid_class_heritage_but_throws_when_constructed() -> () {
+    match execute_source_with_builtins(
+        "class DerivedSymbol extends Symbol {} let threw = false; try { new DerivedSymbol(); } catch (error) { threw = error instanceof TypeError; } return threw;",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected Symbol subclass construction result"),
+    }
+}
+
+#[test]
 fn resizable_transfer_and_growable_shared_buffers_execute() -> () {
     match execute_source_with_builtins(
         "let source = new ArrayBuffer(4, {maxByteLength: 8}); new Uint8Array(source).set([1, 2, 3, 4]); let transferred = source.transfer(6); let fixed = transferred.transferToFixedLength(3); let shared = new SharedArrayBuffer(2, {maxByteLength: 8}); new Uint8Array(shared).set([5, 6]); let growCalls = 0; shared.grow({valueOf() { growCalls += 1; return 5; }}); let shrinkFailed = false; let fixedGrowFailed = false; let transferFailed = false; try { shared.grow(4); } catch (error) { shrinkFailed = error instanceof RangeError; } try { new SharedArrayBuffer(2).grow(3); } catch (error) { fixedGrowFailed = error instanceof TypeError; } try { new ArrayBuffer(2, {maxByteLength: 4}).transfer(5); } catch (error) { transferFailed = error instanceof TypeError; } return source.detached && source.byteLength === 0 && transferred.detached && fixed.byteLength === 3 && fixed.maxByteLength === 3 && !fixed.resizable && Array.from(new Uint8Array(fixed)).join(',') === '1,2,3' && shared.byteLength === 5 && shared.maxByteLength === 8 && shared.growable && Array.from(new Uint8Array(shared)).join(',') === '5,6,0,0,0' && growCalls === 1 && shrinkFailed && fixedGrowFailed && transferFailed && ArrayBuffer[Symbol.species] === ArrayBuffer && SharedArrayBuffer[Symbol.species] === SharedArrayBuffer && ArrayBuffer.prototype.resize.length === 1 && ArrayBuffer.prototype.transfer.length === 0 && ArrayBuffer.prototype.transferToFixedLength.length === 0 && SharedArrayBuffer.prototype.grow.length === 1 && Reflect.ownKeys(ArrayBuffer).map(String).join(',') === 'length,name,isView,prototype,Symbol(Symbol.species)' && Reflect.ownKeys(ArrayBuffer.prototype).map(String).join(',') === 'byteLength,maxByteLength,resizable,detached,resize,slice,transfer,transferToFixedLength,constructor,Symbol(Symbol.toStringTag)' && Reflect.ownKeys(SharedArrayBuffer).map(String).join(',') === 'length,name,prototype,Symbol(Symbol.species)' && Reflect.ownKeys(SharedArrayBuffer.prototype).map(String).join(',') === 'byteLength,maxByteLength,growable,grow,slice,constructor,Symbol(Symbol.toStringTag)';",
@@ -2645,6 +3454,16 @@ fn resizable_and_growable_views_track_backing_lengths() -> () {
     ) {
         runtime::Value::Bool(value) => testing::assert(value),
         _ => testing::fail("expected length-tracking buffer views"),
+    }
+}
+
+#[test]
+fn length_tracking_typed_arrays_floor_partial_trailing_elements() -> () {
+    match execute_source_with_builtins(
+        "let buffer = new ArrayBuffer(10, {maxByteLength: 20}); let integers = new Int32Array(buffer); let floats = new Float64Array(buffer); let bigints = new BigInt64Array(buffer); let initial = integers.length === 2 && integers.byteLength === 8 && floats.length === 1 && bigints.length === 1; buffer.resize(12); let grown = integers.length === 3 && floats.length === 1 && bigints.length === 1; let fixedFailed = false; try { new Int32Array(new ArrayBuffer(10)); } catch (error) { fixedFailed = error instanceof RangeError; } let source = Int32Array.of(1, 2); let destinationBuffer = new ArrayBuffer(10, {maxByteLength: 20}); let destination = new Int32Array(destinationBuffer); destinationBuffer.resize(0); source.constructor = {[Symbol.species]: function() { return destination; }}; let mapFailed = false; let filterFailed = false; try { source.map(value => value); } catch (error) { mapFailed = error instanceof TypeError; } try { source.filter(() => true); } catch (error) { filterFailed = error instanceof TypeError; } return initial && grown && fixedFailed && mapFailed && filterFailed;",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected partial trailing TypedArray elements"),
     }
 }
 
@@ -2701,7 +3520,7 @@ fn primitive_and_date_constructors_prepare_values_before_selecting_prototypes() 
 #[test]
 fn proxy_self_allocation_and_iterator_new_target_rules_match_quickjs() -> () {
     match execute_source_with_builtins(
-        "let reads = 0; let ProxyTarget = Object.defineProperty(function() {}.bind(null), 'prototype', {get() { reads += 1; throw new Error('prototype'); }}); let proxy = Reflect.construct(Proxy, [{value: 1}, {}], ProxyTarget); let directFailed = false; try { new Iterator(); } catch (error) { directFailed = error instanceof TypeError; } function DefaultTarget() {} DefaultTarget.prototype = null; let defaultIterator = Reflect.construct(Iterator, [], DefaultTarget); function SamePrototypeTarget() {} SamePrototypeTarget.prototype = Iterator.prototype; let samePrototypeIterator = Reflect.construct(Iterator, [], SamePrototypeTarget); return reads === 0 && proxy.value === 1 && !Object.prototype.hasOwnProperty.call(Proxy, 'prototype') && directFailed && Object.getPrototypeOf(defaultIterator) === Iterator.prototype && Object.getPrototypeOf(samePrototypeIterator) === Iterator.prototype;",
+        "let reads = 0; let ProxyTarget = Object.defineProperty(function() {}.bind(null), 'prototype', {get() { reads += 1; throw new Error('prototype'); }}); let proxy = Reflect.construct(Proxy, [{value: 1}, {}], ProxyTarget); let directFailed = false; try { new Iterator(); } catch (error) { directFailed = error instanceof TypeError; } function DefaultTarget() {} DefaultTarget.prototype = null; let defaultIterator = Reflect.construct(Iterator, [], DefaultTarget); function SamePrototypeTarget() {} SamePrototypeTarget.prototype = Iterator.prototype; let samePrototypeIterator = Reflect.construct(Iterator, [], SamePrototypeTarget); let handle; handle = Proxy.revocable(function() {}, {get() { handle.revoke(); }}); let revokedFailed = false; try { new handle.proxy(); } catch (error) { revokedFailed = error instanceof TypeError; } return reads === 0 && proxy.value === 1 && !Object.prototype.hasOwnProperty.call(Proxy, 'prototype') && directFailed && Object.getPrototypeOf(defaultIterator) === Iterator.prototype && Object.getPrototypeOf(samePrototypeIterator) === Iterator.prototype && revokedFailed;",
     ) {
         runtime::Value::Bool(value) => testing::assert(value),
         _ => testing::fail("expected Proxy and Iterator construction rules"),
@@ -2769,12 +3588,102 @@ fn typed_array_search_join_and_in_place_algorithms_validate_receivers() -> () {
 }
 
 #[test]
+fn typed_array_searches_preserve_initial_length_and_property_presence() -> () {
+    match execute_source_with_builtins(
+        "let conversions = 0; let fromIndex = {valueOf() { conversions += 1; throw new Error('unexpected'); }}; let empty = new Uint8Array(); let emptyResults = empty.indexOf(0, fromIndex) === -1 && empty.lastIndexOf(0, fromIndex) === -1 && !empty.includes(0, fromIndex); let explicit = Uint8Array.of(1, 2).lastIndexOf(2, undefined) === -1; let detached = new Uint8Array(1); let detach = {valueOf() { detached.buffer.transfer(); return 0; }}; let detachedIndex = detached.indexOf(undefined, detach) === -1; let detachedLastSource = new Uint8Array(1); let detachLast = {valueOf() { detachedLastSource.buffer.transfer(); return 0; }}; let detachedLast = detachedLastSource.lastIndexOf(undefined, detachLast) === -1; let detachedIncludesSource = new Uint8Array(1); let detachIncludes = {valueOf() { detachedIncludesSource.buffer.transfer(); return 0; }}; let detachedIncludes = detachedIncludesSource.includes(undefined, detachIncludes); let buffer = new ArrayBuffer(4, {maxByteLength: 8}); let fixed = new Uint8Array(buffer, 0, 4); let fixedResult = fixed.indexOf(0, {valueOf() { buffer.resize(2); return 0; }}) === -1; let trackingBuffer = new ArrayBuffer(4, {maxByteLength: 8}); let tracking = new Uint8Array(trackingBuffer); tracking[2] = 2; let trackingResult = tracking.lastIndexOf(2, {valueOf() { trackingBuffer.resize(2); return 2; }}) === -1; return emptyResults && conversions === 0 && explicit && detachedIndex && detachedLast && detachedIncludes && fixedResult && trackingResult;",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected TypedArray search resize and presence semantics"),
+    }
+}
+
+#[test]
+fn typed_array_with_converts_before_validating_and_copying() -> () {
+    match execute_source_with_builtins(
+        "let marker = {}; let conversionError = false; try { Uint8Array.of(1).with(9, {valueOf() { throw marker; }}); } catch (error) { conversionError = error === marker; } let source = Uint8Array.of(0, 1, 2); let copied = source.with(1, {valueOf() { source[0] = 3; return 4; }}); let big = BigInt64Array.of(0n, 1n); let bigCopied = big.with(1, {valueOf() { big[0] = 2n; return 3n; }}); let emptyBuffer = new ArrayBuffer(0, {maxByteLength: 1}); let empty = new Uint8Array(emptyBuffer); let emptyResult = empty.with(0, {valueOf() { emptyBuffer.resize(1); return 7; }}); let shrinkBuffer = new ArrayBuffer(4, {maxByteLength: 4}); let fixed = new Uint8Array(shrinkBuffer, 0, 4); let shrinkConverted = false; let shrinkFailed = false; try { fixed.with(-1, {valueOf() { shrinkConverted = true; shrinkBuffer.resize(1); return 9; }}); } catch (error) { shrinkFailed = error instanceof RangeError; } let growBuffer = new ArrayBuffer(2, {maxByteLength: 5}); let tracking = new Uint8Array(growBuffer); tracking[0] = 11; tracking[1] = 22; let grownResult = tracking.with(4, {valueOf() { growBuffer.resize(5); return 8; }}); return conversionError && copied.join() === '3,4,2' && source.join() === '3,1,2' && bigCopied.join() === '2,3' && big.join() === '2,1' && emptyResult.length === 0 && empty.length === 1 && shrinkConverted && shrinkFailed && grownResult.join() === '11,22' && tracking.length === 5;",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected TypedArray with conversion and resize ordering"),
+    }
+}
+
+#[test]
+fn typed_array_slice_revalidates_and_clamps_after_species_creation() -> () {
+    match execute_source_with_builtins(
+        "let trackingBuffer = new ArrayBuffer(4, {maxByteLength: 4}); let tracking = new Uint8Array(trackingBuffer); tracking.set([1, 2, 3, 4]); tracking.constructor = {[Symbol.species]: function(length) { trackingBuffer.resize(2); return new Uint8Array(length); }}; let trackingResult = tracking.slice(); let fixedBuffer = new ArrayBuffer(4, {maxByteLength: 4}); let fixed = new Uint8Array(fixedBuffer, 0, 4); fixed.constructor = {[Symbol.species]: function(length) { fixedBuffer.resize(2); return new Uint8Array(length); }}; let fixedFailed = false; try { fixed.slice(); } catch (error) { fixedFailed = error instanceof TypeError; } let zeroBuffer = new ArrayBuffer(16, {maxByteLength: 16}); let zero = new Int32Array(zeroBuffer); zero.fill(9); let zeroResult = zero.slice({valueOf() { zeroBuffer.resize(0); return 0; }}); let detached = Uint8Array.of(1); detached.constructor = {[Symbol.species]: function(length) { detached.buffer.transfer(); return new Uint8Array(length); }}; let detachedFailed = false; try { detached.slice(); } catch (error) { detachedFailed = error instanceof TypeError; } let otherBuffer = new ArrayBuffer(8, {maxByteLength: 8}); let other = new Int16Array(otherBuffer); other.set([1, 2, 3, 4]); other.constructor = {[Symbol.species]: function(length) { otherBuffer.resize(4); return new Float64Array(length); }}; let otherResult = other.slice(); let alias = Uint8Array.of(10, 20, 30, 40, 50, 60); alias.constructor = {[Symbol.species]: function() { return new Uint8Array(alias.buffer, 2); }}; let aliasResult = alias.slice(1, 4); return trackingResult.join() === '1,2,0,0' && fixedFailed && zeroResult.join() === '0,0,0,0' && detachedFailed && otherResult.join() === '1,2,0,0' && aliasResult.join() === '20,20,20,60';",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected TypedArray slice resize and species semantics"),
+    }
+}
+
+#[test]
+fn typed_array_fill_and_copy_within_preserve_conversion_and_resize_semantics() -> () {
+    match execute_source_with_builtins(
+        "let conversions = 0; let filled = new Uint8Array(2); filled.fill({valueOf() { conversions += 1; return 7; }}); let bigintConversions = 0; let big = new BigInt64Array(2); big.fill({valueOf() { bigintConversions += 1; return 3n; }}); let lengthReads = 0; Object.defineProperty(filled, 'length', {get() { lengthReads += 1; return 0; }}); filled.copyWithin(1, 0, 1); let buffer = new ArrayBuffer(4, {maxByteLength: 8}); let tracking = new Uint8Array(buffer); tracking.set([0, 1, 2, 3]); tracking.copyWithin({valueOf() { buffer.resize(3); return 2; }}, 0); let fixedBuffer = new ArrayBuffer(4, {maxByteLength: 8}); let fixed = new Uint8Array(fixedBuffer, 0, 4); let fixedFailed = false; try { fixed.copyWithin({valueOf() { fixedBuffer.resize(2); return 0; }}, 1); } catch (error) { fixedFailed = error instanceof TypeError; } let detached = new Uint8Array(2); let detachFailed = false; try { detached.fill(1, {valueOf() { detached.buffer.transfer(); return 0; }}, 2); } catch (error) { detachFailed = error instanceof TypeError; } return conversions === 1 && filled[0] === 7 && filled[1] === 7 && bigintConversions === 1 && big[0] === 3n && big[1] === 3n && lengthReads === 0 && Array.from(tracking).join(',') === '0,1,0' && fixedFailed && detachFailed;",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected TypedArray fill and copyWithin conversion semantics"),
+    }
+}
+
+#[test]
+fn typed_array_set_uses_internal_lengths_and_interleaves_reads_writes() -> () {
+    match execute_source_with_builtins(
+        "let target = new Uint8Array(4); let order = []; let source = {length: 3, get 0() { order.push(target.join()); return 4; }, get 1() { order.push(target.join()); return 5; }, get 2() { order.push(target.join()); return 6; }}; target.set(source, -0.5); let lengthReads = 0; let typedSource = Uint8Array.of(7, 8); Object.defineProperty(target, 'length', {get() { lengthReads += 1; return 0; }}); Object.defineProperty(typedSource, 'length', {get() { lengthReads += 1; return 0; }}); target.set(typedSource, 2); let detached = new Uint8Array(3); let finalRead = false; detached.set({length: 3, 0: 1, get 1() { detached.buffer.transfer(); return 2; }, get 2() { finalRead = true; return 3; }}); let buffer = new ArrayBuffer(3, {maxByteLength: 6}); let tracking = new Uint8Array(buffer); let conversions = []; tracking.set({length: 3, 0: {valueOf() { conversions.push('shrink'); buffer.resize(1); return 1; }}, 1: {valueOf() { conversions.push('grow'); buffer.resize(3); return 2; }}, 2: 3}); let bigConversions = 0; let big = new BigInt64Array(2); big.set({length: 2, 0: {valueOf() { bigConversions += 1; return 9n; }}, 1: 10n}); return order.join('|') === '0,0,0,0|4,0,0,0|4,5,0,0' && target.join() === '4,5,7,8' && lengthReads === 0 && finalRead && detached.length === 0 && tracking.join() === '1,2,3' && conversions.join(',') === 'shrink,grow' && big[0] === 9n && big[1] === 10n && bigConversions === 1 && Uint8Array.prototype.set.length === 1;",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected TypedArray set ordering and resize semantics"),
+    }
+}
+
+#[test]
+fn typed_array_to_locale_string_dispatches_and_observes_resize() -> () {
+    match execute_source_with_builtins(
+        "let oldNumber = Number.prototype.toLocaleString; let oldBigInt = BigInt.prototype.toLocaleString; let numberCalls = 0; let numberConversions = 0; Number.prototype.toLocaleString = function() { numberCalls += 1; let call = numberCalls; return {toString() { numberConversions += 1; return 'n' + call; }}; }; let numbers = Uint8Array.of(1, 2).toLocaleString(); let bigintCalls = 0; let bigintConversions = 0; BigInt.prototype.toLocaleString = function() { bigintCalls += 1; let call = bigintCalls; return {toString: undefined, valueOf() { bigintConversions += 1; return 'b' + call; }}; }; let bigints = BigInt64Array.of(3n, 4n).toLocaleString(); let buffer = new ArrayBuffer(4, {maxByteLength: 8}); let fixed = new Uint8Array(buffer, 0, 4); let resizeCalls = 0; Number.prototype.toLocaleString = function() { resizeCalls += 1; if (resizeCalls === 2) buffer.resize(2); return 'x'; }; let lengthReads = 0; Object.defineProperty(fixed, 'length', {get() { lengthReads += 1; return 0; }}); let resized = fixed.toLocaleString(); Number.prototype.toLocaleString = oldNumber; BigInt.prototype.toLocaleString = oldBigInt; return numbers === 'n1,n2' && numberCalls === 2 && numberConversions === 2 && bigints === 'b1,b2' && bigintCalls === 2 && bigintConversions === 2 && resized === 'x,x,,' && resizeCalls === 2 && lengthReads === 0 && Uint8Array.prototype.toLocaleString.length === 0;",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected TypedArray localized string dispatch and resize behavior"),
+    }
+}
+
+#[test]
+fn typed_array_subarray_uses_raw_offsets_tracking_and_species() -> () {
+    match execute_source_with_builtins(
+        "let reads = 0; let source = Uint8Array.of(1, 2, 3); Object.defineProperty(source, 'constructor', {get() { reads += 1; }}); let defaulted = source.subarray(1); let badSource = Uint8Array.of(1); badSource.constructor = {[Symbol.species]: function() {}}; let bad = false; try { badSource.subarray(0); } catch (error) { bad = error instanceof TypeError; } let buffer = new ArrayBuffer(6, {maxByteLength: 6}); let tracking = new Uint8Array(buffer, 2); let fixed = new Uint8Array(buffer, 2, 2); buffer.resize(0); let trackingResult = tracking.subarray({valueOf() { buffer.resize(6); return 1; }}); buffer.resize(0); let fixedResult = fixed.subarray({valueOf() { buffer.resize(6); return 1; }}); let detached = new Uint8Array(2); detached.buffer.transfer(); let begin = 0; let end = 0; let detachedFailed = false; try { detached.subarray({valueOf() { begin += 1; return 0; }}, {valueOf() { end += 1; return 0; }}); } catch (error) { detachedFailed = error instanceof TypeError; } return reads === 1 && defaulted.constructor === Uint8Array && defaulted.join() === '2,3' && bad && trackingResult.byteOffset === 2 && trackingResult.length === 4 && fixedResult.byteOffset === 2 && fixedResult.length === 0 && detachedFailed && begin === 1 && end === 1 && Uint8Array.prototype.subarray.length === 2;",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected TypedArray subarray resize and species semantics"),
+    }
+}
+
+#[test]
 fn typed_array_callback_and_reduce_algorithms_preserve_values_and_order() -> () {
     match execute_source_with_builtins(
         "let values = Int16Array.of(1, 2, 3, 4); let seen = ''; let receiver = true; let thisArg = {tag: 'x'}; values.forEach(function(value, index, array) { seen += this.tag + value + index; receiver = receiver && array === values; }, thisArg); let every = values.every(value => value > 0); let some = values.some(value => value === 3); let found = values.find(value => value > 2); let foundIndex = values.findIndex(value => value > 2); let last = values.findLast(value => value < 4); let lastIndex = values.findLastIndex(value => value < 4); let sum = values.reduce((total, value) => total + value, 0); let reverse = values.reduceRight((text, value) => text + value, ''); let big = BigInt64Array.of(1n, 2n, 3n).reduce((total, value) => total + value, 0n); let callbackFailed = false; let detachedFailed = false; try { values.some(1); } catch (error) { callbackFailed = error instanceof TypeError; } let detached = new Uint8Array(1); detached.buffer.transfer(); try { detached.forEach(() => {}); } catch (error) { detachedFailed = error instanceof TypeError; } return seen === 'x10x21x32x43' && receiver && every && some && found === 3 && foundIndex === 2 && last === 3 && lastIndex === 2 && sum === 10 && reverse === '4321' && big === 6n && callbackFailed && detachedFailed && values.forEach.length === 1 && values.reduce.length === 1 && values.findLast.length === 1;",
     ) {
         runtime::Value::Bool(value) => testing::assert(value),
         _ => testing::fail("expected TypedArray callback result"),
+    }
+}
+
+#[test]
+fn typed_array_callbacks_use_internal_length_and_visit_resized_indices() -> () {
+    match execute_source_with_builtins(
+        "let sample = new Uint8Array([2, 4, 6]); let lengthReads = 0; Object.defineProperty(sample, 'length', {get() { lengthReads += 1; return 0; }}); let seen = ''; sample.forEach(function(value) { seen += value; }); let buffer = new ArrayBuffer(4, {maxByteLength: 8}); let tracking = new Uint8Array(buffer); tracking.set([1, 2, 3, 4]); let resized = []; let every = tracking.every(function(value, index) { resized.push(value); if (index === 0) buffer.resize(1); return true; }); let detached = new Uint8Array([5, 6, 7]); let detachedValues = []; detached.forEach(function(value, index) { detachedValues.push(value); if (index === 0) detached.buffer.transfer(); }); return lengthReads === 0 && seen === '246' && every && resized.length === 4 && resized[0] === 1 && resized[1] === undefined && resized[2] === undefined && resized[3] === undefined && detachedValues.length === 3 && detachedValues[0] === 5 && detachedValues[1] === undefined && detachedValues[2] === undefined;",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected TypedArray internal-length callback iteration"),
+    }
+}
+
+#[test]
+fn typed_array_reduce_uses_internal_length_and_visits_resized_indices() -> () {
+    match execute_source_with_builtins(
+        "let sample = new Uint8Array([2, 4, 6]); let lengthReads = 0; Object.defineProperty(sample, 'length', {get() { lengthReads += 1; return 0; }}); let total = sample.reduce(function(sum, value) { return sum + value; }, 0); let buffer = new ArrayBuffer(4, {maxByteLength: 8}); let tracking = new Uint8Array(buffer); tracking.set([1, 2, 3, 4]); let resized = []; let resizedTotal = tracking.reduce(function(sum, value, index) { resized.push(value); if (index === 0) buffer.resize(1); return sum + (value === undefined ? 10 : value); }, 0); let detached = new Uint8Array([1, 2, 3, 4]); let detachedValues = []; let detachedTotal = detached.reduceRight(function(sum, value, index) { detachedValues.push(value); if (index === 3) detached.buffer.transfer(); return sum + (value === undefined ? 10 : value); }, 0); return lengthReads === 0 && total === 12 && resizedTotal === 31 && resized.length === 4 && resized[0] === 1 && resized[1] === undefined && resized[2] === undefined && resized[3] === undefined && detachedTotal === 34 && detachedValues.length === 4 && detachedValues[0] === 4 && detachedValues[1] === undefined && detachedValues[2] === undefined && detachedValues[3] === undefined;",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected TypedArray internal-length reduction"),
     }
 }
 
@@ -2795,6 +3704,16 @@ fn typed_array_sort_and_change_by_copy_follow_numeric_and_intrinsic_rules() -> (
     ) {
         runtime::Value::Bool(value) => testing::assert(value),
         _ => testing::fail("expected TypedArray sorting result"),
+    }
+}
+
+#[test]
+fn typed_array_sort_calls_comparators_for_equal_values_and_converts_results() -> () {
+    match execute_source_with_builtins(
+        "let global = function() { return this; }(); let valid = true; let numberCalls = 0; Uint8Array.of(42, 42, 42, 42, 42).sort(function(left, right) { numberCalls += 1; valid = valid && this === global && arguments.length === 2 && left === 42 && right === 42; }); let bigintCalls = 0; BigInt64Array.of(42n, 42n, 42n, 42n, 42n).sort(function(left, right) { bigintCalls += 1; valid = valid && this === global && arguments.length === 2 && left === 42n && right === 42n; }); let detached = new Uint8Array(4); let buffer = detached.buffer; let detachedOnce = false; let converted = false; detached.sort(function() { if (!detachedOnce) { buffer.transfer(); detachedOnce = true; } return {[Symbol.toPrimitive]() { converted = true; return 0; }}; }); return valid && numberCalls > 0 && bigintCalls > 0 && converted;",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected TypedArray comparator calls and result conversion"),
     }
 }
 
@@ -2858,6 +3777,16 @@ fn generators_suspend_resume_delegate_and_preserve_finally_state() -> () {
 }
 
 #[test]
+fn generator_parameters_initialize_before_instance_creation_and_body_start() -> () {
+    match execute_source_with_builtins(
+        "let bodyCalls = 0; function* values(value = (values.prototype = null)) { bodyCalls += 1; } let previous = values.prototype; let iterator = values(); let prototypeUpdated = Object.getPrototypeOf(iterator) !== previous; let beforeBody = bodyCalls === 0; let done = iterator.next().done; let tdz = false; function* invalid(value = value) { bodyCalls += 1; } try { invalid(); } catch (error) { tdz = error instanceof ReferenceError; } return prototypeUpdated && beforeBody && done && bodyCalls === 1 && tdz;",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected generator initialization ordering"),
+    }
+}
+
+#[test]
 fn generator_throw_injects_values_at_the_suspension_point() -> () {
     match execute_source_with_builtins(
         "let finalized = 0; let marker = {}; function *guarded() { try { yield 1; } catch (error) { yield error; } finally { finalized += 1; } } let active = guarded(); let first = active.next(); let caught = active.throw(marker); let done = active.next(); let completedSame = false; try { active.throw(marker); } catch (error) { completedSame = error === marker; } let started = false; function *unstarted() { started = true; yield 1; } let fresh = unstarted(); let freshSame = false; try { fresh.throw(marker); } catch (error) { freshSame = error === marker; } return first.value === 1 && !first.done && caught.value === marker && !caught.done && done.done && done.value === undefined && finalized === 1 && completedSame && freshSame && !started && fresh.next().done;",
@@ -2898,6 +3827,16 @@ fn yield_delegation_forwards_next_throw_and_return_completions() -> () {
 }
 
 #[test]
+fn yield_delegation_preserves_incomplete_iterator_results() -> () {
+    match execute_source_with_builtins(
+        "let reads = 0; let result = Object.defineProperty({done: false}, 'value', {get() { reads += 1; return 3; }}); let source = {[Symbol.iterator]() { return this; }, next() { return result; }, return() { return result; }, throw() { return result; }}; function* values() { yield *source; } let normal = values(); let first = normal.next(); let returned = normal.return(); let thrown = values(); thrown.next(); let thrownResult = thrown.throw(); result.done = true; let completed = values().next(); return first === result && returned === result && thrownResult === result && reads === 1 && completed.done === true && completed.value === undefined;",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected raw delegated iterator results"),
+    }
+}
+
+#[test]
 fn generator_functions_report_named_constructor_errors() -> () {
     match execute_source_with_builtins(
         "function *Generator() {} try { new Generator(); } catch (error) { return error instanceof TypeError && error.message === 'Generator is not a constructor'; } return false;",
@@ -2914,6 +3853,26 @@ fn for_in_assigns_identifier_and_member_targets_each_iteration() -> () {
     ) {
         runtime::Value::Bool(value) => testing::assert(value),
         _ => testing::fail("expected for-in assignment result"),
+    }
+}
+
+#[test]
+fn for_in_preserves_rhs_sequences_and_conditional_var_initializers() -> () {
+    match execute_source_with_builtins(
+        "let key = ''; let first = ''; for (key in null, {item: 0}) first += key; let evaluated = 0; let second = ''; for (var name = true ? (evaluated += 1, 'x' in {}) : 'seed' in false || {next: 0}) second += name; return first === 'item' && second === 'next' && evaluated === 1;",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected complete for-in rhs result"),
+    }
+}
+
+#[test]
+fn eval_loop_completion_values_start_as_undefined() -> () {
+    match execute_source_with_builtins(
+        "let emptyForIn = eval('var a; 1; for (a in {}) {}'); let skippedForIn = eval('var b; 2; for (b in null) { 3; }'); let emptyFor = eval('4; for (; false;) { 5; }'); let emptyWhile = eval('6; while (false) { 7; }'); let broken = eval('8; for (var c in {x: 0}) { 9; break; }'); let continued = eval('10; outer: do { for (var d in {x: 0}) { 11; continue outer; } } while (false)'); let emptyIf = eval('12; if (false) {}'); let emptyAbruptIf = eval('do { 13; if (true) { break; } } while (false)'); return emptyForIn === undefined && skippedForIn === undefined && emptyFor === undefined && emptyWhile === undefined && broken === 9 && continued === 11 && emptyIf === undefined && emptyAbruptIf === undefined;",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected eval loop completion result"),
     }
 }
 
@@ -2954,6 +3913,16 @@ fn optional_chains_share_short_circuit_state_until_a_grouping_boundary() -> () {
     ) {
         runtime::Value::Bool(value) => testing::assert(value),
         _ => testing::fail("expected continuous optional chain result"),
+    }
+}
+
+#[test]
+fn computed_members_check_nullish_bases_before_property_key_conversion() -> () {
+    match execute_source_with_builtins(
+        "let evaluated = 0; let converted = 0; let key = {toString() { converted += 1; return 'field'; }}; function property() { evaluated += 1; return key; } let nullFailed = false; let undefinedFailed = false; try { null[property()]; } catch (error) { nullFailed = error instanceof TypeError; } try { undefined[property()]; } catch (error) { undefinedFailed = error instanceof TypeError; } return nullFailed && undefinedFailed && evaluated === 2 && converted === 0;",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected computed member ordering result"),
     }
 }
 
@@ -3066,6 +4035,16 @@ fn proxy_dispatches_property_call_construct_enumeration_and_revocation_traps() -
 }
 
 #[test]
+fn array_is_array_unwraps_live_proxies_and_rejects_revoked_proxies() -> () {
+    match execute_source_with_builtins(
+        "let arrayProxy = new Proxy([], {}); let objectProxy = new Proxy({}, {}); let pair = Proxy.revocable([], {}); let before = Array.isArray(pair.proxy); pair.revoke(); let rejected = false; try { Array.isArray(pair.proxy); } catch (error) { rejected = error instanceof TypeError; } return Array.isArray(arrayProxy) && !Array.isArray(objectProxy) && before && rejected;",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected proxy Array.isArray result"),
+    }
+}
+
+#[test]
 fn proxy_enforces_target_invariants_and_reflect_traps() -> () {
     match execute_source_with_builtins(
         "let fixed = {}; Object.defineProperty(fixed, 'value', {value: 1, writable: false, configurable: false}); let getFailed = false; let setFailed = false; let hasFailed = false; let deleteFailed = false; let missingFailed = false; let extraFailed = false; try { new Proxy(fixed, {get() { return 2; }}).value; } catch (error) { getFailed = error instanceof TypeError; } try { new Proxy(fixed, {set() { return true; }}).value = 2; } catch (error) { setFailed = error instanceof TypeError; } try { 'value' in new Proxy(fixed, {has() { return false; }}); } catch (error) { hasFailed = error instanceof TypeError; } try { Reflect.deleteProperty(new Proxy(fixed, {deleteProperty() { return true; }}), 'value'); } catch (error) { deleteFailed = error instanceof TypeError; } try { Reflect.ownKeys(new Proxy(fixed, {ownKeys() { return []; }})); } catch (error) { missingFailed = error instanceof TypeError; } let sealed = Object.preventExtensions({}); try { Reflect.ownKeys(new Proxy(sealed, {ownKeys() { return ['extra']; }})); } catch (error) { extraFailed = error instanceof TypeError; } let target = {x: 1}; let proxy = new Proxy(target, {has() { return false; }, deleteProperty() { return false; }, ownKeys() { return ['z']; }}); let reflected = !Reflect.has(proxy, 'x') && !Reflect.deleteProperty(proxy, 'x') && Reflect.ownKeys(proxy).join(',') === 'z'; let same = new Proxy(fixed, {get() { return 1; }, set() { return true; }}); return getFailed && setFailed && hasFailed && deleteFailed && missingFailed && extraFailed && reflected && same.value === 1 && Reflect.set(same, 'value', 1);",
@@ -3112,6 +4091,66 @@ fn object_enumeration_and_ownership_methods_observe_proxy_traps() -> () {
     ) {
         runtime::Value::Bool(value) => testing::assert(value),
         _ => testing::fail("expected Proxy object enumeration result"),
+    }
+}
+
+#[test]
+fn proxy_own_keys_accepts_array_like_trap_results() -> () {
+    match execute_source_with_builtins(
+        "let log = []; let symbol = Symbol('key'); let target = {x: true}; let keys = {get length() { log.push('length'); return 3; }, get 0() { log.push('0'); return 'a'; }, get 1() { log.push('1'); return symbol; }, get 2() { log.push('2'); return 'b'; }}; let descriptors = {a: {enumerable: true, configurable: true, value: 1}, b: {enumerable: false, configurable: true, value: 2}}; let handler = {get ownKeys() { log.push('ownKeys'); return function(value) { log.push(this === handler && value === target ? 'call' : 'bad'); return keys; }; }, get getOwnPropertyDescriptor() { log.push('descriptor'); return function(value, key) { log.push(key); return descriptors[key]; }; }}; let result = Object.keys(new Proxy(target, handler)); return result.join(',') === 'a' && log.join(',') === 'ownKeys,call,length,0,1,2,descriptor,a,descriptor,b';",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected array-like Proxy ownKeys result"),
+    }
+}
+
+#[test]
+fn object_prototype_methods_follow_validation_and_coercion_order() -> () {
+    match execute_source_with_builtins(
+        "let keyReads = 0; let key = {toString() { keyReads += 1; return 'value'; }}; let getterFailed = false; let setterFailed = false; try { Object.prototype.__defineGetter__.call({}, key, 1); } catch (error) { getterFailed = error instanceof TypeError; } try { Object.prototype.__defineSetter__.call({}, key, null); } catch (error) { setterFailed = error instanceof TypeError; } let marker = {}; let hint = ''; let coercible = {[Symbol.toPrimitive](value) { hint = value; throw marker; }}; let preserved = false; try { Object.prototype.hasOwnProperty.call(null, coercible); } catch (error) { preserved = error === marker; } let staticReads = 0; let staticKey = {[Symbol.toPrimitive]() { staticReads += 1; throw marker; }}; let staticFailed = false; try { Object.hasOwn(null, staticKey); } catch (error) { staticFailed = error instanceof TypeError; } return getterFailed && setterFailed && keyReads === 0 && preserved && hint === 'string' && staticFailed && staticReads === 0 && Object.prototype.isPrototypeOf.call(null, 1) === false && Object.prototype.isPrototypeOf.call(undefined, Symbol()) === false;",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected Object prototype validation order"),
+    }
+}
+
+#[test]
+fn object_to_string_ignores_non_string_modern_builtin_tags() -> () {
+    match execute_source_with_builtins(
+        "let toString = Object.prototype.toString; let before = toString.call(1n) === '[object BigInt]' && toString.call(Symbol()) === '[object Symbol]' && toString.call(Math) === '[object Math]' && toString.call(JSON) === '[object JSON]'; Object.defineProperty(BigInt.prototype, Symbol.toStringTag, {value: 1}); delete Symbol.prototype[Symbol.toStringTag]; Object.defineProperty(Math, Symbol.toStringTag, {value: Symbol()}); delete JSON[Symbol.toStringTag]; return before && toString.call(1n) === '[object Object]' && toString.call(Object(1n)) === '[object Object]' && toString.call(Symbol()) === '[object Object]' && toString.call(Object(Symbol())) === '[object Object]' && toString.call(Math) === '[object Object]' && toString.call(JSON) === '[object Object]';",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected non-string Symbol.toStringTag fallback"),
+    }
+}
+
+#[test]
+fn prototype_operations_dispatch_traps_stop_at_proxies_and_lock_object_prototype() -> () {
+    match execute_source_with_builtins(
+        "let descriptor = Object.getOwnPropertyDescriptor(Object.prototype, '__proto__'); let getToken = {}; let setToken = {}; let getPreserved = false; let setPreserved = false; let getProxy = new Proxy({}, {getPrototypeOf() { throw getToken; }}); let setTarget = {}; let setProxy = new Proxy(setTarget, {setPrototypeOf() { throw setToken; }}); try { descriptor.get.call(getProxy); } catch (error) { getPreserved = error === getToken; } try { descriptor.set.call(setProxy, {}); } catch (error) { setPreserved = error === setToken; } let root = {}; let intermediary = new Proxy(Object.create(root), {}); let leaf = Object.create(intermediary); let shadowed = Reflect.setPrototypeOf(root, leaf) && Object.getPrototypeOf(root) === leaf; let immutable = Object.create(null); let objectFailed = false; try { Object.setPrototypeOf(Object.prototype, immutable); } catch (error) { objectFailed = error instanceof TypeError; } let reflected = Reflect.setPrototypeOf(Object.prototype, immutable); let unchanged = Object.setPrototypeOf(Object.prototype, null) === Object.prototype && Reflect.setPrototypeOf(Object.prototype, null); return getPreserved && setPreserved && Object.getPrototypeOf(setTarget) === Object.prototype && shadowed && objectFailed && !reflected && unchanged;",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected prototype internal method semantics"),
+    }
+}
+
+#[test]
+fn object_integrity_proxy_traps_receive_partial_descriptors() -> () {
+    match execute_source_with_builtins(
+        "let symbol = Symbol(); let frozenSeen = {}; let frozen = new Proxy({[symbol]: 1, get value() {}}, {defineProperty(target, key, descriptor) { frozenSeen[key === symbol ? 'data' : 'accessor'] = descriptor; return Reflect.defineProperty(target, key, descriptor); }}); Object.freeze(frozen); let data = frozenSeen.data; let accessor = frozenSeen.accessor; let freezeCorrect = data.configurable === false && data.writable === false && !('value' in data) && !('enumerable' in data) && accessor.configurable === false && !('writable' in accessor) && !('get' in accessor) && !('set' in accessor) && !('enumerable' in accessor); let sealedSeen; let sealed = new Proxy({item: 1}, {defineProperty(target, key, descriptor) { sealedSeen = descriptor; return Reflect.defineProperty(target, key, descriptor); }}); Object.seal(sealed); let sealCorrect = sealedSeen.configurable === false && !('writable' in sealedSeen) && !('value' in sealedSeen) && !('enumerable' in sealedSeen); return freezeCorrect && sealCorrect && Object.isFrozen(frozen) && Object.isSealed(sealed);",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected partial integrity descriptors"),
+    }
+}
+
+#[test]
+fn freezing_variable_length_buffer_typed_arrays_rejects_zero_length_views() -> () {
+    match execute_source_with_builtins(
+        "let fixedBuffer = new ArrayBuffer(0); let fixed = new Uint8Array(fixedBuffer); let fixedResult = Object.freeze(fixed) === fixed && Object.isFrozen(fixed); let buffer = new ArrayBuffer(4, {maxByteLength: 8}); let zero = new Uint8Array(buffer, 0, 0); let zeroFailed = false; try { Object.freeze(zero); } catch (error) { zeroFailed = error instanceof TypeError; } let tracking = new Uint8Array(buffer); buffer.resize(0); let trackingFailed = false; try { Object.freeze(tracking); } catch (error) { trackingFailed = error instanceof TypeError; } return fixedResult && zeroFailed && trackingFailed && !Object.isExtensible(zero) && !Object.isExtensible(tracking);",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected variable-length TypedArray freeze rejection"),
     }
 }
 
@@ -3228,6 +4267,28 @@ fn await_context_and_async_constructors_report_compile_errors() -> () {
 }
 
 #[test]
+fn module_top_level_functions_conflict_with_var_declarations() -> () {
+    let invalid = Vec::from_array(
+        [
+            "var smoosh; function smoosh() {}",
+            "function smoosh() {} var smoosh;",
+            "function smoosh() {} function smoosh() {}",
+            "var smoosh; export function smoosh() {}",
+        ],
+    );
+    for source in invalid {
+        match compile_module(source) {
+            Ok(_) => testing::fail("expected module declaration conflict"),
+            Err(errors) => testing::assert(has_message(errors, "duplicate declaration")),
+        }
+    }
+    match compile("var smoosh; function smoosh() {}") {
+        Ok(_) => (),
+        Err(_) => testing::fail("expected script var and function declarations to merge"),
+    }
+}
+
+#[test]
 fn executes_contextual_await_and_yield_identifiers() -> () {
     match execute_source_with_builtins(
         "var await = 1; var yield = 2; let arrowAwait = (await => await + 1)(3); let arrowYield = (yield => yield + 1)(4); function sum(await, yield) { return await + yield; } function escaped() { var \\u0061wait = 5; var \\u0079ield = 6; return await + yield; } function destructure(source) { let {await, yield} = source; return await + yield; } let caught = 0; try { throw 7; } catch (yield) { caught = yield; } let labelled = 0; await: { labelled = 8; break await; labelled = 0; } async function asyncOuter() { return (() => await)(); } function* generatorOuter() { return (() => yield)(); } async function asyncEval() { return eval('await'); } function* generatorEval() { return eval('yield'); } let asyncValue = 0; let evalValue = 0; asyncOuter().then(value => asyncValue = value); asyncEval().then(value => evalValue = value); Promise.drainJobs(); return arrowAwait === 4 && arrowYield === 5 && sum(2, 3) === 5 && escaped() === 11 && destructure({await: 4, yield: 5}) === 9 && caught === 7 && labelled === 8 && asyncValue === 1 && generatorOuter().next().value === 2 && evalValue === 1 && generatorEval().next().value === 2;",
@@ -3285,31 +4346,45 @@ fn class_strict_context_rejects_yield_and_static_block_await() -> () {
 fn enforces_contextual_await_yield_early_errors() -> () {
     match compile("'use strict'; var yield = 1;") {
         Ok(_) => testing::fail("expected strict yield binding error"),
-        Err(errors) => testing::assert(has_message(errors, "yield")),
+        Err(errors) => if has_message(errors, "yield") {} else {
+            testing::fail("expected strict yield diagnostic")
+        },
     };
     match compile("'use strict'; var \\u0079ield = 1;") {
         Ok(_) => testing::fail("expected escaped strict yield binding error"),
-        Err(errors) => testing::assert(has_message(errors, "yield")),
+        Err(errors) => if has_message(errors, "yield") {} else {
+            testing::fail("expected escaped strict yield diagnostic")
+        },
     };
     match compile_module("var await = 1;") {
         Ok(_) => testing::fail("expected module await binding error"),
-        Err(errors) => testing::assert(has_message(errors, "reserved word")),
+        Err(errors) => if has_message(errors, "reserved word") {} else {
+            testing::fail("expected module await reserved word diagnostic")
+        },
     };
     match compile_module("function nested() { var await = 1; return await; }") {
         Ok(_) => testing::fail("expected nested module await error"),
-        Err(errors) => testing::assert(has_message(errors, "reserved word")),
+        Err(errors) => if has_message(errors, "reserved word") {} else {
+            testing::fail("expected nested module await reserved word diagnostic")
+        },
     };
     match compile("async function invalid(value = await 1) {}") {
         Ok(_) => testing::fail("expected await parameter initializer error"),
-        Err(errors) => testing::assert(has_message(errors, "parameter initializer")),
+        Err(errors) => if has_message(errors, "parameter initializer") {} else {
+            testing::fail("expected await parameter initializer diagnostic")
+        },
     };
     match compile("function* invalid(value = yield 1) {}") {
         Ok(_) => testing::fail("expected yield parameter initializer error"),
-        Err(errors) => testing::assert(has_message(errors, "parameter initializer")),
+        Err(errors) => if has_message(errors, "parameter initializer") {} else {
+            testing::fail("expected yield parameter initializer diagnostic")
+        },
     };
     match compile("async function invalid() { return await 2 ** 3; }") {
         Ok(_) => testing::fail("expected await exponentiation error"),
-        Err(errors) => testing::assert(has_message(errors, "left operand")),
+        Err(errors) => if has_message(errors, "left operand") {} else {
+            testing::fail("expected await exponentiation left operand diagnostic")
+        },
     };
     match compile(
         "async function validAwait(value = () => await) { return (await 2) ** 3 + await (2 ** 3); } function* validYield(value = () => yield) { return value; } async function await() {} function* yield() {}",
@@ -3326,6 +4401,16 @@ fn inherited_strict_eval_rejects_yield_identifiers() -> () {
     ) {
         runtime::Value::Bool(value) => testing::assert(value),
         _ => testing::fail("expected strict eval rejection"),
+    }
+}
+
+#[test]
+fn inherited_strict_eval_rejects_restricted_assignments_and_var_bindings() -> () {
+    match execute_source_with_builtins(
+        "function strict() { 'use strict'; let direct = false; let nested = false; let argumentsWrite = false; try { eval('eval = 42;'); } catch (error) { direct = error instanceof SyntaxError; } try { eval('(function() { var eval; })'); } catch (error) { nested = error instanceof SyntaxError; } try { eval('arguments = 42;'); } catch (error) { argumentsWrite = error instanceof SyntaxError; } return direct && nested && argumentsWrite; } return strict();",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected inherited strict eval errors"),
     }
 }
 
@@ -3382,7 +4467,7 @@ fn async_yield_delegation_awaits_return_before_missing_throw_rejection() -> () {
 #[test]
 fn async_from_sync_iterator_assimilates_values_and_caches_next() -> () {
     match execute_source_with_builtins(
-        "let reads = 0; let calls = 0; let argumentCounts = []; let iterator = {}; Object.defineProperty(iterator, 'next', {get() { reads += 1; return function(value) { argumentCounts.push(arguments.length); calls += 1; if (calls === 1) return {value: Promise.resolve(3), done: false}; if (calls === 2) return {value: {then(resolve) { resolve(4); }}, done: false}; return {value: Promise.resolve(5), done: true}; }; }}); let source = {[Symbol.iterator]() { return iterator; }}; async function* delegated() { return yield *source; } let results = []; let values = delegated(); values.next().then(value => results.push(value)); values.next().then(value => results.push(value)); values.next().then(value => results.push(value)); Promise.drainJobs(); return reads === 1 && argumentCounts.join(',') === '0,1,1' && results.length === 3 && results[0].value === 3 && !results[0].done && results[1].value === 4 && !results[1].done && results[2].value === 5 && results[2].done;",
+        "let reads = 0; let calls = 0; let argumentCounts = []; let iterator = {}; Object.defineProperty(iterator, 'next', {get() { reads += 1; return function(value) { argumentCounts.push(arguments.length); calls += 1; if (calls === 1) return {value: Promise.resolve(3), done: false}; if (calls === 2) return {value: {then(resolve) { resolve(4); }}, done: false}; return {value: Promise.resolve(5), done: true}; }; }}); let source = {[Symbol.iterator]() { return iterator; }}; async function* delegated() { return yield *source; } let results = []; let values = delegated(); values.next().then(value => results.push(value)); values.next().then(value => results.push(value)); values.next().then(value => results.push(value)); Promise.drainJobs(); return reads === 1 && argumentCounts.join(',') === '1,1,1' && results.length === 3 && results[0].value === 3 && !results[0].done && results[1].value === 4 && !results[1].done && results[2].value === 5 && results[2].done;",
     ) {
         runtime::Value::Bool(value) => testing::assert(value),
         _ => testing::fail("expected async-from-sync value assimilation"),
@@ -3440,12 +4525,82 @@ fn for_await_iterates_async_sources_and_assimilates_sync_values() -> () {
 }
 
 #[test]
+fn for_await_observes_promise_constructor_lookups_and_abrupt_completion() -> () {
+    match execute_source_with_builtins(
+        "let lookups = 0; let value = 0; let source = Promise.resolve(7); Object.defineProperty(Promise.prototype, 'constructor', {get() { lookups += 1; return Promise; }, configurable: true}); async function collect() { for await (let item of [source]) value = item; } collect(); Promise.drainJobs(); let timing = value === 7 && lookups === 3; let marker = {}; let rejected = Promise.resolve(1); let caught = false; Object.defineProperty(rejected, 'constructor', {get() { throw marker; }}); async function fail() { try { for await (let item of [rejected]) {} } catch (error) { caught = error === marker; } } fail(); Promise.drainJobs(); return timing && caught;",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected PromiseResolve behavior in for-await iteration"),
+    }
+}
+
+#[test]
+fn for_await_destructuring_writes_the_implicit_arguments_binding() -> () {
+    match execute_source_with_builtins(
+        "let eval; let functionResult = false; let generatorResult = false; async function collect() { for await ([arguments = 4, eval = 5] of [[]]) functionResult = arguments === 4 && eval === 5; } async function* generate() { for await ([arguments = 6, eval = 7] of [[]]) generatorResult = arguments === 6 && eval === 7; } collect(); generate().next(); Promise.drainJobs(); return functionResult && generatorResult;",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected writable implicit arguments binding"),
+    }
+}
+
+#[test]
 fn for_await_awaits_iterator_close_on_break() -> () {
     match execute_source_with_builtins(
         "let events = []; let release; let gate = new Promise(resolve => release = resolve); let source = {[Symbol.asyncIterator]() { return this; }, next() { events.push('next'); return {value: 1, done: false}; }, return() { events.push('return' + arguments.length); return gate.then(() => { events.push('closed'); return {done: true}; }); }}; let completed = false; async function stop() { for await (let value of source) { events.push('body' + value); break; } events.push('after'); } stop().then(() => { completed = true; events.push('complete'); }); Promise.drainJobs(); let pending = !completed && events.join(',') === 'next,body1,return0'; release(); Promise.drainJobs(); return pending && completed && events.join(',') === 'next,body1,return0,closed,after,complete';",
     ) {
         runtime::Value::Bool(value) => testing::assert(value),
         _ => testing::fail("expected awaited for-await break close"),
+    }
+}
+
+#[test]
+fn object_literal_loop_conditions_are_truthy() -> () {
+    match execute_source_with_builtins(
+        "let count = 0; while ({}) { count += 1; break; } do { count += 1; break; } while ({}); return count === 2;",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected truthy object literal loop conditions"),
+    }
+}
+
+#[test]
+fn switch_resets_completion_and_scopes_case_block_lexicals_after_the_discriminant() -> () {
+    match execute_source_with_builtins(
+        "let x = 'outside'; let expression; let selector; let statement; switch (expression = function() { return x; }, null) { case selector = function() { return x; }, null: statement = function() { return x; }; let x = 'inside'; } let scoped = expression() === 'outside' && selector() === 'inside' && statement() === 'inside'; let empty = eval('1; switch (0) { case 0: break; }') === undefined; let valued = eval('2; switch (0) { case 0: 3; break; }') === 3; return scoped && empty && valued;",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected switch completion and lexical scope behavior"),
+    }
+}
+
+#[test]
+fn try_preserves_completion_and_validates_inherited_strict_catch_bindings() -> () {
+    match execute_source_with_builtins(
+        "let values = eval('1; try { 2; } catch (error) {}') === 2 && eval('1; try {} catch (error) { 2; }') === undefined && eval('1; try { throw 0; } catch (error) { 3; }') === 3 && eval('1; try { 4; } finally { 5; }') === 4 && eval('1; do { try { 6; } finally { 7; break; } } while (false)') === 7 && eval('1; do { try { 6; } finally { break; } } while (false)') === undefined; let strictCatch = function() { 'use strict'; try { eval('try {} catch (eval) {}'); } catch (error) { return error instanceof SyntaxError; } return false; }; return values && strictCatch();",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected try completion and strict catch binding behavior"),
+    }
+}
+
+#[test]
+fn with_boxes_primitives_routes_var_initializers_and_resets_completion() -> () {
+    match execute_source_with_builtins(
+        "let primitive = 1; with (2) { primitive = 3; } let object = {value: 1}; let captured; let outer = 4; with (object) { var value = 5, missing = 6; captured = function() { return value; }; } let empty = eval('1; with ({}) {}') === undefined; let abrupt = eval('do { with ({}) { 7; break; } } while (false)') === 7; return primitive === 3 && object.value === 5 && missing === 6 && captured() === 5 && outer === 4 && empty && abrupt;",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected with object environment behavior"),
+    }
+}
+
+#[test]
+fn with_rechecks_object_bindings_for_get_and_set() -> () {
+    match execute_source_with_builtins(
+        "let log = []; let target = {value: 1}; let proxy = new Proxy(target, {has(object, key) { log.push('has:' + String(key)); return Reflect.has(object, key); }, get(object, key, receiver) { log.push('get:' + String(key)); return Reflect.get(object, key, receiver); }, set(object, key, value, receiver) { log.push('set:' + String(key)); return Reflect.set(object, key, value, receiver); }}); with (proxy) { value += 2; } let env = {binding: 1, get [Symbol.unscopables]() { delete this.binding; return null; }}; let rejected = false; with (env) { rejected = function() { 'use strict'; try { return binding; } catch (error) { return error instanceof ReferenceError; } }(); } return target.value === 3 && rejected && log.join(',') === 'has:value,get:Symbol(Symbol.unscopables),has:value,get:value,has:value,set:value';",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected object environment binding rechecks"),
     }
 }
 
@@ -3470,7 +4625,7 @@ fn debugger_statement_executes_as_a_no_op_without_a_debugger() -> () {
 #[test]
 fn shared_array_buffer_and_single_agent_atomics_execute() -> () {
     match execute_source_with_builtins(
-        "let buffer = new SharedArrayBuffer(24); let values = new Int32Array(buffer, 0, 2); let stored = Atomics.store(values, 0, 7); let added = Atomics.add(values, 0, 5); let exchanged = Atomics.exchange(values, 1, 9); let compared = Atomics.compareExchange(values, 1, 9, 4); let anded = Atomics.and(values, 0, 6); let ored = Atomics.or(values, 0, 8); let xored = Atomics.xor(values, 0, 3); let subtracted = Atomics.sub(values, 0, 1); let bytes = new Uint8Array(buffer, 8, 1); Atomics.store(bytes, 0, 257); let big = new BigInt64Array(buffer, 16, 1); let bigStored = Atomics.store(big, 0, -1n); let bigAdded = Atomics.add(big, 0, 2n); let copy = buffer.slice(0, 8); let rejected = false; try { Atomics.load(new Int32Array(1), 0); } catch (error) { rejected = error instanceof TypeError; } return buffer instanceof SharedArrayBuffer && Object.prototype.toString.call(buffer) === '[object SharedArrayBuffer]' && copy instanceof SharedArrayBuffer && stored === 7 && added === 7 && exchanged === 0 && compared === 9 && anded === 12 && ored === 4 && xored === 12 && subtracted === 15 && Atomics.load(values, 0) === 14 && Atomics.load(values, 1) === 4 && Atomics.load(bytes, 0) === 1 && bigStored === -1n && bigAdded === -1n && Atomics.load(big, 0) === 1n && Atomics.isLockFree(4) && !Atomics.isLockFree(3) && rejected;",
+        "let buffer = new SharedArrayBuffer(24); let values = new Int32Array(buffer, 0, 2); let stored = Atomics.store(values, 0, 7); let added = Atomics.add(values, 0, 5); let exchanged = Atomics.exchange(values, 1, 9); let compared = Atomics.compareExchange(values, 1, 9, 4); let anded = Atomics.and(values, 0, 6); let ored = Atomics.or(values, 0, 8); let xored = Atomics.xor(values, 0, 3); let subtracted = Atomics.sub(values, 0, 1); let bytes = new Uint8Array(buffer, 8, 1); let byteStored = Atomics.store(bytes, 0, 257); let big = new BigInt64Array(buffer, 16, 1); let bigStored = Atomics.store(big, 0, -1n); let bigAdded = Atomics.add(big, 0, 2n); let copy = buffer.slice(0, 8); let local = new Int32Array(1); let localStored = Atomics.store(local, 0, 6); let localAdded = Atomics.add(local, 0, 2); let zeroStored = Object.is(Atomics.store(local, 0, -0), 0); return buffer instanceof SharedArrayBuffer && Object.prototype.toString.call(buffer) === '[object SharedArrayBuffer]' && copy instanceof SharedArrayBuffer && stored === 7 && added === 7 && exchanged === 0 && compared === 9 && anded === 12 && ored === 4 && xored === 12 && subtracted === 15 && Atomics.load(values, 0) === 14 && Atomics.load(values, 1) === 4 && byteStored === 257 && Atomics.load(bytes, 0) === 1 && bigStored === -1n && bigAdded === -1n && Atomics.load(big, 0) === 1n && localStored === 6 && localAdded === 6 && zeroStored && local[0] === 0 && Atomics.isLockFree(4) && !Atomics.isLockFree(3) && !Atomics.isLockFree(NaN);",
     ) {
         runtime::Value::Bool(value) => testing::assert(value),
         _ => testing::fail("expected SharedArrayBuffer and Atomics result"),
@@ -4047,4 +5202,269 @@ fn script_instantiation_checks_conflicts_in_source_declaration_order() -> () {
         Err(vm::VmError { kind: vm::VmErrorKind::TypeError(_), .. }) => (),
         _ => testing::fail("expected nested var source-order TypeError"),
     }
+}
+
+#[test]
+fn strict_unresolvable_assignment_preserves_the_pre_rhs_reference() -> () {
+    let context = script_test_context();
+    match execute_script_source(context, "'use strict'; undeclared = (globalThis.undeclared = 5);") {
+        Err(vm::VmError { kind: vm::VmErrorKind::ReferenceError(_), .. }) => (),
+        _ => testing::fail("expected unresolved strict assignment ReferenceError"),
+    };
+    expect_int(
+        execute_script_source(context, "globalThis.undeclared;").unwrap_or(
+            runtime::Value::Undefined,
+        ),
+        5,
+    )
+}
+
+#[test]
+fn numeric_binary_coercion_finishes_the_left_operand_first() -> () {
+    expect_bool(
+        execute_source_with_builtins(
+            "let trace = ''; let left = {valueOf() { trace += '3'; return Symbol('x'); }}; let right = {valueOf() { trace += '4'; return 1; }}; try { (() => { trace += '1'; return left; })() * (() => { trace += '2'; return right; })(); } catch (_) {} return trace === '123';",
+        ),
+        true,
+    )
+}
+
+#[test]
+fn remainder_and_power_preserve_ecmascript_zero_and_infinity_edges() -> () {
+    expect_bool(
+        execute_source_with_builtins(
+            "return 1 / (-1 % 1) === -Infinity && Number.isNaN(1 ** Infinity) && Number.isNaN((-1) ** -Infinity);",
+        ),
+        true,
+    )
+}
+
+#[test]
+fn strict_update_rechecks_a_deleted_global_binding() -> () {
+    expect_bool(
+        execute_source_with_builtins(
+            "Object.defineProperty(globalThis, 'updateTarget', {configurable: true, get() { delete globalThis.updateTarget; return 2; }}); let caught = false; try { (() => {'use strict'; updateTarget++;})(); } catch (error) { caught = error instanceof ReferenceError; } return caught && !('updateTarget' in globalThis);",
+        ),
+        true,
+    )
+}
+
+#[test]
+fn computed_update_converts_its_property_key_once() -> () {
+    expect_bool(
+        execute_source_with_builtins(
+            "let calls = 0; let object = {}; let key = {toString() { calls += 1; return 'value'; }}; object[key]++; return calls === 1;",
+        ),
+        true,
+    )
+}
+
+#[test]
+fn computed_update_checks_its_nullish_base_before_property_key_conversion() -> () {
+    expect_bool(
+        execute_source_with_builtins(
+            "let converted = false; let key = {toString() { converted = true; return 'value'; }}; let caught = false; try { let base = null; base[key]++; } catch (error) { caught = error instanceof TypeError; } return caught && !converted;",
+        ),
+        true,
+    )
+}
+
+#[test]
+fn bigint_literal_property_names_use_decimal_strings() -> () {
+    expect_bool(
+        execute_source_with_builtins(
+            "let object = {999999999999999999n: true, 0x10n() { return 16; }}; class C { 1n() { return 1; } } let {2n: value} = {'2': 2}; return object['999999999999999999'] && object['16']() === 16 && new C()['1']() === 1 && value === 2;",
+        ),
+        true,
+    )
+}
+
+#[test]
+fn object_literal_definitions_bypass_inherited_setters_and_handle_proto_syntax() -> () {
+    expect_bool(
+        execute_source_with_builtins(
+            "let proto = {}; let own = {}; let object = {__proto__: proto, ['__proto__']: own}; let calls = 0; Object.defineProperty(Object.prototype, 'poisoned', {set(_) { calls += 1; }, configurable: true}); let data = {poisoned: 1}; delete Object.prototype.poisoned; let ignored = {__proto__: 1}; return Object.getPrototypeOf(object) === proto && Object.hasOwn(object, '__proto__') && object.__proto__ === own && calls === 0 && data.poisoned === 1 && Object.getPrototypeOf(ignored) === Object.prototype && !Object.hasOwn(ignored, '__proto__');",
+        ),
+        true,
+    )
+}
+
+#[test]
+fn async_generators_await_native_promises_in_one_microtask() -> () {
+    expect_bool(
+        execute_source_with_builtins(
+            "let events = []; async function push() { events.push('await'); } async function* values() { await push(); await push(); } values().next(); new Promise(resolve => { events.push(1); resolve(); }).then(() => events.push(2)); Promise.drainJobs(); return events.join(',') === 'await,1,await,2';",
+        ),
+        true,
+    )
+}
+
+#[test]
+fn promise_resolving_functions_have_standard_metadata() -> () {
+    expect_bool(
+        execute_source_with_builtins(
+            "let resolve; let reject; new Promise((first, second) => { resolve = first; reject = second; }); let constructable = true; try { Reflect.construct(function() {}, [], resolve); } catch (_) { constructable = false; } return resolve.length === 1 && resolve.name === '' && reject.length === 1 && reject.name === '' && !constructable;",
+        ),
+        true,
+    )
+}
+
+#[test]
+fn promise_constructor_requires_new_and_validates_before_selecting_prototype() -> () {
+    expect_bool(
+        execute_source_with_builtins(
+            "let directFailed = false; try { Promise(function() {}); } catch (error) { directFailed = error instanceof TypeError; } let calledFailed = false; try { Promise.call({}, function() {}); } catch (error) { calledFailed = error instanceof TypeError; } let marker = {}; let NewTarget = new Proxy(function() {}, {get(target, key) { if (key === 'prototype') throw marker; return target[key]; }}); let orderingFailed = false; try { Reflect.construct(Promise, [], NewTarget); } catch (error) { orderingFailed = error instanceof TypeError; } let custom = {}; function Custom() {} Custom.prototype = custom; let result = Reflect.construct(Promise, [function() {}], Custom); let branded = Promise.prototype.then.call(result, function() {}) instanceof Promise; return directFailed && calledFailed && orderingFailed && Object.getPrototypeOf(result) === custom && branded;",
+        ),
+        true,
+    )
+}
+
+#[test]
+fn promise_static_capabilities_use_the_receiver_constructor() -> () {
+    expect_bool(
+        execute_source_with_builtins(
+            "let calls = []; function Custom(executor) { calls.push('construct'); executor(value => calls.push('resolve:' + value), value => calls.push('reject:' + value)); } let resolved = Promise.resolve.call(Custom, 7); let rejected = Promise.reject.call(Custom, 8); let tried = Promise.try.call(Custom, (a, b) => a + b, 4, 5); let record = Promise.withResolvers.call(Custom); record.resolve(10); record.reject(11); let marker = {}; function Throwing(executor) { executor(() => { throw marker; }, function() {}); } let propagated = false; try { Promise.resolve.call(Throwing, 1); } catch (error) { propagated = error === marker; } return resolved instanceof Custom && rejected instanceof Custom && tried instanceof Custom && record.promise instanceof Custom && calls.join(',') === 'construct,resolve:7,construct,reject:8,construct,resolve:9,construct,resolve:10,reject:11' && propagated;",
+        ),
+        true,
+    )
+}
+
+#[test]
+fn promise_prototype_methods_use_then_and_species_protocols() -> () {
+    expect_bool(
+        execute_source_with_builtins(
+            "let marker = {}; let rejected = function() {}; let catchArgs; let generic = {then(first, second) { catchArgs = [this, first, second]; return marker; }}; let caught = Promise.prototype.catch.call(generic, rejected); let finallyArgs; let finalized = Promise.prototype.finally.call({constructor: Promise, then(first, second) { finallyArgs = [first, second]; return marker; }}, 7); let resolve; let source = new Promise(value => resolve = value); let calls = []; function Custom(executor) { executor(value => calls.push('resolve:' + value), value => calls.push('reject:' + value)); } Object.defineProperty(source, 'constructor', {value: {[Symbol.species]: Custom}}); let child = source.then(value => value + 1); resolve(4); Promise.drainJobs(); return caught === marker && catchArgs[0] === generic && catchArgs[1] === undefined && catchArgs[2] === rejected && finalized === marker && finallyArgs[0] === 7 && finallyArgs[1] === 7 && child instanceof Custom && calls.join(',') === 'resolve:5';",
+        ),
+        true,
+    )
+}
+
+#[test]
+fn promise_resolution_observes_overridden_then_methods() -> () {
+    expect_bool(
+        execute_source_with_builtins(
+            "let expected = {}; let inner = Promise.resolve(); inner.then = function(resolve) { resolve(expected); }; let observed; Promise.resolve().then(() => inner).then(value => observed = value); Promise.drainJobs(); return observed === expected;",
+        ),
+        true,
+    )
+}
+
+#[test]
+fn promise_all_uses_receiver_capabilities_and_idempotent_elements() -> () {
+    expect_bool(
+        execute_source_with_builtins(
+            "let calls = []; function Custom(executor) { executor(values => calls.push(values.join(',')), reason => calls.push('reject:' + reason)); } Custom.resolve = value => value; let first = {then(resolve, reject) { resolve(1); resolve(9); reject(8); }}; let second = {then(resolve) { resolve(2); }}; let result = Promise.all.call(Custom, [first, second]); return result instanceof Custom && calls.join('|') === 'reject:8|1,2';",
+        ),
+        true,
+    )
+}
+
+#[test]
+fn promise_combinators_use_capabilities_and_preserve_ordered_results() -> () {
+    expect_bool(
+        execute_source_with_builtins(
+            "let calls = []; function Custom(executor) { executor(value => calls.push('resolve:' + value), reason => calls.push('reject:' + reason)); } Custom.resolve = value => ({then(resolve) { resolve(value); }}); let raced = Promise.race.call(Custom, [3]); let settled; Promise.allSettled([1, Promise.reject(2)]).then(values => settled = values); let aggregate; Promise.any([Promise.reject(3), Promise.reject(4)]).catch(error => aggregate = error); Promise.drainJobs(); return raced instanceof Custom && calls.join(',') === 'resolve:3' && settled[0].status === 'fulfilled' && settled[0].value === 1 && settled[1].status === 'rejected' && settled[1].reason === 2 && aggregate instanceof AggregateError && aggregate.errors.join(',') === '3,4';",
+        ),
+        true,
+    )
+}
+
+#[test]
+fn aggregate_error_collects_iterables_and_accepts_proxy_new_targets() -> () {
+    expect_bool(
+        execute_source_with_builtins(
+            "let order = ''; let errors = {[Symbol.iterator]() { order += 'iterator,'; let index = 0; return {next() { order += 'next,'; index += 1; return index <= 2 ? {value: index, done: false} : {done: true}; }}; }}; let message = {toString() { order += 'message,'; return 'many'; }}; let custom = {}; let NewTarget = new Proxy(function() {}, {get(target, key) { return key === 'prototype' ? custom : target[key]; }}); let result = Reflect.construct(AggregateError, [errors, message], NewTarget); let revoked = Proxy.revocable(function() {}, {}); revoked.revoke(); let revokedFailed = false; try { Reflect.construct(Error, [], revoked.proxy); } catch (error) { revokedFailed = error instanceof TypeError; } return Object.getPrototypeOf(result) === custom && result.message === 'many' && result.errors.join(',') === '1,2' && order === 'message,iterator,next,next,next,' && revokedFailed;",
+        ),
+        true,
+    )
+}
+
+#[test]
+fn proxy_internal_methods_forward_through_prototypes_and_nested_targets() -> () {
+    expect_bool(
+        execute_source_with_builtins(
+            "let getReceiver; let setReceiver; let hasCalls = 0; let target = {get value() { getReceiver = this; return 7; }, set value(value) { setReceiver = this; }}; let proxy = new Proxy(target, {has(target, key) { hasCalls += 1; return false; }}); let heir = Object.create(proxy); let read = heir.value; heir.value = 9; let nestedKeys = new Proxy(new Proxy([], {ownKeys() { return ['length', 'x']; }}), {}); let getInvariant = false; let getProxy = new Proxy({}, {getOwnPropertyDescriptor(target, key) { Object.defineProperty(target, key, {configurable: false, writable: true}); return {configurable: false, writable: false}; }}); try { Object.getOwnPropertyDescriptor(getProxy, 'x'); } catch (error) { getInvariant = error instanceof TypeError; } let defineInvariant = false; let defineProxy = new Proxy({}, {defineProperty(target, key) { Object.defineProperty(target, key, {configurable: false, writable: true}); return true; }}); try { Reflect.defineProperty(defineProxy, 'x', {writable: false}); } catch (error) { defineInvariant = error instanceof TypeError; } let defineCalls = 0; let nestedDefine = new Proxy(new Proxy({}, {defineProperty() { defineCalls += 1; return true; }}), {}); let nestedDefined = Reflect.defineProperty(nestedDefine, 'ok', {}); return read === 7 && getReceiver === heir && setReceiver === heir && !('anything' in heir) && hasCalls === 1 && Reflect.ownKeys(nestedKeys).join(',') === 'length,x' && getInvariant && defineInvariant && nestedDefined && defineCalls === 1;",
+        ),
+        true,
+    )
+}
+
+#[test]
+fn json_uses_observable_proxy_and_boxed_primitive_operations() -> () {
+    expect_bool(
+        execute_source_with_builtins(
+            "let object = new Proxy({}, {ownKeys() { return ['a', 'b']; }, getOwnPropertyDescriptor() { return {enumerable: true, configurable: true}; }, get(target, key) { return key === 'a' ? 1 : 2; }}); let number = new Number(1); number.valueOf = function() { return 3; }; let string = new String('x'); string.toString = function() { return 'y'; }; let token = {}; let arrayAbrupt = false; let array = new Proxy([], {get(target, key) { if (key === 'length') throw token; return target[key]; }}); try { JSON.stringify(array); } catch (error) { arrayAbrupt = error === token; } let reviveAbrupt = false; let bad = new Proxy({a: 1}, {ownKeys() { throw token; }}); try { JSON.parse('[0,0]', function(key, value) { if (key === '0') this[1] = bad; return value; }); } catch (error) { reviveAbrupt = error === token; } return JSON.stringify(object) === '{\"a\":1,\"b\":2}' && JSON.stringify(number) === '3' && JSON.stringify(string) === '\"y\"' && arrayAbrupt && reviveAbrupt;",
+        ),
+        true,
+    )
+}
+
+#[test]
+fn bigint_is_constructable_but_rejects_construction_and_templates_use_string_hint() -> () {
+    expect_bool(
+        execute_source_with_builtins(
+            "let constructable = true; try { Reflect.construct(function() {}, [], BigInt); } catch (_) { constructable = false; } let touched = false; let rejected = false; try { new BigInt({valueOf() { touched = true; return 1; }}); } catch (error) { rejected = error instanceof TypeError; } let value = Object(1n); value.toString = function() { return 'text'; }; value.valueOf = function() { return 2n; }; return constructable && rejected && !touched && `${value}` === 'text' && value + 1n === 3n;",
+        ),
+        true,
+    )
+}
+
+#[test]
+fn number_formatting_truncates_digits_and_orders_non_finite_checks() -> () {
+    expect_bool(
+        execute_source_with_builtins(
+            "let fixedRange = false; try { NaN.toFixed(Infinity); } catch (error) { fixedRange = error instanceof RangeError; } let precisionRange = false; try { (1).toPrecision(NaN); } catch (error) { precisionRange = error instanceof RangeError; } return Number.prototype.toFixed(NaN) === '0' && (123.456).toExponential(0.9) === '1e+2' && NaN.toExponential(Infinity) === 'NaN' && Infinity.toPrecision(1000) === 'Infinity' && fixedRange && precisionRange;",
+        ),
+        true,
+    )
+}
+
+#[test]
+fn math_special_values_preserve_ecmascript_results() -> () {
+    expect_bool(
+        execute_source_with_builtins(
+            "let large = 2 / Number.EPSILON - 1; return Number.isNaN(Math.pow(1, NaN)) && Number.isNaN(Math.pow(-1, Infinity)) && Number.isNaN(1 ** NaN) && 1 / Math.round(-0.25) === -Infinity && Math.round(0.5 - Number.EPSILON / 4) === 0 && Math.round(large) === large && Math.log10(1000) === 3;",
+        ),
+        true,
+    )
+}
+
+#[test]
+fn map_upsert_callbacks_receive_canonical_keys() -> () {
+    expect_bool(
+        execute_source_with_builtins(
+            "let received; new Map().getOrInsertComputed(-0, function(key) { received = key; }); return 1 / received === Infinity;",
+        ),
+        true,
+    )
+}
+
+#[test]
+fn completed_collection_iterators_remain_completed() -> () {
+    expect_bool(
+        execute_source_with_builtins(
+            "let set = new Set([1]); let setValues = set.values(); setValues.next(); let setDone = setValues.next(); set.add(2); let map = new Map([[1, 1]]); let mapValues = map.values(); mapValues.next(); let mapDone = mapValues.next(); map.set(2, 2); return setDone.done && setValues.next().done && mapDone.done && mapValues.next().done;",
+        ),
+        true,
+    )
+}
+
+#[test]
+fn registered_symbols_cannot_be_held_weakly() -> () {
+    expect_bool(
+        execute_source_with_builtins(
+            "let local = Symbol('local'); let registered = Symbol.for('registered'); let map = new WeakMap([[local, 1]]); let mapRejected = false; let setRejected = false; try { map.set(registered, 2); } catch (error) { mapRejected = error instanceof TypeError; } try { new WeakSet().add(registered); } catch (error) { setRejected = error instanceof TypeError; } return map.get(local) === 1 && mapRejected && setRejected;",
+        ),
+        true,
+    )
+}
+
+#[test]
+fn collection_constructors_fall_back_from_non_object_new_target_prototypes() -> () {
+    expect_bool(
+        execute_source_with_builtins(
+            "function NewTarget() {} NewTarget.prototype = null; let map = Reflect.construct(Map, [], NewTarget); let set = Reflect.construct(Set, [], NewTarget); let weakMap = Reflect.construct(WeakMap, [], NewTarget); let weakSet = Reflect.construct(WeakSet, [], NewTarget); let weakRef = Reflect.construct(WeakRef, [{}], NewTarget); let registry = Reflect.construct(FinalizationRegistry, [function() {}], NewTarget); return Object.getPrototypeOf(map) === Map.prototype && Object.getPrototypeOf(set) === Set.prototype && Object.getPrototypeOf(weakMap) === WeakMap.prototype && Object.getPrototypeOf(weakSet) === WeakSet.prototype && Object.getPrototypeOf(weakRef) === WeakRef.prototype && Object.getPrototypeOf(registry) === FinalizationRegistry.prototype;",
+        ),
+        true,
+    )
 }

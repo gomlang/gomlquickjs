@@ -174,7 +174,7 @@ fn forced_module_eval_supports_await_and_forced_script_rejects_it() -> () {
 
 #[test]
 fn executes_source_through_compiler_and_vm() -> () {
-    match execute_source("return 6 * 7;") {
+    match execute_source("6 * 7;") {
         Ok(runtime::Value::Float(value)) => testing::assert_eq(value, 42.0),
         Ok(runtime::Value::Int(value)) => testing::assert_eq(value, 42),
         _ => testing::fail("expected numeric result"),
@@ -183,14 +183,12 @@ fn executes_source_through_compiler_and_vm() -> () {
 
 #[test]
 fn eval_source_functions_expose_cmdline_metadata() -> () {
-    match execute_source(
-        "function f(){} return f.fileName + '|' + f.lineNumber + '|' + f.columnNumber;",
-    ) {
+    match execute_source("function f(){} f.fileName + '|' + f.lineNumber + '|' + f.columnNumber;") {
         Ok(value) => expect_host_string(value, "<cmdline>|1|1"),
         Err(value) => testing::fail(value),
     };
     match execute_source_with_arguments_at_path(
-        "function f(){} return f.fileName;",
+        "function f(){} f.fileName;",
         Vec::new(),
         Option::Some("named.js"),
     ) {
@@ -201,7 +199,7 @@ fn eval_source_functions_expose_cmdline_metadata() -> () {
 
 #[test]
 fn renders_recoverable_compile_diagnostics() -> () {
-    match execute_source("missing; let = ;") {
+    match execute_source("missing; const = ;") {
         Err(message) => {
             testing::assert(text::find(message, "expected variable name").is_some())
         },
@@ -222,7 +220,7 @@ fn renders_uncaught_error_stack_diagnostics() -> () {
 
 #[test]
 fn executes_math_builtins_from_source() -> () {
-    match execute_source("return Math.max(6, 7) * Math.sqrt(36);") {
+    match execute_source("Math.max(6, 7) * Math.sqrt(36);") {
         Ok(runtime::Value::Float(value)) => testing::assert_eq(value, 42.0),
         Ok(runtime::Value::Int(value)) => testing::assert_eq(value, 42),
         _ => testing::fail("expected builtin numeric result"),
@@ -231,10 +229,7 @@ fn executes_math_builtins_from_source() -> () {
 
 #[test]
 fn exposes_eval_and_file_script_arguments() -> () {
-    match execute_source_with_arguments(
-        "return scriptArgs.join('|');",
-        Vec::from_array(["alpha", "beta"]),
-    ) {
+    match execute_source_with_arguments("scriptArgs.join('|');", Vec::from_array(["alpha", "beta"])) {
         Ok(value) => expect_host_string(value, "alpha|beta"),
         Err(value) => testing::fail(value),
     };
@@ -250,7 +245,7 @@ fn exposes_eval_and_file_script_arguments() -> () {
 
 #[test]
 fn executes_json_builtins_from_source() -> () {
-    match execute_source("return JSON.stringify(JSON.parse('{\"value\":42}'));") {
+    match execute_source("JSON.stringify(JSON.parse('{\"value\":42}'));") {
         Ok(runtime::Value::String(value)) => match value.to_host_string() {
             Ok(value) => testing::assert_eq(value, "{\"value\":42}"),
             Err(value) => testing::fail(value.debug()),
@@ -271,20 +266,20 @@ fn expect_host_string(value: runtime::Value, expected: string) -> () {
 
 #[test]
 fn executes_bigint_regexp_uri_and_date_builtins_from_source() -> () {
-    match execute_source("return String(2n ** 100n);") {
+    match execute_source("String(2n ** 100n);") {
         Ok(value) => expect_host_string(value, "1267650600228229401496703205376"),
         Err(value) => testing::fail(value),
     };
-    match execute_source("return RegExp('a+', 'g').test('caa');") {
+    match execute_source("RegExp('a+', 'g').test('caa');") {
         Ok(runtime::Value::Bool(value)) => testing::assert(value),
         Ok(_) => testing::fail("expected RegExp result"),
         Err(value) => testing::fail(value),
     };
-    match execute_source("return decodeURIComponent(encodeURIComponent('a/😀'));") {
+    match execute_source("decodeURIComponent(encodeURIComponent('a/😀'));") {
         Ok(value) => expect_host_string(value, "a/😀"),
         Err(value) => testing::fail(value),
     };
-    match execute_source("return Date.toISOString(Date.UTC(2000, 1, 30));") {
+    match execute_source("Date.toISOString(Date.UTC(2000, 1, 30));") {
         Ok(value) => expect_host_string(value, "2000-03-01T00:00:00.000Z"),
         Err(value) => testing::fail(value),
     }
@@ -292,12 +287,12 @@ fn executes_bigint_regexp_uri_and_date_builtins_from_source() -> () {
 
 #[test]
 fn executes_symbol_buffer_error_and_promise_builtins_from_source() -> () {
-    match execute_source("return Symbol.keyFor(Symbol.for('shared'));") {
+    match execute_source("Symbol.keyFor(Symbol.for('shared'));") {
         Ok(value) => expect_host_string(value, "shared"),
         Err(value) => testing::fail(value),
     };
     match execute_source(
-        "let buffer = new ArrayBuffer(4); let view = new DataView(buffer); view.setUint32(0, 305419896); return view.getUint32(0);",
+        "let buffer = new ArrayBuffer(4); let view = new DataView(buffer); view.setUint32(0, 305419896); view.getUint32(0);",
     ) {
         Ok(runtime::Value::Float(value)) => testing::assert_eq(value, 305419896.0),
         Ok(runtime::Value::Int(value)) => testing::assert_eq(value, 305419896),
@@ -305,13 +300,13 @@ fn executes_symbol_buffer_error_and_promise_builtins_from_source() -> () {
         _ => testing::fail("expected DataView result"),
     };
     match execute_source(
-        "try { throw TypeError('broken'); } catch (error) { return error.name + ': ' + error.message; }",
+        "try { throw TypeError('broken'); } catch (error) { error.name + ': ' + error.message; }",
     ) {
         Ok(value) => expect_host_string(value, "TypeError: broken"),
         Err(value) => testing::fail(value),
     };
     match execute_source(
-        "let result = 0; Promise.resolve(41).then(function(value) { result = value + 1; }); Promise.drainJobs(); return result;",
+        "let result = 0; Promise.resolve(41).then(function(value) { result = value + 1; }); Promise.drainJobs(); result;",
     ) {
         Ok(runtime::Value::Float(value)) => testing::assert_eq(value, 42.0),
         Ok(runtime::Value::Int(value)) => testing::assert_eq(value, 42),
@@ -323,7 +318,7 @@ fn executes_symbol_buffer_error_and_promise_builtins_from_source() -> () {
 #[test]
 fn drains_host_jobs_after_top_level_execution() -> () {
     match execute_source(
-        "os.setTimeout(function(value) { if (value !== 42) throw TypeError('wrong timer value'); }, 0, 42); return os.platform;",
+        "os.setTimeout(function(value) { if (value !== 42) throw TypeError('wrong timer value'); }, 0, 42); os.platform;",
     ) {
         Ok(value) => expect_host_string(value, "linux"),
         Err(value) => testing::fail(value),

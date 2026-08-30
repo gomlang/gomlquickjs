@@ -255,6 +255,26 @@ fn decodes_template_escapes_and_normalizes_crlf() -> () {
 }
 
 #[test]
+fn removes_unicode_line_continuations_from_template_values() -> () {
+    let result = lex("`\\\u2028\\\u2029`");
+    testing::assert_eq(result.errors.len(), 0);
+    assert_kind(result, 0, TokenKind::NoSubstitutionTemplate);
+    testing::assert_eq(result.tokens[0].value, "")
+}
+
+#[test]
+fn malformed_template_escapes_stop_at_template_boundaries() -> () {
+    let result = lex("tag`\\u0`; tag`\\u{g`; value");
+    testing::assert_eq(result.errors.len(), 0);
+    assert_kind(result, 0, TokenKind::Identifier);
+    assert_kind(result, 1, TokenKind::NoSubstitutionTemplate);
+    assert_kind(result, 4, TokenKind::NoSubstitutionTemplate);
+    assert_kind(result, 7, TokenKind::Eof);
+    testing::assert(!result.tokens[1].template_errors.is_empty());
+    testing::assert(!result.tokens[4].template_errors.is_empty())
+}
+
+#[test]
 fn reports_unterminated_templates_and_recovers_to_eof() -> () {
     let result = lex("before `never ${ends");
     testing::assert_eq(result.errors.len(), 1);
@@ -413,6 +433,13 @@ fn decodes_common_string_escapes() -> () {
 }
 
 #[test]
+fn decodes_legacy_octal_and_non_octal_string_escapes() -> () {
+    let result = lex("'\\1\\40\\377\\400\\8\\9'");
+    testing::assert_eq(result.errors.len(), 0);
+    testing::assert_eq(result.tokens[0].value.byte_len(), 8)
+}
+
+#[test]
 fn accepts_surrogate_code_units_in_string_escapes() -> () {
     let result = lex("\"\\ud800\\u{dc00}\" '\\udfff'");
     testing::assert_eq(result.errors.len(), 0);
@@ -446,6 +473,12 @@ fn scans_legacy_octal_before_property_access() -> () {
     assert_kind(result, 2, TokenKind::Identifier);
     testing::assert_eq(result.tokens[3].lexeme, "077");
     testing::assert_eq(result.tokens[4].lexeme, "08.5")
+}
+
+#[test]
+fn rejects_numeric_separators_after_a_leading_zero() -> () {
+    let result = lex("0_0 0_8 0_0123456789 08_0 09_0");
+    testing::assert_eq(result.errors.len(), 5)
 }
 
 #[test]
