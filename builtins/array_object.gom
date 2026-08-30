@@ -1,6 +1,5 @@
 package builtins;
 
-use gomlang::quickjs::arrayx;
 use gomlang::quickjs::dtoa;
 use gomlang::quickjs::runtime;
 use gomlang::quickjs::vm;
@@ -32,254 +31,28 @@ struct ArraySortSlot {
 
 const ARRAY_FROM_LIMIT: isize = 16777216;
 
+const ARRAY_MAX_SAFE_INTEGER: isize = 9007199254740991;
+
 const ARRAY_FLAT_RECURSION_LIMIT: isize = 256;
 
-fn array_builtin_receiver(value: runtime::Value) -> Result[runtime::ObjectId, vm::NativeError] {
-    match value {
-        runtime::Value::Object(value) => Result::Ok(value),
-        _ => Result::Err(native_error("Array method requires an Array receiver")),
-    }
-}
-
-fn array_builtin_error(value: arrayx::ArrayError) -> vm::NativeError {
-    native_error(value.to_string())
-}
-
-fn array_builtin_integer(value: runtime::Value, default_value: isize) -> Result[
-    isize,
-    vm::NativeError,
-] {
-    match value {
-        runtime::Value::Undefined => Result::Ok(default_value),
-        value => {
-            let number = match runtime::primitive_to_number(value) {
-                Ok(value) => value,
-                Err(value) => return Result::Err(native_error(value.message)),
-            };
-            if math::is_nan(number) || number == 0.0 {
-                Result::Ok(0)
-            } else if number == infinity() || number > 4294967296.0 {
-                Result::Ok(4294967296)
-            } else if number == -infinity() || number < -4294967296.0 {
-                Result::Ok(-4294967296)
-            } else {
-                Result::Ok(
-                    num::parse_int_structured(dtoa::number_to_string(math::trunc(number))).unwrap_or(
-                        0,
-                    ),
-                )
-            }
-        },
-    }
-}
-
-fn array_builtin_slot(value: arrayx::ArraySlot) -> runtime::Value {
-    match value {
-        arrayx::ArraySlot::Hole => runtime::Value::Undefined,
-        arrayx::ArraySlot::Value(value) => value,
-    }
-}
-
-fn array_builtin_at(heap: runtime::Heap, this_value: runtime::Value, arguments: Vec[runtime::Value]) -> Result[
-    runtime::Value,
-    vm::NativeError,
-] {
-    let array = array_builtin_receiver(this_value)?;
-    let index = array_builtin_integer(argument(arguments, 0), 0)?;
-    match arrayx::at(heap, array, index) {
-        Ok(value) => Result::Ok(array_builtin_slot(value)),
-        Err(value) => Result::Err(array_builtin_error(value)),
-    }
-}
-
-fn array_builtin_join(
-    heap: runtime::Heap,
+fn array_builtin_at(
+    context: vm::Context,
     this_value: runtime::Value,
     arguments: Vec[runtime::Value],
-) -> Result[runtime::Value, vm::NativeError] {
-    let array = array_builtin_receiver(this_value)?;
-    let separator = match argument(arguments, 0) {
-        runtime::Value::Undefined => js_string(","),
-        value => value_string(heap, value)?,
-    };
-    match arrayx::join(heap, array, separator) {
-        Ok(value) => Result::Ok(runtime::Value::String(value)),
-        Err(value) => Result::Err(array_builtin_error(value)),
-    }
-}
-
-fn array_builtin_reverse(
-    heap: runtime::Heap,
-    this_value: runtime::Value,
-    arguments: Vec[runtime::Value],
-) -> Result[runtime::Value, vm::NativeError] {
-    let _ = arguments;
-    let array = array_builtin_receiver(this_value)?;
-    match arrayx::reverse(heap, array) {
-        Ok(()) => Result::Ok(runtime::Value::Object(array)),
-        Err(value) => Result::Err(array_builtin_error(value)),
-    }
-}
-
-fn array_builtin_slice(
-    heap: runtime::Heap,
-    this_value: runtime::Value,
-    arguments: Vec[runtime::Value],
-) -> Result[runtime::Value, vm::NativeError] {
-    let array = array_builtin_receiver(this_value)?;
-    let start = array_builtin_integer(argument(arguments, 0), 0)?;
-    let end = match argument(arguments, 1) {
-        runtime::Value::Undefined => Option::None,
-        value => Option::Some(array_builtin_integer(value, 0)?),
-    };
-    match arrayx::slice(heap, array, start, end) {
-        Ok(value) => Result::Ok(runtime::Value::Object(value)),
-        Err(value) => Result::Err(array_builtin_error(value)),
-    }
-}
-
-fn array_builtin_concat(
-    heap: runtime::Heap,
-    this_value: runtime::Value,
-    arguments: Vec[runtime::Value],
-) -> Result[runtime::Value, vm::NativeError] {
-    let array = array_builtin_receiver(this_value)?;
-    let items: Vec[arrayx::ConcatItem] = Vec::with_capacity(arguments.len());
-    for argument in arguments {
-        match argument {
-            runtime::Value::Object(value) => match heap.get(value) {
-                Some(object) => match object.kind() {
-                    runtime::ObjectKind::Array => items.push(arrayx::ConcatItem::Spread(value)),
-                    _ => items.push(arrayx::ConcatItem::Value(runtime::Value::Object(value))),
-                },
-                None => items.push(arrayx::ConcatItem::Value(runtime::Value::Object(value))),
-            },
-            value => items.push(arrayx::ConcatItem::Value(value)),
-        }
-    }
-    match arrayx::concat(heap, array, items) {
-        Ok(value) => Result::Ok(runtime::Value::Object(value)),
-        Err(value) => Result::Err(array_builtin_error(value)),
-    }
-}
-
-fn array_builtin_index_of(
-    heap: runtime::Heap,
-    this_value: runtime::Value,
-    arguments: Vec[runtime::Value],
-) -> Result[runtime::Value, vm::NativeError] {
-    let array = array_builtin_receiver(this_value)?;
-    let index = array_builtin_integer(argument(arguments, 1), 0)?;
-    match arrayx::index_of(heap, array, argument(arguments, 0), index) {
-        Ok(value) => Result::Ok(runtime::Value::Int(value.to_i32())),
-        Err(value) => Result::Err(array_builtin_error(value)),
-    }
-}
-
-fn array_builtin_last_index_of(
-    heap: runtime::Heap,
-    this_value: runtime::Value,
-    arguments: Vec[runtime::Value],
-) -> Result[runtime::Value, vm::NativeError] {
-    let array = array_builtin_receiver(this_value)?;
-    let index = match argument(arguments, 1) {
-        runtime::Value::Undefined => Option::None,
-        value => Option::Some(array_builtin_integer(value, 0)?),
-    };
-    match arrayx::last_index_of(heap, array, argument(arguments, 0), index) {
-        Ok(value) => Result::Ok(runtime::Value::Int(value.to_i32())),
-        Err(value) => Result::Err(array_builtin_error(value)),
-    }
-}
-
-fn array_builtin_includes(
-    heap: runtime::Heap,
-    this_value: runtime::Value,
-    arguments: Vec[runtime::Value],
-) -> Result[runtime::Value, vm::NativeError] {
-    let array = array_builtin_receiver(this_value)?;
-    let index = array_builtin_integer(argument(arguments, 1), 0)?;
-    match arrayx::includes(heap, array, argument(arguments, 0), index) {
-        Ok(value) => Result::Ok(runtime::Value::Bool(value)),
-        Err(value) => Result::Err(array_builtin_error(value)),
-    }
-}
-
-fn array_builtin_push(
-    heap: runtime::Heap,
-    this_value: runtime::Value,
-    arguments: Vec[runtime::Value],
-) -> Result[runtime::Value, vm::NativeError] {
-    let array = array_builtin_receiver(this_value)?;
-    match arrayx::push(heap, array, arguments) {
-        Ok(value) => Result::Ok(array_length_value(value)),
-        Err(value) => Result::Err(array_builtin_error(value)),
-    }
-}
-
-fn array_builtin_pop(
-    heap: runtime::Heap,
-    this_value: runtime::Value,
-    arguments: Vec[runtime::Value],
-) -> Result[runtime::Value, vm::NativeError] {
-    let _ = arguments;
-    let array = array_builtin_receiver(this_value)?;
-    match arrayx::pop(heap, array) {
-        Ok(value) => Result::Ok(array_builtin_slot(value)),
-        Err(value) => Result::Err(array_builtin_error(value)),
-    }
-}
-
-fn array_builtin_shift(
-    heap: runtime::Heap,
-    this_value: runtime::Value,
-    arguments: Vec[runtime::Value],
-) -> Result[runtime::Value, vm::NativeError] {
-    let _ = arguments;
-    let array = array_builtin_receiver(this_value)?;
-    match arrayx::shift(heap, array) {
-        Ok(value) => Result::Ok(array_builtin_slot(value)),
-        Err(value) => Result::Err(array_builtin_error(value)),
-    }
-}
-
-fn array_builtin_unshift(
-    heap: runtime::Heap,
-    this_value: runtime::Value,
-    arguments: Vec[runtime::Value],
-) -> Result[runtime::Value, vm::NativeError] {
-    let array = array_builtin_receiver(this_value)?;
-    match arrayx::unshift(heap, array, arguments) {
-        Ok(value) => Result::Ok(array_length_value(value)),
-        Err(value) => Result::Err(array_builtin_error(value)),
-    }
-}
-
-fn array_builtin_splice(
-    heap: runtime::Heap,
-    this_value: runtime::Value,
-    arguments: Vec[runtime::Value],
-) -> Result[runtime::Value, vm::NativeError] {
-    let array = array_builtin_receiver(this_value)?;
-    let size = match arrayx::length(heap, array) {
-        Ok(value) => value,
-        Err(value) => return Result::Err(array_builtin_error(value)),
-    };
-    let start = array_builtin_integer(argument(arguments, 0), 0)?;
-    let delete_count = if arguments.len() < 2 {
-        size
+    depth: isize,
+) -> Result[runtime::Value, vm::VmError] {
+    let object = array_object_value(context, this_value)?;
+    let length = array_iterator_length(context, object, depth)?;
+    let relative = array_copy_integer(context, argument(arguments, 0), 0, depth)?;
+    let index = if relative >= 0 {
+        relative
     } else {
-        array_builtin_integer(argument(arguments, 1), 0)?
+        length + relative
     };
-    let items: Vec[runtime::Value] = Vec::new();
-    let mut index = 2;
-    while index < arguments.len() {
-        items.push(arguments[index]);
-        index += 1;
-    }
-    match arrayx::splice(heap, array, start, delete_count, items) {
-        Ok(value) => Result::Ok(runtime::Value::Object(value)),
-        Err(value) => Result::Err(array_builtin_error(value)),
+    if index < 0 || index >= length {
+        Result::Ok(runtime::Value::Undefined)
+    } else {
+        context.read_property_at_depth(object, array_length_value(index), depth)
     }
 }
 
@@ -299,10 +72,10 @@ fn array_copy_integer(
             };
             if math::is_nan(number) || number == 0.0 {
                 Result::Ok(0)
-            } else if number >= 4294967296.0 || number == infinity() {
-                Result::Ok(4294967296)
-            } else if number <= -4294967296.0 || number == -infinity() {
-                Result::Ok(-4294967296)
+            } else if number >= 9007199254740991.0 || number == infinity() {
+                Result::Ok(ARRAY_MAX_SAFE_INTEGER)
+            } else if number <= -9007199254740991.0 || number == -infinity() {
+                Result::Ok(-ARRAY_MAX_SAFE_INTEGER)
             } else {
                 Result::Ok(
                     num::parse_int_structured(dtoa::number_to_string(math::trunc(number))).unwrap_or(
@@ -346,22 +119,11 @@ fn array_object_value(context: vm::Context, value: runtime::Value) -> Result[
     }
 }
 
-fn array_property_present(context: vm::Context, object: runtime::Value, index: isize) -> Result[
+fn array_property_present(context: vm::Context, object: runtime::Value, index: isize, depth: isize) -> Result[
     bool,
     vm::VmError,
 ] {
-    let object = match object {
-        runtime::Value::Object(value) => value,
-        _ => return Result::Err(function_vm_error("Array receiver is not an object")),
-    };
-    match runtime::get_property_descriptor(
-        context.heap(),
-        object,
-        runtime::string_property_key(index.to_string()),
-    ) {
-        Ok(value) => Result::Ok(value.is_some()),
-        Err(value) => Result::Err(function_vm_error(value.message)),
-    }
+    context.has_property_at_depth(object, array_length_value(index), depth)
 }
 
 fn array_set_value(
@@ -378,19 +140,11 @@ fn array_set_value(
     }
 }
 
-fn array_delete_value(context: vm::Context, object: runtime::Value, index: isize) -> Result[
+fn array_delete_value(context: vm::Context, object: runtime::Value, index: isize, depth: isize) -> Result[
     (),
     vm::VmError,
 ] {
-    let object = match object {
-        runtime::Value::Object(value) => value,
-        _ => return Result::Err(function_vm_error("Array receiver is not an object")),
-    };
-    if runtime::delete_property(
-        context.heap(),
-        object,
-        runtime::string_property_key(index.to_string()),
-    ) {
+    if context.delete_property_at_depth(object, array_length_value(index), depth)? {
         Result::Ok(())
     } else {
         Result::Err(function_vm_error("Array property is not configurable"))
@@ -408,6 +162,52 @@ fn array_copy_result(context: vm::Context, values: Vec[runtime::Value]) -> Resul
     }
 }
 
+fn array_join_append(output: Vec[u16], value: runtime::JsString) -> Result[(), vm::VmError] {
+    if value.len() > STRING_LENGTH_LIMIT - output.len() {
+        return Result::Err(function_range_error("Array string exceeds implementation limit"))
+    } else {};
+    let mut index = 0;
+    while index < value.len() {
+        output.push(value.get(index));
+        index += 1;
+    }
+    Result::Ok(())
+}
+
+fn array_join(
+    context: vm::Context,
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+    depth: isize,
+) -> Result[runtime::Value, vm::VmError] {
+    let source = array_object_value(context, this_value)?;
+    let length = array_iterator_length(context, source, depth)?;
+    let separator = match argument(arguments, 0) {
+        runtime::Value::Undefined => js_string(","),
+        value => match string_value_at_depth(context, value, depth)? {
+            runtime::Value::String(value) => value,
+            _ => return Result::Err(function_vm_error("Array separator is not a string")),
+        },
+    };
+    let output: Vec[u16] = Vec::new();
+    let mut index = 0;
+    while index < length {
+        if index > 0 {
+            array_join_append(output, separator)?
+        } else {};
+        let value = context.read_property_at_depth(source, array_length_value(index), depth)?;
+        match value {
+            runtime::Value::Undefined | runtime::Value::Null => (),
+            _ => match string_value_at_depth(context, value, depth)? {
+                runtime::Value::String(value) => array_join_append(output, value)?,
+                _ => return Result::Err(function_vm_error("Array value is not a string")),
+            },
+        };
+        index += 1;
+    }
+    Result::Ok(runtime::Value::String(runtime::JsString::from_code_units(output)))
+}
+
 fn array_value_is_array(heap: runtime::Heap, value: runtime::Value) -> bool {
     match value {
         runtime::Value::Object(value) => match heap.get(value) {
@@ -421,15 +221,95 @@ fn array_value_is_array(heap: runtime::Heap, value: runtime::Value) -> bool {
     }
 }
 
+fn array_species_default(context: vm::Context, length: isize) -> Result[runtime::Value, vm::VmError] {
+    if length < 0 || length > 4294967295 {
+        Result::Err(function_range_error("invalid array length"))
+    } else {
+        match runtime::new_array(context.heap(), length) {
+            Ok(value) => Result::Ok(runtime::Value::Object(value)),
+            Err(value) => Result::Err(function_vm_error(value.message)),
+        }
+    }
+}
+
+fn array_is_intrinsic_constructor(context: vm::Context, value: runtime::Value) -> bool {
+    match context.global_object() {
+        Some(global) => match runtime::get_property(
+            context.heap(),
+            global,
+            runtime::string_property_key("Array"),
+        ) {
+            Ok(Some(array)) => runtime::same_value(array, value),
+            _ => false,
+        },
+        None => false,
+    }
+}
+
+fn array_length_descriptor_at_depth(
+    context: vm::Context,
+    object: runtime::ObjectId,
+    key: runtime::PropertyKey,
+    descriptor: runtime::PropertyDescriptor,
+    depth: isize,
+) -> Result[runtime::PropertyDescriptor, vm::VmError] {
+    let is_array_length = match context.heap().get(object) {
+        Some(value) => match value.kind() {
+            runtime::ObjectKind::Array => key == runtime::string_property_key("length"),
+            _ => false,
+        },
+        None => false,
+    };
+    if !is_array_length {
+        return Result::Ok(descriptor)
+    } else {};
+    match descriptor {
+        runtime::PropertyDescriptor::Data { value, writable, enumerable, configurable } => {
+            let first = context.to_primitive_number_at_depth(value, depth)?;
+            let first_number = match runtime::primitive_to_number(first) {
+                Ok(value) => value,
+                Err(value) => return Result::Err(function_vm_error(value.message)),
+            };
+            let new_length = to_u32(first_number);
+            let second = context.to_primitive_number_at_depth(value, depth)?;
+            let second_number = match runtime::primitive_to_number(second) {
+                Ok(value) => value,
+                Err(value) => return Result::Err(function_vm_error(value.message)),
+            };
+            let normalized_number = num::parse_float64_structured(new_length.to_string()).unwrap_or(
+                0.0,
+            );
+            if normalized_number != second_number {
+                Result::Err(function_range_error("invalid array length"))
+            } else {
+                Result::Ok(
+                    runtime::data_descriptor(
+                        if new_length <= 2147483647 {
+                            runtime::Value::Int(new_length.to_i32())
+                        } else {
+                            runtime::Value::Float(normalized_number)
+                        },
+                        writable,
+                        enumerable,
+                        configurable,
+                    ),
+                )
+            }
+        },
+        runtime::PropertyDescriptor::Accessor { .. } => Result::Ok(descriptor),
+    }
+}
+
 fn array_species_create(context: vm::Context, original: runtime::Value, length: isize, depth: isize) -> Result[
     runtime::Value,
     vm::VmError,
 ] {
-    if !array_value_is_array(context.heap(), original) {
-        return match runtime::new_array(context.heap(), length) {
-            Ok(value) => Result::Ok(runtime::Value::Object(value)),
-            Err(value) => Result::Err(function_vm_error(value.message)),
-        }
+    let is_array = match array_is_array_value(context.heap(), original) {
+        Ok(value) => value,
+        Err(value) => return Result::Err(function_vm_error(value.message)),
+    };
+    if !is_array {
+        return array_species_default(context, length)
     } else {};
     let constructor = context.read_property_at_depth(
         original,
@@ -447,22 +327,18 @@ fn array_species_create(context: vm::Context, original: runtime::Value, length: 
                 None => runtime::Value::Undefined,
             };
             match species {
-                runtime::Value::Null | runtime::Value::Undefined => return match runtime::new_array(
-                    context.heap(),
-                    length,
-                ) {
-                    Ok(value) => Result::Ok(runtime::Value::Object(value)),
-                    Err(value) => Result::Err(function_vm_error(value.message)),
+                runtime::Value::Null | runtime::Value::Undefined => {
+                    return array_species_default(context, length)
                 },
                 value => value,
             }
         },
-        runtime::Value::Undefined => return match runtime::new_array(context.heap(), length) {
-            Ok(value) => Result::Ok(runtime::Value::Object(value)),
-            Err(value) => Result::Err(function_vm_error(value.message)),
-        },
+        runtime::Value::Undefined => return array_species_default(context, length),
         value => value,
     };
+    if array_is_intrinsic_constructor(context, selected) && length > 4294967295 {
+        return Result::Err(function_range_error("invalid array length"))
+    } else {};
     let result = context.construct_with_new_target_at_depth(
         selected,
         Vec::from_array([array_length_value(length)]),
@@ -560,7 +436,11 @@ fn array_to_spliced(
     } else {
         0
     };
-    let new_length = length - delete_count + item_count;
+    let retained_count = length - delete_count;
+    if item_count > ARRAY_MAX_SAFE_INTEGER - retained_count {
+        return Result::Err(function_vm_error("invalid array length"))
+    } else {};
+    let new_length = retained_count + item_count;
     if new_length > ARRAY_FROM_LIMIT {
         return Result::Err(function_range_error("Array result exceeds implementation limit"))
     } else {};
@@ -637,9 +517,7 @@ fn array_sort_compare_slots(
                 array_sort_slot_string(context, right, depth)?,
             ),
         ),
-        _ => if runtime::strict_equal(left.value, right.value) {
-            Result::Ok(0)
-        } else {
+        _ => {
             let result = context.invoke_with_this_at_depth(
                 callback,
                 Vec::from_array([left.value, right.value]),
@@ -694,7 +572,7 @@ fn array_collect_sort_values(
     let mut undefined_count = 0;
     let mut index = 0;
     while index < length {
-        if dense || array_property_present(context, object, index)? {
+        if dense || array_property_present(context, object, index, depth)? {
             let value = array_copy_read(context, object, index, depth)?;
             match value {
                 runtime::Value::Undefined => {
@@ -806,17 +684,308 @@ fn array_copy_within(
     } else {};
     let mut remaining = count;
     while remaining > 0 {
-        if array_property_present(context, object, source)? {
+        if array_property_present(context, object, source, depth)? {
             let value = array_copy_read(context, object, source, depth)?;
             array_set_value(context, object, target, value, depth)?
         } else {
-            array_delete_value(context, object, target)?
+            array_delete_value(context, object, target, depth)?
         };
         source += direction;
         target += direction;
         remaining -= 1;
     }
     Result::Ok(object)
+}
+
+fn array_reverse(
+    context: vm::Context,
+    this_value: runtime::Value,
+    _arguments: Vec[runtime::Value],
+    depth: isize,
+) -> Result[runtime::Value, vm::VmError] {
+    let object = array_object_value(context, this_value)?;
+    let length = array_iterator_length(context, object, depth)?;
+    let mut lower = 0;
+    while lower < length / 2 {
+        let upper = length - lower - 1;
+        let lower_value = if array_property_present(context, object, lower, depth)? {
+            Option::Some(array_copy_read(context, object, lower, depth)?)
+        } else {
+            Option::None
+        };
+        let upper_value = if array_property_present(context, object, upper, depth)? {
+            Option::Some(array_copy_read(context, object, upper, depth)?)
+        } else {
+            Option::None
+        };
+        match (lower_value, upper_value) {
+            (Some(lower_value), Some(upper_value)) => {
+                array_set_value(context, object, lower, upper_value, depth)?;
+                array_set_value(context, object, upper, lower_value, depth)?
+            },
+            (Some(lower_value), None) => {
+                array_delete_value(context, object, lower, depth)?;
+                array_set_value(context, object, upper, lower_value, depth)?
+            },
+            (None, Some(upper_value)) => {
+                array_set_value(context, object, lower, upper_value, depth)?;
+                array_delete_value(context, object, upper, depth)?
+            },
+            (None, None) => (),
+        };
+        lower += 1;
+    }
+    Result::Ok(object)
+}
+
+fn array_index_of(
+    context: vm::Context,
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+    depth: isize,
+) -> Result[runtime::Value, vm::VmError] {
+    let object = array_object_value(context, this_value)?;
+    let length = array_iterator_length(context, object, depth)?;
+    if length == 0 {
+        return Result::Ok(runtime::Value::Int(-1))
+    } else {};
+    let from_index = array_copy_integer(context, argument(arguments, 1), 0, depth)?;
+    if from_index >= length {
+        return Result::Ok(runtime::Value::Int(-1))
+    } else {};
+    let mut index = if from_index >= 0 {
+        from_index
+    } else {
+        let relative = length + from_index;
+        if relative < 0 {
+            0
+        } else {
+            relative
+        }
+    };
+    let search_element = argument(arguments, 0);
+    while index < length {
+        if array_property_present(context, object, index, depth)?
+            && runtime::strict_equal(
+                array_copy_read(context, object, index, depth)?,
+                search_element,
+            ) {
+            return Result::Ok(array_length_value(index))
+        } else {};
+        index += 1;
+    }
+    Result::Ok(runtime::Value::Int(-1))
+}
+
+fn array_last_index_start(context: vm::Context, value: runtime::Value, length: isize, depth: isize) -> Result[
+    Option[isize],
+    vm::VmError,
+] {
+    let primitive = context.to_primitive_number_at_depth(value, depth)?;
+    let number = match runtime::primitive_to_number(primitive) {
+        Ok(value) => value,
+        Err(value) => return Result::Err(function_vm_error(value.message)),
+    };
+    let integer = if math::is_nan(number) {
+        0.0
+    } else {
+        math::trunc(number)
+    };
+    if integer == 0.0 {
+        Result::Ok(Option::Some(0))
+    } else if integer > 0.0 {
+        if integer >= int_float(length - 1) {
+            Result::Ok(Option::Some(length - 1))
+        } else {
+            Result::Ok(
+                Option::Some(
+                    num::parse_int_structured(dtoa::number_to_string(integer)).unwrap_or(0),
+                ),
+            )
+        }
+    } else {
+        let relative = int_float(length) + integer;
+        if relative < 0.0 {
+            Result::Ok(Option::None)
+        } else {
+            Result::Ok(
+                Option::Some(
+                    num::parse_int_structured(dtoa::number_to_string(relative)).unwrap_or(0),
+                ),
+            )
+        }
+    }
+}
+
+fn array_last_index_of(
+    context: vm::Context,
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+    depth: isize,
+) -> Result[runtime::Value, vm::VmError] {
+    let object = array_object_value(context, this_value)?;
+    let length = array_iterator_length(context, object, depth)?;
+    if length == 0 {
+        return Result::Ok(runtime::Value::Int(-1))
+    } else {};
+    let start = if arguments.len() < 2 {
+        Option::Some(length - 1)
+    } else {
+        array_last_index_start(context, arguments[1], length, depth)?
+    };
+    let mut index = match start {
+        Some(value) => value,
+        None => return Result::Ok(runtime::Value::Int(-1)),
+    };
+    let search_element = argument(arguments, 0);
+    while index >= 0 {
+        if array_property_present(context, object, index, depth)?
+            && runtime::strict_equal(
+                array_copy_read(context, object, index, depth)?,
+                search_element,
+            ) {
+            return Result::Ok(array_length_value(index))
+        } else {};
+        index -= 1;
+    }
+    Result::Ok(runtime::Value::Int(-1))
+}
+
+fn array_includes(
+    context: vm::Context,
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+    depth: isize,
+) -> Result[runtime::Value, vm::VmError] {
+    let object = array_object_value(context, this_value)?;
+    let length = array_iterator_length(context, object, depth)?;
+    if length == 0 {
+        return Result::Ok(runtime::Value::Bool(false))
+    } else {};
+    let from_index = array_copy_integer(context, argument(arguments, 1), 0, depth)?;
+    if from_index >= length {
+        return Result::Ok(runtime::Value::Bool(false))
+    } else {};
+    let mut index = if from_index >= 0 {
+        from_index
+    } else {
+        let relative = length + from_index;
+        if relative < 0 {
+            0
+        } else {
+            relative
+        }
+    };
+    let search_element = argument(arguments, 0);
+    while index < length {
+        if runtime::same_value_zero(array_copy_read(context, object, index, depth)?, search_element) {
+            return Result::Ok(runtime::Value::Bool(true))
+        } else {};
+        index += 1;
+    }
+    Result::Ok(runtime::Value::Bool(false))
+}
+
+fn array_push(
+    context: vm::Context,
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+    depth: isize,
+) -> Result[runtime::Value, vm::VmError] {
+    let object = array_object_value(context, this_value)?;
+    let mut length = array_iterator_length(context, object, depth)?;
+    if arguments.len() > ARRAY_MAX_SAFE_INTEGER - length {
+        return Result::Err(function_vm_error("Array push exceeds maximum safe length"))
+    } else {};
+    for value in arguments {
+        array_set_value(context, object, length, value, depth)?;
+        length += 1;
+    }
+    array_set_length(context, object, length, depth)?;
+    Result::Ok(array_length_value(length))
+}
+
+fn array_pop(
+    context: vm::Context,
+    this_value: runtime::Value,
+    _arguments: Vec[runtime::Value],
+    depth: isize,
+) -> Result[runtime::Value, vm::VmError] {
+    let object = array_object_value(context, this_value)?;
+    let length = array_iterator_length(context, object, depth)?;
+    if length == 0 {
+        array_set_length(context, object, 0, depth)?;
+        return Result::Ok(runtime::Value::Undefined)
+    } else {};
+    let new_length = length - 1;
+    let element = array_copy_read(context, object, new_length, depth)?;
+    array_delete_value(context, object, new_length, depth)?;
+    array_set_length(context, object, new_length, depth)?;
+    Result::Ok(element)
+}
+
+fn array_shift(
+    context: vm::Context,
+    this_value: runtime::Value,
+    _arguments: Vec[runtime::Value],
+    depth: isize,
+) -> Result[runtime::Value, vm::VmError] {
+    let object = array_object_value(context, this_value)?;
+    let length = array_iterator_length(context, object, depth)?;
+    if length == 0 {
+        array_set_length(context, object, 0, depth)?;
+        return Result::Ok(runtime::Value::Undefined)
+    } else {};
+    let first = array_copy_read(context, object, 0, depth)?;
+    let mut index = 1;
+    while index < length {
+        if array_property_present(context, object, index, depth)? {
+            let value = array_copy_read(context, object, index, depth)?;
+            array_set_value(context, object, index - 1, value, depth)?
+        } else {
+            array_delete_value(context, object, index - 1, depth)?
+        };
+        index += 1;
+    }
+    array_delete_value(context, object, length - 1, depth)?;
+    array_set_length(context, object, length - 1, depth)?;
+    Result::Ok(first)
+}
+
+fn array_unshift(
+    context: vm::Context,
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+    depth: isize,
+) -> Result[runtime::Value, vm::VmError] {
+    let object = array_object_value(context, this_value)?;
+    let length = array_iterator_length(context, object, depth)?;
+    let item_count = arguments.len();
+    if item_count > ARRAY_MAX_SAFE_INTEGER - length {
+        return Result::Err(function_vm_error("Array unshift exceeds maximum safe length"))
+    } else {};
+    if item_count > 0 {
+        let mut index = length;
+        while index > 0 {
+            let source = index - 1;
+            let target = index + item_count - 1;
+            if array_property_present(context, object, source, depth)? {
+                let value = array_copy_read(context, object, source, depth)?;
+                array_set_value(context, object, target, value, depth)?
+            } else {
+                array_delete_value(context, object, target, depth)?
+            };
+            index -= 1;
+        }
+        let mut item_index = 0;
+        for value in arguments {
+            array_set_value(context, object, item_index, value, depth)?;
+            item_index += 1;
+        }
+    } else {};
+    let new_length = length + item_count;
+    array_set_length(context, object, new_length, depth)?;
+    Result::Ok(array_length_value(new_length))
 }
 
 fn array_sort(
@@ -850,7 +1019,7 @@ fn array_sort(
         index += 1;
     }
     while index < length {
-        array_delete_value(context, object, index)?;
+        array_delete_value(context, object, index, depth)?;
         index += 1;
     }
     Result::Ok(object)
@@ -875,7 +1044,7 @@ fn array_flatten_into(
     let mut output_index = target_index;
     let mut source_index = 0;
     while source_index < source_length {
-        if array_property_present(context, source, source_index)? {
+        if array_property_present(context, source, source_index, depth)? {
             let original = array_copy_read(context, source, source_index, depth)?;
             let element = if map_values {
                 context.invoke_with_this_at_depth(
@@ -1010,14 +1179,12 @@ fn array_concat(
     for value in inputs {
         if array_concat_spreadable(context, value, depth)? {
             let length = array_iterator_length(context, value, depth)?;
-            if length > ARRAY_FROM_LIMIT - output_index {
-                return Result::Err(
-                    function_range_error("Array concat exceeds implementation limit"),
-                )
+            if length > ARRAY_MAX_SAFE_INTEGER - output_index {
+                return Result::Err(function_vm_error("Array concat exceeds maximum safe length"))
             } else {};
             let mut index = 0;
             while index < length {
-                if array_property_present(context, value, index)? {
+                if array_property_present(context, value, index, depth)? {
                     let element = array_copy_read(context, value, index, depth)?;
                     context.create_data_property_at_depth(
                         target,
@@ -1030,10 +1197,8 @@ fn array_concat(
                 index += 1;
             }
         } else {
-            if output_index >= ARRAY_FROM_LIMIT {
-                return Result::Err(
-                    function_range_error("Array concat exceeds implementation limit"),
-                )
+            if output_index >= ARRAY_MAX_SAFE_INTEGER {
+                return Result::Err(function_vm_error("Array concat exceeds maximum safe length"))
             } else {};
             context.create_data_property_at_depth(
                 target,
@@ -1044,7 +1209,167 @@ fn array_concat(
             output_index += 1;
         }
     }
-    Result::Ok(target)
+    if context.reflect_set_at_depth(
+        target,
+        runtime::Value::String(js_string("length")),
+        array_length_value(output_index),
+        target,
+        depth,
+    )? {
+        Result::Ok(target)
+    } else {
+        Result::Err(function_vm_error("Array concat result length is not writable"))
+    }
+}
+
+fn array_slice(
+    context: vm::Context,
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+    depth: isize,
+) -> Result[runtime::Value, vm::VmError] {
+    let source = array_object_value(context, this_value)?;
+    let length = array_iterator_length(context, source, depth)?;
+    let first = array_copy_start(
+        array_copy_integer(context, argument(arguments, 0), 0, depth)?,
+        length,
+    );
+    let final_index = match argument(arguments, 1) {
+        runtime::Value::Undefined => length,
+        value => array_copy_start(array_copy_integer(context, value, 0, depth)?, length),
+    };
+    let count = if final_index > first {
+        final_index - first
+    } else {
+        0
+    };
+    let target = array_species_create(context, source, count, depth)?;
+    let mut source_index = first;
+    let mut target_index = 0;
+    while source_index < final_index {
+        if array_property_present(context, source, source_index, depth)? {
+            let value = array_copy_read(context, source, source_index, depth)?;
+            context.create_data_property_at_depth(
+                target,
+                array_length_value(target_index),
+                value,
+                depth,
+            )?
+        } else {};
+        source_index += 1;
+        target_index += 1;
+    }
+    if context.reflect_set_at_depth(
+        target,
+        runtime::Value::String(js_string("length")),
+        array_length_value(target_index),
+        target,
+        depth,
+    )? {
+        Result::Ok(target)
+    } else {
+        Result::Err(function_vm_error("Array slice result length is not writable"))
+    }
+}
+
+fn array_splice(
+    context: vm::Context,
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+    depth: isize,
+) -> Result[runtime::Value, vm::VmError] {
+    let source = array_object_value(context, this_value)?;
+    let length = array_iterator_length(context, source, depth)?;
+    let start = array_copy_start(
+        array_copy_integer(context, argument(arguments, 0), 0, depth)?,
+        length,
+    );
+    let item_count = if arguments.len() > 2 {
+        arguments.len() - 2
+    } else {
+        0
+    };
+    let delete_count = if arguments.len() == 0 {
+        0
+    } else if arguments.len() == 1 {
+        length - start
+    } else {
+        let requested = array_copy_integer(context, argument(arguments, 1), 0, depth)?;
+        if requested <= 0 {
+            0
+        } else if requested > length - start {
+            length - start
+        } else {
+            requested
+        }
+    };
+    if item_count > ARRAY_MAX_SAFE_INTEGER - (length - delete_count) {
+        return Result::Err(function_vm_error("Array splice exceeds maximum safe length"))
+    } else {};
+    let removed = array_species_create(context, source, delete_count, depth)?;
+    let mut index = 0;
+    while index < delete_count {
+        let source_index = start + index;
+        if array_property_present(context, source, source_index, depth)? {
+            context.create_data_property_at_depth(
+                removed,
+                array_length_value(index),
+                array_copy_read(context, source, source_index, depth)?,
+                depth,
+            )?
+        } else {};
+        index += 1;
+    }
+    array_set_length(context, removed, delete_count, depth)?;
+    if item_count < delete_count {
+        index = start;
+        while index < length - delete_count {
+            let from = index + delete_count;
+            let to = index + item_count;
+            if array_property_present(context, source, from, depth)? {
+                array_set_value(
+                    context,
+                    source,
+                    to,
+                    array_copy_read(context, source, from, depth)?,
+                    depth,
+                )?
+            } else {
+                array_delete_value(context, source, to, depth)?
+            };
+            index += 1;
+        }
+        index = length;
+        while index > length - delete_count + item_count {
+            array_delete_value(context, source, index - 1, depth)?;
+            index -= 1;
+        }
+    } else if item_count > delete_count {
+        index = length - delete_count;
+        while index > start {
+            let from = index + delete_count - 1;
+            let to = index + item_count - 1;
+            if array_property_present(context, source, from, depth)? {
+                array_set_value(
+                    context,
+                    source,
+                    to,
+                    array_copy_read(context, source, from, depth)?,
+                    depth,
+                )?
+            } else {
+                array_delete_value(context, source, to, depth)?
+            };
+            index -= 1;
+        }
+    } else {};
+    index = 0;
+    while index < item_count {
+        array_set_value(context, source, start + index, arguments[index + 2], depth)?;
+        index += 1;
+    }
+    array_set_length(context, source, length - delete_count + item_count, depth)?;
+    Result::Ok(removed)
 }
 
 fn array_iteration_callback(arguments: Vec[runtime::Value]) -> Result[runtime::Value, vm::VmError] {
@@ -1100,6 +1425,18 @@ fn array_iterate(
 ) -> Result[runtime::Value, vm::VmError] {
     let object = array_object_value(context, this_value)?;
     let length = array_iterator_length(context, object, depth)?;
+    array_iterate_with_length(context, mode, object, length, arguments, depth, false)
+}
+
+fn array_iterate_with_length(
+    context: vm::Context,
+    mode: ArrayIterationMode,
+    object: runtime::Value,
+    length: isize,
+    arguments: Vec[runtime::Value],
+    depth: isize,
+    dense: bool,
+) -> Result[runtime::Value, vm::VmError] {
     let callback = array_iteration_callback(arguments)?;
     let callback_this = argument(arguments, 1);
     let output = array_iteration_result_array(context, mode, object, length, depth)?;
@@ -1115,13 +1452,13 @@ fn array_iterate(
     } else {
         index < length
     } {
-        let present = array_property_present(context, object, index)?;
+        let present = if dense {
+            true
+        } else {
+            array_property_present(context, object, index, depth)?
+        };
         if present || array_iteration_visits_holes(mode) {
-            let value = context.read_property_at_depth(
-                object,
-                runtime::Value::Int(index.to_i32()),
-                depth,
-            )?;
+            let value = array_copy_read(context, object, index, depth)?;
             let selected = context.invoke_with_this_at_depth(
                 callback,
                 Vec::from_array([value, array_length_value(index), object]),
@@ -1209,6 +1546,18 @@ fn array_reduce(
 ) -> Result[runtime::Value, vm::VmError] {
     let object = array_object_value(context, this_value)?;
     let length = array_iterator_length(context, object, depth)?;
+    array_reduce_with_length(context, object, length, arguments, reverse, depth, false)
+}
+
+fn array_reduce_with_length(
+    context: vm::Context,
+    object: runtime::Value,
+    length: isize,
+    arguments: Vec[runtime::Value],
+    reverse: bool,
+    depth: isize,
+    dense: bool,
+) -> Result[runtime::Value, vm::VmError] {
     let callback = array_iteration_callback(arguments)?;
     let mut index = if reverse {
         length - 1
@@ -1226,10 +1575,13 @@ fn array_reduce(
         } else {
             index < length
         } {
-        if array_property_present(context, object, index)? {
-            accumulator = Option::Some(
-                context.read_property_at_depth(object, runtime::Value::Int(index.to_i32()), depth)?,
-            );
+        let present = if dense {
+            true
+        } else {
+            array_property_present(context, object, index, depth)?
+        };
+        if present {
+            accumulator = Option::Some(array_copy_read(context, object, index, depth)?);
         } else {};
         if reverse {
             index -= 1;
@@ -1246,12 +1598,13 @@ fn array_reduce(
     } else {
         index < length
     } {
-        if array_property_present(context, object, index)? {
-            let value = context.read_property_at_depth(
-                object,
-                runtime::Value::Int(index.to_i32()),
-                depth,
-            )?;
+        let present = if dense {
+            true
+        } else {
+            array_property_present(context, object, index, depth)?
+        };
+        if present {
+            let value = array_copy_read(context, object, index, depth)?;
             result = context.invoke_with_this_at_depth(
                 callback,
                 Vec::from_array([result, value, array_length_value(index), object]),
@@ -1393,14 +1746,15 @@ fn array_iterator_length(context: vm::Context, object: runtime::Value, depth: is
         runtime::Value::String(js_string("length")),
         depth,
     )?;
-    let number = match runtime::primitive_to_number(value) {
+    let primitive = context.to_primitive_number_at_depth(value, depth)?;
+    let number = match runtime::primitive_to_number(primitive) {
         Ok(value) => value,
         Err(value) => return Result::Err(function_vm_error(value.message)),
     };
     if math::is_nan(number) || number <= 0.0 {
         Result::Ok(0)
-    } else if number >= 4294967296.0 || number == infinity() {
-        Result::Ok(4294967296)
+    } else if number >= 9007199254740991.0 || number == infinity() {
+        Result::Ok(ARRAY_MAX_SAFE_INTEGER)
     } else {
         Result::Ok(
             num::parse_int_structured(dtoa::number_to_string(math::trunc(number))).unwrap_or(0),
@@ -1459,75 +1813,182 @@ fn array_from_close(context: vm::Context, iterator: runtime::Value, depth: isize
     }
 }
 
+fn array_from_with_root[T](
+    context: vm::Context,
+    value: runtime::Value,
+    callback: () -> Result[T, vm::VmError],
+) -> Result[T, vm::VmError] {
+    let root = Ref::new(value);
+    context.add_external_root(root);
+    let result = callback();
+    let _ = context.remove_external_root(root);
+    result
+}
+
+fn array_from_result(
+    context: vm::Context,
+    constructor: runtime::Value,
+    length: Option[isize],
+    depth: isize,
+) -> Result[runtime::Value, vm::VmError] {
+    if vm::is_constructor(context, constructor) {
+        let arguments = match length {
+            Some(value) => Vec::from_array([array_length_value(value)]),
+            None => Vec::new(),
+        };
+        context.construct_with_new_target_at_depth(constructor, arguments, constructor, depth)
+    } else {
+        match runtime::new_array(context.heap(), length.unwrap_or(0)) {
+            Ok(value) => Result::Ok(runtime::Value::Object(value)),
+            Err(value) => Result::Err(function_vm_error(value.message)),
+        }
+    }
+}
+
+fn array_set_length(context: vm::Context, result: runtime::Value, length: isize, depth: isize) -> Result[
+    (),
+    vm::VmError,
+] {
+    if context.reflect_set_at_depth(
+        result,
+        runtime::Value::String(js_string("length")),
+        array_length_value(length),
+        result,
+        depth,
+    )? {
+        Result::Ok(())
+    } else {
+        Result::Err(function_vm_error("Array length is not writable"))
+    }
+}
+
 fn array_from_iterator(
     context: vm::Context,
+    constructor: runtime::Value,
     source: runtime::Value,
     method: runtime::Value,
     mapper: runtime::Value,
     this_argument: runtime::Value,
     depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
-    let iterator_arguments: Vec[runtime::Value] = Vec::new();
-    let iterator = context.invoke_with_this_at_depth(method, iterator_arguments, source, depth)?;
-    match iterator {
-        runtime::Value::Object(_) => (),
-        _ => return Result::Err(function_vm_error("iterator result is not an object")),
-    };
-    let next = context.read_property_at_depth(
-        iterator,
-        runtime::Value::String(js_string("next")),
-        depth,
-    )?;
-    match next {
-        runtime::Value::Object(object) => if !object.is_callable() {
-            return Result::Err(function_vm_error("iterator next is not callable"))
-        } else {},
-        _ => return Result::Err(function_vm_error("iterator next is not callable")),
-    };
-    let values: Vec[runtime::Value] = Vec::new();
-    while values.len() < ARRAY_FROM_LIMIT {
-        let next_arguments: Vec[runtime::Value] = Vec::new();
-        let result = context.invoke_with_this_at_depth(next, next_arguments, iterator, depth)?;
-        match result {
-            runtime::Value::Object(_) => (),
-            _ => return Result::Err(function_vm_error("iterator next result is not an object")),
-        };
-        let done = context.read_property_at_depth(
-            result,
-            runtime::Value::String(js_string("done")),
-            depth,
-        )?;
-        if runtime::to_boolean(done) {
-            return match allocate_array(context.heap(), values, values.len()) {
-                Ok(value) => Result::Ok(runtime::Value::Object(value)),
-                Err(value) => Result::Err(function_vm_error(value.message)),
-            }
-        } else {};
-        let value = context.read_property_at_depth(
-            result,
-            runtime::Value::String(js_string("value")),
-            depth,
-        )?;
-        let mapped = match array_from_map(
-            context,
-            mapper,
-            this_argument,
-            value,
-            values.len(),
-            depth,
-        ) {
-            Ok(value) => value,
-            Err(value) => {
-                let _ = array_from_close(context, iterator, depth);
-                return Result::Err(value)
-            },
-        };
-        values.push(mapped);
-    }
-    match array_from_close(context, iterator, depth) {
-        Ok(()) => Result::Err(function_vm_error("Array.from input exceeds implementation limit")),
-        Err(value) => Result::Err(value),
-    }
+    let output = array_from_result(context, constructor, Option::None, depth)?;
+    array_from_with_root(
+        context,
+        output,
+        || {
+            let iterator_arguments: Vec[runtime::Value] = Vec::new();
+            let iterator = context.invoke_with_this_at_depth(
+                method,
+                iterator_arguments,
+                source,
+                depth,
+            )?;
+            match iterator {
+                runtime::Value::Object(_) => (),
+                _ => return Result::Err(function_vm_error("iterator result is not an object")),
+            };
+            array_from_with_root(
+                context,
+                iterator,
+                || {
+                    let next = context.read_property_at_depth(
+                        iterator,
+                        runtime::Value::String(js_string("next")),
+                        depth,
+                    )?;
+                    match next {
+                        runtime::Value::Object(object) => if !object.is_callable() {
+                            return Result::Err(function_vm_error("iterator next is not callable"))
+                        } else {},
+                        _ => return Result::Err(function_vm_error("iterator next is not callable")),
+                    };
+                    let mut index = 0;
+                    while index < ARRAY_FROM_LIMIT {
+                        let next_arguments: Vec[runtime::Value] = Vec::new();
+                        let result = match context.invoke_with_this_at_depth(
+                            next,
+                            next_arguments,
+                            iterator,
+                            depth,
+                        ) {
+                            Ok(value) => value,
+                            Err(value) => {
+                                let _ = array_from_close(context, iterator, depth);
+                                return Result::Err(value)
+                            },
+                        };
+                        match result {
+                            runtime::Value::Object(_) => (),
+                            _ => {
+                                let _ = array_from_close(context, iterator, depth);
+                                return Result::Err(
+                                    function_vm_error("iterator next result is not an object"),
+                                )
+                            },
+                        };
+                        let done = match context.read_property_at_depth(
+                            result,
+                            runtime::Value::String(js_string("done")),
+                            depth,
+                        ) {
+                            Ok(value) => value,
+                            Err(value) => {
+                                let _ = array_from_close(context, iterator, depth);
+                                return Result::Err(value)
+                            },
+                        };
+                        if runtime::to_boolean(done) {
+                            array_set_length(context, output, index, depth)?;
+                            return Result::Ok(output)
+                        } else {};
+                        let value = match context.read_property_at_depth(
+                            result,
+                            runtime::Value::String(js_string("value")),
+                            depth,
+                        ) {
+                            Ok(value) => value,
+                            Err(value) => {
+                                let _ = array_from_close(context, iterator, depth);
+                                return Result::Err(value)
+                            },
+                        };
+                        let mapped = match array_from_map(
+                            context,
+                            mapper,
+                            this_argument,
+                            value,
+                            index,
+                            depth,
+                        ) {
+                            Ok(value) => value,
+                            Err(value) => {
+                                let _ = array_from_close(context, iterator, depth);
+                                return Result::Err(value)
+                            },
+                        };
+                        match context.create_data_property_at_depth(
+                            output,
+                            array_length_value(index),
+                            mapped,
+                            depth,
+                        ) {
+                            Ok(()) => (),
+                            Err(value) => {
+                                let _ = array_from_close(context, iterator, depth);
+                                return Result::Err(value)
+                            },
+                        };
+                        index += 1;
+                    }
+                    let error = function_range_error(
+                        "Array.from input exceeds implementation limit",
+                    );
+                    let _ = array_from_close(context, iterator, depth);
+                    Result::Err(error)
+                },
+            )
+        },
+    )
 }
 
 fn array_from(
@@ -1536,7 +1997,6 @@ fn array_from(
     arguments: Vec[runtime::Value],
     depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
-    let _ = this_value;
     let source = argument(arguments, 0);
     match source {
         runtime::Value::Undefined | runtime::Value::Null => {
@@ -1561,7 +2021,15 @@ fn array_from(
     match method {
         runtime::Value::Undefined | runtime::Value::Null => (),
         runtime::Value::Object(object) => if object.is_callable() {
-            return array_from_iterator(context, source, method, mapper, this_argument, depth)
+            return array_from_iterator(
+                context,
+                this_value,
+                source,
+                method,
+                mapper,
+                this_argument,
+                depth,
+            )
         } else {
             return Result::Err(function_vm_error("iterator method is not callable"))
         },
@@ -1569,27 +2037,57 @@ fn array_from(
     };
     let length = array_iterator_length(context, source, depth)?;
     if length > ARRAY_FROM_LIMIT {
-        return Result::Err(function_vm_error("Array.from input exceeds implementation limit"))
+        return Result::Err(function_range_error("Array.from input exceeds implementation limit"))
     } else {};
-    let values: Vec[runtime::Value] = Vec::with_capacity(length);
-    let mut index = 0;
-    while index < length {
-        let value = context.read_property_at_depth(source, array_length_value(index), depth)?;
-        values.push(array_from_map(context, mapper, this_argument, value, index, depth)?);
-        index += 1;
-    }
-    match allocate_array(context.heap(), values, length) {
-        Ok(value) => Result::Ok(runtime::Value::Object(value)),
-        Err(value) => Result::Err(function_vm_error(value.message)),
-    }
+    let output = array_from_result(context, this_value, Option::Some(length), depth)?;
+    array_from_with_root(
+        context,
+        output,
+        || {
+            let mut index = 0;
+            while index < length {
+                let value = context.read_property_at_depth(source, array_length_value(index), depth)?;
+                let mapped = array_from_map(context, mapper, this_argument, value, index, depth)?;
+                context.create_data_property_at_depth(
+                    output,
+                    array_length_value(index),
+                    mapped,
+                    depth,
+                )?;
+                index += 1;
+            }
+            array_set_length(context, output, length, depth)?;
+            Result::Ok(output)
+        },
+    )
 }
 
-fn array_of(heap: runtime::Heap, this_value: runtime::Value, arguments: Vec[runtime::Value]) -> Result[
-    runtime::Value,
-    vm::NativeError,
-] {
-    let _ = this_value;
-    Result::Ok(runtime::Value::Object(allocate_array(heap, arguments, arguments.len())?))
+fn array_of(
+    context: vm::Context,
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+    depth: isize,
+) -> Result[runtime::Value, vm::VmError] {
+    let length = arguments.len();
+    let output = array_from_result(context, this_value, Option::Some(length), depth)?;
+    array_from_with_root(
+        context,
+        output,
+        || {
+            let mut index = 0;
+            while index < length {
+                context.create_data_property_at_depth(
+                    output,
+                    array_length_value(index),
+                    arguments[index],
+                    depth,
+                )?;
+                index += 1;
+            }
+            array_set_length(context, output, length, depth)?;
+            Result::Ok(output)
+        },
+    )
 }
 
 fn array_iterator_value(
@@ -1614,6 +2112,103 @@ fn array_iterator_value(
     }
 }
 
+fn array_iterator_kind_value(kind: ArrayIteratorKind) -> isize {
+    match kind {
+        ArrayIteratorKind::Keys => 0,
+        ArrayIteratorKind::Values => 1,
+        ArrayIteratorKind::Entries => 2,
+    }
+}
+
+fn array_iterator_kind(kind: isize) -> ArrayIteratorKind {
+    match kind {
+        0 => ArrayIteratorKind::Keys,
+        1 => ArrayIteratorKind::Values,
+        _ => ArrayIteratorKind::Entries,
+    }
+}
+
+fn array_iterator_next(
+    context: vm::Context,
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+    depth: isize,
+) -> Result[runtime::Value, vm::VmError] {
+    let _ = arguments;
+    let iterator = match this_value {
+        runtime::Value::Object(value) => value,
+        _ => return Result::Err(function_vm_error("Array Iterator receiver is invalid")),
+    };
+    let state = match context.array_iterator_state(iterator) {
+        Some(value) => value,
+        None => return Result::Err(function_vm_error("Array Iterator receiver is invalid")),
+    };
+    if state.done.get() {
+        return array_iterator_result(context, runtime::Value::Undefined, true)
+    } else {};
+    match state.iterable {
+        runtime::Value::Object(value) => if runtime::is_typed_array_detached(context.heap(), value)
+            || runtime::is_typed_array_out_of_bounds(context.heap(), value) {
+            return Result::Err(function_vm_error("TypedArray is out of bounds"))
+        } else {},
+        _ => (),
+    };
+    let length = array_iterator_length(context, state.iterable, depth)?;
+    let current = state.index.get();
+    if current >= length {
+        state.done.set(true);
+        array_iterator_result(context, runtime::Value::Undefined, true)
+    } else {
+        state.index.set(current + 1);
+        let value = array_iterator_value(
+            context,
+            array_iterator_kind(state.kind),
+            state.iterable,
+            current,
+            depth,
+        )?;
+        array_iterator_result(context, value, false)
+    }
+}
+
+fn array_iterator_prototype(context: vm::Context) -> Result[runtime::ObjectId, vm::VmError] {
+    match context.array_iterator_prototype() {
+        Some(value) => return Result::Ok(value),
+        None => (),
+    };
+    let prototype = match runtime::new_ordinary_object(
+        context.heap(),
+        iterator_prototype_from_global(context),
+    ) {
+        Ok(value) => value,
+        Err(value) => return Result::Err(function_vm_error(value.message)),
+    };
+    let next = match allocate_vm_function(
+        context,
+        "Array Iterator.prototype.next",
+        |this_value, arguments, depth| {
+            array_iterator_next(context, this_value, arguments, depth)
+        },
+    ) {
+        Ok(value) => value,
+        Err(value) => return Result::Err(function_vm_error(value.message)),
+    };
+    if !runtime::define_own_property(
+        context.heap(),
+        prototype,
+        runtime::string_property_key("next"),
+        runtime::data_descriptor(next, true, false, true),
+    ) {
+        return Result::Err(function_vm_error("cannot define Array Iterator next"))
+    } else {};
+    match define_to_string_tag(context, prototype, "Array Iterator") {
+        Ok(()) => (),
+        Err(value) => return Result::Err(function_vm_error(value.message)),
+    };
+    context.set_array_iterator_prototype(prototype);
+    Result::Ok(prototype)
+}
+
 fn array_create_iterator(
     context: vm::Context,
     kind: ArrayIteratorKind,
@@ -1622,7 +2217,8 @@ fn array_create_iterator(
 ) -> Result[runtime::Value, vm::VmError] {
     let object = match this_value {
         runtime::Value::Object(value) => if validate_typed_array
-            && (runtime::is_typed_array_detached(context.heap(), value)
+            && (!runtime::is_typed_array(context.heap(), value)
+                || runtime::is_typed_array_detached(context.heap(), value)
                 || runtime::is_typed_array_out_of_bounds(context.heap(), value)) {
             return Result::Err(function_vm_error("TypedArray is out of bounds"))
         } else {
@@ -1630,54 +2226,20 @@ fn array_create_iterator(
         },
         _ => return Result::Err(function_vm_error("Array iterator requires an Array receiver")),
     };
-    let index = Ref::new(0);
-    let next = context.new_vm_function(
-        |this_value, arguments, depth| {
-            let _ = this_value;
-            let _ = arguments;
-            match object {
-                runtime::Value::Object(value) => if validate_typed_array
-                    && (runtime::is_typed_array_detached(context.heap(), value)
-                        || runtime::is_typed_array_out_of_bounds(context.heap(), value)) {
-                    return Result::Err(function_vm_error("TypedArray is out of bounds"))
-                } else {},
-                _ => (),
-            };
-            let length = array_iterator_length(context, object, depth)?;
-            let current = index.get();
-            if current >= length {
-                array_iterator_result(context, runtime::Value::Undefined, true)
-            } else {
-                index.set(current + 1);
-                let value = array_iterator_value(context, kind, object, current, depth)?;
-                array_iterator_result(context, value, false)
-            }
-        },
-    )?;
-    let iterator = iterator_allocate_object(context)?;
-    if !runtime::define_own_property(
+    let iterator = match runtime::new_ordinary_object(
         context.heap(),
-        iterator,
-        runtime::string_property_key("next"),
-        runtime::data_descriptor(next, true, false, true),
+        Option::Some(array_iterator_prototype(context)?),
     ) {
-        return Result::Err(function_vm_error("cannot define Array iterator next"))
-    } else {};
-    let symbol = match context.iterator_symbol() {
-        Some(value) => value,
-        None => return Result::Err(function_vm_error("iterator symbol is not installed")),
+        Ok(value) => value,
+        Err(value) => return Result::Err(function_vm_error(value.message)),
     };
-    let identity = context.new_native_function(array_iterator_identity)?;
-    if !runtime::define_own_property(
-        context.heap(),
+    context.register_array_iterator(
         iterator,
-        runtime::PropertyKey::Symbol(symbol),
-        runtime::data_descriptor(identity, true, false, true),
-    ) {
-        Result::Err(function_vm_error("cannot define Array iterator identity"))
-    } else {
-        Result::Ok(runtime::Value::Object(iterator))
-    }
+        object,
+        array_iterator_kind_value(kind),
+        validate_typed_array,
+    );
+    Result::Ok(runtime::Value::Object(iterator))
 }
 
 fn array_species_getter(
@@ -1732,40 +2294,34 @@ fn install_array_prototype(context: vm::Context, constructor: runtime::Value) ->
         },
         None => (),
     };
-    for (name, callback) in Vec::from_array(
-        [
-            ("at", array_builtin_at),
-            ("join", array_builtin_join),
-            ("reverse", array_builtin_reverse),
-            ("slice", array_builtin_slice),
-            ("indexOf", array_builtin_index_of),
-            ("lastIndexOf", array_builtin_last_index_of),
-            ("includes", array_builtin_includes),
-            ("push", array_builtin_push),
-            ("pop", array_builtin_pop),
-            ("shift", array_builtin_shift),
-            ("unshift", array_builtin_unshift),
-            ("splice", array_builtin_splice),
-        ],
-    ) {
-        define_function(context, prototype, name, callback)?;
-        if name == "join" {
-            define_value(
-                context.heap(),
-                prototype,
-                "toString",
-                allocate_vm_function(
-                    context,
-                    "Array.prototype.toString",
-                    |this_value, arguments, depth| {
-                        array_to_string(context, this_value, arguments, depth)
-                    },
-                )?,
-                true,
-                true,
-            )?
-        } else {}
-    }
+    define_value(
+        context.heap(),
+        prototype,
+        "at",
+        allocate_vm_function(
+            context,
+            "Array.prototype.at",
+            |this_value, arguments, depth| {
+                array_builtin_at(context, this_value, arguments, depth)
+            },
+        )?,
+        true,
+        true,
+    )?;
+    define_value(
+        context.heap(),
+        prototype,
+        "toString",
+        allocate_vm_function(
+            context,
+            "Array.prototype.toString",
+            |this_value, arguments, depth| {
+                array_to_string(context, this_value, arguments, depth)
+            },
+        )?,
+        true,
+        true,
+    )?;
     define_value(
         context.heap(),
         prototype,
@@ -1816,8 +2372,19 @@ fn install_array_prototype(context: vm::Context, constructor: runtime::Value) ->
             ("toSpliced", array_to_spliced),
             ("fill", array_fill),
             ("copyWithin", array_copy_within),
+            ("reverse", array_reverse),
+            ("indexOf", array_index_of),
+            ("lastIndexOf", array_last_index_of),
+            ("includes", array_includes),
+            ("push", array_push),
+            ("pop", array_pop),
+            ("shift", array_shift),
+            ("unshift", array_unshift),
             ("sort", array_sort),
+            ("join", array_join),
             ("concat", array_concat),
+            ("slice", array_slice),
+            ("splice", array_splice),
         ],
     ) {
         define_value(
@@ -1934,14 +2501,16 @@ fn install_array_prototype(context: vm::Context, constructor: runtime::Value) ->
                     "values",
                 ],
             ) {
-                define_value(
+                if !runtime::define_own_property(
                     context.heap(),
                     unscopables,
-                    name,
-                    runtime::Value::Bool(true),
-                    true,
-                    true,
-                )?
+                    runtime::string_property_key(name),
+                    runtime::data_descriptor(runtime::Value::Bool(true), true, true, true),
+                ) {
+                    return Result::Err(
+                        BuiltinError { message: "cannot define Array unscopables entry" },
+                    )
+                } else {}
             }
             if !runtime::define_own_property(
                 context.heap(),

@@ -349,7 +349,7 @@ fn iterator_from_iterable(context: vm::Context, value: runtime::Value, depth: is
     iterator_record(context, iterator, depth)
 }
 
-fn iterator_wrap(context: vm::Context, record: IteratorRecord) -> Result[
+fn iterator_wrap(context: vm::Context, record: IteratorRecord, prototype: runtime::ObjectId) -> Result[
     runtime::Value,
     vm::VmError,
 ] {
@@ -390,11 +390,24 @@ fn iterator_wrap(context: vm::Context, record: IteratorRecord) -> Result[
             }
         },
     )?;
-    iterator_create_object(context, next, Option::Some(return_method))
+    let result = iterator_create_object(context, next, Option::Some(return_method))?;
+    match result {
+        runtime::Value::Object(object) => if runtime::set_prototype_of(
+            context.heap(),
+            object,
+            Option::Some(prototype),
+        ) {
+            Result::Ok(result)
+        } else {
+            Result::Err(function_vm_error("cannot set wrapped iterator prototype"))
+        },
+        _ => Result::Err(function_vm_error("wrapped iterator is not an object")),
+    }
 }
 
 fn iterator_from(
     context: vm::Context,
+    wrap_prototype: runtime::ObjectId,
     this_value: runtime::Value,
     arguments: Vec[runtime::Value],
     depth: isize,
@@ -403,7 +416,7 @@ fn iterator_from(
     let record = iterator_from_iterable(context, argument(arguments, 0), depth)?;
     let prototype = match iterator_prototype_from_global(context) {
         Some(value) => value,
-        None => return iterator_wrap(context, record),
+        None => return iterator_wrap(context, record, wrap_prototype),
     };
     match record.iterator {
         runtime::Value::Object(object) => if iterator_has_prototype(
@@ -413,9 +426,9 @@ fn iterator_from(
         ) {
             Result::Ok(record.iterator)
         } else {
-            iterator_wrap(context, record)
+            iterator_wrap(context, record, wrap_prototype)
         },
-        _ => iterator_wrap(context, record),
+        _ => iterator_wrap(context, record, wrap_prototype),
     }
 }
 
@@ -557,13 +570,7 @@ fn iterator_helper_next_value(context: vm::Context, state: IteratorHelperState, 
             match state.inner.get() {
                 Some(record) => match iterator_step(context, record, depth) {
                     Ok(Some(value)) => return iterator_result(context, value, false),
-                    Ok(None) => match iterator_close_record(context, record, depth) {
-                        Ok(()) => state.inner.set(Option::None),
-                        Err(value) => {
-                            state.inner.set(Option::None);
-                            return iterator_helper_fail(context, state, depth, value)
-                        },
-                    },
+                    Ok(None) => state.inner.set(Option::None),
                     Err(value) => return iterator_helper_fail(context, state, depth, value),
                 },
                 None => {
@@ -1142,6 +1149,11 @@ fn install_iterator(context: vm::Context) -> Result[runtime::Value, BuiltinError
         Ok(()) => (),
         Err(_) => return Result::Err(BuiltinError { message: "cannot register Iterator" }),
     };
+    let wrap_prototype = match runtime::new_ordinary_object(context.heap(), Option::Some(prototype)) {
+        Ok(value) => value,
+        Err(value) => return Result::Err(BuiltinError { message: value.message }),
+    };
+    context.add_external_root(Ref::new(runtime::Value::Object(wrap_prototype)));
     define_value(
         context.heap(),
         constructor_object,
@@ -1150,7 +1162,7 @@ fn install_iterator(context: vm::Context) -> Result[runtime::Value, BuiltinError
             context,
             "Iterator.from",
             |this_value, arguments, depth| {
-                iterator_from(context, this_value, arguments, depth)
+                iterator_from(context, wrap_prototype, this_value, arguments, depth)
             },
         )?,
         true,

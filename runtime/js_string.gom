@@ -272,6 +272,38 @@ impl JsString {
         encode_utf8(self)
     }
 
+    pub fn to_host_string_lossy(self: JsString) -> string {
+        let output: Vec[byte] = Vec::with_capacity(self.len() * 3);
+        let mut index = 0;
+        while index < self.len() {
+            let first = self.get(index);
+            if is_high_surrogate(first) && index + 1 < self.len() {
+                match combine_surrogates(first, self.get(index + 1)) {
+                    Some(code_point) => {
+                        append_utf8(output, code_point);
+                        index += 2;
+                    },
+                    None => {
+                        append_utf8(output, 0xfffd);
+                        index += 1;
+                    },
+                }
+            } else {
+                append_utf8(
+                    output,
+                    if is_surrogate(first) {
+                        0xfffd
+                    } else {
+                        first.to_u32()
+                    },
+                );
+                index += 1;
+            }
+        }
+        let (_, value) = string_from_utf8(output);
+        value
+    }
+
     pub fn to_host_string(self: JsString) -> Result[string, JsStringUtf8Error] {
         let encoded = encode_utf8(self);
         let (valid, value) = string_from_utf8(encoded);

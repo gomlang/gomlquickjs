@@ -109,6 +109,7 @@ pub enum Instruction {
     CopyDataPropertiesExcluded(isize),
     Enumerate,
     EnumerableProperty,
+    OwnEnumerableProperty,
     OwnKeys,
     GetPrototypeOf,
     SetPrototypeOf,
@@ -133,19 +134,31 @@ pub enum Instruction {
     GetLoc(isize),
     PutLoc(isize),
     SetLoc(isize),
+    InitTdz(isize),
+    GetTdzLoc(isize),
+    SetTdzLoc(isize, bool),
     CloneLoc(isize),
     GetUpvalue(isize),
     PutUpvalue(isize),
     SetUpvalue(isize),
+    GetTdzUpvalue(isize),
+    SetTdzUpvalue(isize, bool),
     GetGlobal(isize),
     SetGlobal(isize),
     DeleteGlobal(isize),
     GetEval(isize),
     GetEvalOrUndefined(isize),
+    HasEvalBinding(isize),
+    ResolveEvalBindingDepth(isize, isize),
     GetEvalOrUpvalue(isize, isize, isize),
     GetEvalOrArguments(isize, isize),
+    GetCapturedEvalOrUpvalue(isize, isize, isize),
+    GetCapturedEvalOrArguments(isize, isize),
     SetEval(isize),
     SetEvalOrUpvalue(isize, isize, isize, bool, bool),
+    SetEvalOrArguments(isize, isize),
+    SetCapturedEvalOrUpvalue(isize, isize, isize, bool, bool),
+    SetCapturedEvalOrArguments(isize, isize),
     DeleteEval(isize),
     DeleteEvalOrFalse(isize, isize),
     InitEval(isize),
@@ -153,6 +166,9 @@ pub enum Instruction {
     EnterEvalEnvironment,
     GetField(isize),
     PutField(isize),
+    DefineDataProperty(isize),
+    DefineDataPropertyComputed,
+    SetObjectPrototype,
     DefineGetter(isize),
     DefineSetter(isize),
     DefineGetterComputed,
@@ -171,11 +187,15 @@ pub enum Instruction {
     DefineThisPrivateSetter,
     SetClassInstanceInitializer,
     SetFunctionHomeObject,
+    SetFunctionName(isize),
     SetClassHeritage(bool),
     GetSuperField(isize),
     PutSuperField(isize),
     GetSuperEl,
     PutSuperEl,
+    PushSuperBase,
+    GetSuperReference,
+    PutSuperReference(bool),
     GetArrayEl,
     PutArrayEl,
     ReflectGet,
@@ -192,11 +212,13 @@ pub enum Instruction {
     ConstructArray,
     CallSuper(isize),
     CallSuperArray,
-    Eval(isize, isize),
+    Eval(isize, isize, bool),
+    EvalArray(isize, bool),
     DynamicImport,
     InitializeInstanceFields,
     Await,
     Yield,
+    YieldRaw,
     Return,
     ReturnUndef,
     Throw,
@@ -214,6 +236,7 @@ pub enum Instruction {
     ToPrimitiveNumber,
     ToPrimitiveString,
     ToPropertyKey,
+    ToObject,
     RequireObjectCoercible,
     Delete,
     Mul,
@@ -235,6 +258,8 @@ pub enum Instruction {
     StrictNeq,
     In,
     WithHasBinding,
+    GetWithBinding(isize, bool),
+    PutWithBinding(isize, bool),
     InstanceOf,
     IsPrototypeOf,
     BitAnd,
@@ -826,7 +851,7 @@ struct StackEffect {
 
 fn stack_effect(instruction: Instruction) -> StackEffect {
     match instruction {
-        Instruction::PushI32(_) | Instruction::PushConst(_) | Instruction::Undefined | Instruction::Null | Instruction::PushFalse | Instruction::PushTrue | Instruction::PushThis | Instruction::PushNewTarget | Instruction::PushArguments | Instruction::PushRest(_) | Instruction::NewObject | Instruction::NewArray(_) | Instruction::NewPrivateName | Instruction::NewRegExp(_, _) | Instruction::GetLoc(_) | Instruction::GetUpvalue(_) | Instruction::GetGlobal(_) | Instruction::DeleteGlobal(_) | Instruction::GetEval(_) | Instruction::GetEvalOrUndefined(_) | Instruction::GetEvalOrUpvalue(_, _, _) | Instruction::GetEvalOrArguments(_, _) | Instruction::DeleteEval(_) | Instruction::DeleteEvalOrFalse(_, _) | Instruction::GetSuperField(_) => StackEffect {
+        Instruction::PushI32(_) | Instruction::PushConst(_) | Instruction::Undefined | Instruction::Null | Instruction::PushFalse | Instruction::PushTrue | Instruction::PushThis | Instruction::PushNewTarget | Instruction::PushArguments | Instruction::PushRest(_) | Instruction::NewObject | Instruction::NewArray(_) | Instruction::NewPrivateName | Instruction::NewRegExp(_, _) | Instruction::GetLoc(_) | Instruction::GetTdzLoc(_) | Instruction::GetUpvalue(_) | Instruction::GetTdzUpvalue(_) | Instruction::GetGlobal(_) | Instruction::DeleteGlobal(_) | Instruction::GetEval(_) | Instruction::GetEvalOrUndefined(_) | Instruction::HasEvalBinding(_) | Instruction::ResolveEvalBindingDepth(_, _) | Instruction::GetEvalOrUpvalue(_, _, _) | Instruction::GetEvalOrArguments(_, _) | Instruction::GetCapturedEvalOrUpvalue(_, _, _) | Instruction::GetCapturedEvalOrArguments(_, _) | Instruction::DeleteEval(_) | Instruction::DeleteEvalOrFalse(_, _) | Instruction::GetSuperField(_) | Instruction::PushSuperBase => StackEffect {
             required: 0,
             delta: 1,
         },
@@ -835,10 +860,11 @@ fn stack_effect(instruction: Instruction) -> StackEffect {
             delta: -1,
         },
         Instruction::Dup => StackEffect { required: 1, delta: 1 },
-        Instruction::SetLoc(_) | Instruction::SetUpvalue(_) | Instruction::SetGlobal(_) | Instruction::SetEval(_) | Instruction::SetEvalOrUpvalue(_, _, _, _, _) | Instruction::GetField(_) | Instruction::GetSuperEl | Instruction::ArrayAppendHole | Instruction::Enumerate | Instruction::OwnKeys | Instruction::GetPrototypeOf | Instruction::IsExtensible | Instruction::PreventExtensions | Instruction::Await | Instruction::Yield | Instruction::Neg | Instruction::Plus | Instruction::LNot | Instruction::Not | Instruction::TypeOf | Instruction::ToPrimitiveDefault | Instruction::ToPrimitiveNumber | Instruction::ToPrimitiveString | Instruction::ToPropertyKey | Instruction::RequireObjectCoercible | Instruction::IsUndefinedOrNull => StackEffect {
+        Instruction::SetLoc(_) | Instruction::SetTdzLoc(_, _) | Instruction::SetUpvalue(_) | Instruction::SetTdzUpvalue(_, _) | Instruction::SetGlobal(_) | Instruction::SetEval(_) | Instruction::SetEvalOrUpvalue(_, _, _, _, _) | Instruction::SetEvalOrArguments(_, _) | Instruction::SetCapturedEvalOrUpvalue(_, _, _, _, _) | Instruction::SetCapturedEvalOrArguments(_, _) | Instruction::GetField(_) | Instruction::GetWithBinding(_, _) | Instruction::GetSuperEl | Instruction::ArrayAppendHole | Instruction::Enumerate | Instruction::OwnKeys | Instruction::GetPrototypeOf | Instruction::IsExtensible | Instruction::PreventExtensions | Instruction::Await | Instruction::Yield | Instruction::YieldRaw | Instruction::Neg | Instruction::Plus | Instruction::LNot | Instruction::Not | Instruction::TypeOf | Instruction::ToPrimitiveDefault | Instruction::ToPrimitiveNumber | Instruction::ToPrimitiveString | Instruction::ToPropertyKey | Instruction::ToObject | Instruction::RequireObjectCoercible | Instruction::IsUndefinedOrNull => StackEffect {
             required: 1,
             delta: 0,
         },
+        Instruction::PutWithBinding(_, _) => StackEffect { required: 2, delta: -2 },
         Instruction::IteratorStart | Instruction::AsyncIteratorStart => StackEffect {
             required: 1,
             delta: 1,
@@ -852,15 +878,15 @@ fn stack_effect(instruction: Instruction) -> StackEffect {
         Instruction::IteratorCallNext => StackEffect { required: 2, delta: -1 },
         Instruction::IteratorCallNextValue => StackEffect { required: 3, delta: -2 },
         Instruction::IteratorCallThrow => StackEffect { required: 2, delta: 0 },
-        Instruction::IteratorCallReturn => StackEffect { required: 2, delta: -1 },
+        Instruction::IteratorCallReturn => StackEffect { required: 2, delta: 0 },
         Instruction::IteratorResult => StackEffect { required: 1, delta: 1 },
         Instruction::IteratorThrowResult => StackEffect { required: 2, delta: 0 },
         Instruction::IteratorCloseThrow => StackEffect { required: 2, delta: -1 },
-        Instruction::PutField(_) | Instruction::DefineGetter(_) | Instruction::DefineSetter(_) | Instruction::DefineClassMethod(_) | Instruction::DefineClassGetter(_) | Instruction::DefineClassSetter(_) => StackEffect {
+        Instruction::PutField(_) | Instruction::DefineDataProperty(_) | Instruction::DefineGetter(_) | Instruction::DefineSetter(_) | Instruction::DefineClassMethod(_) | Instruction::DefineClassGetter(_) | Instruction::DefineClassSetter(_) | Instruction::SetObjectPrototype => StackEffect {
             required: 2,
             delta: -2,
         },
-        Instruction::DefineGetterComputed | Instruction::DefineSetterComputed => StackEffect {
+        Instruction::DefineDataPropertyComputed | Instruction::DefineGetterComputed | Instruction::DefineSetterComputed => StackEffect {
             required: 3,
             delta: -3,
         },
@@ -879,13 +905,17 @@ fn stack_effect(instruction: Instruction) -> StackEffect {
             StackEffect { required: 2, delta: -2 }
         },
         Instruction::SetClassInstanceInitializer => StackEffect { required: 3, delta: -3 },
-        Instruction::SetFunctionHomeObject => StackEffect { required: 2, delta: -1 },
-        Instruction::GetArrayEl | Instruction::EnumerableProperty | Instruction::SetPrototypeOf | Instruction::WithHasBinding | Instruction::IsPrototypeOf => {
+        Instruction::SetFunctionHomeObject | Instruction::SetFunctionName(_) => {
+            StackEffect { required: 2, delta: -1 }
+        },
+        Instruction::GetArrayEl | Instruction::EnumerableProperty | Instruction::OwnEnumerableProperty | Instruction::SetPrototypeOf | Instruction::WithHasBinding | Instruction::IsPrototypeOf => {
             StackEffect { required: 2, delta: -1 }
         },
         Instruction::PutArrayEl => StackEffect { required: 3, delta: -3 },
         Instruction::ReflectGet => StackEffect { required: 3, delta: -2 },
         Instruction::ReflectSet => StackEffect { required: 4, delta: -3 },
+        Instruction::GetSuperReference => StackEffect { required: 3, delta: -2 },
+        Instruction::PutSuperReference(_) => StackEffect { required: 4, delta: -4 },
         Instruction::Call(arguments) | Instruction::Construct(arguments) => {
             StackEffect { required: arguments + 1, delta: -arguments }
         },
@@ -904,12 +934,19 @@ fn stack_effect(instruction: Instruction) -> StackEffect {
             StackEffect { required: arguments, delta: 1 - arguments }
         },
         Instruction::CallSuperArray => StackEffect { required: 1, delta: 0 },
-        Instruction::Eval(arguments, _) => {
+        Instruction::Eval(arguments, _, method) => if method {
+            StackEffect { required: arguments + 2, delta: -arguments - 1 }
+        } else {
             StackEffect { required: arguments + 1, delta: -arguments }
+        },
+        Instruction::EvalArray(_, method) => if method {
+            StackEffect { required: 3, delta: -2 }
+        } else {
+            StackEffect { required: 2, delta: -1 }
         },
         Instruction::DynamicImport => StackEffect { required: 3, delta: -2 },
         Instruction::Return | Instruction::Throw => StackEffect { required: 1, delta: -1 },
-        Instruction::CloneLoc(_) | Instruction::ReturnUndef | Instruction::ThrowTypeError | Instruction::ThrowReferenceError | Instruction::Goto(_) | Instruction::InitializeInstanceFields | Instruction::InitEval(_) | Instruction::EnterEvalEnvironment => {
+        Instruction::InitTdz(_) | Instruction::CloneLoc(_) | Instruction::ReturnUndef | Instruction::ThrowTypeError | Instruction::ThrowReferenceError | Instruction::Goto(_) | Instruction::InitializeInstanceFields | Instruction::InitEval(_) | Instruction::EnterEvalEnvironment => {
             StackEffect { required: 0, delta: 0 }
         },
         Instruction::IfFalse(_) | Instruction::IfTrue(_) => StackEffect { required: 1, delta: -1 },
@@ -931,7 +968,7 @@ fn validate_operand(
     errors: Vec[VerifyError],
 ) -> () {
     match instruction {
-        Instruction::PushConst(index) | Instruction::GetGlobal(index) | Instruction::SetGlobal(index) | Instruction::DeleteGlobal(index) | Instruction::GetEval(index) | Instruction::GetEvalOrUndefined(index) | Instruction::SetEval(index) | Instruction::DeleteEval(index) | Instruction::InitEval(index) | Instruction::InitGlobalLexical(index) | Instruction::GetField(index) | Instruction::PutField(index) | Instruction::DefineGetter(index) | Instruction::DefineSetter(index) | Instruction::DefineClassMethod(index) | Instruction::DefineClassGetter(index) | Instruction::DefineClassSetter(index) | Instruction::DefineThisField(index) | Instruction::GetSuperField(index) | Instruction::PutSuperField(index) => {
+        Instruction::PushConst(index) | Instruction::GetGlobal(index) | Instruction::SetGlobal(index) | Instruction::DeleteGlobal(index) | Instruction::GetEval(index) | Instruction::GetEvalOrUndefined(index) | Instruction::HasEvalBinding(index) | Instruction::SetEval(index) | Instruction::DeleteEval(index) | Instruction::InitEval(index) | Instruction::InitGlobalLexical(index) | Instruction::GetField(index) | Instruction::PutField(index) | Instruction::GetWithBinding(index, _) | Instruction::PutWithBinding(index, _) | Instruction::DefineDataProperty(index) | Instruction::DefineGetter(index) | Instruction::DefineSetter(index) | Instruction::DefineClassMethod(index) | Instruction::DefineClassGetter(index) | Instruction::DefineClassSetter(index) | Instruction::DefineThisField(index) | Instruction::GetSuperField(index) | Instruction::PutSuperField(index) => {
             if index < 0 || index >= function.constants_value.len() {
                 errors.push(VerifyError::InvalidConstant(offset, index))
             } else {}
@@ -947,12 +984,39 @@ fn validate_operand(
                 errors.push(VerifyError::InvalidEvalEnvironmentDepth(offset, depth))
             } else {}
         },
-        Instruction::GetEvalOrArguments(name, depth) | Instruction::DeleteEvalOrFalse(name, depth,) => {
+        Instruction::GetCapturedEvalOrUpvalue(name, upvalue, resolution) | Instruction::SetCapturedEvalOrUpvalue(name, upvalue, resolution, _, _,) => {
+            if name < 0 || name >= function.constants_value.len() {
+                errors.push(VerifyError::InvalidConstant(offset, name))
+            } else {};
+            if upvalue < 0 || upvalue >= function.upvalue_sources_value.len() {
+                errors.push(VerifyError::InvalidUpvalue(offset, upvalue))
+            } else {};
+            if resolution < 0 || resolution >= function.local_count_value {
+                errors.push(VerifyError::InvalidLocal(offset, resolution))
+            } else {}
+        },
+        Instruction::GetEvalOrArguments(name, depth) | Instruction::SetEvalOrArguments(name, depth) | Instruction::DeleteEvalOrFalse(name, depth,) => {
             if name < 0 || name >= function.constants_value.len() {
                 errors.push(VerifyError::InvalidConstant(offset, name))
             } else {};
             if depth < 0 {
                 errors.push(VerifyError::InvalidEvalEnvironmentDepth(offset, depth))
+            } else {}
+        },
+        Instruction::ResolveEvalBindingDepth(name, depth) => {
+            if name < 0 || name >= function.constants_value.len() {
+                errors.push(VerifyError::InvalidConstant(offset, name))
+            } else {};
+            if depth < 0 {
+                errors.push(VerifyError::InvalidEvalEnvironmentDepth(offset, depth))
+            } else {}
+        },
+        Instruction::GetCapturedEvalOrArguments(name, resolution) | Instruction::SetCapturedEvalOrArguments(name, resolution) => {
+            if name < 0 || name >= function.constants_value.len() {
+                errors.push(VerifyError::InvalidConstant(offset, name))
+            } else {};
+            if resolution < 0 || resolution >= function.local_count_value {
+                errors.push(VerifyError::InvalidLocal(offset, resolution))
             } else {}
         },
         Instruction::NewRegExp(pattern, flags) => {
@@ -963,12 +1027,12 @@ fn validate_operand(
                 errors.push(VerifyError::InvalidConstant(offset, flags))
             } else {}
         },
-        Instruction::GetLoc(index) | Instruction::PutLoc(index) | Instruction::SetLoc(index) | Instruction::CloneLoc(index) => {
+        Instruction::GetLoc(index) | Instruction::PutLoc(index) | Instruction::SetLoc(index) | Instruction::InitTdz(index) | Instruction::GetTdzLoc(index) | Instruction::SetTdzLoc(index, _) | Instruction::CloneLoc(index) => {
             if index < 0 || index >= function.local_count_value {
                 errors.push(VerifyError::InvalidLocal(offset, index))
             } else {}
         },
-        Instruction::GetUpvalue(index) | Instruction::PutUpvalue(index) | Instruction::SetUpvalue(index) => {
+        Instruction::GetUpvalue(index) | Instruction::PutUpvalue(index) | Instruction::SetUpvalue(index) | Instruction::GetTdzUpvalue(index) | Instruction::SetTdzUpvalue(index, _) => {
             if index < 0 || index >= function.upvalue_sources_value.len() {
                 errors.push(VerifyError::InvalidUpvalue(offset, index))
             } else {}
@@ -978,10 +1042,15 @@ fn validate_operand(
                 errors.push(VerifyError::InvalidArgumentCount(offset, arguments))
             } else {}
         },
-        Instruction::Eval(arguments, site) => {
+        Instruction::Eval(arguments, site, _) => {
             if arguments < 0 {
                 errors.push(VerifyError::InvalidArgumentCount(offset, arguments))
             } else {};
+            if site < 0 || site >= function.eval_sites_value.get().len() {
+                errors.push(VerifyError::InvalidEvalSite(offset, site))
+            } else {}
+        },
+        Instruction::EvalArray(site, _) => {
             if site < 0 || site >= function.eval_sites_value.get().len() {
                 errors.push(VerifyError::InvalidEvalSite(offset, site))
             } else {}
@@ -1086,7 +1155,7 @@ fn validate_generator_return_handlers(function: Function, errors: Vec[VerifyErro
             errors.push(VerifyError::InvalidGeneratorReturnYield(index, handler.yield_offset))
         } else {
             match function.code_value[handler.yield_offset] {
-                Instruction::Await | Instruction::Yield => (),
+                Instruction::Await | Instruction::Yield | Instruction::YieldRaw => (),
                 _ => errors.push(
                     VerifyError::InvalidGeneratorReturnYield(index, handler.yield_offset),
                 ),

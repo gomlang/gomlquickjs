@@ -631,6 +631,114 @@ fn scan_fixed_hex(source: string, start: isize, count: isize) -> Option[u32] {
     }
 }
 
+fn unicode_escape_value(source: string, slash: isize) -> Option[(u32, isize)] {
+    if slash + 2 >= source.byte_len() || source.byte_get(slash) != b'\\'
+        || source.byte_get(slash + 1) != b'u' {
+        return Option::None
+    } else {};
+    let start = slash + 2;
+    if source.byte_get(start) == b'{' {
+        let mut index = start + 1;
+        let mut count = 0;
+        let mut value = 0.to_u32();
+        while index < source.byte_len() && source.byte_get(index) != b'}' {
+            match hex_value(source.byte_get(index)) {
+                Some(digit) => {
+                    value = value * 16 + digit;
+                    count += 1;
+                },
+                None => return Option::None,
+            }
+            index += 1;
+        }
+        if index < source.byte_len() && count > 0 && count <= 6 && value <= 1114111 {
+            Option::Some((value, index + 1))
+        } else {
+            Option::None
+        }
+    } else {
+        scan_fixed_hex(source, start, 4).map(|value| (value, start + 4))
+    }
+}
+
+fn following_low_surrogate(source: string, start: isize) -> Option[(u32, isize)] {
+    match unicode_escape_value(source, start) {
+        Some((value, end)) => if value >= 0xdc00 && value <= 0xdfff {
+            Option::Some((value, end))
+        } else {
+            Option::None
+        },
+        None => Option::None,
+    }
+}
+
+pub fn string_literal_well_formed(raw: string) -> bool {
+    if raw.byte_len() < 2 {
+        return true
+    } else {};
+    let limit = raw.byte_len() - 1;
+    let mut index = 1;
+    let mut high = false;
+    while index < limit {
+        let mut value: Option[u32] = Option::None;
+        if raw.byte_get(index) == b'\\' && index + 1 < limit {
+            let escaped = raw.byte_get(index + 1);
+            if escaped == b'u' {
+                match unicode_escape_value(raw, index) {
+                    Some((codepoint, end)) => {
+                        value = Option::Some(codepoint);
+                        index = end;
+                    },
+                    None => {
+                        value = Option::Some(0);
+                        index += 2;
+                    },
+                }
+            } else if escaped == b'\r' || escaped == b'\n' {
+                if escaped == b'\r' && index + 2 < limit && raw.byte_get(index + 2) == b'\n' {
+                    index += 3;
+                } else {
+                    index += 2;
+                }
+                continue
+            } else {
+                value = Option::Some(0);
+                index += 2;
+            }
+        } else {
+            match raw.decode_at(index) {
+                Some((character, width)) => {
+                    value = Option::Some(character.to_u32());
+                    index += width;
+                },
+                None => {
+                    value = Option::Some(0);
+                    index += 1;
+                },
+            }
+        };
+        match value {
+            Some(codepoint) => if codepoint >= 0xd800 && codepoint <= 0xdbff {
+                if high {
+                    return false
+                } else {
+                    high = true;
+                }
+            } else if codepoint >= 0xdc00 && codepoint <= 0xdfff {
+                if high {
+                    high = false;
+                } else {
+                    return false
+                }
+            } else if high {
+                return false
+            } else {},
+            None => (),
+        }
+    }
+    !high
+}
+
 fn scan_unicode_escape(
     source: string,
     slash: isize,
@@ -642,19 +750,14 @@ fn scan_unicode_escape(
         let mut index = start + 1;
         let mut count = 0;
         let mut codepoint = 0.to_u32();
-        let mut valid = true;
-        while index < source.byte_len() && source.byte_get(index) != b'}' {
+        while index < source.byte_len() && source.byte_get(index) != b'}'
+            && hex_value(source.byte_get(index)).is_some() {
             match hex_value(source.byte_get(index)) {
                 Some(value) => {
                     codepoint = codepoint * 16 + value;
                     count += 1;
-                    if count > 6 {
-                        valid = false;
-                    } else {}
                 },
-                None => {
-                    valid = false;
-                },
+                None => (),
             }
             index += 1;
         }
@@ -663,10 +766,26 @@ fn scan_unicode_escape(
             index
         } else {
             let end = index + 1;
-            if !valid || count == 0 || codepoint > 1114111 {
+            if count == 0 || count > 6 || codepoint > 1114111 {
                 push_error(errors, "invalid Unicode escape", slash, end)
             } else {
-                write_codepoint(builder, errors, codepoint, slash, end)
+                match if codepoint >= 0xd800 && codepoint <= 0xdbff {
+                    following_low_surrogate(source, end)
+                } else {
+                    Option::None
+                } {
+                    Some((low, pair_end)) => {
+                        write_codepoint(
+                            builder,
+                            errors,
+                            0x10000 + (codepoint - 0xd800) * 0x400 + low - 0xdc00,
+                            slash,
+                            pair_end,
+                        );
+                        return pair_end
+                    },
+                    None => write_codepoint(builder, errors, codepoint, slash, end),
+                }
             };
             end
         }
@@ -674,15 +793,33 @@ fn scan_unicode_escape(
         match scan_fixed_hex(source, start, 4) {
             Some(codepoint) => {
                 let end = start + 4;
-                write_codepoint(builder, errors, codepoint, slash, end);
-                end
+                match if codepoint >= 0xd800 && codepoint <= 0xdbff {
+                    following_low_surrogate(source, end)
+                } else {
+                    Option::None
+                } {
+                    Some((low, pair_end)) => {
+                        write_codepoint(
+                            builder,
+                            errors,
+                            0x10000 + (codepoint - 0xd800) * 0x400 + low - 0xdc00,
+                            slash,
+                            pair_end,
+                        );
+                        pair_end
+                    },
+                    None => {
+                        write_codepoint(builder, errors, codepoint, slash, end);
+                        end
+                    },
+                }
             },
             None => {
-                let end = if start + 4 < source.byte_len() {
-                    start + 4
-                } else {
-                    source.byte_len()
-                };
+                let mut end = start;
+                while end < source.byte_len() && end < start + 4
+                    && hex_value(source.byte_get(end)).is_some() {
+                    end += 1;
+                }
                 push_error(errors, "invalid Unicode escape", slash, end);
                 if end > slash + 2 {
                     end
@@ -708,11 +845,11 @@ fn scan_hex_escape(
             end
         },
         None => {
-            let end = if start + 2 < source.byte_len() {
-                start + 2
-            } else {
-                source.byte_len()
-            };
+            let mut end = start;
+            while end < source.byte_len() && end < start + 2
+                && hex_value(source.byte_get(end)).is_some() {
+                end += 1;
+            }
             push_error(errors, "invalid hexadecimal escape", slash, end);
             if end > slash + 2 {
                 end
@@ -752,13 +889,23 @@ fn scan_string_escape(
         } else if escaped == b'v' {
             write_byte(builder, errors, 11, slash, slash + 2);
             slash + 2
-        } else if escaped == b'0' {
-            if slash + 2 < source.byte_len() && ascii::is_digit(source.byte_get(slash + 2)) {
-                push_error(errors, "legacy octal escape is not supported", slash, slash + 2)
+        } else if escaped >= b'0' && escaped <= b'7' {
+            let limit = if escaped <= b'3' {
+                3
             } else {
-                write_byte(builder, errors, 0, slash, slash + 2)
+                2
             };
-            slash + 2
+            let mut index = slash + 1;
+            let mut count = 0;
+            let mut value = 0;
+            while index < source.byte_len() && count < limit && source.byte_get(index) >= b'0'
+                && source.byte_get(index) <= b'7' {
+                value = value * 8 + (source.byte_get(index) - b'0').to_isize();
+                index += 1;
+                count += 1;
+            }
+            write_codepoint(builder, errors, value.to_u32(), slash, index);
+            index
         } else if escaped == b'x' {
             scan_hex_escape(source, slash, builder, errors)
         } else if escaped == b'u' {
@@ -777,7 +924,9 @@ fn scan_string_escape(
         } else {
             match source.decode_at(slash + 1) {
                 Some((character, width)) => {
-                    builder.write_char(character);
+                    if character != '\u2028' && character != '\u2029' {
+                        builder.write_char(character)
+                    } else {};
                     slash + 1 + width
                 },
                 None => {
@@ -853,8 +1002,10 @@ fn scan_template(source: string, start: isize, initial: bool, errors: Vec[LexErr
                 errors: template_errors,
             }
         } else if value == b'\\' {
-            if index + 1 < source.byte_len() && source.byte_get(index + 1) >= b'1'
-                && source.byte_get(index + 1) <= b'9' {
+            if index + 1 < source.byte_len()
+                && (source.byte_get(index + 1) >= b'1' && source.byte_get(index + 1) <= b'9'
+                    || source.byte_get(index + 1) == b'0' && index + 2 < source.byte_len()
+                        && ascii::is_digit(source.byte_get(index + 2))) {
                 push_error(
                     template_errors,
                     "legacy octal escape is not supported",
@@ -1018,6 +1169,15 @@ fn scan_decimal_number(tables: unicode::IdentifierTables, source: string, start:
         index = digits.end;
         valid = valid && digits.valid && digits.any;
         integer_digits = index - start;
+        if source.byte_get(start) == b'0' {
+            let mut separator = start + 1;
+            while separator < index {
+                if source.byte_get(separator) == b'_' {
+                    valid = false;
+                } else {};
+                separator += 1;
+            }
+        } else {}
     } else {};
     if index < source.byte_len() && source.byte_get(index) == b'.' {
         fractional = true;

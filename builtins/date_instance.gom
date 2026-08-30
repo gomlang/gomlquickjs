@@ -70,12 +70,22 @@ fn date_instance_timezone_offset(timezone: date::TimeZone, value: i64) -> isize 
 }
 
 fn date_instance_local_to_utc(timezone: date::TimeZone, value: f64) -> f64 {
+    if !math::is_finite(value) {
+        return date_instance_nan()
+    } else {};
+    let maximum = date_instance_float(date::MAX_TIME_MILLISECONDS);
     let unadjusted = match date::time_clip(value) {
         Ok(value) => value,
-        Err(_) => return date_instance_nan(),
+        Err(_) => if value > maximum {
+            date::MAX_TIME_MILLISECONDS
+        } else if value < -maximum {
+            -date::MAX_TIME_MILLISECONDS
+        } else {
+            return date_instance_nan()
+        },
     };
     let offset = date_instance_timezone_offset(timezone, unadjusted).to_i64() * 60000;
-    date_instance_clip(date_instance_float(unadjusted - offset))
+    date_instance_clip(value - date_instance_float(offset))
 }
 
 fn date_instance_parse_string(timezone: date::TimeZone, value: runtime::JsString) -> f64 {
@@ -101,8 +111,7 @@ fn date_instance_parse_string(timezone: date::TimeZone, value: runtime::JsString
             },
         },
         Err(_) => match date::parse_timestamp(source) {
-            Ok(value) => if text::find(source, " GMT+").is_some()
-                || text::find(source, " GMT-").is_some() {
+            Ok(value) => if text::find(source, " GMT").is_some() {
                 date_instance_float(value)
             } else {
                 date_instance_local_to_utc(timezone, date_instance_float(value))
@@ -129,7 +138,12 @@ fn date_instance_from_components(
         };
         index += 1;
     }
-    Result::Ok(date_instance_local_to_utc(timezone, date::make_date_from_float_components(values)))
+    Result::Ok(
+        date_instance_local_to_utc(
+            timezone,
+            date::make_unclipped_date_from_float_components(values),
+        ),
+    )
 }
 
 fn date_instance_utc_from_components(
@@ -465,6 +479,7 @@ fn date_instance_set_component(
     depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     let state = date_instance_state(states, this_value)?;
+    let current = state.get();
     let converted: Vec[i64] = Vec::new();
     let limit = match operation {
         0 | 4 | 7 => 1,
@@ -488,11 +503,10 @@ fn date_instance_set_component(
         state.set(date_instance_nan());
         return Result::Ok(runtime::Value::Float(date_instance_nan()))
     } else {};
-    let current = state.get();
     let fields = match date_instance_fields(timezone, current, local) {
         Some(value) => value,
         None => if operation == 6 || operation == 7 {
-            match date_instance_fields(timezone, 0.0, local) {
+            match date_instance_fields(timezone, 0.0, false) {
                 Some(value) => value,
                 None => {
                     state.set(date_instance_nan());
@@ -500,7 +514,6 @@ fn date_instance_set_component(
                 },
             }
         } else {
-            state.set(date_instance_nan());
             return Result::Ok(runtime::Value::Float(date_instance_nan()))
         },
     };
@@ -765,10 +778,6 @@ fn install_date_object(context: vm::Context) -> Result[runtime::Value, BuiltinEr
         Ok(value) => value,
         Err(value) => return Result::Err(BuiltinError { message: value.message }),
     };
-    states[prototype] = Ref::new(date_instance_nan());
-    if !context.set_object_builtin_tag(prototype, js_string("Date")) {
-        return Result::Err(BuiltinError { message: "cannot register Date prototype" })
-    } else {};
     let constructor = allocate_vm_function(
         context,
         "Date",

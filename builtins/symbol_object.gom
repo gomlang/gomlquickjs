@@ -64,7 +64,7 @@ fn symbol_for_vm(
         Some(value) => Result::Ok(runtime::Value::Symbol(value)),
         None => {
             let symbol = match fresh_symbol(next_id, Option::Some(key)) {
-                Ok(runtime::Value::Symbol(value)) => value,
+                Ok(runtime::Value::Symbol(value)) => value.with_registry_registration(),
                 Ok(_) => return Result::Err(function_vm_error("cannot allocate symbol")),
                 Err(value) => return Result::Err(function_native_error(value)),
             };
@@ -119,6 +119,20 @@ fn install_symbol(context: vm::Context) -> Result[runtime::Value, BuiltinError] 
         },
     )?;
     let object = function_object(function, "Symbol")?;
+    match context.set_vm_constructor_callback(
+        function,
+        |receiver, arguments, selected_prototype, new_target, depth| {
+            let _ = receiver;
+            let _ = arguments;
+            let _ = selected_prototype;
+            let _ = new_target;
+            let _ = depth;
+            Result::Err(function_vm_error("Symbol is not a constructor"))
+        },
+    ) {
+        Ok(()) => (),
+        Err(value) => return Result::Err(BuiltinError { message: value.kind.debug() }),
+    };
     define_value(
         context.heap(),
         object,

@@ -5,7 +5,7 @@ use gomlang::quickjs::unicode;
 
 const MAX_NESTING: isize = 256;
 
-const MAX_REPEAT: isize = 100000;
+const MAX_REPEAT: isize = 9007199254740991;
 
 const MAX_CAPTURES: isize = 255;
 
@@ -716,6 +716,20 @@ fn hex_digit(value: u16) -> Option[u16] {
     }
 }
 
+fn parser_has_hex_digits(parser: Parser, digits: isize) -> bool {
+    let mut index = 0;
+    while index < digits {
+        match parser_peek(parser, index) {
+            Some(value) => if hex_digit(value).is_none() {
+                return false
+            } else {},
+            None => return false,
+        };
+        index += 1;
+    }
+    true
+}
+
 fn parse_fixed_hex(parser: Parser, digits: isize, offset: isize) -> Result[u32, RegexError] {
     let mut value: u32 = 0;
     let mut index = 0;
@@ -757,6 +771,35 @@ fn parse_unicode_code_point_escape(parser: Parser, offset: isize) -> Result[u32,
     }
 }
 
+fn regexp_syntax_character(value: u16) -> bool {
+    value == 94 || value == 36 || value == 92 || value == 46 || value == 42 || value == 43
+        || value == 63
+        || value == 40
+        || value == 41
+        || value == 91
+        || value == 93
+        || value == 123
+        || value == 125
+        || value == 124
+}
+
+fn unicode_set_reserved_punctuator(value: u16) -> bool {
+    value == 38 || value == 45 || value == 33 || value == 35 || value == 37 || value == 44
+        || value == 58
+        || value == 59
+        || value == 60
+        || value == 61
+        || value == 62
+        || value == 64
+        || value == 96
+        || value == 126
+}
+
+fn identity_escape_allowed(flags: RegexFlags, value: u16, in_class: bool) -> bool {
+    regexp_syntax_character(value) || value == 47 || (in_class && value == 45)
+        || (in_class && flags.unicode_sets && unicode_set_reserved_punctuator(value))
+}
+
 fn parse_character_escape(parser: Parser, offset: isize, in_class: bool) -> Result[u32, RegexError] {
     let value = match parser_advance(parser) {
         Some(value) => value,
@@ -775,12 +818,18 @@ fn parse_character_escape(parser: Parser, offset: isize, in_class: bool) -> Resu
     } else if value == 98 && in_class {
         Result::Ok(8)
     } else if value == 120 {
-        parse_fixed_hex(parser, 2, offset)
+        if unicode_mode(parser.flags.get()) || parser_has_hex_digits(parser, 2) {
+            parse_fixed_hex(parser, 2, offset)
+        } else {
+            Result::Ok(120)
+        }
     } else if value == 117 {
         if unicode_mode(parser.flags.get()) && parser_current(parser) == Option::Some(123) {
             parse_unicode_code_point_escape(parser, offset)
-        } else {
+        } else if unicode_mode(parser.flags.get()) || parser_has_hex_digits(parser, 4) {
             parse_fixed_hex(parser, 4, offset)
+        } else {
+            Result::Ok(117)
         }
     } else if value == 99 {
         let control = match parser_advance(parser) {
@@ -816,8 +865,7 @@ fn parse_character_escape(parser: Parser, offset: isize, in_class: bool) -> Resu
     } else if value == 10 || value == 13 || value == 0x2028 || value == 0x2029 {
         Result::Err(regex_error("line terminator in escape sequence", offset))
     } else if unicode_mode(parser.flags.get())
-        && ((value >= 48 && value <= 57) || (value >= 65 && value <= 90)
-            || (value >= 97 && value <= 122)) {
+        && !identity_escape_allowed(parser.flags.get(), value, in_class) {
         Result::Err(regex_error("invalid identity escape in unicode mode", offset))
     } else {
         Result::Ok(value.to_u32())
@@ -1130,6 +1178,28 @@ fn parse_v_string_disjunction(parser: Parser, offset: isize) -> Result[ClassSet,
     }
 }
 
+fn v_reserved_single_punctuator(value: u16) -> bool {
+    value == 40 || value == 41 || value == 123 || value == 125 || value == 47 || value == 45
+        || value == 124
+}
+
+fn v_reserved_double_punctuator(value: u16) -> bool {
+    value == 33 || value == 35 || value == 36 || value == 37 || value == 38 || value == 42
+        || value == 43
+        || value == 44
+        || value == 46
+        || value == 58
+        || value == 59
+        || value == 60
+        || value == 61
+        || value == 62
+        || value == 63
+        || value == 64
+        || value == 94
+        || value == 96
+        || value == 126
+}
+
 fn parse_v_base_operand(parser: Parser) -> Result[ClassSetOperand, RegexError] {
     let offset = parser.index.get();
     let current = match parser_advance(parser) {
@@ -1187,6 +1257,9 @@ fn parse_v_base_operand(parser: Parser) -> Result[ClassSetOperand, RegexError] {
             },
             None => Result::Err(regex_error("unterminated Unicode set escape", offset)),
         }
+    } else if v_reserved_single_punctuator(current)
+        || v_reserved_double_punctuator(current) && parser_current(parser) == Option::Some(current) {
+        Result::Err(regex_error("unescaped punctuator in Unicode set", offset))
     } else if current == 93 || current == 38 && parser_current(parser) == Option::Some(38)
         || current == 45 && parser_current(parser) == Option::Some(45) {
         Result::Err(regex_error("expected Unicode set operand", offset))
@@ -1313,7 +1386,13 @@ fn parse_class(parser: Parser, offset: isize) -> Result[isize, RegexError] {
         let first = parse_class_unit(parser)?;
         match first {
             ClassUnit::Set(values) => {
-                range.union_with(values)
+                range.union_with(values);
+                if unicode_mode(parser.flags.get()) && parser_current(parser) == Option::Some(45)
+                    && parser_peek(parser, 1) != Option::Some(93) {
+                    return Result::Err(
+                        regex_error("character class escape cannot begin a range", first_offset),
+                    )
+                } else {}
             },
             ClassUnit::Single(first_value) => if parser_consume(parser, 45) {
                 match parser_current(parser) {
@@ -1554,8 +1633,11 @@ fn parse_atom(parser: Parser) -> Result[isize, RegexError] {
                             Node::ClassSet(property.range, property.strings, maximum),
                         ),
                     )
-                } else if current == 107 && parser_peek(parser, 1) == Option::Some(60)
+                } else if current == 107
                     && (unicode_mode(parser.flags.get()) || has_capture_names(parser.capture_names)) {
+                    if parser_peek(parser, 1) != Option::Some(60) {
+                        return Result::Err(regex_error("expected named backreference", offset))
+                    } else {};
                     parser_advance(parser);
                     parser_advance(parser);
                     let (name, end) = parse_group_name(parser.pattern, parser.index.get())?;
@@ -2117,6 +2199,223 @@ fn match_sequence(
     positions
 }
 
+fn simple_repeat_node(regex: Regex, node: isize) -> bool {
+    match regex.nodes[node] {
+        Node::Literal(_) | Node::Any | Node::Class(_, _) => true,
+        Node::ClassSet(_, strings, _) => strings.is_empty(),
+        _ => false,
+    }
+}
+
+fn match_simple_node_position(
+    regex: Regex,
+    flags: RegexFlags,
+    node: isize,
+    input: runtime::JsString,
+    position: isize,
+    backward: bool,
+) -> Option[isize] {
+    let available = if backward {
+        position > 0
+    } else {
+        position < input.len()
+    };
+    if !available {
+        return Option::None
+    } else {};
+    let (actual, width) = if backward {
+        input_backward_code_point(input, position, unicode_mode(flags))
+    } else {
+        input_forward_code_point(input, position, unicode_mode(flags))
+    };
+    let matches = match regex.nodes[node] {
+        Node::Literal(expected) => literal_matches(regex, flags, expected, actual),
+        Node::Any => dot_matches(flags, actual),
+        Node::Class(range, negated) => class_matches(range, negated, actual),
+        Node::ClassSet(range, strings, _) => strings.is_empty() && range.contains(actual),
+        _ => false,
+    };
+    if matches {
+        Option::Some(
+            if backward {
+                position - width
+            } else {
+                position + width
+            },
+        )
+    } else {
+        Option::None
+    }
+}
+
+fn repeat_previous_position(
+    flags: RegexFlags,
+    input: runtime::JsString,
+    position: isize,
+    backward: bool,
+) -> isize {
+    if backward {
+        let (_, width) = input_forward_code_point(input, position, unicode_mode(flags));
+        position + width
+    } else {
+        let (_, width) = input_backward_code_point(input, position, unicode_mode(flags));
+        position - width
+    }
+}
+
+fn match_simple_repeat_sequence_first(
+    regex: Regex,
+    flags: RegexFlags,
+    child: isize,
+    minimum: isize,
+    maximum: Option[isize],
+    greedy: bool,
+    input: runtime::JsString,
+    start: MatchState,
+    backward: bool,
+    children: Vec[isize],
+    next_child: isize,
+) -> Option[MatchState] {
+    let limit = repeat_limit(minimum, maximum, input.len());
+    let mut count = 0;
+    let mut position = start.position;
+    while count < minimum {
+        match match_simple_node_position(regex, flags, child, input, position, backward) {
+            Some(next) => {
+                position = next;
+                count += 1;
+            },
+            None => return Option::None,
+        }
+    }
+    if greedy {
+        while count < limit {
+            match match_simple_node_position(regex, flags, child, input, position, backward) {
+                Some(next) => {
+                    position = next;
+                    count += 1;
+                },
+                None => break,
+            }
+        }
+        loop {
+            match match_sequence_first_from(
+                regex,
+                flags,
+                children,
+                input,
+                MatchState { position, captures: start.captures },
+                backward,
+                next_child,
+            ) {
+                Some(value) => return Option::Some(value),
+                None => (),
+            };
+            if count <= minimum {
+                return Option::None
+            } else {
+                position = repeat_previous_position(flags, input, position, backward);
+                count -= 1;
+            }
+        }
+    } else {
+        loop {
+            match match_sequence_first_from(
+                regex,
+                flags,
+                children,
+                input,
+                MatchState { position, captures: start.captures },
+                backward,
+                next_child,
+            ) {
+                Some(value) => return Option::Some(value),
+                None => (),
+            };
+            if count >= limit {
+                return Option::None
+            } else {};
+            match match_simple_node_position(regex, flags, child, input, position, backward) {
+                Some(next) => {
+                    position = next;
+                    count += 1;
+                },
+                None => return Option::None,
+            }
+        }
+    }
+}
+
+fn match_sequence_first_from(
+    regex: Regex,
+    flags: RegexFlags,
+    children: Vec[isize],
+    input: runtime::JsString,
+    state: MatchState,
+    backward: bool,
+    child_index: isize,
+) -> Option[MatchState] {
+    if child_index >= children.len() {
+        return Option::Some(state)
+    } else {};
+    let node_index = if backward {
+        children.len() - child_index - 1
+    } else {
+        child_index
+    };
+    let node = children[node_index];
+    match regex.nodes[node] {
+        Node::Repeat(child, minimum, maximum, greedy) => if simple_repeat_node(regex, child) {
+            match_simple_repeat_sequence_first(
+                regex,
+                flags,
+                child,
+                minimum,
+                maximum,
+                greedy,
+                input,
+                state,
+                backward,
+                children,
+                child_index + 1,
+            )
+        } else {
+            for outcome in match_node_direction_flags(regex, flags, node, input, state, backward) {
+                match match_sequence_first_from(
+                    regex,
+                    flags,
+                    children,
+                    input,
+                    outcome,
+                    backward,
+                    child_index + 1,
+                ) {
+                    Some(value) => return Option::Some(value),
+                    None => (),
+                }
+            }
+            Option::None
+        },
+        _ => {
+            for outcome in match_node_direction_flags(regex, flags, node, input, state, backward) {
+                match match_sequence_first_from(
+                    regex,
+                    flags,
+                    children,
+                    input,
+                    outcome,
+                    backward,
+                    child_index + 1,
+                ) {
+                    Some(value) => return Option::Some(value),
+                    None => (),
+                }
+            }
+            Option::None
+        },
+    }
+}
+
 fn class_matches(range: unicode::CharRange, negated: bool, value: u32) -> bool {
     let contains = range.contains(value);
     if negated {
@@ -2348,10 +2647,7 @@ fn starts_line(flags: RegexFlags, input: runtime::JsString, position: isize) -> 
 
 fn ends_line(flags: RegexFlags, input: runtime::JsString, position: isize) -> bool {
     position == input.len()
-        || (position < input.len() && is_line_terminator(input.get(position))
-            && (flags.multiline || position + 1 == input.len()
-                || (input.get(position) == 13 && position + 2 == input.len()
-                    && input.get(position + 1) == 10)))
+        || (flags.multiline && position < input.len() && is_line_terminator(input.get(position)))
 }
 
 fn word_code_point(regex: Regex, flags: RegexFlags, value: u32) -> bool {
@@ -2745,19 +3041,79 @@ fn match_node(regex: Regex, node: isize, input: runtime::JsString, state: MatchS
     match_node_direction(regex, node, input, state, false)
 }
 
+fn match_root_first_with_flags(
+    regex: Regex,
+    flags: RegexFlags,
+    node: isize,
+    input: runtime::JsString,
+    state: MatchState,
+) -> Option[MatchState] {
+    match regex.nodes[node] {
+        Node::Alternation(children) => {
+            for child in children {
+                let outcomes = match_node_direction_flags(regex, flags, child, input, state, false);
+                if !outcomes.is_empty() {
+                    return Option::Some(outcomes[0])
+                } else {}
+            }
+            Option::None
+        },
+        Node::Sequence(children) => {
+            match_sequence_first_from(regex, flags, children, input, state, false, 0)
+        },
+        Node::Group(child) => match_root_first_with_flags(regex, flags, child, input, state),
+        Node::ScopedFlags(child, scoped) => match_root_first_with_flags(
+            regex,
+            scoped,
+            child,
+            input,
+            state,
+        ),
+        Node::Repeat(child, minimum, maximum, greedy) => if simple_repeat_node(regex, child) {
+            match_simple_repeat_sequence_first(
+                regex,
+                flags,
+                child,
+                minimum,
+                maximum,
+                greedy,
+                input,
+                state,
+                false,
+                Vec::new(),
+                0,
+            )
+        } else {
+            let outcomes = match_node_direction_flags(regex, flags, node, input, state, false);
+            if outcomes.is_empty() {
+                Option::None
+            } else {
+                Option::Some(outcomes[0])
+            }
+        },
+        _ => {
+            let outcomes = match_node_direction_flags(regex, flags, node, input, state, false);
+            if outcomes.is_empty() {
+                Option::None
+            } else {
+                Option::Some(outcomes[0])
+            }
+        },
+    }
+}
+
 pub fn match_at(regex: Regex, input: runtime::JsString, start: isize) -> Option[RegexMatch] {
     if start < 0 || start > input.len() {
         return Option::None
     } else {};
     let initial = MatchState { position: start, captures: empty_captures(regex.capture_count) };
-    let outcomes = match_node(regex, regex.root, input, initial);
-    if outcomes.is_empty() {
-        Option::None
-    } else {
-        let outcome = outcomes[0];
-        let captures = copy_captures(outcome.captures);
-        captures.set(0, Option::Some(RegexCapture { start, end: outcome.position }));
-        Option::Some(RegexMatch { start, end: outcome.position, captures })
+    match match_root_first_with_flags(regex, regex.flags, regex.root, input, initial) {
+        Some(outcome) => {
+            let captures = copy_captures(outcome.captures);
+            captures.set(0, Option::Some(RegexCapture { start, end: outcome.position }));
+            Option::Some(RegexMatch { start, end: outcome.position, captures })
+        },
+        None => Option::None,
     }
 }
 

@@ -103,22 +103,35 @@ fn primitive_number_text(value: f64, radix: isize) -> Result[string, vm::NativeE
     }
 }
 
+struct PrimitiveFormatDigits {
+    digits: Option[isize],
+    in_range: bool,
+}
+
 fn primitive_format_digits(arguments: Vec[runtime::Value], minimum: isize, maximum: isize) -> Result[
-    Option[isize],
+    PrimitiveFormatDigits,
     vm::NativeError,
 ] {
     match argument(arguments, 0) {
-        runtime::Value::Undefined => Result::Ok(Option::None),
+        runtime::Value::Undefined => {
+            Result::Ok(PrimitiveFormatDigits { digits: Option::None, in_range: true })
+        },
         _ => {
             let number = number_argument(arguments, 0)?;
             let digits = string_truncated_int(number, 0);
-            if !math::is_finite(number) || digits < minimum || digits > maximum {
-                Result::Err(native_error("RangeError: precision is outside the supported range"))
-            } else {
-                Result::Ok(Option::Some(digits))
-            }
+            Result::Ok(
+                PrimitiveFormatDigits {
+                    digits: Option::Some(digits),
+                    in_range: (math::is_nan(number) || math::is_finite(number)) && digits >= minimum
+                        && digits <= maximum,
+                },
+            )
         },
     }
+}
+
+fn primitive_format_range_error() -> vm::NativeError {
+    native_error("RangeError: precision is outside the supported range")
 }
 
 fn primitive_number_value_of(
@@ -149,7 +162,11 @@ fn primitive_number_to_fixed(
     arguments: Vec[runtime::Value],
 ) -> Result[runtime::Value, vm::NativeError] {
     let value = primitive_number_receiver(heap, this_value, prototype)?;
-    let digits = primitive_format_digits(arguments, 0, 100)?.unwrap_or(0);
+    let format = primitive_format_digits(arguments, 0, 100)?;
+    if !format.in_range {
+        return Result::Err(primitive_format_range_error())
+    } else {};
+    let digits = format.digits.unwrap_or(0);
     Result::Ok(runtime::Value::String(js_string(dtoa::number_to_fixed(value, digits))))
 }
 
@@ -160,8 +177,11 @@ fn primitive_number_to_exponential(
     arguments: Vec[runtime::Value],
 ) -> Result[runtime::Value, vm::NativeError] {
     let value = primitive_number_receiver(heap, this_value, prototype)?;
-    let digits = primitive_format_digits(arguments, 0, 100)?;
-    Result::Ok(runtime::Value::String(js_string(dtoa::number_to_exponential(value, digits))))
+    let format = primitive_format_digits(arguments, 0, 100)?;
+    if math::is_finite(value) && !format.in_range {
+        return Result::Err(primitive_format_range_error())
+    } else {};
+    Result::Ok(runtime::Value::String(js_string(dtoa::number_to_exponential(value, format.digits))))
 }
 
 fn primitive_number_to_precision(
@@ -171,8 +191,11 @@ fn primitive_number_to_precision(
     arguments: Vec[runtime::Value],
 ) -> Result[runtime::Value, vm::NativeError] {
     let value = primitive_number_receiver(heap, this_value, prototype)?;
-    let digits = primitive_format_digits(arguments, 1, 100)?;
-    Result::Ok(runtime::Value::String(js_string(dtoa::number_to_precision(value, digits))))
+    let format = primitive_format_digits(arguments, 1, 100)?;
+    if math::is_finite(value) && !format.in_range {
+        return Result::Err(primitive_format_range_error())
+    } else {};
+    Result::Ok(runtime::Value::String(js_string(dtoa::number_to_precision(value, format.digits))))
 }
 
 fn primitive_number_to_locale_string(
@@ -430,7 +453,10 @@ fn primitive_prototype(context: vm::Context, constructor: runtime::Value, name: 
     runtime::ObjectId,
     BuiltinError,
 ] {
-    let prototype = match runtime::new_ordinary_object(context.heap(), Option::None) {
+    let prototype = match runtime::new_ordinary_object(
+        context.heap(),
+        context.heap().object_prototype(),
+    ) {
         Ok(value) => value,
         Err(value) => return Result::Err(BuiltinError { message: value.message }),
     };
@@ -517,6 +543,9 @@ fn install_primitive_prototypes(
     string_prototype: runtime::ObjectId,
 ) -> Result[(), BuiltinError] {
     let number_prototype = primitive_prototype(context, number, "Number")?;
+    if !runtime::set_primitive_value(context.heap(), number_prototype, runtime::Value::Int(0)) {
+        return Result::Err(BuiltinError { message: "cannot initialize Number prototype" })
+    } else {};
     primitive_method(
         context,
         number_prototype,
@@ -566,6 +595,9 @@ fn install_primitive_prototypes(
         },
     )?;
     let boolean_prototype = primitive_prototype(context, boolean, "Boolean")?;
+    if !runtime::set_primitive_value(context.heap(), boolean_prototype, runtime::Value::Bool(false)) {
+        return Result::Err(BuiltinError { message: "cannot initialize Boolean prototype" })
+    } else {};
     primitive_method(
         context,
         boolean_prototype,

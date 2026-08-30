@@ -187,7 +187,6 @@ pub fn decode_base64(
     let limit = decode_capacity(capacity);
     let mut cursor = 0;
     let mut read = 0;
-    let mut terminal = false;
     while cursor < input.len() {
         if output.len() >= limit {
             break
@@ -199,8 +198,6 @@ pub fn decode_base64(
         if cursor >= input.len() {
             read = cursor;
             break
-        } else if terminal {
-            return Result::Err(base64_failure(output, read))
         } else {};
         let digits: Vec[isize] = Vec::new();
         while cursor < input.len() && digits.len() < 4 {
@@ -263,21 +260,23 @@ pub fn decode_base64(
             LastChunkHandling::Strict => true,
             _ => false,
         };
+        let mut terminal_cursor = cursor;
+        if padded {
+            while terminal_cursor < input.len() && base64_whitespace(input[terminal_cursor]) {
+                terminal_cursor += 1;
+            }
+            if terminal_cursor < input.len() {
+                return Result::Err(base64_failure(output, read))
+            } else {}
+        } else {};
         match base64_emit(output, digits, count, strict_mode) {
             Ok(_) => (),
             Err(_) => return Result::Err(base64_failure(output, read)),
         };
         read = cursor;
         if padded {
-            terminal = true;
-            while cursor < input.len() && base64_whitespace(input[cursor]) {
-                cursor += 1;
-            }
-            if cursor < input.len() {
-                return Result::Err(base64_failure(output, read))
-            } else {
-                read = cursor;
-            }
+            cursor = terminal_cursor;
+            read = cursor;
         } else {}
     }
     Result::Ok(DecodeResult { bytes: output, read })

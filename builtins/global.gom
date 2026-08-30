@@ -534,11 +534,17 @@ fn string_raw(
             _ => (),
         };
         if index + 1 < length {
-            let substitution = string_value_at_depth(context, argument(arguments, index + 1), depth)?;
-            match substitution {
-                runtime::Value::String(value) => string_raw_append(output, value),
-                _ => (),
-            }
+            if index + 1 < arguments.len() {
+                let substitution = string_value_at_depth(
+                    context,
+                    argument(arguments, index + 1),
+                    depth,
+                )?;
+                match substitution {
+                    runtime::Value::String(value) => string_raw_append(output, value),
+                    _ => (),
+                }
+            } else {}
         } else {};
         index += 1;
     }
@@ -1069,10 +1075,7 @@ fn global_eval(
     let _ = depth;
     let source = argument(arguments, 0);
     let text = match source {
-        runtime::Value::String(value) => match value.to_host_string() {
-            Ok(value) => value,
-            Err(value) => return Result::Err(function_syntax_error(value.debug())),
-        },
+        runtime::Value::String(value) => value,
         _ => return Result::Ok(source),
     };
     let bindings: Vec[bytecode::EvalBinding] = Vec::new();
@@ -1089,10 +1092,7 @@ fn global_eval_script(
     let _ = this_value;
     let source = string_value_at_depth(context, argument(arguments, 0), depth)?;
     let text = match source {
-        runtime::Value::String(value) => match value.to_host_string() {
-            Ok(value) => value,
-            Err(value) => return Result::Err(function_syntax_error(value.debug())),
-        },
+        runtime::Value::String(value) => value.to_host_string_lossy(),
         _ => return Result::Err(function_vm_error("evalScript source is not a string")),
     };
     let function = context.compile_dynamic_script_source(text, "<evalScript>")?;
@@ -1437,37 +1437,49 @@ fn object_constructor(
     }
 }
 
-fn array_constructor(
-    heap: runtime::Heap,
+fn array_constructor_vm(
+    context: vm::Context,
     this_value: runtime::Value,
     arguments: Vec[runtime::Value],
-) -> Result[runtime::Value, vm::NativeError] {
+    depth: isize,
+) -> Result[runtime::Value, vm::VmError] {
     let _ = this_value;
+    let _ = depth;
     if arguments.len() == 1 {
         match arguments[0] {
             runtime::Value::Int(value) => if value >= 0 {
-                Result::Ok(
-                    runtime::Value::Object(allocate_array(heap, Vec::new(), value.to_isize())?),
-                )
+                match allocate_array(context.heap(), Vec::new(), value.to_isize()) {
+                    Ok(value) => Result::Ok(runtime::Value::Object(value)),
+                    Err(value) => Result::Err(function_native_error(value)),
+                }
             } else {
-                Result::Err(native_error("invalid array length"))
+                Result::Err(function_range_error("invalid array length"))
             },
             runtime::Value::Float(value) => if math::is_finite(value) && value >= 0.0
                 && value <= 4294967295.0
                 && math::trunc(value) == value {
                 let length = num::parse_int_structured(dtoa::number_to_string(value)).unwrap_or(-1);
                 if length >= 0 {
-                    Result::Ok(runtime::Value::Object(allocate_array(heap, Vec::new(), length)?))
+                    match allocate_array(context.heap(), Vec::new(), length) {
+                        Ok(value) => Result::Ok(runtime::Value::Object(value)),
+                        Err(value) => Result::Err(function_native_error(value)),
+                    }
                 } else {
-                    Result::Err(native_error("invalid array length"))
+                    Result::Err(function_range_error("invalid array length"))
                 }
             } else {
-                Result::Err(native_error("invalid array length"))
+                Result::Err(function_range_error("invalid array length"))
             },
-            _ => Result::Ok(runtime::Value::Object(allocate_array(heap, arguments, 1)?)),
+            _ => match allocate_array(context.heap(), arguments, 1) {
+                Ok(value) => Result::Ok(runtime::Value::Object(value)),
+                Err(value) => Result::Err(function_native_error(value)),
+            },
         }
     } else {
-        Result::Ok(runtime::Value::Object(allocate_array(heap, arguments, arguments.len())?))
+        match allocate_array(context.heap(), arguments, arguments.len()) {
+            Ok(value) => Result::Ok(runtime::Value::Object(value)),
+            Err(value) => Result::Err(function_native_error(value)),
+        }
     }
 }
 
@@ -1532,22 +1544,11 @@ fn function_to_string(
     depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     let _ = arguments;
+    let _ = depth;
     let callable = function_callable(this_value)?;
     match vm::function_source(context, callable) {
         Some(source) => Result::Ok(runtime::Value::String(source)),
-        None => {
-            let name = match context.read_property_at_depth(
-                callable,
-                runtime::Value::String(js_string("name")),
-                depth,
-            )? {
-                runtime::Value::String(value) => value.to_host_string().unwrap_or(""),
-                _ => "",
-            };
-            Result::Ok(
-                runtime::Value::String(js_string("function " + name + "() {\n    [native code]\n}")),
-            )
-        },
+        None => Result::Ok(runtime::Value::String(js_string("function () {\n    [native code]\n}"))),
     }
 }
 
@@ -1690,14 +1691,26 @@ fn function_bind(
         bound_arguments.push(arguments[index]);
         index += 1;
     }
-    let target_length = match context.read_property_at_depth(
-        callable,
-        runtime::Value::String(js_string("length")),
-        depth,
-    )? {
-        runtime::Value::Int(value) => int_float(value.to_isize()),
-        runtime::Value::Float(value) => value,
-        _ => 0.0,
+    let target_has_length = match callable {
+        runtime::Value::Object(object) => match context.heap().get(object) {
+            Some(value) => value.is_proxy()
+                || value.own_property(runtime::string_property_key("length")).is_some(),
+            None => false,
+        },
+        _ => false,
+    };
+    let target_length = if target_has_length {
+        match context.read_property_at_depth(
+            callable,
+            runtime::Value::String(js_string("length")),
+            depth,
+        )? {
+            runtime::Value::Int(value) => int_float(value.to_isize()),
+            runtime::Value::Float(value) => value,
+            _ => 0.0,
+        }
+    } else {
+        0.0
     };
     let length = if target_length > 0.0 && !math::is_finite(target_length) {
         runtime::Value::Float(target_length)
@@ -1743,10 +1756,7 @@ fn function_bind(
 
 fn dynamic_function_source_text(value: runtime::Value) -> Result[string, vm::VmError] {
     match value {
-        runtime::Value::String(value) => match value.to_host_string() {
-            Ok(value) => Result::Ok(value),
-            Err(_) => Result::Err(function_syntax_error("invalid dynamic function source")),
-        },
+        runtime::Value::String(value) => Result::Ok(value.to_host_string_lossy()),
         _ => Result::Err(function_vm_error("dynamic function source is not a string")),
     }
 }
@@ -1924,6 +1934,10 @@ fn object_prototype_is_prototype_of_at_depth(
     arguments: Vec[runtime::Value],
     depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
+    match argument(arguments, 0) {
+        runtime::Value::Object(_) => (),
+        _ => return Result::Ok(runtime::Value::Bool(false)),
+    };
     let prototype = match object_coercion(context.heap(), this_value) {
         Ok(value) => runtime::Value::Object(value),
         Err(value) => return Result::Err(function_native_error(value)),
@@ -1947,15 +1961,13 @@ fn object_prototype_to_string(
         runtime::Value::Bool(_) => "Boolean",
         runtime::Value::Int(_) | runtime::Value::Float(_) => "Number",
         runtime::Value::String(_) => "String",
-        runtime::Value::BigInt(_) => "BigInt",
-        runtime::Value::Symbol(_) => "Symbol",
+        runtime::Value::BigInt(_) | runtime::Value::Symbol(_) => "Object",
         runtime::Value::Object(value) => match heap.get(value) {
             Some(object) => match object.primitive_value() {
                 Some(runtime::Value::Bool(_)) => "Boolean",
                 Some(runtime::Value::Int(_)) | Some(runtime::Value::Float(_)) => "Number",
                 Some(runtime::Value::String(_)) => "String",
-                Some(runtime::Value::BigInt(_)) => "BigInt",
-                Some(runtime::Value::Symbol(_)) => "Symbol",
+                Some(runtime::Value::BigInt(_)) | Some(runtime::Value::Symbol(_)) => "Object",
                 Some(runtime::Value::Undefined) | Some(runtime::Value::Null) | Some(runtime::Value::Object(_)) | None => match object.kind() {
                     runtime::ObjectKind::Array => "Array",
                     runtime::ObjectKind::Function => "Function",
@@ -2041,11 +2053,6 @@ fn object_prototype_define_accessor_at_depth(
     getter: bool,
     depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
-    let object = match object_coercion(context.heap(), this_value) {
-        Ok(value) => value,
-        Err(value) => return Result::Err(function_native_error(value)),
-    };
-    let key = property_key_value_at_depth(context, argument(arguments, 0), depth)?;
     let callable = argument(arguments, 1);
     match callable {
         runtime::Value::Object(value) => if !value.is_callable() {
@@ -2053,6 +2060,11 @@ fn object_prototype_define_accessor_at_depth(
         } else {},
         _ => return Result::Err(function_vm_error("accessor must be callable")),
     };
+    let object = match object_coercion(context.heap(), this_value) {
+        Ok(value) => value,
+        Err(value) => return Result::Err(function_native_error(value)),
+    };
+    let key = property_key_value_at_depth(context, argument(arguments, 0), depth)?;
     let descriptor = match allocate_ordinary(context.heap(), Option::None) {
         Ok(value) => value,
         Err(value) => return Result::Err(function_native_error(value)),
@@ -2141,43 +2153,46 @@ fn object_prototype_lookup_accessor_at_depth(
     Result::Err(function_vm_error("object prototype chain exceeds implementation limit"))
 }
 
-fn object_prototype_proto_get(
-    heap: runtime::Heap,
+fn object_prototype_proto_get_at_depth(
+    context: vm::Context,
     this_value: runtime::Value,
     arguments: Vec[runtime::Value],
-) -> Result[runtime::Value, vm::NativeError] {
+    depth: isize,
+) -> Result[runtime::Value, vm::VmError] {
     let _ = arguments;
-    let object = object_coercion(heap, this_value)?;
-    match heap.get(object) {
-        Some(value) => match value.prototype() {
-            Some(value) => Result::Ok(runtime::Value::Object(value)),
-            None => Result::Ok(runtime::Value::Null),
-        },
-        None => Result::Err(native_error("object does not belong to this heap")),
-    }
+    let object = match object_coercion(context.heap(), this_value) {
+        Ok(value) => value,
+        Err(value) => return Result::Err(function_native_error(value)),
+    };
+    context.get_prototype_of_at_depth(runtime::Value::Object(object), depth)
 }
 
-fn object_prototype_proto_set(
-    heap: runtime::Heap,
+fn object_prototype_proto_set_at_depth(
+    context: vm::Context,
     this_value: runtime::Value,
     arguments: Vec[runtime::Value],
-) -> Result[runtime::Value, vm::NativeError] {
+    depth: isize,
+) -> Result[runtime::Value, vm::VmError] {
     match this_value {
         runtime::Value::Undefined | runtime::Value::Null => {
-            return Result::Err(native_error("cannot set prototype of null or undefined"))
+            return Result::Err(function_vm_error("cannot set prototype of null or undefined"))
         },
         _ => (),
     };
     let prototype = match argument(arguments, 0) {
-        runtime::Value::Null => Option::None,
-        runtime::Value::Object(value) => Option::Some(value),
+        runtime::Value::Null => runtime::Value::Null,
+        runtime::Value::Object(value) => runtime::Value::Object(value),
         _ => return Result::Ok(runtime::Value::Undefined),
     };
     match this_value {
-        runtime::Value::Object(object) => if runtime::set_prototype_of(heap, object, prototype) {
+        runtime::Value::Object(_) => if context.set_prototype_of_at_depth(
+            this_value,
+            prototype,
+            depth,
+        )? {
             Result::Ok(runtime::Value::Undefined)
         } else {
-            Result::Err(native_error("cannot set object prototype"))
+            Result::Err(function_vm_error("cannot set object prototype"))
         },
         _ => Result::Ok(runtime::Value::Undefined),
     }
@@ -3124,22 +3139,33 @@ fn object_is_frozen(heap: runtime::Heap, this_value: runtime::Value, arguments: 
     }
 }
 
+fn array_is_array_value(heap: runtime::Heap, value: runtime::Value) -> Result[bool, vm::NativeError] {
+    let object = match value {
+        runtime::Value::Object(value) => match heap.get(value) {
+            Some(object) => object,
+            None => return Result::Ok(false),
+        },
+        _ => return Result::Ok(false),
+    };
+    if object.is_proxy() {
+        match object.proxy_target() {
+            Some(target) => array_is_array_value(heap, runtime::Value::Object(target)),
+            None => Result::Err(native_error("proxy has been revoked")),
+        }
+    } else {
+        match object.kind() {
+            runtime::ObjectKind::Array => Result::Ok(true),
+            runtime::ObjectKind::Ordinary | runtime::ObjectKind::Function => Result::Ok(false),
+        }
+    }
+}
+
 fn array_is_array(heap: runtime::Heap, this_value: runtime::Value, arguments: Vec[runtime::Value]) -> Result[
     runtime::Value,
     vm::NativeError,
 ] {
     let _ = this_value;
-    let result = match argument(arguments, 0) {
-        runtime::Value::Object(value) => match heap.get(value) {
-            Some(object) => match object.kind() {
-                runtime::ObjectKind::Array => true,
-                runtime::ObjectKind::Ordinary | runtime::ObjectKind::Function => false,
-            },
-            None => false,
-        },
-        _ => false,
-    };
-    Result::Ok(runtime::Value::Bool(result))
+    Result::Ok(runtime::Value::Bool(array_is_array_value(heap, argument(arguments, 0))?))
 }
 
 fn global_is_nan(heap: runtime::Heap, this_value: runtime::Value, arguments: Vec[runtime::Value]) -> Result[
@@ -3255,10 +3281,13 @@ fn math_round(heap: runtime::Heap, this_value: runtime::Value, arguments: Vec[ru
     let _ = heap;
     let _ = this_value;
     let value = number_argument(arguments, 0)?;
-    let result = if math::is_nan(value) || math::is_infinite(value) || value == 0.0 {
+    let result = if math::is_nan(value) || math::is_infinite(value) || value == 0.0
+        || math::trunc(value) == value {
         value
     } else if value < 0.0 && value >= -0.5 {
         num::parse_float64_structured("-0").unwrap_or(0.0)
+    } else if value > 0.0 && value < 0.5 {
+        0.0
     } else {
         math::floor(value + 0.5)
     };
@@ -3317,7 +3346,18 @@ fn math_log10(heap: runtime::Heap, this_value: runtime::Value, arguments: Vec[ru
 ] {
     let _ = heap;
     let _ = this_value;
-    Result::Ok(runtime::Value::Float(math::log(number_argument(arguments, 0)?) / 2.302585092994046))
+    let value = number_argument(arguments, 0)?;
+    let result = math::log(value) / math::LN_10;
+    let nearest = math::round(result);
+    Result::Ok(
+        runtime::Value::Float(
+            if value > 0.0 && math::is_finite(value) && math::pow(10.0, nearest) == value {
+                nearest
+            } else {
+                result
+            },
+        ),
+    )
 }
 
 fn math_sin(heap: runtime::Heap, this_value: runtime::Value, arguments: Vec[runtime::Value]) -> Result[
@@ -3391,7 +3431,13 @@ fn math_pow(heap: runtime::Heap, this_value: runtime::Value, arguments: Vec[runt
     let _ = this_value;
     let base = number_argument(arguments, 0)?;
     let exponent = number_argument(arguments, 1)?;
-    Result::Ok(runtime::Value::Float(math::pow(base, exponent)))
+    let result = if math::is_nan(exponent)
+        || math::is_infinite(exponent) && (base == 1.0 || base == -1.0) {
+        nan()
+    } else {
+        math::pow(base, exponent)
+    };
+    Result::Ok(runtime::Value::Float(result))
 }
 
 fn math_max(heap: runtime::Heap, this_value: runtime::Value, arguments: Vec[runtime::Value]) -> Result[
@@ -3734,6 +3780,8 @@ fn builtin_function_length(name: string) -> isize {
         "Array.prototype.with" | "Array.prototype.toSpliced" | "Array.prototype.copyWithin" => 2,
         "Array.prototype.toReversed" | "Array.prototype.flat" => 0,
         "Array.prototype.toSorted" | "Array.prototype.fill" | "Array.prototype.findLast" | "Array.prototype.findLastIndex" | "Array.prototype.flatMap" | "Array.prototype.sort" => 1,
+        "TypedArray.prototype.set" => 1,
+        "TypedArray.prototype.subarray" => 2,
         "Map.prototype.clear" | "Map.prototype.entries" | "Map.prototype.keys" | "Map.prototype.values" | "Set.prototype.clear" | "Set.prototype.entries" | "Set.prototype.values" => 0,
         "Map.prototype.delete" | "Map.prototype.get" | "Map.prototype.has" | "Map.prototype.forEach" | "Set.prototype.add" | "Set.prototype.delete" | "Set.prototype.has" | "Set.prototype.forEach" | "Set.prototype.isDisjointFrom" | "Set.prototype.isSubsetOf" | "Set.prototype.isSupersetOf" | "Set.prototype.intersection" | "Set.prototype.difference" | "Set.prototype.symmetricDifference" | "Set.prototype.union" | "WeakMap.prototype.get" | "WeakMap.prototype.has" | "WeakMap.prototype.delete" | "WeakSet.prototype.add" | "WeakSet.prototype.has" | "WeakSet.prototype.delete" => 1,
         "Map.groupBy" | "Set.groupBy" | "Map.prototype.set" | "Map.prototype.getOrInsert" | "Map.prototype.getOrInsertComputed" | "WeakMap.prototype.set" | "WeakMap.prototype.getOrInsert" | "WeakMap.prototype.getOrInsertComputed" => 2,
@@ -4382,9 +4430,41 @@ fn proxy_target_current_descriptor(
     match reflect_proxy_parts(context, object)? {
         Some((target, _)) => proxy_target_current_descriptor(context, target, key),
         None => match context.heap().get(object) {
-            Some(value) => Result::Ok(value.own_property(key)),
+            Some(value) => checked_module_namespace_descriptor(
+                context,
+                object,
+                value.own_property(key),
+            ),
             None => Result::Err(reflect_type_error("object is invalid")),
         },
+    }
+}
+
+fn checked_module_namespace_descriptor(
+    context: vm::Context,
+    object: runtime::ObjectId,
+    descriptor: Option[runtime::PropertyDescriptor],
+) -> Result[Option[runtime::PropertyDescriptor], vm::VmError] {
+    match descriptor {
+        Some(runtime::PropertyDescriptor::Data { value, writable, enumerable, configurable }) => {
+            if runtime::is_module_namespace(context.heap(), object)
+                && runtime::is_tdz_value(context.heap(), value) {
+                Result::Err(
+                    vm::VmError {
+                        offset: -1,
+                        kind: vm::VmErrorKind::ReferenceError("binding is not initialized"),
+                    },
+                )
+            } else {
+                Result::Ok(
+                    Option::Some(
+                        runtime::data_descriptor(value, writable, enumerable, configurable),
+                    ),
+                )
+            }
+        },
+        Some(value) => Result::Ok(Option::Some(value)),
+        None => Result::Ok(Option::None),
     }
 }
 
@@ -4467,6 +4547,20 @@ fn proxy_get_own_property_descriptor_at_depth(
                                 ),
                             }
                         } else {};
+                        match target_descriptor {
+                            Some(value) => if !runtime::descriptor_configurable(descriptor)
+                                && runtime::descriptor_is_data(descriptor)
+                                && !runtime::descriptor_writable(descriptor)
+                                && runtime::descriptor_is_data(value)
+                                && runtime::descriptor_writable(value) {
+                                return Result::Err(
+                                    reflect_type_error(
+                                        "proxy getOwnPropertyDescriptor trap made a writable property non-writable",
+                                    ),
+                                )
+                            } else {},
+                            None => (),
+                        };
                         Result::Ok(Option::Some(descriptor))
                     },
                     _ => Result::Err(
@@ -4479,9 +4573,28 @@ fn proxy_get_own_property_descriptor_at_depth(
             None => proxy_get_own_property_descriptor_at_depth(context, target, key, depth),
         },
         None => match context.heap().get(object) {
-            Some(value) => Result::Ok(value.own_property(key)),
+            Some(value) => checked_module_namespace_descriptor(
+                context,
+                object,
+                value.own_property(key),
+            ),
             None => Result::Err(reflect_type_error("object is invalid")),
         },
+    }
+}
+
+fn proxy_descriptor_field_present(
+    context: vm::Context,
+    descriptor: Option[runtime::Value],
+    name: string,
+) -> bool {
+    match descriptor {
+        Some(runtime::Value::Object(object)) => match context.heap().get(object) {
+            Some(value) => value.own_property(runtime::string_property_key(name)).is_some(),
+            None => false,
+        },
+        Some(_) => false,
+        None => true,
     }
 }
 
@@ -4546,7 +4659,12 @@ fn proxy_define_property_at_depth(
                         ),
                     )
                 } else {};
-                if !runtime::descriptor_configurable(descriptor) {
+                let setting_configurable_false = !runtime::descriptor_configurable(descriptor)
+                    && proxy_descriptor_field_present(context, trap_descriptor, "configurable");
+                let setting_writable_false = runtime::descriptor_is_data(descriptor)
+                    && !runtime::descriptor_writable(descriptor)
+                    && proxy_descriptor_field_present(context, trap_descriptor, "writable");
+                if setting_configurable_false {
                     match target_descriptor {
                         Some(value) => if runtime::descriptor_configurable(value) {
                             return Result::Err(
@@ -4562,6 +4680,18 @@ fn proxy_define_property_at_depth(
                         ),
                     }
                 } else {};
+                match target_descriptor {
+                    Some(value) => if setting_writable_false && runtime::descriptor_is_data(value)
+                        && !runtime::descriptor_configurable(value)
+                        && runtime::descriptor_writable(value) {
+                        return Result::Err(
+                            reflect_type_error(
+                                "proxy defineProperty trap made a writable property non-writable",
+                            ),
+                        )
+                    } else {},
+                    None => (),
+                };
                 Result::Ok(true)
             },
             None => proxy_define_property_at_depth(
@@ -4573,14 +4703,31 @@ fn proxy_define_property_at_depth(
                 depth,
             ),
         },
-        None => Result::Ok(
-            runtime::define_own_property(
+        None => {
+            let valid_typed_index = runtime::is_typed_array_valid_numeric_property(
                 context.heap(),
                 object,
                 key,
-                typed_array_descriptor_at_depth(context, object, key, descriptor, depth)?,
-            ),
-        ),
+            );
+            let converted = array_length_descriptor_at_depth(
+                context,
+                object,
+                key,
+                descriptor,
+                depth,
+            )?;
+            let converted = typed_array_descriptor_at_depth(context, object, key, converted, depth)?;
+            let defined = runtime::define_own_property(context.heap(), object, key, converted);
+            Result::Ok(
+                defined
+                    || valid_typed_index
+                        && !runtime::is_typed_array_valid_numeric_property(
+                            context.heap(),
+                            object,
+                            key,
+                        ),
+            )
+        },
     }
 }
 
@@ -4679,20 +4826,11 @@ fn object_get_own_property_descriptor_at_depth(
 
 fn object_own_property_test_at_depth(
     context: vm::Context,
-    receiver: runtime::Value,
-    key_value: runtime::Value,
+    object: runtime::ObjectId,
+    key: runtime::PropertyKey,
     enumerable: bool,
     depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
-    let object = match object_coercion(context.heap(), receiver) {
-        Ok(value) => value,
-        Err(value) => return Result::Err(function_native_error(value)),
-    };
-    let converted = property_key_value_at_depth(context, key_value, depth)?;
-    let key = match property_key_from_value(context.heap(), converted) {
-        Ok(value) => value,
-        Err(value) => return Result::Err(function_native_error(value)),
-    };
     let descriptor = proxy_get_own_property_descriptor_at_depth(context, object, key, depth)?;
     Result::Ok(
         runtime::Value::Bool(
@@ -4711,13 +4849,35 @@ fn object_has_own_at_depth(
     depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     let _ = this_value;
-    object_own_property_test_at_depth(
-        context,
-        argument(arguments, 0),
-        argument(arguments, 1),
-        false,
-        depth,
-    )
+    let object = match object_coercion(context.heap(), argument(arguments, 0)) {
+        Ok(value) => value,
+        Err(value) => return Result::Err(function_native_error(value)),
+    };
+    let converted = property_key_value_at_depth(context, argument(arguments, 1), depth)?;
+    let key = match property_key_from_value(context.heap(), converted) {
+        Ok(value) => value,
+        Err(value) => return Result::Err(function_native_error(value)),
+    };
+    object_own_property_test_at_depth(context, object, key, false, depth)
+}
+
+fn object_prototype_own_property_test_at_depth(
+    context: vm::Context,
+    receiver: runtime::Value,
+    key_value: runtime::Value,
+    enumerable: bool,
+    depth: isize,
+) -> Result[runtime::Value, vm::VmError] {
+    let converted = property_key_value_at_depth(context, key_value, depth)?;
+    let key = match property_key_from_value(context.heap(), converted) {
+        Ok(value) => value,
+        Err(value) => return Result::Err(function_native_error(value)),
+    };
+    let object = match object_coercion(context.heap(), receiver) {
+        Ok(value) => value,
+        Err(value) => return Result::Err(function_native_error(value)),
+    };
+    object_own_property_test_at_depth(context, object, key, enumerable, depth)
 }
 
 fn object_prototype_has_own_property_at_depth(
@@ -4726,7 +4886,13 @@ fn object_prototype_has_own_property_at_depth(
     arguments: Vec[runtime::Value],
     depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
-    object_own_property_test_at_depth(context, this_value, argument(arguments, 0), false, depth)
+    object_prototype_own_property_test_at_depth(
+        context,
+        this_value,
+        argument(arguments, 0),
+        false,
+        depth,
+    )
 }
 
 fn object_prototype_property_is_enumerable_at_depth(
@@ -4735,7 +4901,13 @@ fn object_prototype_property_is_enumerable_at_depth(
     arguments: Vec[runtime::Value],
     depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
-    object_own_property_test_at_depth(context, this_value, argument(arguments, 0), true, depth)
+    object_prototype_own_property_test_at_depth(
+        context,
+        this_value,
+        argument(arguments, 0),
+        true,
+        depth,
+    )
 }
 
 fn object_own_keys_by_kind_at_depth(
@@ -4930,6 +5102,44 @@ fn object_integrity_descriptor(descriptor: runtime::PropertyDescriptor, frozen: 
     }
 }
 
+fn object_integrity_trap_descriptor(
+    context: vm::Context,
+    descriptor: runtime::PropertyDescriptor,
+    frozen: bool,
+) -> Result[runtime::Value, vm::VmError] {
+    let object = match allocate_ordinary(context.heap(), Option::None) {
+        Ok(value) => value,
+        Err(value) => return Result::Err(function_native_error(value)),
+    };
+    match define_data(
+        context.heap(),
+        object,
+        runtime::string_property_key("configurable"),
+        runtime::Value::Bool(false),
+        true,
+        true,
+        true,
+    ) {
+        Ok(()) => (),
+        Err(value) => return Result::Err(function_native_error(value)),
+    };
+    if frozen && runtime::descriptor_is_data(descriptor) {
+        match define_data(
+            context.heap(),
+            object,
+            runtime::string_property_key("writable"),
+            runtime::Value::Bool(false),
+            true,
+            true,
+            true,
+        ) {
+            Ok(()) => (),
+            Err(value) => return Result::Err(function_native_error(value)),
+        }
+    } else {};
+    Result::Ok(runtime::Value::Object(object))
+}
+
 fn object_set_integrity_level_at_depth(
     context: vm::Context,
     target: runtime::Value,
@@ -4943,6 +5153,9 @@ fn object_set_integrity_level_at_depth(
     if !context.prevent_extensions_at_depth(target, depth)? {
         return Result::Err(reflect_type_error("cannot prevent object extensions"))
     } else {};
+    if frozen && runtime::is_typed_array_backed_by_variable_length_buffer(context.heap(), object) {
+        return Result::Err(reflect_type_error("cannot freeze variable-length TypedArray"))
+    } else {};
     for key_value in proxy_own_key_values_at_depth(context, object, depth)? {
         let key = match key_value {
             runtime::Value::String(value) => runtime::js_string_property_key(value),
@@ -4950,16 +5163,19 @@ fn object_set_integrity_level_at_depth(
             _ => return Result::Err(reflect_type_error("property key is invalid")),
         };
         match proxy_get_own_property_descriptor_at_depth(context, object, key, depth)? {
-            Some(descriptor) => if !proxy_define_property_at_depth(
-                context,
-                object,
-                key,
-                object_integrity_descriptor(descriptor, frozen),
-                Option::None,
-                depth,
-            )? {
-                return Result::Err(reflect_type_error("cannot set object integrity level"))
-            } else {},
+            Some(descriptor) => {
+                let trap_descriptor = object_integrity_trap_descriptor(context, descriptor, frozen)?;
+                if !proxy_define_property_at_depth(
+                    context,
+                    object,
+                    key,
+                    object_integrity_descriptor(descriptor, frozen),
+                    Option::Some(trap_descriptor),
+                    depth,
+                )? {
+                    return Result::Err(reflect_type_error("cannot set object integrity level"))
+                } else {}
+            },
             None => (),
         }
     }
@@ -5292,9 +5508,10 @@ fn reflect_get(
     let _ = this_value;
     let target = argument(arguments, 0);
     let _ = reflect_object(target)?;
-    let receiver = match argument(arguments, 2) {
-        runtime::Value::Undefined => target,
-        value => value,
+    let receiver = if arguments.len() < 3 {
+        target
+    } else {
+        arguments[2]
     };
     context.reflect_get_at_depth(target, argument(arguments, 1), receiver, depth)
 }
@@ -5392,9 +5609,10 @@ fn reflect_set(
     let _ = this_value;
     let target = argument(arguments, 0);
     let _ = reflect_object(target)?;
-    let receiver = match argument(arguments, 3) {
-        runtime::Value::Undefined => target,
-        value => value,
+    let receiver = if arguments.len() < 4 {
+        target
+    } else {
+        arguments[3]
     };
     Result::Ok(
         runtime::Value::Bool(
@@ -5526,11 +5744,19 @@ fn reparent_callable_properties(
     };
     for key in runtime::own_property_keys(heap, holder) {
         match object.own_property(key) {
-            Some(descriptor) => match runtime::descriptor_value(descriptor) {
-                Some(runtime::Value::Object(value)) => if value.is_callable() {
-                    let _ = runtime::set_prototype_of(heap, value, Option::Some(prototype));
-                } else {},
-                _ => (),
+            Some(descriptor) => for value in Vec::from_array(
+                [
+                    runtime::descriptor_value(descriptor),
+                    runtime::descriptor_get(descriptor),
+                    runtime::descriptor_set(descriptor),
+                ],
+            ) {
+                match value {
+                    Some(runtime::Value::Object(value)) => if value.is_callable() {
+                        let _ = runtime::set_prototype_of(heap, value, Option::Some(prototype));
+                    } else {},
+                    _ => (),
+                }
             },
             None => (),
         }
@@ -5583,7 +5809,19 @@ fn install_function(context: vm::Context, object_constructor: runtime::Value) ->
     define_value(context.heap(), constructor_object, "prototype", prototype_value, false, false)?;
     let thrower = allocate_function_with_length(context, "", 0, function_restricted_property)?;
     let thrower_object = function_object(thrower, "restricted function property")?;
-    if !runtime::prevent_extensions(context.heap(), thrower_object) {
+    if !runtime::define_own_property(
+        context.heap(),
+        thrower_object,
+        runtime::string_property_key("length"),
+        runtime::data_descriptor(runtime::Value::Int(0), false, false, false),
+    )
+        || !runtime::define_own_property(
+            context.heap(),
+            thrower_object,
+            runtime::string_property_key("name"),
+            runtime::data_descriptor(runtime::Value::String(js_string("")), false, false, false),
+        )
+        || !runtime::prevent_extensions(context.heap(), thrower_object) {
         return Result::Err(BuiltinError { message: "cannot freeze restricted function property" })
     } else {};
     for name in Vec::from_array(["caller", "arguments"]) {
@@ -5792,7 +6030,24 @@ fn install_object(context: vm::Context) -> Result[runtime::Value, BuiltinError] 
     if !context.heap().set_object_prototype(prototype) {
         return Result::Err(BuiltinError { message: "cannot install Object prototype" })
     } else {};
+    if !runtime::set_immutable_prototype(context.heap(), prototype) {
+        return Result::Err(BuiltinError { message: "cannot lock Object prototype" })
+    } else {};
     let _ = runtime::set_prototype_of(context.heap(), object, Option::Some(prototype));
+    match context.set_native_constructor_callback(
+        function,
+        |heap, receiver, arguments, selected_prototype, new_target| {
+            let _ = selected_prototype;
+            if runtime::same_value(new_target, function) {
+                object_constructor(heap, runtime::Value::Object(receiver), arguments)
+            } else {
+                Result::Ok(runtime::Value::Object(receiver))
+            }
+        },
+    ) {
+        Ok(()) => (),
+        Err(value) => return Result::Err(BuiltinError { message: value.kind.debug() }),
+    };
     define_value(
         context.heap(),
         object,
@@ -5910,8 +6165,20 @@ fn install_object(context: vm::Context) -> Result[runtime::Value, BuiltinError] 
         )?
     }
     define_function(context, prototype, "valueOf", object_prototype_value_of)?;
-    let proto_get = allocate_function(context, "get __proto__", object_prototype_proto_get)?;
-    let proto_set = allocate_function(context, "set __proto__", object_prototype_proto_set)?;
+    let proto_get = allocate_vm_function(
+        context,
+        "get __proto__",
+        |this_value, arguments, depth| {
+            object_prototype_proto_get_at_depth(context, this_value, arguments, depth)
+        },
+    )?;
+    let proto_set = allocate_vm_function(
+        context,
+        "set __proto__",
+        |this_value, arguments, depth| {
+            object_prototype_proto_set_at_depth(context, this_value, arguments, depth)
+        },
+    )?;
     if !runtime::define_own_property(
         context.heap(),
         prototype,
@@ -6160,10 +6427,50 @@ fn install_object(context: vm::Context) -> Result[runtime::Value, BuiltinError] 
 }
 
 fn install_array(context: vm::Context) -> Result[runtime::Value, BuiltinError] {
-    let function = allocate_function(context, "Array", array_constructor)?;
+    let function = allocate_vm_function(
+        context,
+        "Array",
+        |this_value, arguments, depth| {
+            array_constructor_vm(context, this_value, arguments, depth)
+        },
+    )?;
+    match context.set_vm_constructor_callback(
+        function,
+        |receiver, arguments, selected_prototype, new_target, depth| {
+            let _ = receiver;
+            let _ = new_target;
+            let result = array_constructor_vm(context, runtime::Value::Undefined, arguments, depth)?;
+            match (result, selected_prototype) {
+                (runtime::Value::Object(object), Some(prototype)) => if runtime::set_prototype_of(
+                    context.heap(),
+                    object,
+                    Option::Some(prototype),
+                ) {
+                    Result::Ok(result)
+                } else {
+                    Result::Err(function_vm_error("cannot set Array instance prototype"))
+                },
+                _ => Result::Ok(result),
+            }
+        },
+    ) {
+        Ok(()) => (),
+        Err(value) => return Result::Err(BuiltinError { message: value.kind.debug() }),
+    };
     let object = function_object(function, "Array")?;
     define_function(context, object, "isArray", array_is_array)?;
-    define_function(context, object, "of", array_of)?;
+    define_value(
+        context.heap(),
+        object,
+        "of",
+        allocate_vm_function(
+            context,
+            "Array.of",
+            |this_value, arguments, depth| array_of(context, this_value, arguments, depth),
+        )?,
+        true,
+        true,
+    )?;
     define_value(
         context.heap(),
         object,
@@ -6365,7 +6672,13 @@ fn create_proxy_value(context: vm::Context, arguments: Vec[runtime::Value]) -> R
     let target = proxy_object_argument(argument(arguments, 0), "target")?;
     let handler = proxy_object_argument(argument(arguments, 1), "handler")?;
     match runtime::new_proxy(context.heap(), target, handler) {
-        Ok(value) => Result::Ok(runtime::Value::Object(value)),
+        Ok(value) => {
+            let result = runtime::Value::Object(value);
+            if vm::is_constructor(context, runtime::Value::Object(target)) {
+                context.mark_proxy_constructor(result)?
+            } else {};
+            Result::Ok(result)
+        },
         Err(value) => Result::Err(function_vm_error(value.message)),
     }
 }
@@ -6526,6 +6839,20 @@ pub fn install(context: vm::Context) -> Result[Realm, BuiltinError] {
             bigint_constructor_vm(context, this_value, arguments, depth)
         },
     )?;
+    match context.set_vm_constructor_callback(
+        bigint,
+        |receiver, arguments, selected_prototype, new_target, depth| {
+            let _ = receiver;
+            let _ = arguments;
+            let _ = selected_prototype;
+            let _ = new_target;
+            let _ = depth;
+            Result::Err(function_vm_error("BigInt is not a constructor"))
+        },
+    ) {
+        Ok(()) => (),
+        Err(value) => return Result::Err(BuiltinError { message: value.kind.debug() }),
+    };
     let bigint_object = function_object(bigint, "BigInt")?;
     define_bigint_width_function(context, bigint_object, "asUintN", bigint_as_uint_n)?;
     define_bigint_width_function(context, bigint_object, "asIntN", bigint_as_int_n)?;
@@ -6556,7 +6883,7 @@ pub fn install(context: vm::Context) -> Result[Realm, BuiltinError] {
     let regexp_install = install_regexp_runtime(context)?;
     let regexp = regexp_install.constructor;
     let date = install_date(context)?;
-    let collections = install_collections(context)?;
+    let collections = install_collections(context, iterator)?;
     let errors = install_errors(context)?;
     let buffers = install_arraybuffer(context)?;
     let os_state = new_os_state(buffers.buffer_states);
@@ -6566,7 +6893,12 @@ pub fn install(context: vm::Context) -> Result[Realm, BuiltinError] {
     let _ = install_worker(context, os_object, buffers)?;
     let promise_queue = promise::JobQueue::new();
     context.set_microtask_queue(|| promise_queue.run_all(), || !promise_queue.is_empty());
-    let promise = install_promise_with_queue(context, promise_queue, Option::Some(function))?;
+    let promise = install_promise_with_queue(
+        context,
+        promise_queue,
+        Option::Some(function),
+        Option::Some(errors.aggregate_error),
+    )?;
     define_value(
         heap,
         os_object,
@@ -6608,12 +6940,14 @@ pub fn install(context: vm::Context) -> Result[Realm, BuiltinError] {
         string_function,
         string_prototype,
     )?;
+    install_string_iterator(context, string_prototype, iterator)?;
     install_regexp_string_methods(
         context,
         string_prototype,
         regexp,
         regexp_install.prototype,
         regexp_install.states,
+        regexp_install.exec,
         iterator,
     )?;
     let _ = install_bjson(context, buffers, date)?;

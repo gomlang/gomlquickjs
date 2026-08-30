@@ -40,6 +40,22 @@ fn collection_object(value: runtime::Value, kind: string) -> Result[
     }
 }
 
+fn collection_constructor_receiver_prototype(
+    heap: runtime::Heap,
+    receiver: runtime::ObjectId,
+    selected: Option[runtime::ObjectId],
+    prototype: runtime::ObjectId,
+) -> Result[(), vm::VmError] {
+    match selected {
+        Some(_) => Result::Ok(()),
+        None => if runtime::set_prototype_of(heap, receiver, Option::Some(prototype)) {
+            Result::Ok(())
+        } else {
+            Result::Err(function_vm_error("cannot initialize collection prototype"))
+        },
+    }
+}
+
 fn map_state(states: HashMap[runtime::ObjectId, collections::JsMap], value: runtime::Value) -> Result[
     collections::JsMap,
     vm::NativeError,
@@ -164,7 +180,7 @@ fn map_get_or_insert(
     } else {
         Option::None
     };
-    let key = argument(arguments, 0);
+    let key = collections::canonical_key(argument(arguments, 0));
     match state.get(key) {
         Some(value) => Result::Ok(value),
         None => {
@@ -617,6 +633,97 @@ enum SetIteratorKind {
     Entries,
 }
 
+struct MapIteratorState {
+    source: runtime::ObjectId,
+    index: Ref[isize],
+    done: Ref[bool],
+    kind: isize,
+}
+
+struct SetIteratorState {
+    source: runtime::ObjectId,
+    index: Ref[isize],
+    done: Ref[bool],
+    kind: isize,
+}
+
+fn map_collection_gc_edges(
+    heap: runtime::Heap,
+    states: HashMap[runtime::ObjectId, collections::JsMap],
+    iterator_states: HashMap[runtime::ObjectId, MapIteratorState],
+) -> Vec[runtime::GcEdge] {
+    let edges: Vec[runtime::GcEdge] = Vec::new();
+    let stale: Vec[runtime::ObjectId] = Vec::new();
+    for (object, state) in states.entries() {
+        if heap.contains(object) {
+            let values: Vec[runtime::Value] = Vec::new();
+            for entry in state.entries() {
+                values.push(entry.key);
+                values.push(entry.value)
+            }
+            edges.push(runtime::GcEdge { owner: object, values })
+        } else {
+            stale.push(object)
+        }
+    }
+    for object in stale {
+        let _ = states.remove(object);
+    }
+    let stale_iterators: Vec[runtime::ObjectId] = Vec::new();
+    for (object, state) in iterator_states.entries() {
+        if heap.contains(object) {
+            edges.push(
+                runtime::GcEdge {
+                    owner: object,
+                    values: Vec::from_array([runtime::Value::Object(state.source)]),
+                },
+            )
+        } else {
+            stale_iterators.push(object)
+        }
+    }
+    for object in stale_iterators {
+        let _ = iterator_states.remove(object);
+    }
+    edges
+}
+
+fn set_collection_gc_edges(
+    heap: runtime::Heap,
+    states: HashMap[runtime::ObjectId, collections::JsSet],
+    iterator_states: HashMap[runtime::ObjectId, SetIteratorState],
+) -> Vec[runtime::GcEdge] {
+    let edges: Vec[runtime::GcEdge] = Vec::new();
+    let stale: Vec[runtime::ObjectId] = Vec::new();
+    for (object, state) in states.entries() {
+        if heap.contains(object) {
+            edges.push(runtime::GcEdge { owner: object, values: state.values() })
+        } else {
+            stale.push(object)
+        }
+    }
+    for object in stale {
+        let _ = states.remove(object);
+    }
+    let stale_iterators: Vec[runtime::ObjectId] = Vec::new();
+    for (object, state) in iterator_states.entries() {
+        if heap.contains(object) {
+            edges.push(
+                runtime::GcEdge {
+                    owner: object,
+                    values: Vec::from_array([runtime::Value::Object(state.source)]),
+                },
+            )
+        } else {
+            stale_iterators.push(object)
+        }
+    }
+    for object in stale_iterators {
+        let _ = iterator_states.remove(object);
+    }
+    edges
+}
+
 fn collection_iterator_object(context: vm::Context, next: runtime::Value) -> Result[
     runtime::Value,
     vm::VmError,
@@ -661,9 +768,97 @@ fn map_iterator_value(context: vm::Context, kind: MapIteratorKind, entry: collec
     }
 }
 
+fn map_iterator_kind_value(kind: MapIteratorKind) -> isize {
+    match kind {
+        MapIteratorKind::Keys => 0,
+        MapIteratorKind::Values => 1,
+        MapIteratorKind::Entries => 2,
+    }
+}
+
+fn map_iterator_kind(kind: isize) -> MapIteratorKind {
+    match kind {
+        0 => MapIteratorKind::Keys,
+        1 => MapIteratorKind::Values,
+        _ => MapIteratorKind::Entries,
+    }
+}
+
+fn map_iterator_next(
+    context: vm::Context,
+    states: HashMap[runtime::ObjectId, collections::JsMap],
+    iterator_states: HashMap[runtime::ObjectId, MapIteratorState],
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+) -> Result[runtime::Value, vm::VmError] {
+    let _ = arguments;
+    let iterator = match this_value {
+        runtime::Value::Object(value) => value,
+        _ => return Result::Err(function_vm_error("Map iterator has an invalid receiver")),
+    };
+    let iterator_state = match iterator_states.get(iterator) {
+        Some(value) => value,
+        None => return Result::Err(function_vm_error("Map iterator has an invalid receiver")),
+    };
+    if iterator_state.done.get() {
+        return array_iterator_result(context, runtime::Value::Undefined, true)
+    } else {};
+    let state = match states.get(iterator_state.source) {
+        Some(value) => value,
+        None => return Result::Err(function_vm_error("Map iterator has an invalid receiver")),
+    };
+    while iterator_state.index.get() < state.slot_len() {
+        let current = iterator_state.index.get();
+        iterator_state.index.set(current + 1);
+        match state.entry_at(current) {
+            Some(entry) => {
+                return array_iterator_result(
+                    context,
+                    map_iterator_value(context, map_iterator_kind(iterator_state.kind), entry)?,
+                    false,
+                )
+            },
+            None => (),
+        }
+    }
+    iterator_state.done.set(true);
+    array_iterator_result(context, runtime::Value::Undefined, true)
+}
+
+fn install_map_iterator_prototype(
+    context: vm::Context,
+    states: HashMap[runtime::ObjectId, collections::JsMap],
+    iterator_states: HashMap[runtime::ObjectId, MapIteratorState],
+    base_prototype: runtime::ObjectId,
+) -> Result[runtime::ObjectId, BuiltinError] {
+    let prototype = match allocate_ordinary(context.heap(), Option::Some(base_prototype)) {
+        Ok(value) => value,
+        Err(value) => return Result::Err(BuiltinError { message: value.message }),
+    };
+    define_value(
+        context.heap(),
+        prototype,
+        "next",
+        allocate_vm_function(
+            context,
+            "Map Iterator.prototype.next",
+            |this_value, arguments, depth| {
+                let _ = depth;
+                map_iterator_next(context, states, iterator_states, this_value, arguments)
+            },
+        )?,
+        true,
+        true,
+    )?;
+    define_to_string_tag(context, prototype, "Map Iterator")?;
+    Result::Ok(prototype)
+}
+
 fn create_map_iterator(
     context: vm::Context,
     states: HashMap[runtime::ObjectId, collections::JsMap],
+    iterator_states: HashMap[runtime::ObjectId, MapIteratorState],
+    iterator_prototype: runtime::ObjectId,
     kind: MapIteratorKind,
     this_value: runtime::Value,
 ) -> Result[runtime::Value, vm::VmError] {
@@ -674,36 +869,17 @@ fn create_map_iterator(
     if states.get(object).is_none() {
         return Result::Err(function_vm_error("Map method called on incompatible receiver"))
     } else {};
-    let index = Ref::new(0);
-    let next = context.new_vm_function(
-        |next_this, arguments, depth| {
-            let _ = next_this;
-            let _ = arguments;
-            let _ = depth;
-            let state = match states.get(object) {
-                Some(value) => value,
-                None => {
-                    return Result::Err(function_vm_error("Map iterator has an invalid receiver"))
-                },
-            };
-            while index.get() < state.slot_len() {
-                let current = index.get();
-                index.set(current + 1);
-                match state.entry_at(current) {
-                    Some(entry) => {
-                        return array_iterator_result(
-                            context,
-                            map_iterator_value(context, kind, entry)?,
-                            false,
-                        )
-                    },
-                    None => (),
-                }
-            }
-            array_iterator_result(context, runtime::Value::Undefined, true)
-        },
-    )?;
-    collection_iterator_object(context, next)
+    let iterator = match allocate_ordinary(context.heap(), Option::Some(iterator_prototype)) {
+        Ok(value) => value,
+        Err(value) => return Result::Err(function_vm_error(value.message)),
+    };
+    iterator_states[iterator] = MapIteratorState {
+        source: object,
+        index: Ref::new(0),
+        done: Ref::new(false),
+        kind: map_iterator_kind_value(kind),
+    };
+    Result::Ok(runtime::Value::Object(iterator))
 }
 
 fn set_iterator_value(context: vm::Context, kind: SetIteratorKind, value: runtime::Value) -> Result[
@@ -719,9 +895,96 @@ fn set_iterator_value(context: vm::Context, kind: SetIteratorKind, value: runtim
     }
 }
 
+fn set_iterator_kind_value(kind: SetIteratorKind) -> isize {
+    match kind {
+        SetIteratorKind::Values => 0,
+        SetIteratorKind::Entries => 1,
+    }
+}
+
+fn set_iterator_kind(kind: isize) -> SetIteratorKind {
+    if kind == 0 {
+        SetIteratorKind::Values
+    } else {
+        SetIteratorKind::Entries
+    }
+}
+
+fn set_iterator_next(
+    context: vm::Context,
+    states: HashMap[runtime::ObjectId, collections::JsSet],
+    iterator_states: HashMap[runtime::ObjectId, SetIteratorState],
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+) -> Result[runtime::Value, vm::VmError] {
+    let _ = arguments;
+    let iterator = match this_value {
+        runtime::Value::Object(value) => value,
+        _ => return Result::Err(function_vm_error("Set iterator has an invalid receiver")),
+    };
+    let iterator_state = match iterator_states.get(iterator) {
+        Some(value) => value,
+        None => return Result::Err(function_vm_error("Set iterator has an invalid receiver")),
+    };
+    if iterator_state.done.get() {
+        return array_iterator_result(context, runtime::Value::Undefined, true)
+    } else {};
+    let state = match states.get(iterator_state.source) {
+        Some(value) => value,
+        None => return Result::Err(function_vm_error("Set iterator has an invalid receiver")),
+    };
+    while iterator_state.index.get() < state.slot_len() {
+        let current = iterator_state.index.get();
+        iterator_state.index.set(current + 1);
+        match state.value_at(current) {
+            Some(value) => {
+                return array_iterator_result(
+                    context,
+                    set_iterator_value(context, set_iterator_kind(iterator_state.kind), value)?,
+                    false,
+                )
+            },
+            None => (),
+        }
+    }
+    iterator_state.done.set(true);
+    array_iterator_result(context, runtime::Value::Undefined, true)
+}
+
+fn install_set_iterator_prototype(
+    context: vm::Context,
+    states: HashMap[runtime::ObjectId, collections::JsSet],
+    iterator_states: HashMap[runtime::ObjectId, SetIteratorState],
+    base_prototype: runtime::ObjectId,
+) -> Result[runtime::ObjectId, BuiltinError] {
+    let prototype = match allocate_ordinary(context.heap(), Option::Some(base_prototype)) {
+        Ok(value) => value,
+        Err(value) => return Result::Err(BuiltinError { message: value.message }),
+    };
+    define_value(
+        context.heap(),
+        prototype,
+        "next",
+        allocate_vm_function(
+            context,
+            "Set Iterator.prototype.next",
+            |this_value, arguments, depth| {
+                let _ = depth;
+                set_iterator_next(context, states, iterator_states, this_value, arguments)
+            },
+        )?,
+        true,
+        true,
+    )?;
+    define_to_string_tag(context, prototype, "Set Iterator")?;
+    Result::Ok(prototype)
+}
+
 fn create_set_iterator(
     context: vm::Context,
     states: HashMap[runtime::ObjectId, collections::JsSet],
+    iterator_states: HashMap[runtime::ObjectId, SetIteratorState],
+    iterator_prototype: runtime::ObjectId,
     kind: SetIteratorKind,
     this_value: runtime::Value,
 ) -> Result[runtime::Value, vm::VmError] {
@@ -732,36 +995,17 @@ fn create_set_iterator(
     if states.get(object).is_none() {
         return Result::Err(function_vm_error("Set method called on incompatible receiver"))
     } else {};
-    let index = Ref::new(0);
-    let next = context.new_vm_function(
-        |next_this, arguments, depth| {
-            let _ = next_this;
-            let _ = arguments;
-            let _ = depth;
-            let state = match states.get(object) {
-                Some(value) => value,
-                None => {
-                    return Result::Err(function_vm_error("Set iterator has an invalid receiver"))
-                },
-            };
-            while index.get() < state.slot_len() {
-                let current = index.get();
-                index.set(current + 1);
-                match state.value_at(current) {
-                    Some(value) => {
-                        return array_iterator_result(
-                            context,
-                            set_iterator_value(context, kind, value)?,
-                            false,
-                        )
-                    },
-                    None => (),
-                }
-            }
-            array_iterator_result(context, runtime::Value::Undefined, true)
-        },
-    )?;
-    collection_iterator_object(context, next)
+    let iterator = match allocate_ordinary(context.heap(), Option::Some(iterator_prototype)) {
+        Ok(value) => value,
+        Err(value) => return Result::Err(function_vm_error(value.message)),
+    };
+    iterator_states[iterator] = SetIteratorState {
+        source: object,
+        index: Ref::new(0),
+        done: Ref::new(false),
+        kind: set_iterator_kind_value(kind),
+    };
+    Result::Ok(runtime::Value::Object(iterator))
 }
 
 fn collection_callback(arguments: Vec[runtime::Value], kind: string) -> Result[
@@ -1731,13 +1975,26 @@ fn initialize_finalization_registry(
     }
 }
 
-fn install_map(context: vm::Context) -> Result[MapInstallData, BuiltinError] {
+fn install_map(context: vm::Context, iterator_prototype: runtime::ObjectId) -> Result[
+    MapInstallData,
+    BuiltinError,
+] {
     let heap = context.heap();
     let prototype = match allocate_ordinary(heap, Option::None) {
         Ok(value) => value,
         Err(value) => return Result::Err(BuiltinError { message: value.message }),
     };
     let states: HashMap[runtime::ObjectId, collections::JsMap] = HashMap::new();
+    let iterator_states: HashMap[runtime::ObjectId, MapIteratorState] = HashMap::new();
+    context.add_external_edge_provider(
+        || map_collection_gc_edges(context.heap(), states, iterator_states),
+    );
+    let map_iterator_prototype = install_map_iterator_prototype(
+        context,
+        states,
+        iterator_states,
+        iterator_prototype,
+    )?;
     define_value(
         heap,
         prototype,
@@ -1851,7 +2108,14 @@ fn install_map(context: vm::Context) -> Result[MapInstallData, BuiltinError] {
         |this_value, arguments, depth| {
             let _ = arguments;
             let _ = depth;
-            create_map_iterator(context, states, MapIteratorKind::Entries, this_value)
+            create_map_iterator(
+                context,
+                states,
+                iterator_states,
+                map_iterator_prototype,
+                MapIteratorKind::Entries,
+                this_value,
+            )
         },
     )?;
     let keys = allocate_vm_function(
@@ -1860,7 +2124,14 @@ fn install_map(context: vm::Context) -> Result[MapInstallData, BuiltinError] {
         |this_value, arguments, depth| {
             let _ = arguments;
             let _ = depth;
-            create_map_iterator(context, states, MapIteratorKind::Keys, this_value)
+            create_map_iterator(
+                context,
+                states,
+                iterator_states,
+                map_iterator_prototype,
+                MapIteratorKind::Keys,
+                this_value,
+            )
         },
     )?;
     let values = allocate_vm_function(
@@ -1869,7 +2140,14 @@ fn install_map(context: vm::Context) -> Result[MapInstallData, BuiltinError] {
         |this_value, arguments, depth| {
             let _ = arguments;
             let _ = depth;
-            create_map_iterator(context, states, MapIteratorKind::Values, this_value)
+            create_map_iterator(
+                context,
+                states,
+                iterator_states,
+                map_iterator_prototype,
+                MapIteratorKind::Values,
+                this_value,
+            )
         },
     )?;
     define_value(
@@ -1944,17 +2222,45 @@ fn install_map(context: vm::Context) -> Result[MapInstallData, BuiltinError] {
     };
     define_value(heap, prototype, "constructor", constructor, true, true)?;
     define_to_string_tag(context, prototype, "Map")?;
-    mark_constructor(context, constructor, "Map")?;
+    match context.set_vm_constructor_callback(
+        constructor,
+        |receiver, arguments, selected_prototype, new_target, depth| {
+            let _ = new_target;
+            collection_constructor_receiver_prototype(
+                context.heap(),
+                receiver,
+                selected_prototype,
+                prototype,
+            )?;
+            initialize_map(context, states, runtime::Value::Object(receiver), arguments, depth)
+        },
+    ) {
+        Ok(()) => (),
+        Err(value) => return Result::Err(BuiltinError { message: value.kind.debug() }),
+    };
     Result::Ok(MapInstallData { constructor, prototype, states })
 }
 
-fn install_set(context: vm::Context, map: MapInstallData) -> Result[runtime::Value, BuiltinError] {
+fn install_set(context: vm::Context, map: MapInstallData, iterator_prototype: runtime::ObjectId) -> Result[
+    runtime::Value,
+    BuiltinError,
+] {
     let heap = context.heap();
     let prototype = match allocate_ordinary(heap, Option::None) {
         Ok(value) => value,
         Err(value) => return Result::Err(BuiltinError { message: value.message }),
     };
     let states: HashMap[runtime::ObjectId, collections::JsSet] = HashMap::new();
+    let iterator_states: HashMap[runtime::ObjectId, SetIteratorState] = HashMap::new();
+    context.add_external_edge_provider(
+        || set_collection_gc_edges(context.heap(), states, iterator_states),
+    );
+    let set_iterator_prototype = install_set_iterator_prototype(
+        context,
+        states,
+        iterator_states,
+        iterator_prototype,
+    )?;
     for (name, function) in Vec::from_array(
         [
             (
@@ -2022,7 +2328,14 @@ fn install_set(context: vm::Context, map: MapInstallData) -> Result[runtime::Val
         |this_value, arguments, depth| {
             let _ = arguments;
             let _ = depth;
-            create_set_iterator(context, states, SetIteratorKind::Values, this_value)
+            create_set_iterator(
+                context,
+                states,
+                iterator_states,
+                set_iterator_prototype,
+                SetIteratorKind::Values,
+                this_value,
+            )
         },
     )?;
     let entries = allocate_vm_function(
@@ -2031,7 +2344,14 @@ fn install_set(context: vm::Context, map: MapInstallData) -> Result[runtime::Val
         |this_value, arguments, depth| {
             let _ = arguments;
             let _ = depth;
-            create_set_iterator(context, states, SetIteratorKind::Entries, this_value)
+            create_set_iterator(
+                context,
+                states,
+                iterator_states,
+                set_iterator_prototype,
+                SetIteratorKind::Entries,
+                this_value,
+            )
         },
     )?;
     define_value(
@@ -2189,7 +2509,22 @@ fn install_set(context: vm::Context, map: MapInstallData) -> Result[runtime::Val
     };
     define_value(heap, prototype, "constructor", constructor, true, true)?;
     define_to_string_tag(context, prototype, "Set")?;
-    mark_constructor(context, constructor, "Set")?;
+    match context.set_vm_constructor_callback(
+        constructor,
+        |receiver, arguments, selected_prototype, new_target, depth| {
+            let _ = new_target;
+            collection_constructor_receiver_prototype(
+                context.heap(),
+                receiver,
+                selected_prototype,
+                prototype,
+            )?;
+            initialize_set(context, states, runtime::Value::Object(receiver), arguments, depth)
+        },
+    ) {
+        Ok(()) => (),
+        Err(value) => return Result::Err(BuiltinError { message: value.kind.debug() }),
+    };
     Result::Ok(constructor)
 }
 
@@ -2291,7 +2626,22 @@ fn install_weak_map(context: vm::Context) -> Result[runtime::Value, BuiltinError
     define_value(heap, object, "prototype", runtime::Value::Object(prototype), false, false)?;
     define_value(heap, prototype, "constructor", constructor, true, true)?;
     define_to_string_tag(context, prototype, "WeakMap")?;
-    mark_constructor(context, constructor, "WeakMap")?;
+    match context.set_vm_constructor_callback(
+        constructor,
+        |receiver, arguments, selected_prototype, new_target, depth| {
+            let _ = new_target;
+            collection_constructor_receiver_prototype(
+                context.heap(),
+                receiver,
+                selected_prototype,
+                prototype,
+            )?;
+            initialize_weak_map(context, states, runtime::Value::Object(receiver), arguments, depth)
+        },
+    ) {
+        Ok(()) => (),
+        Err(value) => return Result::Err(BuiltinError { message: value.kind.debug() }),
+    };
     Result::Ok(constructor)
 }
 
@@ -2349,7 +2699,22 @@ fn install_weak_set(context: vm::Context) -> Result[runtime::Value, BuiltinError
     let object = function_object(constructor, "WeakSet")?;
     define_value(heap, object, "prototype", runtime::Value::Object(prototype), false, false)?;
     define_value(heap, prototype, "constructor", constructor, true, true)?;
-    mark_constructor(context, constructor, "WeakSet")?;
+    match context.set_vm_constructor_callback(
+        constructor,
+        |receiver, arguments, selected_prototype, new_target, depth| {
+            let _ = new_target;
+            collection_constructor_receiver_prototype(
+                context.heap(),
+                receiver,
+                selected_prototype,
+                prototype,
+            )?;
+            initialize_weak_set(context, states, runtime::Value::Object(receiver), arguments, depth)
+        },
+    ) {
+        Ok(()) => (),
+        Err(value) => return Result::Err(BuiltinError { message: value.kind.debug() }),
+    };
     Result::Ok(constructor)
 }
 
@@ -2386,7 +2751,22 @@ fn install_weak_ref(context: vm::Context) -> Result[runtime::Value, BuiltinError
     let object = function_object(constructor, "WeakRef")?;
     define_value(heap, object, "prototype", runtime::Value::Object(prototype), false, false)?;
     define_value(heap, prototype, "constructor", constructor, true, true)?;
-    mark_constructor(context, constructor, "WeakRef")?;
+    match context.set_vm_constructor_callback(
+        constructor,
+        |receiver, arguments, selected_prototype, new_target, depth| {
+            let _ = new_target;
+            collection_constructor_receiver_prototype(
+                context.heap(),
+                receiver,
+                selected_prototype,
+                prototype,
+            )?;
+            initialize_weak_ref(context, states, runtime::Value::Object(receiver), arguments, depth)
+        },
+    ) {
+        Ok(()) => (),
+        Err(value) => return Result::Err(BuiltinError { message: value.kind.debug() }),
+    };
     Result::Ok(constructor)
 }
 
@@ -2447,14 +2827,47 @@ fn install_finalization_registry(context: vm::Context) -> Result[runtime::Value,
     } else {};
     define_value(heap, object, "prototype", runtime::Value::Object(prototype), false, false)?;
     define_value(heap, prototype, "constructor", constructor, true, true)?;
-    mark_constructor(context, constructor, "FinalizationRegistry")?;
+    match context.set_vm_constructor_callback(
+        constructor,
+        |receiver, arguments, selected_prototype, new_target, depth| {
+            let _ = new_target;
+            collection_constructor_receiver_prototype(
+                context.heap(),
+                receiver,
+                selected_prototype,
+                prototype,
+            )?;
+            initialize_finalization_registry(
+                context,
+                callback_name,
+                runtime::Value::Object(receiver),
+                arguments,
+                depth,
+            )
+        },
+    ) {
+        Ok(()) => (),
+        Err(value) => return Result::Err(BuiltinError { message: value.kind.debug() }),
+    };
     Result::Ok(constructor)
 }
 
-fn install_collections(context: vm::Context) -> Result[CollectionInstall, BuiltinError] {
-    let map = install_map(context)?;
+fn install_collections(context: vm::Context, iterator_constructor: runtime::Value) -> Result[
+    CollectionInstall,
+    BuiltinError,
+] {
+    let iterator_constructor_object = function_object(iterator_constructor, "Iterator")?;
+    let iterator_prototype = match runtime::get_property(
+        context.heap(),
+        iterator_constructor_object,
+        runtime::string_property_key("prototype"),
+    ) {
+        Ok(Some(runtime::Value::Object(value))) => value,
+        _ => return Result::Err(BuiltinError { message: "Iterator prototype is invalid" }),
+    };
+    let map = install_map(context, iterator_prototype)?;
     let map_constructor = map.constructor;
-    let set = install_set(context, map)?;
+    let set = install_set(context, map, iterator_prototype)?;
     Result::Ok(
         CollectionInstall {
             map: map_constructor,

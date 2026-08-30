@@ -24,6 +24,11 @@ struct RegExpStringIteratorState {
     done: Ref[bool],
 }
 
+struct StringIteratorState {
+    input: runtime::JsString,
+    index: Ref[isize],
+}
+
 type LocatedMatches = Vec[LocatedMatch];
 
 type StringNativeBuiltin = (runtime::Heap, runtime::Value, Vec[runtime::Value]) -> Result[
@@ -1771,7 +1776,6 @@ fn string_literal_matches(input: runtime::JsString, search: runtime::JsString, a
 
 fn string_replace_internal(
     context: vm::Context,
-    states: HashMap[runtime::ObjectId, RegExpState],
     replace_all: bool,
     this_value: runtime::Value,
     arguments: Vec[runtime::Value],
@@ -1782,37 +1786,11 @@ fn string_replace_internal(
         Err(value) => return Result::Err(string_vm_native_error(value)),
     };
     let search_value = argument(arguments, 0);
-    let matches = match search_value {
-        runtime::Value::Object(object) => match states.get(object) {
-            Some(state) => {
-                if replace_all && !state.global {
-                    return Result::Err(
-                        string_vm_type_error("replaceAll requires a global regular expression"),
-                    )
-                } else {};
-                string_find_matches(
-                    context.heap(),
-                    StringPattern { state, object: Option::Some(object) },
-                    input,
-                    state.global,
-                )?
-            },
-            None => {
-                let search = match string_value_at_depth(context, search_value, depth)? {
-                    runtime::Value::String(value) => value,
-                    _ => return Result::Err(string_vm_type_error("search value is not a string")),
-                };
-                string_literal_matches(input, search, replace_all)
-            },
-        },
-        value => {
-            let search = match string_value_at_depth(context, value, depth)? {
-                runtime::Value::String(value) => value,
-                _ => return Result::Err(string_vm_type_error("search value is not a string")),
-            };
-            string_literal_matches(input, search, replace_all)
-        },
+    let search = match string_value_at_depth(context, search_value, depth)? {
+        runtime::Value::String(value) => value,
+        _ => return Result::Err(string_vm_type_error("search value is not a string")),
     };
+    let matches = string_literal_matches(input, search, replace_all);
     let replacement = argument(arguments, 1);
     let replacement = if string_callable(replacement) {
         replacement
@@ -1836,9 +1814,103 @@ fn string_replace_internal(
     Result::Ok(runtime::Value::String(runtime::JsString::from_code_units(output)))
 }
 
+fn string_has_default_regexp_exec(
+    context: vm::Context,
+    receiver: runtime::Value,
+    prototype: runtime::ObjectId,
+    builtin_exec: runtime::Value,
+) -> bool {
+    let object = match receiver {
+        runtime::Value::Object(value) => value,
+        _ => return false,
+    };
+    let current = match context.heap().get(object) {
+        Some(value) => value,
+        None => return false,
+    };
+    let key = runtime::string_property_key("exec");
+    if current.prototype() != Option::Some(prototype) || current.own_property(key).is_some() {
+        return false
+    } else {};
+    let inherited = match context.heap().get(prototype) {
+        Some(value) => value.own_property(key),
+        None => Option::None,
+    };
+    match inherited {
+        Some(descriptor) => match runtime::descriptor_value(descriptor) {
+            Some(value) => runtime::same_value(value, builtin_exec),
+            None => false,
+        },
+        None => false,
+    }
+}
+
+fn string_regexp_builtin_replace_at_depth(
+    context: vm::Context,
+    states: HashMap[runtime::ObjectId, RegExpState],
+    receiver: runtime::Value,
+    input: runtime::JsString,
+    replacement: runtime::Value,
+    functional: bool,
+    global: bool,
+    unicode: bool,
+    depth: isize,
+) -> Result[runtime::Value, vm::VmError] {
+    if global {
+        string_set_property_at_depth(context, receiver, "lastIndex", runtime::Value::Int(0), depth)?
+    } else {};
+    let matches: Vec[LocatedMatch] = Vec::new();
+    loop {
+        let (_, _, found) = regexp_match_at_depth(
+            context,
+            states,
+            receiver,
+            runtime::Value::String(input),
+            depth,
+        )?;
+        match found {
+            Some(value) => {
+                let empty = value.start == value.end;
+                matches.push(value);
+                if !global {
+                    break
+                } else if empty {
+                    string_advance_regexp_last_index(context, receiver, input, unicode, depth)?
+                } else {}
+            },
+            None => break,
+        }
+    }
+    if matches.is_empty() {
+        return Result::Ok(runtime::Value::String(input))
+    } else {};
+    let output: Vec[u16] = Vec::new();
+    let mut next_source_position = 0;
+    for found in matches {
+        if found.start >= next_source_position {
+            string_append_slice(output, input, next_source_position, found.start)?;
+            let replacement_text = if functional {
+                string_replacement(context, input, found, replacement, depth)?
+            } else {
+                let replacement = match replacement {
+                    runtime::Value::String(value) => value,
+                    _ => return Result::Err(string_vm_type_error("replacement is not a string")),
+                };
+                string_replacement_text(input, found, replacement)?
+            };
+            string_append_slice(output, replacement_text, 0, replacement_text.len())?;
+            next_source_position = found.end;
+        } else {}
+    }
+    string_append_slice(output, input, next_source_position, input.len())?;
+    Result::Ok(runtime::Value::String(runtime::JsString::from_code_units(output)))
+}
+
 fn string_regexp_replace_at_depth(
     context: vm::Context,
     states: HashMap[runtime::ObjectId, RegExpState],
+    regexp_prototype: runtime::ObjectId,
+    builtin_exec: runtime::Value,
     this_value: runtime::Value,
     arguments: Vec[runtime::Value],
     depth: isize,
@@ -1867,6 +1939,24 @@ fn string_regexp_replace_at_depth(
             } else {
                 false
             };
+            if string_has_default_regexp_exec(
+                context,
+                receiver_root.get(),
+                regexp_prototype,
+                builtin_exec,
+            ) {
+                return string_regexp_builtin_replace_at_depth(
+                    context,
+                    states,
+                    receiver_root.get(),
+                    input,
+                    replacement_root.get(),
+                    functional,
+                    global,
+                    unicode,
+                    depth,
+                )
+            } else {};
             if global {
                 string_set_property_at_depth(
                     context,
@@ -2342,8 +2432,8 @@ fn string_symbol_method(
     depth: isize,
 ) -> Result[Option[runtime::Value], vm::VmError] {
     match value {
-        runtime::Value::Undefined | runtime::Value::Null => return Result::Ok(Option::None),
-        _ => (),
+        runtime::Value::Object(_) => (),
+        _ => return Result::Ok(Option::None),
     };
     let symbol = match context.well_known_symbol(kind) {
         Some(value) => value,
@@ -2359,6 +2449,58 @@ fn string_symbol_method(
         },
         _ => Result::Err(string_vm_type_error("symbol protocol property is not callable")),
     }
+}
+
+fn string_regexp_create_dispatch(
+    context: vm::Context,
+    regexp_constructor: runtime::Value,
+    receiver: runtime::Value,
+    pattern: runtime::Value,
+    flags: runtime::Value,
+    kind: vm::WellKnownSymbolKind,
+    trailing_arguments: Vec[runtime::Value],
+    depth: isize,
+) -> Result[runtime::Value, vm::VmError] {
+    string_with_roots(
+        context,
+        |roots| {
+            let receiver_root = string_add_root(context, roots, receiver);
+            let pattern_root = string_add_root(context, roots, pattern);
+            let flags_root = string_add_root(context, roots, flags);
+            let constructor_root = string_add_root(context, roots, regexp_constructor);
+            let trailing_roots: Vec[Ref[runtime::Value]] = Vec::new();
+            for argument in trailing_arguments {
+                trailing_roots.push(string_add_root(context, roots, argument))
+            }
+            let input = string_method_receiver_at_depth(context, receiver_root.get(), depth)?;
+            let input_root = string_add_root(context, roots, input);
+            let regexp = context.construct_with_new_target_at_depth(
+                constructor_root.get(),
+                Vec::from_array([pattern_root.get(), flags_root.get()]),
+                constructor_root.get(),
+                depth,
+            )?;
+            let regexp_root = string_add_root(context, roots, regexp);
+            let method = match string_symbol_method(context, regexp_root.get(), kind, depth)? {
+                Some(value) => value,
+                None => return Result::Err(
+                    string_vm_type_error("RegExp symbol protocol property is not callable"),
+                ),
+            };
+            let method_root = string_add_root(context, roots, method);
+            let call_arguments: Vec[runtime::Value] = Vec::with_capacity(trailing_roots.len() + 1);
+            call_arguments.push(input_root.get());
+            for root in trailing_roots {
+                call_arguments.push(root.get())
+            }
+            context.invoke_with_this_at_depth(
+                method_root.get(),
+                call_arguments,
+                regexp_root.get(),
+                depth,
+            )
+        },
+    )
 }
 
 fn string_is_regexp(
@@ -2755,6 +2897,7 @@ fn string_regexp_match_all(
 fn string_match_all_dispatch(
     context: vm::Context,
     states: HashMap[runtime::ObjectId, RegExpState],
+    regexp_constructor: runtime::Value,
     this_value: runtime::Value,
     arguments: Vec[runtime::Value],
     depth: isize,
@@ -2784,33 +2927,23 @@ fn string_match_all_dispatch(
             pattern,
             depth,
         ),
-        None => {
-            let input = match string_receiver(
-                context.heap(),
-                string_method_receiver_at_depth(context, receiver, depth)?,
-            ) {
-                Ok(value) => value,
-                Err(value) => return Result::Err(string_vm_native_error(value)),
-            };
-            let source = match pattern {
-                runtime::Value::Undefined => js_string(""),
-                value => match string_value_at_depth(context, value, depth)? {
-                    runtime::Value::String(value) => value,
-                    _ => return Result::Err(string_vm_type_error("pattern is not a string")),
-                },
-            };
-            let state = match new_regexp_state(source, js_string("g")) {
-                Ok(value) => value,
-                Err(value) => return Result::Err(string_vm_native_error(value)),
-            };
-            string_match_all_iterator(context, state, input, 0)
-        },
+        None => string_regexp_create_dispatch(
+            context,
+            regexp_constructor,
+            receiver,
+            pattern,
+            runtime::Value::String(js_string("g")),
+            vm::WellKnownSymbolKind::MatchAll,
+            Vec::new(),
+            depth,
+        ),
     }
 }
 
 fn string_match_dispatch(
     context: vm::Context,
     states: HashMap[runtime::ObjectId, RegExpState],
+    regexp_constructor: runtime::Value,
     this_value: runtime::Value,
     arguments: Vec[runtime::Value],
     depth: isize,
@@ -2824,11 +2957,14 @@ fn string_match_dispatch(
             pattern,
             depth,
         ),
-        None => string_match_internal(
+        None => string_regexp_create_dispatch(
             context,
-            states,
-            string_method_receiver_at_depth(context, receiver, depth)?,
-            arguments,
+            regexp_constructor,
+            receiver,
+            pattern,
+            runtime::Value::Undefined,
+            vm::WellKnownSymbolKind::Match,
+            Vec::new(),
             depth,
         ),
     }
@@ -2837,6 +2973,7 @@ fn string_match_dispatch(
 fn string_search_dispatch(
     context: vm::Context,
     states: HashMap[runtime::ObjectId, RegExpState],
+    regexp_constructor: runtime::Value,
     this_value: runtime::Value,
     arguments: Vec[runtime::Value],
     depth: isize,
@@ -2850,11 +2987,14 @@ fn string_search_dispatch(
             pattern,
             depth,
         ),
-        None => string_search_internal(
+        None => string_regexp_create_dispatch(
             context,
-            states,
-            string_method_receiver_at_depth(context, receiver, depth)?,
-            arguments,
+            regexp_constructor,
+            receiver,
+            pattern,
+            runtime::Value::Undefined,
+            vm::WellKnownSymbolKind::Search,
+            Vec::new(),
             depth,
         ),
     }
@@ -2895,7 +3035,6 @@ fn string_replace_dispatch(
         ),
         None => string_replace_internal(
             context,
-            states,
             replace_all,
             string_method_receiver_at_depth(context, receiver, depth)?,
             arguments,
@@ -2954,6 +3093,7 @@ fn install_regexp_string_methods(
     regexp_constructor: runtime::Value,
     regexp_prototype: runtime::ObjectId,
     states: HashMap[runtime::ObjectId, RegExpState],
+    builtin_exec: runtime::Value,
     iterator_constructor: runtime::Value,
 ) -> Result[(), BuiltinError] {
     let regexp_iterator_states: HashMap[runtime::ObjectId, RegExpStringIteratorState] = HashMap::new();
@@ -2970,21 +3110,35 @@ fn install_regexp_string_methods(
         context,
         "String.prototype.match",
         |this_value, arguments, depth| {
-            string_match_dispatch(context, states, this_value, arguments, depth)
+            string_match_dispatch(context, states, regexp_constructor, this_value, arguments, depth)
         },
     )?;
     let match_all_method = allocate_vm_function(
         context,
         "String.prototype.matchAll",
         |this_value, arguments, depth| {
-            string_match_all_dispatch(context, states, this_value, arguments, depth)
+            string_match_all_dispatch(
+                context,
+                states,
+                regexp_constructor,
+                this_value,
+                arguments,
+                depth,
+            )
         },
     )?;
     let search_method = allocate_vm_function(
         context,
         "String.prototype.search",
         |this_value, arguments, depth| {
-            string_search_dispatch(context, states, this_value, arguments, depth)
+            string_search_dispatch(
+                context,
+                states,
+                regexp_constructor,
+                this_value,
+                arguments,
+                depth,
+            )
         },
     )?;
     let replace_method = allocate_vm_function(
@@ -3054,7 +3208,15 @@ fn install_regexp_string_methods(
         context,
         "RegExp.prototype[Symbol.replace]",
         |this_value, arguments, depth| {
-            string_regexp_replace_at_depth(context, states, this_value, arguments, depth)
+            string_regexp_replace_at_depth(
+                context,
+                states,
+                regexp_prototype,
+                builtin_exec,
+                this_value,
+                arguments,
+                depth,
+            )
         },
     )?;
     let regexp_split = allocate_vm_function(
@@ -3140,63 +3302,150 @@ fn string_iterator_identity(
     Result::Ok(this_value)
 }
 
-fn string_create_iterator(context: vm::Context, this_value: runtime::Value) -> Result[
-    runtime::Value,
-    vm::VmError,
-] {
+fn string_iterator_gc_edges(
+    heap: runtime::Heap,
+    states: HashMap[runtime::ObjectId, StringIteratorState],
+) -> Vec[runtime::GcEdge] {
+    let stale: Vec[runtime::ObjectId] = Vec::new();
+    for (object, _) in states.entries() {
+        if !heap.contains(object) {
+            stale.push(object)
+        } else {}
+    }
+    for object in stale {
+        let _ = states.remove(object);
+    }
+    Vec::new()
+}
+
+fn string_iterator_state(
+    states: HashMap[runtime::ObjectId, StringIteratorState],
+    value: runtime::Value,
+) -> Result[StringIteratorState, vm::VmError] {
+    match value {
+        runtime::Value::Object(object) => match states.get(object) {
+            Some(value) => Result::Ok(value),
+            None => {
+                Result::Err(string_vm_type_error("String Iterator next receiver is incompatible"))
+            },
+        },
+        _ => Result::Err(string_vm_type_error("String Iterator next receiver is incompatible")),
+    }
+}
+
+fn string_iterator_next(
+    context: vm::Context,
+    states: HashMap[runtime::ObjectId, StringIteratorState],
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+) -> Result[runtime::Value, vm::VmError] {
+    let _ = arguments;
+    let state = string_iterator_state(states, this_value)?;
+    let current = state.index.get();
+    if current >= state.input.len() {
+        string_iterator_result(context, runtime::Value::Undefined, true)
+    } else {
+        let width = if runtime::is_high_surrogate(state.input.get(current))
+            && current + 1 < state.input.len()
+            && runtime::is_low_surrogate(state.input.get(current + 1)) {
+            2
+        } else {
+            1
+        };
+        state.index.set(current + width);
+        string_iterator_result(
+            context,
+            runtime::Value::String(state.input.slice(current, current + width)),
+            false,
+        )
+    }
+}
+
+fn string_create_iterator(
+    context: vm::Context,
+    states: HashMap[runtime::ObjectId, StringIteratorState],
+    prototype: runtime::ObjectId,
+    this_value: runtime::Value,
+) -> Result[runtime::Value, vm::VmError] {
     let value = match string_receiver(context.heap(), this_value) {
         Ok(value) => value,
         Err(value) => return Result::Err(function_vm_error(value.message)),
     };
-    let index = Ref::new(0);
-    let next = context.new_vm_function(
+    let iterator = match runtime::new_ordinary_object(context.heap(), Option::Some(prototype)) {
+        Ok(value) => value,
+        Err(value) => return Result::Err(function_vm_error(value.message)),
+    };
+    states[iterator] = StringIteratorState { input: value, index: Ref::new(0) };
+    Result::Ok(runtime::Value::Object(iterator))
+}
+
+fn install_string_iterator(
+    context: vm::Context,
+    string_prototype: runtime::ObjectId,
+    iterator_constructor: runtime::Value,
+) -> Result[(), BuiltinError] {
+    let iterator_constructor_object = function_object(iterator_constructor, "Iterator")?;
+    let iterator_prototype = match builtin_own_value(
+        context.heap(),
+        iterator_constructor_object,
+        "prototype",
+    )? {
+        runtime::Value::Object(value) => value,
+        _ => return Result::Err(BuiltinError { message: "Iterator prototype is not an object" }),
+    };
+    let prototype = match runtime::new_ordinary_object(
+        context.heap(),
+        Option::Some(iterator_prototype),
+    ) {
+        Ok(value) => value,
+        Err(value) => return Result::Err(BuiltinError { message: value.message }),
+    };
+    let states: HashMap[runtime::ObjectId, StringIteratorState] = HashMap::new();
+    context.add_external_edge_provider(|| string_iterator_gc_edges(context.heap(), states));
+    define_value(
+        context.heap(),
+        prototype,
+        "next",
+        allocate_vm_function_with_length(
+            context,
+            "String Iterator.prototype.next",
+            0,
+            |this_value, arguments, depth| {
+                let _ = depth;
+                string_iterator_next(context, states, this_value, arguments)
+            },
+        )?,
+        true,
+        true,
+    )?;
+    define_to_string_tag(context, prototype, "String Iterator")?;
+    context.add_external_root(Ref::new(runtime::Value::Object(prototype)));
+    let iterator = allocate_vm_function(
+        context,
+        "String.prototype[Symbol.iterator]",
         |this_value, arguments, depth| {
-            let _ = this_value;
             let _ = arguments;
-            let _ = depth;
-            let current = index.get();
-            if current >= value.len() {
-                string_iterator_result(context, runtime::Value::Undefined, true)
-            } else {
-                let width = if runtime::is_high_surrogate(value.get(current))
-                    && current + 1 < value.len()
-                    && runtime::is_low_surrogate(value.get(current + 1)) {
-                    2
-                } else {
-                    1
-                };
-                index.set(current + width);
-                string_iterator_result(
-                    context,
-                    runtime::Value::String(value.slice(current, current + width)),
-                    false,
-                )
-            }
+            string_create_iterator(
+                context,
+                states,
+                prototype,
+                string_method_receiver_at_depth(context, this_value, depth)?,
+            )
         },
     )?;
-    let iterator = iterator_allocate_object(context)?;
-    if !runtime::define_own_property(
-        context.heap(),
-        iterator,
-        runtime::string_property_key("next"),
-        runtime::data_descriptor(next, true, false, true),
-    ) {
-        return Result::Err(function_vm_error("cannot define String iterator next"))
-    } else {};
     let symbol = match context.iterator_symbol() {
         Some(value) => value,
-        None => return Result::Err(function_vm_error("iterator symbol is not installed")),
+        None => return Result::Err(BuiltinError { message: "Symbol.iterator is not installed" }),
     };
-    let identity = context.new_native_function(string_iterator_identity)?;
     if !runtime::define_own_property(
         context.heap(),
-        iterator,
+        string_prototype,
         runtime::PropertyKey::Symbol(symbol),
-        runtime::data_descriptor(identity, true, false, true),
+        runtime::data_descriptor(iterator, true, false, true),
     ) {
-        Result::Err(function_vm_error("cannot define String iterator identity"))
+        Result::Err(BuiltinError { message: "cannot define String iterator" })
     } else {
-        Result::Ok(runtime::Value::Object(iterator))
+        Result::Ok(())
     }
 }
 
@@ -3209,6 +3458,13 @@ pub fn install_string_prototype(context: vm::Context, constructor: runtime::Valu
         Ok(value) => value,
         Err(value) => return Result::Err(BuiltinError { message: value.message }),
     };
+    if !runtime::set_primitive_value(
+        context.heap(),
+        prototype,
+        runtime::Value::String(js_string("")),
+    ) {
+        return Result::Err(BuiltinError { message: "cannot initialize String prototype" })
+    } else {};
     define_value(
         context.heap(),
         constructor_object,
@@ -3407,28 +3663,6 @@ pub fn install_string_prototype(context: vm::Context, constructor: runtime::Valu
     }
     define_function(context, prototype, "replaceAll", string_replace_all)?;
     define_function(context, prototype, "split", string_split)?;
-    let iterator = allocate_vm_function(
-        context,
-        "String.prototype[Symbol.iterator]",
-        |this_value, arguments, depth| {
-            let _ = arguments;
-            string_create_iterator(
-                context,
-                string_method_receiver_at_depth(context, this_value, depth)?,
-            )
-        },
-    )?;
-    match context.iterator_symbol() {
-        Some(symbol) => if !runtime::define_own_property(
-            context.heap(),
-            prototype,
-            runtime::PropertyKey::Symbol(symbol),
-            runtime::data_descriptor(iterator, true, false, true),
-        ) {
-            return Result::Err(BuiltinError { message: "cannot define String iterator" })
-        } else {},
-        None => (),
-    };
     match context.set_primitive_prototype(vm::PrimitiveKind::String, prototype) {
         Ok(()) => Result::Ok(prototype),
         Err(_) => Result::Err(BuiltinError { message: "cannot install String prototype" }),

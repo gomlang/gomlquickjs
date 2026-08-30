@@ -15,42 +15,44 @@ struct ErrorInstall {
     aggregate_error: runtime::Value,
 }
 
-fn error_property(heap: runtime::Heap, object: runtime::ObjectId, name: string) -> Result[
+fn error_property(context: vm::Context, object: runtime::ObjectId, name: string, depth: isize) -> Result[
     runtime::Value,
-    vm::NativeError,
+    vm::VmError,
 ] {
-    match runtime::get_property(heap, object, runtime::string_property_key(name)) {
-        Ok(Some(value)) => Result::Ok(value),
-        Ok(None) => Result::Ok(runtime::Value::Undefined),
-        Err(value) => Result::Err(native_error(value.message)),
-    }
+    context.read_property_at_depth(
+        runtime::Value::Object(object),
+        runtime::Value::String(js_string(name)),
+        depth,
+    )
 }
 
-fn error_string(heap: runtime::Heap, value: runtime::Value) -> Result[
+fn error_string(context: vm::Context, value: runtime::Value, depth: isize) -> Result[
     runtime::JsString,
-    vm::NativeError,
+    vm::VmError,
 ] {
-    value_string(heap, value)
+    context.value_to_string_at_depth(value, depth)
 }
 
-fn error_to_string(heap: runtime::Heap, this_value: runtime::Value, arguments: Vec[runtime::Value]) -> Result[
-    runtime::Value,
-    vm::NativeError,
-] {
+fn error_to_string(
+    context: vm::Context,
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+    depth: isize,
+) -> Result[runtime::Value, vm::VmError] {
     let _ = arguments;
     let object = match this_value {
         runtime::Value::Object(value) => value,
-        _ => return Result::Err(native_error("Error.prototype.toString requires an object")),
+        _ => return Result::Err(function_vm_error("Error.prototype.toString requires an object")),
     };
-    let name_value = error_property(heap, object, "name")?;
-    let message_value = error_property(heap, object, "message")?;
+    let name_value = error_property(context, object, "name", depth)?;
     let name = match name_value {
         runtime::Value::Undefined => js_string("Error"),
-        value => error_string(heap, value)?,
+        value => error_string(context, value, depth)?,
     };
+    let message_value = error_property(context, object, "message", depth)?;
     let message = match message_value {
         runtime::Value::Undefined => js_string(""),
-        value => error_string(heap, value)?,
+        value => error_string(context, value, depth)?,
     };
     if name.len() == 0 {
         Result::Ok(runtime::Value::String(message))
@@ -76,80 +78,228 @@ fn error_is_error(
     Result::Ok(runtime::Value::Bool(result))
 }
 
-fn install_error_cause(heap: runtime::Heap, object: runtime::ObjectId, options: runtime::Value) -> Result[
-    (),
-    vm::NativeError,
-] {
+fn install_error_cause(
+    context: vm::Context,
+    object: runtime::ObjectId,
+    options: runtime::Value,
+    depth: isize,
+) -> Result[(), vm::VmError] {
     match options {
-        runtime::Value::Object(value) => match runtime::get_property(
-            heap,
-            value,
-            runtime::string_property_key("cause"),
-        ) {
-            Ok(Some(cause)) => define_data(
-                heap,
+        runtime::Value::Object(_) => {
+            let key = runtime::Value::String(js_string("cause"));
+            if !context.has_property_at_depth(options, key, depth)? {
+                return Result::Ok(())
+            } else {};
+            let cause = context.read_property_at_depth(options, key, depth)?;
+            match define_data(
+                context.heap(),
                 object,
                 runtime::string_property_key("cause"),
                 cause,
                 true,
                 false,
                 true,
-            ),
-            Ok(None) => Result::Ok(()),
-            Err(value) => Result::Err(native_error(value.message)),
+            ) {
+                Ok(()) => Result::Ok(()),
+                Err(error) => Result::Err(function_native_error(error)),
+            }
         },
         _ => Result::Ok(()),
     }
 }
 
 fn error_construct(
-    heap: runtime::Heap,
+    context: vm::Context,
     prototype: runtime::ObjectId,
     message_index: isize,
     options_index: isize,
     this_value: runtime::Value,
     arguments: Vec[runtime::Value],
-) -> Result[runtime::Value, vm::NativeError] {
+    depth: isize,
+) -> Result[runtime::Value, vm::VmError] {
     let _ = this_value;
-    let object = allocate_ordinary(heap, Option::Some(prototype))?;
-    let message = argument(arguments, message_index);
+    let object = match allocate_ordinary(context.heap(), Option::Some(prototype)) {
+        Ok(value) => value,
+        Err(error) => return Result::Err(function_native_error(error)),
+    };
+    finish_error_object(context, object, message_index, options_index, arguments, depth)
+}
+
+fn finish_error_object(
+    context: vm::Context,
+    object: runtime::ObjectId,
+    message_index: isize,
+    options_index: isize,
+    arguments: Vec[runtime::Value],
+    depth: isize,
+) -> Result[runtime::Value, vm::VmError] {
+    let root = Ref::new(runtime::Value::Object(object));
+    context.add_external_root(root);
+    let result = initialize_error_object(
+        context,
+        object,
+        message_index,
+        options_index,
+        arguments,
+        depth,
+    );
+    let _ = context.remove_external_root(root);
+    match result {
+        Ok(()) => Result::Ok(runtime::Value::Object(object)),
+        Err(error) => Result::Err(error),
+    }
+}
+
+fn register_error_object(context: vm::Context, name: string, result: runtime::Value) -> Result[
+    runtime::Value,
+    vm::VmError,
+] {
+    match result {
+        runtime::Value::Object(object) => if context.set_error_object_type(object, js_string(name)) {
+            Result::Ok(result)
+        } else {
+            Result::Err(function_vm_error("cannot register Error instance"))
+        },
+        _ => Result::Ok(result),
+    }
+}
+
+fn initialize_error_object(
+    context: vm::Context,
+    object: runtime::ObjectId,
+    message_index: isize,
+    options_index: isize,
+    arguments: Vec[runtime::Value],
+    depth: isize,
+) -> Result[(), vm::VmError] {
+    initialize_error_message(context, object, argument(arguments, message_index), depth)?;
+    install_error_cause(context, object, argument(arguments, options_index), depth)
+}
+
+fn initialize_error_message(
+    context: vm::Context,
+    object: runtime::ObjectId,
+    message: runtime::Value,
+    depth: isize,
+) -> Result[(), vm::VmError] {
     match message {
         runtime::Value::Undefined => (),
-        value => define_data(
-            heap,
+        value => match define_data(
+            context.heap(),
             object,
             runtime::string_property_key("message"),
-            runtime::Value::String(error_string(heap, value)?),
+            runtime::Value::String(error_string(context, value, depth)?),
             true,
             false,
             true,
-        )?,
+        ) {
+            Ok(()) => (),
+            Err(error) => return Result::Err(function_native_error(error)),
+        },
     };
-    install_error_cause(heap, object, argument(arguments, options_index))?;
-    Result::Ok(runtime::Value::Object(object))
+    Result::Ok(())
 }
 
-fn aggregate_error_construct(
-    heap: runtime::Heap,
-    prototype: runtime::ObjectId,
-    this_value: runtime::Value,
+fn aggregate_error_values_rooted(
+    context: vm::Context,
+    source: runtime::Value,
+    depth: isize,
+    roots: Vec[Ref[runtime::Value]],
+) -> Result[runtime::Value, vm::VmError] {
+    let started = collection_iterator_start(context, source, depth)?;
+    let mut count = 0;
+    while count < ARRAY_FROM_LIMIT {
+        match collection_iterator_step(context, started.0, started.1, depth)? {
+            Some(value) => {
+                let root = Ref::new(value);
+                context.add_external_root(root);
+                roots.push(root)
+            },
+            None => {
+                let values: Vec[runtime::Value] = Vec::with_capacity(roots.len());
+                for root in roots {
+                    values.push(root.get())
+                }
+                return match allocate_array(context.heap(), values, values.len()) {
+                    Ok(value) => Result::Ok(runtime::Value::Object(value)),
+                    Err(error) => Result::Err(function_native_error(error)),
+                }
+            },
+        };
+        count += 1;
+    }
+    collection_close_with_error(
+        context,
+        started.0,
+        depth,
+        function_range_error("AggregateError errors iterable exceeds implementation limit"),
+    )
+}
+
+fn aggregate_error_values(context: vm::Context, source: runtime::Value, depth: isize) -> Result[
+    runtime::Value,
+    vm::VmError,
+] {
+    let roots: Vec[Ref[runtime::Value]] = Vec::new();
+    let result = aggregate_error_values_rooted(context, source, depth, roots);
+    for root in roots {
+        let _ = context.remove_external_root(root);
+    }
+    result
+}
+
+fn initialize_aggregate_error_object(
+    context: vm::Context,
+    object: runtime::ObjectId,
     arguments: Vec[runtime::Value],
-) -> Result[runtime::Value, vm::NativeError] {
-    let result = error_construct(heap, prototype, 1, 2, this_value, arguments)?;
-    let object = match result {
-        runtime::Value::Object(value) => value,
-        _ => return Result::Err(native_error("cannot allocate AggregateError")),
-    };
-    define_data(
-        heap,
+    depth: isize,
+) -> Result[(), vm::VmError] {
+    initialize_error_message(context, object, argument(arguments, 1), depth)?;
+    install_error_cause(context, object, argument(arguments, 2), depth)?;
+    let errors = aggregate_error_values(context, argument(arguments, 0), depth)?;
+    match define_data(
+        context.heap(),
         object,
         runtime::string_property_key("errors"),
-        argument(arguments, 0),
+        errors,
         true,
         false,
         true,
-    )?;
-    Result::Ok(result)
+    ) {
+        Ok(()) => Result::Ok(()),
+        Err(error) => Result::Err(function_native_error(error)),
+    }
+}
+
+fn finish_aggregate_error_object(
+    context: vm::Context,
+    object: runtime::ObjectId,
+    arguments: Vec[runtime::Value],
+    depth: isize,
+) -> Result[runtime::Value, vm::VmError] {
+    let root = Ref::new(runtime::Value::Object(object));
+    context.add_external_root(root);
+    let result = initialize_aggregate_error_object(context, object, arguments, depth);
+    let _ = context.remove_external_root(root);
+    match result {
+        Ok(()) => Result::Ok(runtime::Value::Object(object)),
+        Err(error) => Result::Err(error),
+    }
+}
+
+fn aggregate_error_construct(
+    context: vm::Context,
+    prototype: runtime::ObjectId,
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+    depth: isize,
+) -> Result[runtime::Value, vm::VmError] {
+    let _ = this_value;
+    let object = match allocate_ordinary(context.heap(), Option::Some(prototype)) {
+        Ok(value) => value,
+        Err(error) => return Result::Err(function_native_error(error)),
+    };
+    finish_aggregate_error_object(context, object, arguments, depth)
 }
 
 fn install_error_type(
@@ -163,7 +313,20 @@ fn install_error_type(
     };
     match parent_prototype {
         Some(_) => (),
-        None => define_function(context, prototype, "toString", error_to_string)?,
+        None => define_value(
+            context.heap(),
+            prototype,
+            "toString",
+            allocate_vm_function(
+                context,
+                "Error.prototype.toString",
+                |this_value, arguments, depth| {
+                    error_to_string(context, this_value, arguments, depth)
+                },
+            )?,
+            true,
+            true,
+        )?,
     };
     define_value(
         context.heap(),
@@ -181,24 +344,32 @@ fn install_error_type(
         true,
         true,
     )?;
-    let constructor = allocate_function(
+    let constructor = allocate_vm_function(
         context,
         name,
-        |heap, this_value, arguments| {
-            let result = error_construct(heap, prototype, 0, 1, this_value, arguments)?;
-            match result {
-                runtime::Value::Object(object) => if context.set_error_object_type(
-                    object,
-                    js_string(name),
-                ) {
-                    Result::Ok(result)
-                } else {
-                    Result::Err(native_error("cannot register Error instance"))
-                },
-                _ => Result::Ok(result),
-            }
+        |this_value, arguments, depth| {
+            register_error_object(
+                context,
+                name,
+                error_construct(context, prototype, 0, 1, this_value, arguments, depth)?,
+            )
         },
     )?;
+    match context.set_vm_constructor_callback(
+        constructor,
+        |receiver, arguments, selected_prototype, new_target, depth| {
+            let _ = new_target;
+            constructor_receiver_prototype(context.heap(), receiver, selected_prototype, prototype)?;
+            register_error_object(
+                context,
+                name,
+                finish_error_object(context, receiver, 0, 1, arguments, depth)?,
+            )
+        },
+    ) {
+        Ok(()) => (),
+        Err(error) => return Result::Err(BuiltinError { message: error.kind.debug() }),
+    };
     let constructor_object = function_object(constructor, name)?;
     if name == "Error" {
         define_value(
@@ -252,11 +423,11 @@ fn install_aggregate_error(context: vm::Context, parent_prototype: runtime::Obje
         true,
         true,
     )?;
-    let constructor = allocate_function(
+    let constructor = allocate_vm_function(
         context,
         "AggregateError",
-        |heap, this_value, arguments| {
-            let result = aggregate_error_construct(heap, prototype, this_value, arguments)?;
+        |this_value, arguments, depth| {
+            let result = aggregate_error_construct(context, prototype, this_value, arguments, depth)?;
             match result {
                 runtime::Value::Object(object) => if context.set_error_object_type(
                     object,
@@ -264,12 +435,27 @@ fn install_aggregate_error(context: vm::Context, parent_prototype: runtime::Obje
                 ) {
                     Result::Ok(result)
                 } else {
-                    Result::Err(native_error("cannot register AggregateError instance"))
+                    Result::Err(function_vm_error("cannot register AggregateError instance"))
                 },
                 _ => Result::Ok(result),
             }
         },
     )?;
+    match context.set_vm_constructor_callback(
+        constructor,
+        |receiver, arguments, selected_prototype, new_target, depth| {
+            let _ = new_target;
+            constructor_receiver_prototype(context.heap(), receiver, selected_prototype, prototype)?;
+            register_error_object(
+                context,
+                "AggregateError",
+                finish_aggregate_error_object(context, receiver, arguments, depth)?,
+            )
+        },
+    ) {
+        Ok(()) => (),
+        Err(error) => return Result::Err(BuiltinError { message: error.kind.debug() }),
+    };
     let constructor_object = function_object(constructor, "AggregateError")?;
     define_value(
         context.heap(),
@@ -291,6 +477,20 @@ fn register_error_prototype(
     match context.set_error_prototype(kind, prototype) {
         Ok(_) => Result::Ok(()),
         Err(value) => Result::Err(BuiltinError { message: value.kind.debug() }),
+    }
+}
+
+fn set_error_constructor_parent(
+    context: vm::Context,
+    constructor: runtime::Value,
+    parent: runtime::Value,
+) -> Result[(), BuiltinError] {
+    let object = function_object(constructor, "Error subtype")?;
+    let parent_object = function_object(parent, "Error")?;
+    if runtime::set_prototype_of(context.heap(), object, Option::Some(parent_object)) {
+        Result::Ok(())
+    } else {
+        Result::Err(BuiltinError { message: "cannot initialize Error constructor inheritance" })
     }
 }
 
@@ -328,6 +528,20 @@ fn install_errors(context: vm::Context) -> Result[ErrorInstall, BuiltinError] {
         Option::Some(error_prototype),
     )?;
     let aggregate_error = install_aggregate_error(context, error_prototype)?;
+    for constructor in Vec::from_array(
+        [
+            internal_error,
+            eval_error,
+            range_error,
+            reference_error,
+            syntax_error,
+            type_error,
+            uri_error,
+            aggregate_error,
+        ],
+    ) {
+        set_error_constructor_parent(context, constructor, error)?
+    }
     register_error_prototype(context, vm::ErrorPrototypeKind::Error, error_prototype)?;
     register_error_prototype(
         context,

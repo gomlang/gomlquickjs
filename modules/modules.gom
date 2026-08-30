@@ -55,6 +55,7 @@ struct ModuleRecord {
     locals: Vec[Ref[runtime::Value]],
     dependencies: HashMap[string, Ref[ModuleRecord]],
     namespace: Ref[Option[runtime::ObjectId]],
+    namespace_cell: Ref[runtime::Value],
     import_meta: Ref[Option[runtime::ObjectId]],
     main: Ref[bool],
     state: Ref[ModuleState],
@@ -71,6 +72,26 @@ struct ModuleRecord {
     async_timestamp: Ref[isize],
     execution_started: Ref[bool],
     module_type: string,
+    dynamic_import_waiters: Vec[DynamicImportWaiter],
+    instantiated: Ref[bool],
+}
+
+enum ExportResolution {
+    Missing,
+    Resolved(Ref[runtime::Value]),
+    Ambiguous,
+}
+
+enum DynamicImportResolution {
+    Ready(runtime::Value),
+    Pending(Ref[ModuleRecord]),
+}
+
+struct DynamicImportWaiter {
+    promise: Ref[runtime::Value],
+    resolve: Ref[runtime::Value],
+    reject: Ref[runtime::Value],
+    depth: isize,
 }
 
 struct Loader {
@@ -178,7 +199,7 @@ fn requested_module_type(module_path: string, attributes: Vec[compiler::ModuleAt
     for attribute in attributes {
         if attribute.key != "type" {
             return Result::Err(
-                module_type_error(
+                module_syntax_error(
                     module_path,
                     "import attribute `" + attribute.key + "` is not supported",
                 ),
@@ -240,6 +261,11 @@ fn load_record_with_type(loader: Loader, module_path: string, requested_type: st
         let attributes: Vec[compiler::ModuleAttribute] = Vec::new();
         compiler::CompiledModule {
             function,
+            instantiation_function: bytecode::Function::new(
+                Vec::new(),
+                Vec::from_array([bytecode::Instruction::ReturnUndef]),
+                3,
+            ),
             imports,
             exports: Vec::from_array(
                 [
@@ -253,6 +279,7 @@ fn load_record_with_type(loader: Loader, module_path: string, requested_type: st
                     },
                 ],
             ),
+            tdz_local_indices: Vec::new(),
             import_meta_index: 1,
             dynamic_import_referrer_index: 2,
         }
@@ -275,12 +302,24 @@ fn load_record_with_type(loader: Loader, module_path: string, requested_type: st
         locals.push(cell);
         loader.context.add_external_root(cell);
     }
+    for index in compiled.tdz_local_indices {
+        if index >= 0 && index < locals.len() {
+            match runtime::new_tdz_value(loader.context.heap()) {
+                Ok(value) => locals[index].set(value),
+                Err(error) => return Result::Err(module_error(canonical, error.message)),
+            }
+        } else {
+            return Result::Err(module_error(canonical, "invalid module TDZ binding"))
+        }
+    }
     match json_value {
         Some(value) => locals[0].set(value),
         None => (),
     };
     let evaluation_error = Ref::new(runtime::Value::Undefined);
     loader.context.add_external_root(evaluation_error);
+    let namespace_cell = Ref::new(runtime::Value::Undefined);
+    loader.context.add_external_root(namespace_cell);
     let record = Ref::new(
         ModuleRecord {
             path: canonical,
@@ -288,6 +327,7 @@ fn load_record_with_type(loader: Loader, module_path: string, requested_type: st
             locals,
             dependencies: HashMap::new(),
             namespace: Ref::new(Option::None),
+            namespace_cell,
             import_meta: Ref::new(Option::None),
             main: Ref::new(false),
             state: Ref::new(ModuleState::Linked),
@@ -304,6 +344,8 @@ fn load_record_with_type(loader: Loader, module_path: string, requested_type: st
             async_timestamp: Ref::new(-1),
             execution_started: Ref::new(false),
             module_type: requested_type,
+            dynamic_import_waiters: Vec::new(),
+            instantiated: Ref::new(false),
         },
     );
     loader.records[canonical] = record;
@@ -420,20 +462,35 @@ fn dynamic_import_validate_attributes(
     attributes: runtime::ObjectId,
     depth: isize,
 ) -> Result[string, vm::VmError] {
-    let object: runtime::Object = match context.heap().get(attributes) {
-        Some(value) => value,
-        None => return Result::Err(dynamic_import_vm_error("import attributes object is invalid")),
-    };
     let mut module_type = "javascript";
-    let keys: Vec[runtime::PropertyKey] = runtime::own_property_keys(context.heap(), attributes);
-    for key in keys {
-        let enumerable: bool = match object.own_property(key) {
-            Some(descriptor) => runtime::descriptor_enumerable(descriptor),
-            None => false,
-        };
+    let keys_value = context.own_keys_at_depth(runtime::Value::Object(attributes), depth)?;
+    let length_value = context.read_property_at_depth(
+        keys_value,
+        runtime::Value::String(runtime::JsString::from_utf8("length".to_bytes().slice(0, 6))),
+        depth,
+    )?;
+    let length = match length_value {
+        runtime::Value::Int(value) => value.to_isize(),
+        _ => return Result::Err(dynamic_import_vm_error("attribute key list is invalid")),
+    };
+    let mut index = 0;
+    while index < length {
+        let index_name = index.to_string();
+        let key_value = context.read_property_at_depth(
+            keys_value,
+            runtime::Value::String(
+                runtime::JsString::from_utf8(index_name.to_bytes().slice(0, index_name.byte_len())),
+            ),
+            depth,
+        )?;
+        let enumerable = context.own_property_enumerable_at_depth(
+            runtime::Value::Object(attributes),
+            key_value,
+            depth,
+        )?;
         if enumerable {
-            match key {
-                runtime::PropertyKey::String(name) => {
+            match key_value {
+                runtime::Value::String(name) => {
                     let key = match name.to_host_string() {
                         Ok(value) => value,
                         Err(error) => return Result::Err(dynamic_import_vm_error(error.debug())),
@@ -445,7 +502,9 @@ fn dynamic_import_validate_attributes(
                     )? {
                         runtime::Value::String(value) => match value.to_host_string() {
                             Ok(value) => value,
-                            Err(error) => return Result::Err(dynamic_import_vm_error(error.debug())),
+                            Err(error) => {
+                                return Result::Err(dynamic_import_vm_error(error.debug()))
+                            },
                         },
                         _ => return Result::Err(
                             dynamic_import_vm_error("module attribute values must be strings"),
@@ -465,9 +524,11 @@ fn dynamic_import_validate_attributes(
                         )
                     }
                 },
-                runtime::PropertyKey::Symbol(_) => (),
+                runtime::Value::Symbol(_) => (),
+                _ => return Result::Err(dynamic_import_vm_error("attribute key is invalid")),
             }
-        } else {}
+        } else {};
+        index += 1;
     }
     Result::Ok(module_type)
 }
@@ -505,10 +566,12 @@ fn dynamic_import_namespace(
     referrer: string,
     specifier: string,
     requested_type: string,
-) -> Result[runtime::Value, ModuleError] {
+) -> Result[DynamicImportResolution, ModuleError] {
     if loader.context.virtual_module(specifier).is_some() || specifier == "std" || specifier == "os" {
         if requested_type == "javascript" {
-            return virtual_module_value(loader, specifier)
+            return Result::Ok(
+                DynamicImportResolution::Ready(virtual_module_value(loader, specifier)?),
+            )
         } else {
             return Result::Err(
                 module_type_error(specifier, "virtual modules must use the javascript module type"),
@@ -518,8 +581,70 @@ fn dynamic_import_namespace(
     let resolved: string = resolve_specifier(referrer, specifier)?;
     let record: Ref[ModuleRecord] = load_record_with_type(loader, resolved, requested_type)?;
     instantiate_graph(loader)?;
-    evaluate_record(loader, record)?;
-    Result::Ok(runtime::Value::Object(create_namespace(loader, record)?))
+    begin_record_evaluation(loader, record)?;
+    match record.get().state.get() {
+        ModuleState::Evaluated => Result::Ok(
+            DynamicImportResolution::Ready(
+                runtime::Value::Object(create_namespace(loader, record)?),
+            ),
+        ),
+        ModuleState::Evaluating | ModuleState::EvaluatingAsync => {
+            Result::Ok(DynamicImportResolution::Pending(record))
+        },
+        ModuleState::Errored => Result::Err(rejection_error(loader, record)),
+        ModuleState::Linked => Result::Err(
+            module_error(record.get().path, "dynamic module evaluation did not start"),
+        ),
+    }
+}
+
+fn add_dynamic_import_waiter(
+    loader: Loader,
+    record: Ref[ModuleRecord],
+    capability: vm::HostPromiseCapability,
+    depth: isize,
+) -> () {
+    let promise = Ref::new(capability.promise());
+    let resolve = Ref::new(capability.resolve());
+    let reject = Ref::new(capability.reject());
+    loader.context.add_external_root(promise);
+    loader.context.add_external_root(resolve);
+    loader.context.add_external_root(reject);
+    record.get().dynamic_import_waiters.push(
+        DynamicImportWaiter { promise, resolve, reject, depth },
+    )
+}
+
+fn release_dynamic_import_waiter(loader: Loader, waiter: DynamicImportWaiter) -> () {
+    let _ = loader.context.remove_external_root(waiter.promise);
+    let _ = loader.context.remove_external_root(waiter.resolve);
+    let _ = loader.context.remove_external_root(waiter.reject);
+}
+
+fn settle_dynamic_import_waiters(loader: Loader, record: Ref[ModuleRecord], fulfilled: bool) -> () {
+    while !record.get().dynamic_import_waiters.is_empty() {
+        let waiter = record.get().dynamic_import_waiters.remove(0);
+        let value = if fulfilled {
+            match record.get().namespace.get() {
+                Some(namespace) => runtime::Value::Object(namespace),
+                None => runtime::Value::Undefined,
+            }
+        } else {
+            record.get().evaluation_error.get()
+        };
+        let callback = if fulfilled {
+            waiter.resolve.get()
+        } else {
+            waiter.reject.get()
+        };
+        let _ = loader.context.invoke_with_this_at_depth(
+            callback,
+            Vec::from_array([value]),
+            runtime::Value::Undefined,
+            waiter.depth,
+        );
+        release_dynamic_import_waiter(loader, waiter)
+    }
 }
 
 fn dynamic_import_job(
@@ -531,13 +656,16 @@ fn dynamic_import_job(
     depth: isize,
 ) -> Result[(), vm::VmError] {
     match dynamic_import_namespace(loader, referrer, specifier, requested_type) {
-        Ok(namespace) => {
+        Ok(DynamicImportResolution::Ready(namespace)) => {
             let _ = loader.context.invoke_with_this_at_depth(
                 capability.resolve(),
                 Vec::from_array([namespace]),
                 runtime::Value::Undefined,
                 depth,
             )?;
+        },
+        Ok(DynamicImportResolution::Pending(record)) => {
+            add_dynamic_import_waiter(loader, record, capability, depth)
         },
         Err(error) => {
             let evaluation_error = match loader.records.get(error.path) {
@@ -680,7 +808,7 @@ fn dependency_record(record: Ref[ModuleRecord], source: string) -> Result[
 
 fn local_import(record: Ref[ModuleRecord], index: isize) -> Option[compiler::ModuleImport] {
     for binding in record.get().compiled.imports {
-        if binding.local_index == index && binding.kind == compiler::ModuleImportKind::Named {
+        if binding.local_index == index && binding.kind != compiler::ModuleImportKind::SideEffect {
             return Option::Some(binding)
         } else {}
     }
@@ -688,12 +816,12 @@ fn local_import(record: Ref[ModuleRecord], index: isize) -> Option[compiler::Mod
 }
 
 fn try_export_cell(record: Ref[ModuleRecord], name: string, resolving: Vec[string]) -> Result[
-    Option[Ref[runtime::Value]],
+    ExportResolution,
     ModuleError,
 ] {
     let marker = record.get().path + "\n" + name;
     if string_vector_contains(resolving, marker) {
-        return Result::Ok(Option::None)
+        return Result::Ok(ExportResolution::Missing)
     } else {};
     resolving.push(marker);
     for binding in record.get().compiled.exports {
@@ -708,11 +836,19 @@ fn try_export_cell(record: Ref[ModuleRecord], name: string, resolving: Vec[strin
             None => match local_import(record, binding.local_index) {
                 Some(imported) => {
                     let dependency = dependency_record(record, imported.source)?;
-                    return try_export_cell(dependency, imported.imported, resolving)
+                    if imported.kind == compiler::ModuleImportKind::Namespace {
+                        return Result::Ok(
+                            ExportResolution::Resolved(dependency.get().namespace_cell),
+                        )
+                    } else {
+                        return try_export_cell(dependency, imported.imported, resolving)
+                    }
                 },
                 None => if binding.local_index >= 0
                     && binding.local_index < record.get().locals.len() {
-                    return Result::Ok(Option::Some(record.get().locals[binding.local_index]))
+                    return Result::Ok(
+                        ExportResolution::Resolved(record.get().locals[binding.local_index]),
+                    )
                 } else {
                     return Result::Err(
                         module_error(record.get().path, "invalid export binding `" + name + "`"),
@@ -733,25 +869,26 @@ fn try_export_cell(record: Ref[ModuleRecord], name: string, resolving: Vec[strin
             };
             let dependency = dependency_record(record, source)?;
             match try_export_cell(dependency, name, resolving)? {
-                Some(value) => match candidate {
+                ExportResolution::Resolved(value) => match candidate {
                     Some(previous) => if previous != value {
-                        return Result::Err(
-                            module_syntax_error(
-                                record.get().path,
-                                "ambiguous star export `" + name + "`",
-                            ),
-                        )
+                        return Result::Ok(ExportResolution::Ambiguous)
                     } else {},
                     None => {
                         candidate = Option::Some(value);
                     },
                 },
-                None => (),
+                ExportResolution::Ambiguous => return Result::Ok(ExportResolution::Ambiguous),
+                ExportResolution::Missing => (),
             }
         }
-        return Result::Ok(candidate)
+        return Result::Ok(
+            match candidate {
+                Some(value) => ExportResolution::Resolved(value),
+                None => ExportResolution::Missing,
+            },
+        )
     } else {};
-    Result::Ok(Option::None)
+    Result::Ok(ExportResolution::Missing)
 }
 
 fn export_cell(record: Ref[ModuleRecord], name: string, resolving: Vec[string]) -> Result[
@@ -759,11 +896,30 @@ fn export_cell(record: Ref[ModuleRecord], name: string, resolving: Vec[string]) 
     ModuleError,
 ] {
     match try_export_cell(record, name, resolving)? {
-        Some(value) => Result::Ok(value),
-        None => Result::Err(
+        ExportResolution::Resolved(value) => Result::Ok(value),
+        ExportResolution::Missing => Result::Err(
             module_syntax_error(record.get().path, "module has no export named `" + name + "`"),
         ),
+        ExportResolution::Ambiguous => Result::Err(
+            module_syntax_error(record.get().path, "ambiguous star export `" + name + "`"),
+        ),
     }
+}
+
+fn validate_indirect_exports(record: Ref[ModuleRecord]) -> Result[(), ModuleError] {
+    for binding in record.get().compiled.exports {
+        if binding.exported == "*" {
+            continue
+        } else {};
+        match binding.source {
+            Some(source) => {
+                let dependency = dependency_record(record, source)?;
+                let _ = export_cell(dependency, binding.imported, Vec::new())?;
+            },
+            None => (),
+        }
+    }
+    Result::Ok(())
 }
 
 fn bind_named_imports(loader: Loader, record: Ref[ModuleRecord]) -> Result[(), ModuleError] {
@@ -867,20 +1023,26 @@ fn create_namespace(loader: Loader, record: Ref[ModuleRecord]) -> Result[
         Ok(value) => value,
         Err(error) => return Result::Err(module_error(record.get().path, error.message)),
     };
+    if !runtime::mark_module_namespace(loader.context.heap(), object) {
+        return Result::Err(module_error(record.get().path, "cannot initialize module namespace"))
+    } else {};
     record.get().namespace.set(Option::Some(object));
+    record.get().namespace_cell.set(runtime::Value::Object(object));
     let root = Ref::new(runtime::Value::Object(object));
     loader.context.add_external_root(root);
     for name in export_names(record) {
-        let cell = export_cell(record, name, Vec::new())?;
-        let getter = match loader.context.new_native_function(|_, _, _| Result::Ok(cell.get())) {
-            Ok(value) => value,
-            Err(error) => return Result::Err(module_error(record.get().path, error.kind.debug())),
+        let cell = match try_export_cell(record, name, Vec::new())? {
+            ExportResolution::Resolved(value) => value,
+            ExportResolution::Ambiguous => continue,
+            ExportResolution::Missing => return Result::Err(
+                module_syntax_error(record.get().path, "module has no export named `" + name + "`"),
+            ),
         };
-        if !runtime::define_own_property(
+        if !runtime::define_module_namespace_export(
             loader.context.heap(),
             object,
             runtime::string_property_key(name),
-            runtime::accessor_descriptor(Option::Some(getter), Option::None, true, false),
+            cell,
         ) {
             return Result::Err(
                 module_error(
@@ -969,18 +1131,23 @@ fn bind_namespace_imports(loader: Loader, record: Ref[ModuleRecord]) -> Result[(
         if binding.kind != compiler::ModuleImportKind::Namespace {
             continue
         } else {};
-        let value = if loader.context.virtual_module(binding.source).is_some()
-            || binding.source == "std"
-            || binding.source == "os" {
-            virtual_module_value(loader, binding.source)?
-        } else {
-            let dependency = dependency_record(record, binding.source)?;
-            runtime::Value::Object(create_namespace(loader, dependency)?)
-        };
         if binding.local_index < 0 || binding.local_index >= record.get().locals.len() {
             return Result::Err(module_error(record.get().path, "invalid namespace import binding"))
         } else {};
-        record.get().locals[binding.local_index].set(value);
+        let value = if loader.context.virtual_module(binding.source).is_some()
+            || binding.source == "std"
+            || binding.source == "os" {
+            Option::Some(virtual_module_value(loader, binding.source)?)
+        } else {
+            let dependency = dependency_record(record, binding.source)?;
+            let _ = create_namespace(loader, dependency)?;
+            record.get().locals[binding.local_index] = dependency.get().namespace_cell;
+            Option::None
+        };
+        match value {
+            Some(value) => record.get().locals[binding.local_index].set(value),
+            None => (),
+        }
     }
     Result::Ok(())
 }
@@ -990,10 +1157,25 @@ fn instantiate_graph(loader: Loader) -> Result[(), ModuleError] {
         bind_named_imports(loader, record)?
     }
     for (_, record) in loader.records.entries() {
+        validate_indirect_exports(record)?
+    }
+    for (_, record) in loader.records.entries() {
         let _ = create_namespace(loader, record)?;
     }
     for (_, record) in loader.records.entries() {
         bind_namespace_imports(loader, record)?
+    }
+    for (_, record) in loader.records.entries() {
+        if record.get().instantiated.get() {
+            continue
+        } else {};
+        match loader.context.execute_with_local_cells(
+            record.get().compiled.instantiation_function,
+            record.get().locals,
+        ) {
+            Ok(_) => record.get().instantiated.set(true),
+            Err(error) => return Result::Err(reject_vm_error(loader, record, error)),
+        }
     }
     Result::Ok(())
 }
@@ -1034,7 +1216,33 @@ fn thrown_type(context: vm::Context, value: runtime::Value) -> string {
     match value {
         runtime::Value::Object(object) => match context.error_object_type(object) {
             Some(value) => value.to_host_string().unwrap_or("Thrown"),
-            None => "Thrown",
+            None => match runtime::get_property(
+                context.heap(),
+                object,
+                runtime::string_property_key("constructor"),
+            ) {
+                Ok(Some(constructor)) => match context.ordinary_has_instance_at_depth(
+                    constructor,
+                    runtime::Value::Object(object),
+                    0,
+                ) {
+                    Ok(true) => match constructor {
+                        runtime::Value::Object(constructor) => match runtime::get_property(
+                            context.heap(),
+                            constructor,
+                            runtime::string_property_key("name"),
+                        ) {
+                            Ok(Some(runtime::Value::String(name))) => {
+                                name.to_host_string().unwrap_or("Thrown")
+                            },
+                            _ => "Thrown",
+                        },
+                        _ => "Thrown",
+                    },
+                    _ => "Thrown",
+                },
+                _ => "Thrown",
+            },
         },
         _ => "Thrown",
     }
@@ -1126,15 +1334,29 @@ fn push_requested_dependency(
 }
 
 fn requested_dependencies(record: Ref[ModuleRecord]) -> Vec[Ref[ModuleRecord]] {
-    let dependencies: Vec[Ref[ModuleRecord]] = Vec::new();
+    let requests: Vec[(isize, string)] = Vec::new();
     for binding in record.get().compiled.imports {
-        push_requested_dependency(record, binding.source, dependencies)
+        requests.push((binding.span.start, binding.source))
     }
     for binding in record.get().compiled.exports {
         match binding.source {
-            Some(source) => push_requested_dependency(record, source, dependencies),
+            Some(source) => requests.push((binding.span.start, source)),
             None => (),
         }
+    }
+    collections::sort_by(
+        requests,
+        |left, right| if left.0 < right.0 {
+            -1
+        } else if left.0 > right.0 {
+            1
+        } else {
+            0
+        },
+    );
+    let dependencies: Vec[Ref[ModuleRecord]] = Vec::new();
+    for (_, source) in requests {
+        push_requested_dependency(record, source, dependencies)
     }
     dependencies
 }
@@ -1315,8 +1537,23 @@ fn gather_available_ancestors(module: Ref[ModuleRecord], records: Vec[Ref[Module
     }
 }
 
-fn async_module_rejected(record: Ref[ModuleRecord], arguments: Vec[runtime::Value]) -> () {
-    reject_module(record, async_module_argument(arguments), record.get().path, Option::None)
+fn collect_rejection_order(record: Ref[ModuleRecord], records: Vec[Ref[ModuleRecord]]) -> () {
+    if record_vector_contains(records, record) || record.get().state.get() == ModuleState::Errored {
+        return
+    } else {};
+    records.push(record);
+    for parent in record.get().async_parents {
+        collect_rejection_order(parent, records)
+    }
+}
+
+fn async_module_rejected(loader: Loader, record: Ref[ModuleRecord], arguments: Vec[runtime::Value]) -> () {
+    let records: Vec[Ref[ModuleRecord]] = Vec::new();
+    collect_rejection_order(record, records);
+    reject_module(record, async_module_argument(arguments), record.get().path, Option::None);
+    for current in records {
+        settle_dynamic_import_waiters(loader, current, false)
+    }
 }
 
 fn start_async_module(loader: Loader, record: Ref[ModuleRecord]) -> Result[(), ModuleError] {
@@ -1332,7 +1569,7 @@ fn start_async_module(loader: Loader, record: Ref[ModuleRecord]) -> Result[(), M
     };
     let rejected = match loader.context.new_vm_function(
         |_, arguments, _| {
-            async_module_rejected(record, arguments);
+            async_module_rejected(loader, record, arguments);
             Result::Ok(runtime::Value::Undefined)
         },
     ) {
@@ -1367,6 +1604,7 @@ fn async_module_fulfilled(loader: Loader, module: Ref[ModuleRecord]) -> () {
     } else {};
     module.get().async_evaluation.set(false);
     module.get().state.set(ModuleState::Evaluated);
+    settle_dynamic_import_waiters(loader, module, true);
     let records: Vec[Ref[ModuleRecord]] = Vec::new();
     gather_available_ancestors(module, records);
     for record in records {
@@ -1383,7 +1621,8 @@ fn async_module_fulfilled(loader: Loader, module: Ref[ModuleRecord]) -> () {
             match execute_module_body(loader, record, false) {
                 Ok(_) => {
                     record.get().async_evaluation.set(false);
-                    record.get().state.set(ModuleState::Evaluated)
+                    record.get().state.set(ModuleState::Evaluated);
+                    settle_dynamic_import_waiters(loader, record, true)
                 },
                 Err(_) => (),
             }
@@ -1468,6 +1707,32 @@ fn inner_module_evaluation(
     Result::Ok(())
 }
 
+fn begin_record_evaluation(loader: Loader, record: Ref[ModuleRecord]) -> Result[(), ModuleError] {
+    match record.get().state.get() {
+        ModuleState::Evaluated | ModuleState::EvaluatingAsync | ModuleState::Evaluating => {
+            return Result::Ok(())
+        },
+        ModuleState::Errored => return Result::Err(rejection_error(loader, record)),
+        ModuleState::Linked => (),
+    };
+    let stack: Vec[Ref[ModuleRecord]] = Vec::new();
+    match inner_module_evaluation(loader, record, Ref::new(0), stack) {
+        Ok(()) => Result::Ok(()),
+        Err(error) => {
+            for active in stack {
+                if active.get().state.get() != ModuleState::Errored {
+                    if record.get().evaluation_error_set.get() {
+                        copy_module_rejection(active, record)
+                    } else {
+                        reject_module_error(active, error)
+                    }
+                } else {}
+            }
+            Result::Err(error)
+        },
+    }
+}
+
 fn await_graph_evaluation(loader: Loader, record: Ref[ModuleRecord]) -> Result[(), ModuleError] {
     let root = cycle_root(record);
     match root.get().state.get() {
@@ -1503,22 +1768,8 @@ fn evaluate_record(loader: Loader, record: Ref[ModuleRecord]) -> Result[(), Modu
         ModuleState::Evaluating => return Result::Ok(()),
         ModuleState::Linked => (),
     };
-    let stack: Vec[Ref[ModuleRecord]] = Vec::new();
-    match inner_module_evaluation(loader, record, Ref::new(0), stack) {
-        Ok(()) => await_graph_evaluation(loader, record),
-        Err(error) => {
-            for active in stack {
-                if active.get().state.get() != ModuleState::Errored {
-                    if record.get().evaluation_error_set.get() {
-                        copy_module_rejection(active, record)
-                    } else {
-                        reject_module_error(active, error)
-                    }
-                } else {}
-            }
-            Result::Err(error)
-        },
-    }
+    begin_record_evaluation(loader, record)?;
+    await_graph_evaluation(loader, record)
 }
 
 fn load_worker_module(context: vm::Context, global: runtime::ObjectId, module_path: string) -> Result[

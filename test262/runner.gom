@@ -2,10 +2,13 @@ package test262;
 
 use gomlang::quickjs::builtins;
 use gomlang::quickjs::compiler;
+use gomlang::quickjs::dtoa;
 use gomlang::quickjs::modules;
 use gomlang::quickjs::runtime;
 use gomlang::quickjs::vm;
 use std::fs;
+use std::math;
+use std::num;
 use std::path;
 use std::text;
 
@@ -45,7 +48,7 @@ fn append_source(builder: text::StringBuilder, source: string) -> () {
 
 fn harness_names(metadata: Metadata, variant: SourceVariant) -> Vec[string] {
     let names: Vec[string] = Vec::new();
-    if variant == SourceVariant::Raw {
+    if variant == SourceVariant::Raw || has_flag(metadata, "raw") {
         return names
     } else {};
     push_unique(names, "assert.js");
@@ -79,7 +82,7 @@ fn prepare_harness(metadata: Metadata, variant: SourceVariant, loader: HarnessLo
 }
 
 fn variant_source(case: TestCase, variant: SourceVariant) -> string {
-    if variant == SourceVariant::Raw {
+    if variant == SourceVariant::Raw || has_flag(case.metadata, "raw") {
         return case.source
     } else {};
     let builder = text::StringBuilder::new();
@@ -119,6 +122,11 @@ fn skip_reason(metadata: Metadata) -> Option[string] {
     if has_flag(metadata, "CanBlockIsTrue") {
         return Option::Some("host cannot block")
     } else {};
+    for include in metadata.includes {
+        if include == "atomicsHelper.js" {
+            return Option::Some("host does not implement test262 agents")
+        } else {}
+    }
     for feature in metadata.features {
         if unsupported_feature(feature) {
             return Option::Some("unsupported feature `" + feature + "`")
@@ -148,7 +156,24 @@ fn thrown_type(context: vm::Context, value: runtime::Value) -> string {
     match value {
         runtime::Value::Object(object) => match context.error_object_type(object) {
             Some(value) => value.to_host_string().unwrap_or("Thrown"),
-            None => "Thrown",
+            None => match context.global_object() {
+                Some(global) => match runtime::get_property(
+                    context.heap(),
+                    global,
+                    runtime::string_property_key("Test262Error"),
+                ) {
+                    Ok(Some(constructor)) => match context.ordinary_has_instance_at_depth(
+                        constructor,
+                        value,
+                        0,
+                    ) {
+                        Ok(true) => "Test262Error",
+                        _ => "Thrown",
+                    },
+                    _ => "Thrown",
+                },
+                None => "Thrown",
+            },
         },
         _ => "Thrown",
     }
@@ -328,6 +353,136 @@ fn install_async_done(
     }
 }
 
+fn host_code_point_argument(value: runtime::Value) -> Result[isize, vm::NativeError] {
+    match value {
+        runtime::Value::Int(value) => Result::Ok(value.to_isize()),
+        value => {
+            let number = match runtime::primitive_to_number(value) {
+                Ok(value) => value,
+                Err(value) => return Result::Err(vm::NativeError { message: value.message }),
+            };
+            if !math::is_finite(number) || math::trunc(number) != number {
+                Result::Err(vm::NativeError { message: "code point range bound is not an integer" })
+            } else {
+                match num::parse_int_structured(dtoa::number_to_string(number)) {
+                    Ok(value) => Result::Ok(value),
+                    Err(_) => Result::Err(
+                        vm::NativeError { message: "code point range bound is out of range" },
+                    ),
+                }
+            }
+        },
+    }
+}
+
+fn host_code_point_range(arguments: Vec[runtime::Value]) -> Result[runtime::Value, vm::NativeError] {
+    let start = host_code_point_argument(async_argument(arguments))?;
+    let end = host_code_point_argument(
+        if arguments.len() > 1 {
+            arguments[1]
+        } else {
+            runtime::Value::Undefined
+        },
+    )?;
+    if start < 0 || end < start || end > 0x110000 {
+        return Result::Err(vm::NativeError { message: "invalid code point range" })
+    } else {};
+    let output: Vec[u16] = Vec::new();
+    let mut point = start;
+    while point < end {
+        if point <= 0xffff {
+            output.push(point.to_u16())
+        } else {
+            let scalar = point - 0x10000;
+            output.push((0xd800 + scalar / 1024).to_u16());
+            output.push((0xdc00 + scalar % 1024).to_u16())
+        };
+        point += 1;
+    }
+    Result::Ok(runtime::Value::String(runtime::JsString::from_code_units(output)))
+}
+
+fn install_test262_host(
+    context: vm::Context,
+    global: runtime::ObjectId,
+    buffers: builtins::ArrayBufferInstall,
+) -> Result[(), string] {
+    let heap = context.heap();
+    let std_object = match runtime::get_property(heap, global, runtime::string_property_key("std")) {
+        Ok(Some(runtime::Value::Object(value))) => value,
+        _ => return Result::Err("cannot find std host object"),
+    };
+    let eval_script = match runtime::get_property(
+        heap,
+        std_object,
+        runtime::string_property_key("evalScript"),
+    ) {
+        Ok(Some(value)) => value,
+        _ => return Result::Err("cannot find evalScript host function"),
+    };
+    let host = match runtime::new_ordinary_object(heap, heap.object_prototype()) {
+        Ok(value) => value,
+        Err(value) => return Result::Err(value.message),
+    };
+    let detach_array_buffer = match context.new_native_function(
+        |heap, this_value, arguments| {
+            let _ = heap;
+            let _ = this_value;
+            match buffers.detach_array_buffer(async_argument(arguments)) {
+                Ok(()) => Result::Ok(runtime::Value::Undefined),
+                Err(message) => Result::Err(vm::NativeError { message }),
+            }
+        },
+    ) {
+        Ok(value) => value,
+        Err(value) => return Result::Err(value.kind.debug()),
+    };
+    let code_point_range = match context.new_native_function(
+        |heap, this_value, arguments| {
+            let _ = heap;
+            let _ = this_value;
+            host_code_point_range(arguments)
+        },
+    ) {
+        Ok(value) => value,
+        Err(value) => return Result::Err(value.kind.debug()),
+    };
+    if !runtime::define_own_property(
+        heap,
+        host,
+        runtime::string_property_key("evalScript"),
+        runtime::data_descriptor(eval_script, true, true, true),
+    )
+        || !runtime::define_own_property(
+            heap,
+            host,
+            runtime::string_property_key("global"),
+            runtime::data_descriptor(runtime::Value::Object(global), true, true, true),
+        )
+        || !runtime::define_own_property(
+            heap,
+            host,
+            runtime::string_property_key("detachArrayBuffer"),
+            runtime::data_descriptor(detach_array_buffer, true, true, true),
+        )
+        || !runtime::define_own_property(
+            heap,
+            host,
+            runtime::string_property_key("codePointRange"),
+            runtime::data_descriptor(code_point_range, true, true, true),
+        )
+        || !runtime::define_own_property(
+            heap,
+            global,
+            runtime::string_property_key("$262"),
+            runtime::data_descriptor(runtime::Value::Object(host), true, false, true),
+        ) {
+        Result::Err("cannot install $262 host object")
+    } else {
+        Result::Ok(())
+    }
+}
+
 fn async_failure_message(context: vm::Context, value: runtime::Value) -> string {
     match context.value_to_string_at_depth(value, 0) {
         Ok(value) => match value.to_host_string() {
@@ -368,7 +523,15 @@ fn async_success(
     }
 }
 
-pub fn run_variant(case: TestCase, variant: SourceVariant, loader: HarnessLoader) -> RunResult {
+fn run_variant_with_referrer(
+    case: TestCase,
+    variant: SourceVariant,
+    loader: HarnessLoader,
+    referrer: Option[string],
+) -> RunResult {
+    if case.source.contains("$262.createRealm") {
+        return result(variant, RunStatus::Skipped, "host does not implement test262 realms")
+    } else {};
     match skip_reason(case.metadata) {
         Some(message) => return result(variant, RunStatus::Skipped, message),
         None => (),
@@ -394,6 +557,12 @@ pub fn run_variant(case: TestCase, variant: SourceVariant, loader: HarnessLoader
             "cannot initialize realm: " + error.message,
         ),
         Ok(realm) => {
+            match install_test262_host(context, realm.global_object(), realm.arraybuffer_install()) {
+                Ok(()) => (),
+                Err(message) => return result(variant, RunStatus::Failed, message),
+            };
+            modules::install_dynamic_import_loader(context, realm.global_object());
+            context.set_current_module_path(referrer);
             let completion = Ref::new(AsyncCompletion::Pending);
             if case.metadata.asynchronous {
                 match install_async_done(context, realm.global_object(), completion) {
@@ -432,6 +601,10 @@ pub fn run_variant(case: TestCase, variant: SourceVariant, loader: HarnessLoader
             }
         },
     }
+}
+
+pub fn run_variant(case: TestCase, variant: SourceVariant, loader: HarnessLoader) -> RunResult {
+    run_variant_with_referrer(case, variant, loader, Option::None)
 }
 
 pub fn run(case: TestCase, loader: HarnessLoader) -> Vec[RunResult] {
@@ -525,6 +698,10 @@ fn run_module_file(case: TestCase, file: string, loader: HarnessLoader) -> RunRe
         ),
     };
     let completion = Ref::new(AsyncCompletion::Pending);
+    match install_test262_host(context, realm.global_object(), realm.arraybuffer_install()) {
+        Ok(()) => (),
+        Err(message) => return result(SourceVariant::Module, RunStatus::Failed, message),
+    };
     if case.metadata.asynchronous {
         match install_async_done(context, realm.global_object(), completion) {
             Ok(()) => (),
@@ -599,7 +776,7 @@ pub fn run_file(file: string, harness_directory: string) -> Result[Vec[RunResult
         if variant == SourceVariant::Module {
             results.push(run_module_file(case, file, loader))
         } else {
-            results.push(run_variant(case, variant, loader))
+            results.push(run_variant_with_referrer(case, variant, loader, Option::Some(file)))
         }
     }
     Result::Ok(results)

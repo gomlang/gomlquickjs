@@ -226,11 +226,14 @@ impl Debug for ObjectId {
 pub struct Object {
     kind_value: ObjectKind,
     prototype_value: Ref[Option[ObjectId]],
+    immutable_prototype_value: Ref[bool],
     extensible_value: Ref[bool],
     properties_value: collections::IndexMap[PropertyKey, PropertyDescriptor],
     private_elements_value: HashMap[ObjectId, PrivateElement],
     primitive_value_value: Ref[Option[Value]],
     argument_map_value: HashMap[u32, Ref[Value]],
+    module_namespace_bindings_value: HashMap[PropertyKey, Ref[Value]],
+    module_namespace_value: Ref[bool],
     typed_array_value: Ref[Option[TypedArrayState]],
     proxy_value: Ref[Option[ProxyData]],
 }
@@ -399,11 +402,14 @@ fn make_object(kind: ObjectKind, prototype: Option[ObjectId]) -> Object {
     Object {
         kind_value: kind,
         prototype_value: Ref::new(prototype),
+        immutable_prototype_value: Ref::new(false),
         extensible_value: Ref::new(true),
         properties_value: collections::IndexMap::new(),
         private_elements_value: HashMap::new(),
         primitive_value_value: Ref::new(Option::None),
         argument_map_value: HashMap::new(),
+        module_namespace_bindings_value: HashMap::new(),
+        module_namespace_value: Ref::new(false),
         typed_array_value: Ref::new(Option::None),
         proxy_value: Ref::new(Option::None),
     }
@@ -530,6 +536,9 @@ fn drain_pending(
                     pending,
                 );
                 for (_, cell) in object.argument_map_value.entries() {
+                    enqueue_value(heap, cell.get(), marked, symbols, pending)
+                }
+                for (_, cell) in object.module_namespace_bindings_value.entries() {
                     enqueue_value(heap, cell.get(), marked, symbols, pending)
                 }
                 match object.typed_array_value.get() {
@@ -991,7 +1000,7 @@ impl Heap {
 fn weak_key_live(heap: Heap, value: Value) -> bool {
     match value {
         Value::Object(object) => heap.contains(object),
-        Value::Symbol(_) => true,
+        Value::Symbol(symbol) => !symbol.is_registered(),
         _ => false,
     }
 }
@@ -1277,6 +1286,27 @@ pub fn is_shared_typed_array(heap: Heap, object: ObjectId) -> bool {
     }
 }
 
+pub fn is_typed_array_backed_by_variable_length_buffer(heap: Heap, object: ObjectId) -> bool {
+    match typed_array_view(heap, object) {
+        Some(TypedArrayView::Uint8(value)) => {
+            value.buffer().is_resizable() || value.buffer().is_growable()
+        },
+        Some(TypedArrayView::Int32(value)) => {
+            value.buffer().is_resizable() || value.buffer().is_growable()
+        },
+        Some(TypedArrayView::Float64(value)) => {
+            value.buffer().is_resizable() || value.buffer().is_growable()
+        },
+        Some(TypedArrayView::Numeric(value)) => {
+            value.buffer().is_resizable() || value.buffer().is_growable()
+        },
+        Some(TypedArrayView::BigInt(value)) => {
+            value.buffer().is_resizable() || value.buffer().is_growable()
+        },
+        None => false,
+    }
+}
+
 pub fn is_typed_array_detached(heap: Heap, object: ObjectId) -> bool {
     match heap.get(object) {
         Some(target) => match target.typed_array_value.get() {
@@ -1406,6 +1436,25 @@ pub fn set_primitive_value(heap: Heap, object: ObjectId, value: Value) -> bool {
             true
         },
         None => false,
+    }
+}
+
+pub fn new_tdz_value(heap: Heap) -> Result[Value, TypeError] {
+    let object = new_null_prototype_object(heap)?;
+    if set_primitive_value(heap, object, Value::Undefined) {
+        Result::Ok(Value::Object(object))
+    } else {
+        Result::Err(TypeError { message: "cannot initialize lexical binding" })
+    }
+}
+
+pub fn is_tdz_value(heap: Heap, value: Value) -> bool {
+    match value {
+        Value::Object(object) => match primitive_value(heap, object) {
+            Some(Value::Undefined) => true,
+            _ => false,
+        },
+        _ => false,
     }
 }
 
@@ -1551,6 +1600,15 @@ fn argument_index(key: PropertyKey) -> Option[u32] {
 }
 
 fn mapped_descriptor(target: Object, key: PropertyKey, descriptor: PropertyDescriptor) -> PropertyDescriptor {
+    match target.module_namespace_bindings_value.get(key) {
+        Some(cell) => return match descriptor {
+            PropertyDescriptor::Data { value: _, writable, enumerable, configurable } => {
+                PropertyDescriptor::Data { value: cell.get(), writable, enumerable, configurable }
+            },
+            PropertyDescriptor::Accessor { .. } => descriptor,
+        },
+        None => (),
+    };
     match (argument_index(key), descriptor) {
         (Some(index), PropertyDescriptor::Data { value: _, writable, enumerable, configurable }) => match target.argument_map_value.get(
             index,
@@ -1597,12 +1655,56 @@ pub fn prevent_extensions(heap: Heap, object: ObjectId) -> bool {
     }
 }
 
+pub fn define_module_namespace_export(
+    heap: Heap,
+    object: ObjectId,
+    key: PropertyKey,
+    cell: Ref[Value],
+) -> bool {
+    let target = match heap.get(object) {
+        Some(value) => value,
+        None => return false,
+    };
+    if target.module_namespace_bindings_value.get(key).is_some()
+        || !ordinary_define_own_property(
+            heap,
+            object,
+            key,
+            data_descriptor(cell.get(), true, true, false),
+        ) {
+        false
+    } else {
+        target.module_namespace_bindings_value[key] = cell;
+        true
+    }
+}
+
+pub fn mark_module_namespace(heap: Heap, object: ObjectId) -> bool {
+    match heap.get(object) {
+        Some(target) => {
+            target.module_namespace_value.set(true);
+            true
+        },
+        None => false,
+    }
+}
+
+pub fn is_module_namespace(heap: Heap, object: ObjectId) -> bool {
+    match heap.get(object) {
+        Some(target) => target.module_namespace_value.get(),
+        None => false,
+    }
+}
+
 pub fn seal_object(heap: Heap, object: ObjectId, frozen: bool) -> bool {
     let target = match heap.get(object) {
         Some(value) => value,
         None => return false,
     };
     target.prevent_extensions();
+    if frozen && target.module_namespace_bindings_value.len() > 0 {
+        return false
+    } else {};
     match target.typed_array_value.get() {
         Some(value) => if typed_array_length(value.view) > 0 {
             return false
@@ -1672,6 +1774,20 @@ fn ordinary_define_own_property(
             },
         },
         None => false,
+    }
+}
+
+fn module_namespace_define_own_property(
+    target: Object,
+    key: PropertyKey,
+    descriptor: PropertyDescriptor,
+) -> bool {
+    match (target.module_namespace_bindings_value.get(key), descriptor) {
+        (Some(cell), PropertyDescriptor::Data { value, writable, enumerable, configurable }) => writable
+            && enumerable
+            && !configurable
+            && same_value(cell.get(), value),
+        _ => false,
     }
 }
 
@@ -1880,6 +1996,9 @@ pub fn define_own_property(
         Some(value) => value,
         None => return false,
     };
+    if target.module_namespace_bindings_value.get(key).is_some() {
+        return module_namespace_define_own_property(target, key, descriptor)
+    } else {};
     match target.typed_array_value.get() {
         Some(value) => if typed_array_numeric_index(key).is_some() {
             return typed_array_define_numeric_property(value, key, descriptor)
@@ -2051,6 +2170,8 @@ pub fn set_prototype_of(heap: Heap, object: ObjectId, prototype: Option[ObjectId
     };
     if target.prototype_value.get() == prototype {
         true
+    } else if target.immutable_prototype_value.get() {
+        false
     } else if !target.extensible_value.get() {
         false
     } else {
@@ -2061,7 +2182,9 @@ pub fn set_prototype_of(heap: Heap, object: ObjectId, prototype: Option[ObjectId
                     return false
                 } else {
                     match heap.get(current) {
-                        Some(candidate) => {
+                        Some(candidate) => if candidate.is_proxy() {
+                            cursor = Option::None;
+                        } else {
                             cursor = candidate.prototype_value.get();
                         },
                         None => return false,
@@ -2072,6 +2195,16 @@ pub fn set_prototype_of(heap: Heap, object: ObjectId, prototype: Option[ObjectId
         }
         target.prototype_value.set(prototype);
         true
+    }
+}
+
+pub fn set_immutable_prototype(heap: Heap, object: ObjectId) -> bool {
+    match heap.get(object) {
+        Some(target) => {
+            target.immutable_prototype_value.set(true);
+            true
+        },
+        None => false,
     }
 }
 
@@ -2163,20 +2296,24 @@ pub fn get_property_descriptor(heap: Heap, object: ObjectId, key: PropertyKey) -
 
 pub fn set_existing_data_property(heap: Heap, object: ObjectId, key: PropertyKey, value: Value) -> bool {
     match heap.get(object) {
-        Some(target) => match target.typed_array_value.get() {
-            Some(state) => match typed_array_numeric_index(key) {
-                Some(TypedArrayNumericIndex::Index(index)) => match typed_array_set_value(
-                    state.view,
-                    index,
-                    value,
-                ) {
-                    Ok(value) => value,
-                    Err(_) => false,
+        Some(target) => if target.module_namespace_value.get() {
+            false
+        } else {
+            match target.typed_array_value.get() {
+                Some(state) => match typed_array_numeric_index(key) {
+                    Some(TypedArrayNumericIndex::Index(index)) => match typed_array_set_value(
+                        state.view,
+                        index,
+                        value,
+                    ) {
+                        Ok(value) => value,
+                        Err(_) => false,
+                    },
+                    Some(TypedArrayNumericIndex::Invalid) => false,
+                    None => set_existing_ordinary_data_property(target, key, value),
                 },
-                Some(TypedArrayNumericIndex::Invalid) => false,
                 None => set_existing_ordinary_data_property(target, key, value),
-            },
-            None => set_existing_ordinary_data_property(target, key, value),
+            }
         },
         None => false,
     }
@@ -2246,6 +2383,9 @@ pub fn set_property(heap: Heap, object: ObjectId, key: PropertyKey, value: Value
         Some(value) => value,
         None => return Result::Err(invalid_object_error()),
     };
+    if target.module_namespace_value.get() {
+        return Result::Ok(false)
+    } else {};
     match target.typed_array_value.get() {
         Some(state) => match typed_array_numeric_index(key) {
             Some(TypedArrayNumericIndex::Index(index)) => {
