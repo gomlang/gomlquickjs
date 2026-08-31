@@ -193,52 +193,37 @@ fn runtime_error_text(context: vm::Context, error: vm::VmError) -> string {
 struct RuntimeSession {
     context: vm::Context,
     realm: builtins::Realm,
-    unhandled_rejections: Vec[PendingRejection],
+    unhandled_rejections: collections::IndexMap[promise::Promise, PendingRejection],
     report_unhandled_rejections: bool,
     checkpoint_reached: Ref[bool],
 }
 
 struct PendingRejection {
-    promise: promise::Promise,
     failure: promise::PromiseFailure,
     roots: Vec[Ref[runtime::Value]],
 }
 
-fn pending_rejection_index(rejections: Vec[PendingRejection], expected: promise::Promise) -> Option[
-    isize,
-] {
-    let mut index = 0;
-    while index < rejections.len() {
-        if rejections[index].promise.same(expected) {
-            return Option::Some(index)
-        }
-        index += 1;
-    }
-    Option::None
-}
-
 fn track_promise_rejection(
     context: vm::Context,
-    rejections: Vec[PendingRejection],
+    rejections: collections::IndexMap[promise::Promise, PendingRejection],
     current: promise::Promise,
     failure: promise::PromiseFailure,
     handled: bool,
 ) -> () {
-    match pending_rejection_index(rejections, current) {
-        Some(index) => if handled {
-            for root in rejections[index].roots {
+    if handled {
+        match rejections.remove(current) {
+            Some(rejection) => for root in rejection.roots {
                 let _ = context.remove_external_root(root);
-            }
-            let _ = rejections.remove(index);
-        },
-        None => if !handled {
-            let roots: Vec[Ref[runtime::Value]] = Vec::new();
-            let promise_root = current.host_object_root();
-            context.add_external_root(promise_root);
-            roots.push(promise_root);
-            root_promise_failure(context, failure, roots);
-            rejections.push(PendingRejection { promise: current, failure, roots })
-        },
+            },
+            None => (),
+        }
+    } else if !rejections.contains(current) {
+        let roots: Vec[Ref[runtime::Value]] = Vec::new();
+        let promise_root = current.host_object_root();
+        context.add_external_root(promise_root);
+        roots.push(promise_root);
+        root_promise_failure(context, failure, roots);
+        let _ = rejections.insert(current, PendingRejection { failure, roots });
     }
 }
 
@@ -269,7 +254,7 @@ fn initialize_runtime_with_tracking(
     match builtins::install(context) {
         Err(error) => Result::Err("cannot initialize runtime: " + error.message),
         Ok(realm) => {
-            let unhandled_rejections: Vec[PendingRejection] = Vec::new();
+            let unhandled_rejections: collections::IndexMap[promise::Promise, PendingRejection] = collections::IndexMap::new();
             let checkpoint_reached = Ref::new(false);
             if report_unhandled_rejections {
                 realm.promise_queue().set_rejection_tracker(
@@ -565,7 +550,7 @@ fn check_unhandled_rejections(session: RuntimeSession) -> Result[(), string] {
     }
     let builder = text::StringBuilder::new();
     let mut first = true;
-    for rejection in session.unhandled_rejections {
+    for rejection in session.unhandled_rejections.values() {
         if !first {
             builder.write_char('\n')
         }
