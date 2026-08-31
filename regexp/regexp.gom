@@ -869,7 +869,11 @@ fn parse_character_escape(parser: Parser, offset: isize, in_class: bool) -> Resu
             Result::Ok(parse_legacy_octal(parser, value))
         }
     } else if value == 10 || value == 13 || value == 0x2028 || value == 0x2029 {
-        Result::Err(regex_error("line terminator in escape sequence", offset))
+        if unicode_mode(parser.flags.get()) {
+            Result::Err(regex_error("line terminator in escape sequence", offset))
+        } else {
+            Result::Ok(value.to_u32())
+        }
     } else if unicode_mode(parser.flags.get())
         && !identity_escape_allowed(parser.flags.get(), value, in_class) {
         Result::Err(regex_error("invalid identity escape in unicode mode", offset))
@@ -899,10 +903,13 @@ fn parse_escaped_code_point(parser: Parser, offset: isize, in_class: bool) -> Re
     u32,
     RegexError,
 ] {
+    let first_fixed = parser_current(parser) == Option::Some(117)
+        && parser_peek(parser, 1) != Option::Some(123);
     let first = parse_character_escape(parser, offset, in_class)?;
-    if unicode_mode(parser.flags.get()) && first >= 0xd800 && first <= 0xdbff
+    if unicode_mode(parser.flags.get()) && first_fixed && first >= 0xd800 && first <= 0xdbff
         && parser_current(parser) == Option::Some(92)
-        && parser_peek(parser, 1) == Option::Some(117) {
+        && parser_peek(parser, 1) == Option::Some(117)
+        && parser_peek(parser, 2) != Option::Some(123) {
         let saved = parser.index.get();
         parser_advance(parser);
         let second = parse_character_escape(parser, saved, in_class)?;
@@ -2629,6 +2636,11 @@ fn input_backward_code_point(input: runtime::JsString, position: isize, unicode:
     }
 }
 
+fn unicode_input_boundary(input: runtime::JsString, position: isize) -> bool {
+    position <= 0 || position >= input.len() || !runtime::is_high_surrogate(input.get(position - 1))
+        || !runtime::is_low_surrogate(input.get(position))
+}
+
 fn starts_line(flags: RegexFlags, input: runtime::JsString, position: isize) -> bool {
     position == 0
         || (flags.multiline && position > 0 && is_line_terminator(input.get(position - 1)))
@@ -2671,6 +2683,10 @@ fn backreference_matches(
     let length = capture.end - capture.start;
     if position + length > input.len() {
         false
+    } else if unicode_mode(flags)
+        && (!unicode_input_boundary(input, position)
+            || !unicode_input_boundary(input, position + length)) {
+        false
     } else {
         let mut index = 0;
         while index < length {
@@ -2697,6 +2713,10 @@ fn backward_backreference_matches(
 ) -> bool {
     let length = capture.end - capture.start;
     if position - length < 0 {
+        false
+    } else if unicode_mode(flags)
+        && (!unicode_input_boundary(input, position - length)
+            || !unicode_input_boundary(input, position)) {
         false
     } else {
         let mut index = 0;

@@ -421,6 +421,26 @@ fn large_hyperbolic(magnitude: f64) -> f64 {
     (half_exponential * 0.5) * half_exponential
 }
 
+pub fn log2(value: f64) -> f64 {
+    if math::is_nan(value) || value < 0.0 {
+        return not_a_number()
+    } else if value == 0.0 {
+        return -positive_infinity()
+    } else if math::is_infinite(value) {
+        return positive_infinity()
+    }
+    let bits = float64_bits(value);
+    let exponent = ((bits & FLOAT64_EXPONENT_MASK) >> 52).to_isize();
+    let fraction = bits & FLOAT64_FRACTION_MASK;
+    if fraction == 0 && exponent > 0 {
+        return int_float(exponent - 1023)
+    }
+    if exponent == 0 && fraction & (fraction - 1) == 0 {
+        return int_float(63 - leading_zeroes_64(fraction) - 1074)
+    }
+    math::log(value) / LN_2
+}
+
 pub fn clz32(value: f64) -> isize {
     let converted = to_u32(value);
     if converted == 0 {
@@ -784,18 +804,25 @@ pub fn sinh(value: f64) -> f64 {
     let magnitude = absolute(value);
     let result = if magnitude > 710.4758600739439 {
         positive_infinity()
-    } else if magnitude > 21.0 {
+    } else if magnitude > 709.782712893384 {
         large_hyperbolic(magnitude)
     } else if magnitude > 0.5 {
         let exponential = math::exp(magnitude);
         (exponential - 1.0 / exponential) * 0.5
     } else {
         let square = magnitude * magnitude;
-        (((-26.30563213397497 * square - 2894.211355989564) * square - 89912.7202203951) * square
-            - 630767.3640497717)
-            * magnitude
-            / (((square - 173.6789535582337) * square + 15215.17378790019) * square
-                - 630767.3640497717)
+        magnitude
+            + magnitude * square
+                * (0.16666666666666666
+                    + square
+                        * (0.008333333333333333
+                            + square
+                                * (0.0001984126984126984
+                                    + square
+                                        * (0.0000027557319223985893
+                                            + square
+                                                * (0.00000002505210838544172
+                                                    + square * 0.00000000016059043836821613)))))
     };
     if negative {
         -result
@@ -811,7 +838,7 @@ pub fn cosh(value: f64) -> f64 {
     let magnitude = absolute(value);
     if magnitude > 710.4758600739439 {
         positive_infinity()
-    } else if magnitude > 21.0 {
+    } else if magnitude > 709.782712893384 {
         large_hyperbolic(magnitude)
     } else {
         let exponential = math::exp(magnitude);

@@ -88,35 +88,42 @@ fn date_instance_local_to_utc(timezone: date::TimeZone, value: f64) -> f64 {
     date_instance_clip(value - date_instance_float(offset))
 }
 
+fn date_instance_parsed_value(timezone: date::TimeZone, parsed: date::ParsedIsoDate) -> f64 {
+    match parsed.time_zone {
+        date::IsoTimeZone::Local => match date::parsed_iso_to_utc(
+            date::ParsedIsoDate {
+                components: parsed.components,
+                time_zone: date::IsoTimeZone::Utc,
+                date_only: parsed.date_only,
+            },
+        ) {
+            Ok(value) => date_instance_local_to_utc(timezone, date_instance_float(value)),
+            Err(_) => date_instance_nan(),
+        },
+        _ => match date::parsed_iso_to_utc(parsed) {
+            Ok(value) => date_instance_float(value),
+            Err(_) => date_instance_nan(),
+        },
+    }
+}
+
 fn date_instance_parse_string(timezone: date::TimeZone, value: runtime::JsString) -> f64 {
     let source = match value.to_host_string() {
         Ok(value) => value,
         Err(_) => return date_instance_nan(),
     };
     match date::parse_iso(source) {
-        Ok(parsed) => match parsed.time_zone {
-            date::IsoTimeZone::Local => match date::parsed_iso_to_utc(
-                date::ParsedIsoDate {
-                    components: parsed.components,
-                    time_zone: date::IsoTimeZone::Utc,
-                    date_only: parsed.date_only,
+        Ok(parsed) => date_instance_parsed_value(timezone, parsed),
+        Err(_) => match date::parse_non_iso(source) {
+            Ok(parsed) => date_instance_parsed_value(timezone, parsed),
+            Err(_) => match date::parse_timestamp(source) {
+                Ok(value) => if text::find(source, " GMT").is_some() {
+                    date_instance_float(value)
+                } else {
+                    date_instance_local_to_utc(timezone, date_instance_float(value))
                 },
-            ) {
-                Ok(value) => date_instance_local_to_utc(timezone, date_instance_float(value)),
                 Err(_) => date_instance_nan(),
             },
-            _ => match date::parsed_iso_to_utc(parsed) {
-                Ok(value) => date_instance_float(value),
-                Err(_) => date_instance_nan(),
-            },
-        },
-        Err(_) => match date::parse_timestamp(source) {
-            Ok(value) => if text::find(source, " GMT").is_some() {
-                date_instance_float(value)
-            } else {
-                date_instance_local_to_utc(timezone, date_instance_float(value))
-            },
-            Err(_) => date_instance_nan(),
         },
     }
 }
@@ -487,19 +494,24 @@ fn date_instance_set_component(
         2 | 6 => 3,
         _ => 4,
     };
+    let mut invalid = false;
     let mut argument_index = 0;
     while argument_index < arguments.len() && argument_index < limit {
         match date_instance_integer(context, arguments[argument_index], depth)? {
             Some(value) => converted.push(value),
             None => {
-                state.set(date_instance_nan());
-                return Result::Ok(runtime::Value::Float(date_instance_nan()))
+                converted.push(0);
+                invalid = true;
             },
         }
         argument_index += 1;
     }
     if converted.is_empty() {
         let _ = date_instance_number(context, runtime::Value::Undefined, depth)?;
+        state.set(date_instance_nan());
+        return Result::Ok(runtime::Value::Float(date_instance_nan()))
+    }
+    if invalid {
         state.set(date_instance_nan());
         return Result::Ok(runtime::Value::Float(date_instance_nan()))
     }

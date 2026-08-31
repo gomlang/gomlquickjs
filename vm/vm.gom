@@ -2569,21 +2569,7 @@ fn constant_value(machine: Machine, offset: isize, index: isize) -> Result[runti
         Some(bytecode::Constant::String(value)) => Result::Ok(runtime::Value::String(value)),
         Some(bytecode::Constant::BigInt(value)) => Result::Ok(runtime::Value::BigInt(value)),
         Some(bytecode::Constant::Function(function)) => {
-            if function.get().upvalue_count() == 0 && function.get().constructable()
-                && !function.get().class_constructor() {
-                let identity = ptr_hash(function);
-                match machine.function_objects.get(identity) {
-                    Some(object) => if machine.heap.contains(object) {
-                        Result::Ok(runtime::Value::Object(object))
-                    } else {
-                        let _ = machine.function_objects.remove(identity);
-                        materialize_function(machine, offset, Option::Some(identity), function)
-                    },
-                    None => materialize_function(machine, offset, Option::Some(identity), function),
-                }
-            } else {
-                materialize_function(machine, offset, Option::None, function)
-            }
+            materialize_function(machine, offset, Option::None, function)
         },
         Some(bytecode::Constant::Template(template)) => {
             materialize_template(machine, offset, template)
@@ -2661,12 +2647,20 @@ fn arguments_thrower(machine: Machine, offset: isize) -> Result[runtime::Value, 
     Result::Ok(runtime::Value::Object(object))
 }
 
-fn materialize_arguments(machine: Machine, offset: isize) -> Result[runtime::Value, VmError] {
-    match machine.arguments_object.get() {
+fn materialize_frame_arguments(
+    machine: Machine,
+    offset: isize,
+    function: bytecode::Function,
+    arguments: Vec[runtime::Value],
+    locals: Vec[Ref[runtime::Value]],
+    callee: Option[runtime::Value],
+    arguments_object: Ref[Option[runtime::ObjectId]],
+) -> Result[runtime::Value, VmError] {
+    match arguments_object.get() {
         Some(value) => if machine.heap.contains(value) {
             return Result::Ok(runtime::Value::Object(value))
         } else {
-            machine.arguments_object.set(Option::None)
+            arguments_object.set(Option::None)
         },
         None => (),
     }
@@ -2679,28 +2673,23 @@ fn materialize_arguments(machine: Machine, offset: isize) -> Result[runtime::Val
         machine.heap,
         object,
         runtime::string_property_key("length"),
-        runtime::data_descriptor(arguments_length_value(machine.arguments.len()), true, false, true),
+        runtime::data_descriptor(arguments_length_value(arguments.len()), true, false, true),
     ) {
         return Result::Err(error(offset, VmErrorKind::TypeError("cannot define arguments length")))
     }
     let mut index = 0;
-    while index < machine.arguments.len() {
+    while index < arguments.len() {
         if !runtime::define_own_property(
             machine.heap,
             object,
             runtime::string_property_key(index.to_string()),
-            runtime::data_descriptor(machine.arguments[index], true, true, true),
+            runtime::data_descriptor(arguments[index], true, true, true),
         ) {
             return Result::Err(error(offset, VmErrorKind::TypeError("cannot define argument")))
         }
-        match machine.function.argument_local(index) {
-            Some(local) => if local >= 0 && local < machine.locals.len() {
-                if !runtime::map_argument_index(
-                    machine.heap,
-                    object,
-                    index.to_u32(),
-                    machine.locals[local],
-                ) {
+        match function.argument_local(index) {
+            Some(local) => if local >= 0 && local < locals.len() {
+                if !runtime::map_argument_index(machine.heap, object, index.to_u32(), locals[local]) {
                     return Result::Err(error(offset, VmErrorKind::TypeError("cannot map argument")))
                 }
             } else {
@@ -2711,8 +2700,8 @@ fn materialize_arguments(machine: Machine, offset: isize) -> Result[runtime::Val
         index += 1;
     }
     let callee_key = runtime::string_property_key("callee");
-    let unmapped = machine.function.strict()
-        || machine.function.parameter_count() > 0 && machine.function.mapped_arguments().is_empty();
+    let unmapped = function.strict()
+        || function.parameter_count() > 0 && function.mapped_arguments().is_empty();
     let callee_defined = if unmapped {
         let thrower = arguments_thrower(machine, offset)?;
         runtime::define_own_property(
@@ -2726,12 +2715,7 @@ fn materialize_arguments(machine: Machine, offset: isize) -> Result[runtime::Val
             machine.heap,
             object,
             callee_key,
-            runtime::data_descriptor(
-                machine.callee.unwrap_or(runtime::Value::Undefined),
-                true,
-                false,
-                true,
-            ),
+            runtime::data_descriptor(callee.unwrap_or(runtime::Value::Undefined), true, false, true),
         )
     };
     if !callee_defined {
@@ -2758,8 +2742,20 @@ fn materialize_arguments(machine: Machine, offset: isize) -> Result[runtime::Val
         },
         _ => (),
     }
-    machine.arguments_object.set(Option::Some(object));
+    arguments_object.set(Option::Some(object));
     Result::Ok(runtime::Value::Object(object))
+}
+
+fn materialize_arguments(machine: Machine, offset: isize) -> Result[runtime::Value, VmError] {
+    materialize_frame_arguments(
+        machine,
+        offset,
+        machine.function,
+        machine.arguments,
+        machine.locals,
+        machine.callee,
+        machine.arguments_object,
+    )
 }
 
 fn read_arguments_binding(machine: Machine, offset: isize) -> Result[runtime::Value, VmError] {
@@ -2809,6 +2805,33 @@ pub fn function_source(self: Context, value: runtime::Value) -> Option[runtime::
             None => Option::None,
         },
         _ => Option::None,
+    }
+}
+
+pub fn native_function_name(self: Context, value: runtime::Value) -> Option[runtime::JsString] {
+    let object = match value {
+        runtime::Value::Object(value) => value,
+        _ => return Option::None,
+    };
+    if self.bound_functions_value.get(object).is_some() {
+        return Option::None
+    }
+    if self.native_functions_value.get(object).is_none()
+        && self.native_constructor_functions_value.get(object).is_none()
+        && self.vm_functions_value.get(object).is_none()
+        && self.vm_constructor_functions_value.get(object).is_none()
+        && !self.native_constructors_value.contains(object) {
+        return Option::None
+    }
+    match self.heap_value.get(object) {
+        Some(value) => match value.own_property(runtime::string_property_key("name")) {
+            Some(descriptor) => match runtime::descriptor_value(descriptor) {
+                Some(runtime::Value::String(name)) => Option::Some(name),
+                _ => Option::None,
+            },
+            None => Option::None,
+        },
+        None => Option::None,
     }
 }
 
@@ -3210,7 +3233,7 @@ fn read_eval_binding(machine: Machine, offset: isize, index: isize, missing_is_u
 ] {
     let name = eval_name(machine, offset, index)?;
     match eval_environment_cell(machine.eval_environment.get(), name) {
-        Some(cell) => Result::Ok(cell.get()),
+        Some(cell) => initialized_tdz_value(machine, offset, cell.get()),
         None => match machine.global_lexical_bindings.get(name) {
             Some(binding) => if binding.initialized.get() {
                 Result::Ok(binding.value.get())
@@ -3228,18 +3251,16 @@ fn read_eval_binding(machine: Machine, offset: isize, index: isize, missing_is_u
                 let object = global_object(machine, offset)?;
                 let key = field_key(machine, offset, index)?;
                 if missing_is_undefined {
-                    match runtime::get_property_descriptor(machine.heap, object, key) {
-                        Ok(Some(_)) => read_object_property(
+                    if has_property(machine, offset, object, key)? {
+                        read_object_property(
                             machine,
                             offset,
                             object,
                             runtime::Value::Object(object),
                             key,
-                        ),
-                        Ok(None) => Result::Ok(runtime::Value::Undefined),
-                        Err(value) => Result::Err(
-                            error(offset, VmErrorKind::TypeError(value.message)),
-                        ),
+                        )
+                    } else {
+                        Result::Ok(runtime::Value::Undefined)
                     }
                 } else {
                     read_global_property(machine, offset, object, key)
@@ -3626,6 +3647,50 @@ fn validate_proxy_set(
     Result::Ok(())
 }
 
+fn active_function_frame(machine: Machine, object: runtime::ObjectId) -> Option[isize] {
+    let mut index = machine.active_frames.len();
+    while index > 0 {
+        index -= 1;
+        match machine.active_frames[index].callee {
+            Some(runtime::Value::Object(value)) => if value == object {
+                return Option::Some(index)
+            },
+            _ => (),
+        }
+    }
+    Option::None
+}
+
+fn restricted_legacy_caller(machine: Machine, value: runtime::Value) -> bool {
+    let object = match value {
+        runtime::Value::Object(value) => value,
+        _ => return false,
+    };
+    match machine.functions.get(object) {
+        Some(closure) => {
+            let function = closure.function.get();
+            function.strict() || function.generator() || function.asynchronous()
+        },
+        None => false,
+    }
+}
+
+fn active_frame_caller(machine: Machine, frame_index: isize) -> runtime::Value {
+    let mut index = frame_index;
+    while index > 0 {
+        index -= 1;
+        match machine.active_frames[index].callee {
+            Some(value) => return if restricted_legacy_caller(machine, value) {
+                runtime::Value::Null
+            } else {
+                value
+            },
+            None => (),
+        }
+    }
+    runtime::Value::Null
+}
+
 fn read_object_property(
     machine: Machine,
     offset: isize,
@@ -3663,7 +3728,23 @@ fn read_object_property(
                     && value.prototype() == machine.heap.function_prototype()
                     && function.constructable()
                     && !function.strict() {
-                    return Result::Ok(runtime::Value::Undefined)
+                    return match active_function_frame(machine, object) {
+                        Some(index) => if property_name(key, "caller") {
+                            Result::Ok(active_frame_caller(machine, index))
+                        } else {
+                            let frame = machine.active_frames[index];
+                            materialize_frame_arguments(
+                                machine,
+                                offset,
+                                frame.function,
+                                frame.arguments,
+                                frame.locals,
+                                frame.callee,
+                                frame.arguments_object,
+                            )
+                        },
+                        None => Result::Ok(runtime::Value::Null),
+                    }
                 }
             },
             _ => (),
@@ -3790,30 +3871,29 @@ fn read_global_property(
     object: runtime::ObjectId,
     key: runtime::PropertyKey,
 ) -> Result[runtime::Value, VmError] {
-    match runtime::get_property_descriptor(machine.heap, object, key) {
-        Ok(Some(_)) => {
-            read_object_property(machine, offset, object, runtime::Value::Object(object), key)
-        },
-        Ok(None) => Result::Err(
+    if has_property(machine, offset, object, key)? {
+        read_object_property(machine, offset, object, runtime::Value::Object(object), key)
+    } else {
+        Result::Err(
             error(
                 offset,
                 VmErrorKind::ReferenceError(global_reference_name(key) + " is not defined"),
             ),
-        ),
-        Err(value) => Result::Err(error(offset, VmErrorKind::TypeError(value.message))),
+        )
     }
 }
 
-fn write_object_property(
+fn write_object_property_with_strict(
     machine: Machine,
     offset: isize,
     object: runtime::ObjectId,
     receiver: runtime::Value,
     key: runtime::PropertyKey,
     value: runtime::Value,
+    strict: bool,
 ) -> Result[(), VmError] {
     let written = reflect_set_property(machine, offset, object, receiver, key, value)?;
-    if written || !machine.function.strict() {
+    if written || !strict {
         Result::Ok(())
     } else {
         Result::Err(error(offset, VmErrorKind::TypeError("property is not writable")))
@@ -5696,14 +5776,31 @@ fn write_property(
     key: runtime::PropertyKey,
     value: runtime::Value,
 ) -> Result[(), VmError] {
+    write_property_with_strict(machine, offset, receiver, key, value, machine.function.strict())
+}
+
+fn write_property_with_strict(
+    machine: Machine,
+    offset: isize,
+    receiver: runtime::Value,
+    key: runtime::PropertyKey,
+    value: runtime::Value,
+    strict: bool,
+) -> Result[(), VmError] {
     match receiver {
-        runtime::Value::Object(object) => {
-            write_object_property(machine, offset, object, receiver, key, value)
-        },
+        runtime::Value::Object(object) => write_object_property_with_strict(
+            machine,
+            offset,
+            object,
+            receiver,
+            key,
+            value,
+            strict,
+        ),
         runtime::Value::Undefined | runtime::Value::Null => Result::Err(
             error(offset, VmErrorKind::TypeError("cannot assign property of null or undefined")),
         ),
-        _ => write_primitive_property(machine, offset, receiver, key, value),
+        _ => write_primitive_property(machine, offset, receiver, key, value, strict),
     }
 }
 
@@ -5728,6 +5825,7 @@ fn write_primitive_property(
     receiver: runtime::Value,
     key: runtime::PropertyKey,
     value: runtime::Value,
+    strict: bool,
 ) -> Result[(), VmError] {
     let string_virtual = match receiver {
         runtime::Value::String(source) => if property_name(key, "length") {
@@ -5755,7 +5853,7 @@ fn write_primitive_property(
             None => false,
         }
     };
-    if written || !machine.function.strict() {
+    if written || !strict {
         Result::Ok(())
     } else {
         Result::Err(error(offset, VmErrorKind::TypeError("cannot assign property of a primitive")))
@@ -8426,16 +8524,16 @@ fn construct_value(
     construct_value_with_new_target(machine, offset, callee, arguments, callee)
 }
 
-fn call_super_constructor(machine: Machine, offset: isize, arguments: Vec[runtime::Value]) -> Result[
-    runtime::Value,
-    VmError,
-] {
-    let base = match super_base(machine, offset)? {
-        Some(value) => runtime::Value::Object(value),
-        None => return Result::Err(
-            error(offset, VmErrorKind::TypeError("super constructor is null")),
-        ),
-    };
+fn call_super_constructor(
+    machine: Machine,
+    offset: isize,
+    base: runtime::Value,
+    arguments: Vec[runtime::Value],
+) -> Result[runtime::Value, VmError] {
+    match base {
+        runtime::Value::Object(_) => (),
+        _ => return Result::Err(error(offset, VmErrorKind::TypeError("super constructor is null"))),
+    }
     let new_target = match machine.new_target {
         Some(value) => value,
         None => return Result::Err(
@@ -8455,7 +8553,8 @@ fn call_super_constructor(machine: Machine, offset: isize, arguments: Vec[runtim
 
 fn push_super_call(machine: Machine, offset: isize, argument_count: isize) -> Result[(), VmError] {
     let arguments = pop_arguments(machine, offset, argument_count)?;
-    let result = call_super_constructor(machine, offset, arguments)?;
+    let base = pop(machine, offset)?;
+    let result = call_super_constructor(machine, offset, base, arguments)?;
     machine.stack.push(result);
     Result::Ok(())
 }
@@ -8463,7 +8562,8 @@ fn push_super_call(machine: Machine, offset: isize, argument_count: isize) -> Re
 fn push_super_array_call(machine: Machine, offset: isize) -> Result[(), VmError] {
     let array = pop(machine, offset)?;
     let arguments = argument_array_values(machine, offset, array)?;
-    let result = call_super_constructor(machine, offset, arguments)?;
+    let base = pop(machine, offset)?;
+    let result = call_super_constructor(machine, offset, base, arguments)?;
     machine.stack.push(result);
     Result::Ok(())
 }
@@ -8801,7 +8901,7 @@ fn step(machine: Machine, offset: isize, instruction: bytecode::Instruction) -> 
                 Some(cell) => cell.get(),
                 None => upvalue_get(machine, offset, upvalue)?,
             };
-            machine.stack.push(value);
+            machine.stack.push(initialized_tdz_value(machine, offset, value)?);
         },
         bytecode::Instruction::GetEvalOrArguments(index, depth) => {
             let name = eval_name(machine, offset, index)?;
@@ -8813,7 +8913,7 @@ fn step(machine: Machine, offset: isize, instruction: bytecode::Instruction) -> 
                 Some(cell) => cell.get(),
                 None => read_arguments_binding(machine, offset)?,
             };
-            machine.stack.push(value);
+            machine.stack.push(initialized_tdz_value(machine, offset, value)?);
         },
         bytecode::Instruction::GetCapturedEvalOrUpvalue(index, upvalue, resolution) => {
             let name = eval_name(machine, offset, index)?;
@@ -8821,7 +8921,7 @@ fn step(machine: Machine, offset: isize, instruction: bytecode::Instruction) -> 
                 Some(cell) => cell.get(),
                 None => upvalue_get(machine, offset, upvalue)?,
             };
-            machine.stack.push(value);
+            machine.stack.push(initialized_tdz_value(machine, offset, value)?);
         },
         bytecode::Instruction::GetCapturedEvalOrArguments(index, resolution) => {
             let name = eval_name(machine, offset, index)?;
@@ -8829,7 +8929,7 @@ fn step(machine: Machine, offset: isize, instruction: bytecode::Instruction) -> 
                 Some(cell) => cell.get(),
                 None => read_arguments_binding(machine, offset)?,
             };
-            machine.stack.push(value);
+            machine.stack.push(initialized_tdz_value(machine, offset, value)?);
         },
         bytecode::Instruction::SetEval(index) => {
             let value = pop(machine, offset)?;
@@ -8907,6 +9007,12 @@ fn step(machine: Machine, offset: isize, instruction: bytecode::Instruction) -> 
             let receiver = pop(machine, offset)?;
             let key = field_key(machine, offset, index)?;
             write_property(machine, offset, receiver, key, value)?;
+        },
+        bytecode::Instruction::PutFieldStrict(index) => {
+            let value = pop(machine, offset)?;
+            let receiver = pop(machine, offset)?;
+            let key = field_key(machine, offset, index)?;
+            write_property_with_strict(machine, offset, receiver, key, value, true)?;
         },
         bytecode::Instruction::DefineDataProperty(index) => {
             define_data_property(machine, offset, index)?
@@ -9002,6 +9108,10 @@ fn step(machine: Machine, offset: isize, instruction: bytecode::Instruction) -> 
             Some(value) => machine.stack.push(runtime::Value::Object(value)),
             None => machine.stack.push(runtime::Value::Null),
         },
+        bytecode::Instruction::PushSuperConstructor => match super_base(machine, offset)? {
+            Some(value) => machine.stack.push(runtime::Value::Object(value)),
+            None => machine.stack.push(runtime::Value::Null),
+        },
         bytecode::Instruction::GetSuperReference => {
             let key = property_key(machine, offset, pop(machine, offset)?)?;
             let receiver = pop(machine, offset)?;
@@ -9027,6 +9137,13 @@ fn step(machine: Machine, offset: isize, instruction: bytecode::Instruction) -> 
             let receiver = pop(machine, offset)?;
             let key = property_reference_key(machine, offset, receiver, property)?;
             write_property(machine, offset, receiver, key, value)?;
+        },
+        bytecode::Instruction::PutArrayElStrict => {
+            let value = pop(machine, offset)?;
+            let property = pop(machine, offset)?;
+            let receiver = pop(machine, offset)?;
+            let key = property_reference_key(machine, offset, receiver, property)?;
+            write_property_with_strict(machine, offset, receiver, key, value, true)?;
         },
         bytecode::Instruction::ReflectGet => push_reflect_get(machine, offset)?,
         bytecode::Instruction::ReflectSet => push_reflect_set(machine, offset)?,

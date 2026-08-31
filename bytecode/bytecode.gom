@@ -168,6 +168,7 @@ pub enum Instruction {
     EnterEvalEnvironment,
     GetField(isize),
     PutField(isize),
+    PutFieldStrict(isize),
     DefineDataProperty(isize),
     DefineDataPropertyComputed,
     SetObjectPrototype,
@@ -196,10 +197,12 @@ pub enum Instruction {
     GetSuperEl,
     PutSuperEl,
     PushSuperBase,
+    PushSuperConstructor,
     GetSuperReference,
     PutSuperReference(bool),
     GetArrayEl,
     PutArrayEl,
+    PutArrayElStrict,
     ReflectGet,
     ReflectSet,
     GetPrivate,
@@ -853,7 +856,7 @@ struct StackEffect {
 
 fn stack_effect(instruction: Instruction) -> StackEffect {
     match instruction {
-        Instruction::PushI32(_) | Instruction::PushConst(_) | Instruction::Undefined | Instruction::Null | Instruction::PushFalse | Instruction::PushTrue | Instruction::PushThis | Instruction::PushNewTarget | Instruction::PushArguments | Instruction::PushRest(_) | Instruction::NewObject | Instruction::NewArray(_) | Instruction::NewPrivateName | Instruction::NewRegExp(_, _) | Instruction::GetLoc(_) | Instruction::GetTdzLoc(_) | Instruction::GetUpvalue(_) | Instruction::GetTdzUpvalue(_) | Instruction::GetGlobal(_) | Instruction::DeleteGlobal(_) | Instruction::GetEval(_) | Instruction::GetEvalOrUndefined(_) | Instruction::HasEvalBinding(_) | Instruction::ResolveEvalBindingDepth(_, _) | Instruction::GetEvalOrUpvalue(_, _, _) | Instruction::GetEvalOrArguments(_, _) | Instruction::GetCapturedEvalOrUpvalue(_, _, _) | Instruction::GetCapturedEvalOrArguments(_, _) | Instruction::DeleteEval(_) | Instruction::DeleteEvalOrFalse(_, _) | Instruction::GetSuperField(_) | Instruction::PushSuperBase => StackEffect {
+        Instruction::PushI32(_) | Instruction::PushConst(_) | Instruction::Undefined | Instruction::Null | Instruction::PushFalse | Instruction::PushTrue | Instruction::PushThis | Instruction::PushNewTarget | Instruction::PushArguments | Instruction::PushRest(_) | Instruction::NewObject | Instruction::NewArray(_) | Instruction::NewPrivateName | Instruction::NewRegExp(_, _) | Instruction::GetLoc(_) | Instruction::GetTdzLoc(_) | Instruction::GetUpvalue(_) | Instruction::GetTdzUpvalue(_) | Instruction::GetGlobal(_) | Instruction::DeleteGlobal(_) | Instruction::GetEval(_) | Instruction::GetEvalOrUndefined(_) | Instruction::HasEvalBinding(_) | Instruction::ResolveEvalBindingDepth(_, _) | Instruction::GetEvalOrUpvalue(_, _, _) | Instruction::GetEvalOrArguments(_, _) | Instruction::GetCapturedEvalOrUpvalue(_, _, _) | Instruction::GetCapturedEvalOrArguments(_, _) | Instruction::DeleteEval(_) | Instruction::DeleteEvalOrFalse(_, _) | Instruction::GetSuperField(_) | Instruction::PushSuperBase | Instruction::PushSuperConstructor => StackEffect {
             required: 0,
             delta: 1,
         },
@@ -884,7 +887,7 @@ fn stack_effect(instruction: Instruction) -> StackEffect {
         Instruction::IteratorResult => StackEffect { required: 1, delta: 1 },
         Instruction::IteratorThrowResult => StackEffect { required: 2, delta: 0 },
         Instruction::IteratorCloseThrow => StackEffect { required: 2, delta: -1 },
-        Instruction::PutField(_) | Instruction::DefineDataProperty(_) | Instruction::DefineGetter(_) | Instruction::DefineSetter(_) | Instruction::DefineClassMethod(_) | Instruction::DefineClassGetter(_) | Instruction::DefineClassSetter(_) | Instruction::SetObjectPrototype => StackEffect {
+        Instruction::PutField(_) | Instruction::PutFieldStrict(_) | Instruction::DefineDataProperty(_) | Instruction::DefineGetter(_) | Instruction::DefineSetter(_) | Instruction::DefineClassMethod(_) | Instruction::DefineClassGetter(_) | Instruction::DefineClassSetter(_) | Instruction::SetObjectPrototype => StackEffect {
             required: 2,
             delta: -2,
         },
@@ -913,7 +916,9 @@ fn stack_effect(instruction: Instruction) -> StackEffect {
         Instruction::GetArrayEl | Instruction::EnumerableProperty | Instruction::OwnEnumerableProperty | Instruction::SetPrototypeOf | Instruction::WithHasBinding | Instruction::IsPrototypeOf => {
             StackEffect { required: 2, delta: -1 }
         },
-        Instruction::PutArrayEl => StackEffect { required: 3, delta: -3 },
+        Instruction::PutArrayEl | Instruction::PutArrayElStrict => {
+            StackEffect { required: 3, delta: -3 }
+        },
         Instruction::ReflectGet => StackEffect { required: 3, delta: -2 },
         Instruction::ReflectSet => StackEffect { required: 4, delta: -3 },
         Instruction::GetSuperReference => StackEffect { required: 3, delta: -2 },
@@ -933,9 +938,9 @@ fn stack_effect(instruction: Instruction) -> StackEffect {
         },
         Instruction::CallMethodArray => StackEffect { required: 3, delta: -2 },
         Instruction::CallSuper(arguments) => {
-            StackEffect { required: arguments, delta: 1 - arguments }
+            StackEffect { required: arguments + 1, delta: -arguments }
         },
-        Instruction::CallSuperArray => StackEffect { required: 1, delta: 0 },
+        Instruction::CallSuperArray => StackEffect { required: 2, delta: -1 },
         Instruction::Eval(arguments, _, method) => if method {
             StackEffect { required: arguments + 2, delta: -arguments - 1 }
         } else {
@@ -970,7 +975,7 @@ fn validate_operand(
     errors: Vec[VerifyError],
 ) -> () {
     match instruction {
-        Instruction::PushConst(index) | Instruction::GetGlobal(index) | Instruction::SetGlobal(index) | Instruction::DeleteGlobal(index) | Instruction::GetEval(index) | Instruction::GetEvalOrUndefined(index) | Instruction::HasEvalBinding(index) | Instruction::SetEval(index) | Instruction::DeleteEval(index) | Instruction::InitEval(index) | Instruction::InitGlobalLexical(index) | Instruction::GetField(index) | Instruction::PutField(index) | Instruction::GetWithBinding(index, _) | Instruction::PutWithBinding(index, _) | Instruction::DefineDataProperty(index) | Instruction::DefineGetter(index) | Instruction::DefineSetter(index) | Instruction::DefineClassMethod(index) | Instruction::DefineClassGetter(index) | Instruction::DefineClassSetter(index) | Instruction::DefineThisField(index) | Instruction::GetSuperField(index) | Instruction::PutSuperField(index) => {
+        Instruction::PushConst(index) | Instruction::GetGlobal(index) | Instruction::SetGlobal(index) | Instruction::DeleteGlobal(index) | Instruction::GetEval(index) | Instruction::GetEvalOrUndefined(index) | Instruction::HasEvalBinding(index) | Instruction::SetEval(index) | Instruction::DeleteEval(index) | Instruction::InitEval(index) | Instruction::InitGlobalLexical(index) | Instruction::GetField(index) | Instruction::PutField(index) | Instruction::PutFieldStrict(index) | Instruction::GetWithBinding(index, _) | Instruction::PutWithBinding(index, _) | Instruction::DefineDataProperty(index) | Instruction::DefineGetter(index) | Instruction::DefineSetter(index) | Instruction::DefineClassMethod(index) | Instruction::DefineClassGetter(index) | Instruction::DefineClassSetter(index) | Instruction::DefineThisField(index) | Instruction::GetSuperField(index) | Instruction::PutSuperField(index) => {
             if index < 0 || index >= function.constants_value.len() {
                 errors.push(VerifyError::InvalidConstant(offset, index))
             }

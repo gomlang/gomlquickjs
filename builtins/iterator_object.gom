@@ -231,28 +231,16 @@ fn iterator_allocate_object(context: vm::Context) -> Result[runtime::ObjectId, v
 }
 
 fn iterator_has_prototype(
-    heap: runtime::Heap,
+    context: vm::Context,
     object: runtime::ObjectId,
     prototype: runtime::ObjectId,
-) -> bool {
-    let mut cursor = match heap.get(object) {
-        Some(value) => value.prototype(),
-        None => return false,
-    };
-    while cursor.is_some() {
-        match cursor {
-            Some(value) => if value == prototype {
-                return true
-            } else {
-                cursor = match heap.get(value) {
-                    Some(value) => value.prototype(),
-                    None => return false,
-                };
-            },
-            None => (),
-        }
-    }
-    false
+    depth: isize,
+) -> Result[bool, vm::VmError] {
+    context.is_prototype_of_at_depth(
+        runtime::Value::Object(prototype),
+        runtime::Value::Object(object),
+        depth,
+    )
 }
 
 fn iterator_identity(
@@ -353,19 +341,32 @@ fn iterator_wrap(context: vm::Context, record: IteratorRecord, prototype: runtim
     runtime::Value,
     vm::VmError,
 ] {
+    let owner: Ref[Option[runtime::ObjectId]] = Ref::new(Option::None);
     let next = context.new_vm_function(
         |this_value, arguments, depth| {
-            let _ = this_value;
-            let _ = arguments;
-            match iterator_step(context, record, depth)? {
-                Some(value) => iterator_result(context, value, false),
-                None => iterator_result(context, runtime::Value::Undefined, true),
+            match (this_value, owner.get()) {
+                (runtime::Value::Object(value), Some(expected)) => if value == expected {} else {
+                    return Result::Err(function_vm_error("incompatible iterator wrapper receiver"))
+                },
+                _ => return Result::Err(function_vm_error("incompatible iterator wrapper receiver")),
             }
+            let _ = arguments;
+            context.invoke_with_this_at_depth(
+                record.next,
+                iterator_no_arguments(),
+                record.iterator,
+                depth,
+            )
         },
     )?;
     let return_method = context.new_vm_function(
         |this_value, arguments, depth| {
-            let _ = this_value;
+            match (this_value, owner.get()) {
+                (runtime::Value::Object(value), Some(expected)) => if value == expected {} else {
+                    return Result::Err(function_vm_error("incompatible iterator wrapper receiver"))
+                },
+                _ => return Result::Err(function_vm_error("incompatible iterator wrapper receiver")),
+            }
             let _ = arguments;
             let method = iterator_property(context, record.iterator, "return", depth)?;
             match method {
@@ -392,14 +393,13 @@ fn iterator_wrap(context: vm::Context, record: IteratorRecord, prototype: runtim
     )?;
     let result = iterator_create_object(context, next, Option::Some(return_method))?;
     match result {
-        runtime::Value::Object(object) => if runtime::set_prototype_of(
-            context.heap(),
-            object,
-            Option::Some(prototype),
-        ) {
-            Result::Ok(result)
-        } else {
-            Result::Err(function_vm_error("cannot set wrapped iterator prototype"))
+        runtime::Value::Object(object) => {
+            owner.set(Option::Some(object));
+            if runtime::set_prototype_of(context.heap(), object, Option::Some(prototype)) {
+                Result::Ok(result)
+            } else {
+                Result::Err(function_vm_error("cannot set wrapped iterator prototype"))
+            }
         },
         _ => Result::Err(function_vm_error("wrapped iterator is not an object")),
     }
@@ -420,10 +420,11 @@ fn iterator_from(
     };
     match record.iterator {
         runtime::Value::Object(object) => if iterator_has_prototype(
-            context.heap(),
+            context,
             object,
             prototype,
-        ) {
+            depth,
+        )? {
             Result::Ok(record.iterator)
         } else {
             iterator_wrap(context, record, wrap_prototype)

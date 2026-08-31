@@ -45,6 +45,7 @@ pub struct ModuleImport {
 
 pub struct ModuleExport {
     pub exported: string,
+    pub star: bool,
     pub source: Option[string],
     pub imported: string,
     pub local_index: isize,
@@ -104,6 +105,7 @@ struct Scope {
 struct WithBinding {
     name: string,
     scope_index: isize,
+    outer_index: isize,
 }
 
 struct LoopContext {
@@ -267,6 +269,7 @@ enum AnnexBVarUpdate {
     Local(isize),
     Upvalue(isize),
     EvalVar(isize),
+    Arguments(isize, isize),
 }
 
 enum ExcludedBindingKey {
@@ -287,9 +290,18 @@ fn compiler_is_strict(compiler: Compiler) -> bool {
     compiler.strict || compiler.strict_context.get()
 }
 
+fn strict_reserved_identifier(name: string) -> bool {
+    name == "implements" || name == "interface" || name == "let" || name == "package"
+        || name == "private"
+        || name == "protected"
+        || name == "public"
+        || name == "static"
+        || name == "yield"
+}
+
 fn validate_strict_identifier(compiler: Compiler, name: string, span: ast::Span) -> () {
-    if compiler_is_strict(compiler) && name == "yield" {
-        compile_error(compiler, "yield cannot be used as an identifier in strict mode", span)
+    if compiler_is_strict(compiler) && strict_reserved_identifier(name) {
+        compile_error(compiler, "reserved word cannot be used as an identifier", span)
     }
 }
 
@@ -577,6 +589,29 @@ fn binding_scope_index(compiler: Compiler, name: string) -> Option[isize] {
         } else {
             index -= 1;
         }
+    }
+}
+
+fn outer_binding_index(compiler: Compiler, name: string) -> isize {
+    let mut index = 0;
+    while index < compiler.outer_bindings.len() {
+        if compiler.outer_bindings[index].name == name {
+            return index
+        }
+        index += 1;
+    }
+    return -1
+}
+
+fn with_binding_precedes_identifier(compiler: Compiler, binding: WithBinding, name: string) -> bool {
+    match binding_scope_index(compiler, name) {
+        Some(scope_index) => binding.scope_index > scope_index,
+        None => if binding.outer_index < 0 {
+            true
+        } else {
+            let name_index = outer_binding_index(compiler, name);
+            name_index < 0 || binding.outer_index < name_index
+        },
     }
 }
 
@@ -933,6 +968,15 @@ fn add_dynamic_eval_var(
     span: ast::Span,
 ) -> () {
     let _ = compiler.dynamic_eval_vars.insert(name);
+    add_dynamic_eval_declaration(compiler, name, kind, span)
+}
+
+fn add_dynamic_eval_declaration(
+    compiler: Compiler,
+    name: string,
+    kind: bytecode::EvalDeclarationKind,
+    span: ast::Span,
+) -> () {
     compiler.dynamic_eval_declarations.push(
         DynamicEvalDeclaration { name, kind, offset: span.start },
     )
@@ -990,7 +1034,14 @@ fn declare_var_pattern(compiler: Compiler, pattern: ast::BindingPattern) -> () {
                 record_global_var(compiler, name, bytecode::ScriptBindingKind::Var, span)
             } else if compiler.direct_eval.get() && !compiler_is_strict(compiler) {
                 match lookup_outer_binding(compiler, name) {
-                    Some(binding) => if binding.declaration_target && !binding.catch_binding {
+                    Some(binding) => if binding.catch_binding {
+                        add_dynamic_eval_declaration(
+                            compiler,
+                            name,
+                            bytecode::EvalDeclarationKind::Var,
+                            span,
+                        )
+                    } else if binding.declaration_target {
                         if binding.kind != BindingKind::Var {
                             compile_error(compiler, "duplicate declaration of `" + name + "`", span)
                         }
@@ -1038,12 +1089,20 @@ fn annex_b_var_scope_write_target(compiler: Compiler, name: string, span: ast::S
     AnnexBVarUpdate,
 ] {
     let var_scope_index = compiler.var_scope_index.get();
-    if compiler.script_mode.get() && var_scope_index == 0 {
+    if name == "arguments" && compiler.arguments_available && var_scope_index == 0 {
+        Option::Some(
+            AnnexBVarUpdate::Arguments(
+                string_constant(compiler, name),
+                current_eval_environment_depth(compiler),
+            ),
+        )
+    } else if compiler.script_mode.get() && var_scope_index == 0 {
         record_global_var(compiler, name, bytecode::ScriptBindingKind::Var, span);
         Option::Some(AnnexBVarUpdate::EvalVar(string_constant(compiler, name)))
     } else if compiler.direct_eval.get() {
         match lookup_outer_binding(compiler, name) {
-            Some(binding) => if binding.declaration_target && !binding.catch_binding {
+            Some(binding) => if binding.declaration_target
+                && (binding.catch_binding || binding.kind == BindingKind::Var) {
                 match resolve_upvalue(compiler, name) {
                     Some((index, _)) => Option::Some(AnnexBVarUpdate::Upvalue(index)),
                     None => Option::None,
@@ -1078,14 +1137,15 @@ fn declare_annex_b_function(
     name: string,
     span: ast::Span,
     ancestors: collections::IndexSet[string],
+    allow_arguments_update: bool,
 ) -> () {
     if compiler_is_strict(compiler) || compiler.module_mode.get() {
         return
     }
-    if name == "arguments" && compiler.arguments_available {
+    if compiler.parameter_names.contains(name) {
         return
     }
-    if compiler.parameter_names.contains(name) {
+    if name == "arguments" && compiler.arguments_available && !allow_arguments_update {
         return
     }
     if ancestors.contains(name) {
@@ -1203,6 +1263,7 @@ fn collect_annex_b_body_level(
     ancestors: collections::IndexSet[string],
     top_level: bool,
 ) -> () {
+    let allow_arguments_update = !top_level && body.len() == 1;
     let lexicals: Vec[string] = Vec::new();
     let functions: Vec[string] = Vec::new();
     for statement in body {
@@ -1222,7 +1283,13 @@ fn collect_annex_b_body_level(
     for statement in body {
         match statement {
             ast::Stmt::FunctionDeclaration { .. } if top_level => (),
-            _ => collect_annex_b_statement(compiler, statement, combined, child_combined),
+            _ => collect_annex_b_statement(
+                compiler,
+                statement,
+                combined,
+                child_combined,
+                allow_arguments_update,
+            ),
         }
     }
 }
@@ -1232,11 +1299,12 @@ fn collect_annex_b_statement(
     statement: ast::Stmt,
     ancestors: collections::IndexSet[string],
     child_ancestors: collections::IndexSet[string],
+    allow_arguments_update: bool,
 ) -> () {
     match statement {
         ast::Stmt::FunctionDeclaration { name, span, generator, asynchronous, .. } => {
             if !generator && !asynchronous {
-                declare_annex_b_function(compiler, name, span, ancestors)
+                declare_annex_b_function(compiler, name, span, ancestors, allow_arguments_update)
             }
         },
         ast::Stmt::Block { body, .. } => collect_annex_b_body_level(
@@ -1246,7 +1314,13 @@ fn collect_annex_b_statement(
             false,
         ),
         ast::Stmt::If { consequent, alternate, .. } => {
-            collect_annex_b_statement(compiler, consequent.get(), child_ancestors, child_ancestors);
+            collect_annex_b_statement(
+                compiler,
+                consequent.get(),
+                child_ancestors,
+                child_ancestors,
+                false,
+            );
             match alternate {
                 Some(value) => {
                     collect_annex_b_statement(
@@ -1254,6 +1328,7 @@ fn collect_annex_b_statement(
                         value.get(),
                         child_ancestors,
                         child_ancestors,
+                        false,
                     );
                 },
                 None => (),
@@ -1263,7 +1338,7 @@ fn collect_annex_b_statement(
             body,
             ..,
         } => {
-            collect_annex_b_statement(compiler, body.get(), child_ancestors, child_ancestors)
+            collect_annex_b_statement(compiler, body.get(), child_ancestors, child_ancestors, false)
         },
         ast::Stmt::For { initializer, body, .. } => {
             let mut initializer_lexicals: Vec[string] = Vec::new();
@@ -1276,7 +1351,7 @@ fn collect_annex_b_statement(
                 None => (),
             }
             let for_combined = merge_lexical_names(child_ancestors, initializer_lexicals);
-            collect_annex_b_statement(compiler, body.get(), for_combined, for_combined)
+            collect_annex_b_statement(compiler, body.get(), for_combined, for_combined, false)
         },
         ast::Stmt::ForOf { kind, pattern, body, .. } | ast::Stmt::ForIn { kind, pattern, body, .. } => {
             let mut iteration_lexicals: Vec[string] = Vec::new();
@@ -1284,7 +1359,7 @@ fn collect_annex_b_statement(
                 collect_pattern_lexical_names(compiler, pattern.get(), iteration_lexicals)
             }
             let for_combined = merge_lexical_names(child_ancestors, iteration_lexicals);
-            collect_annex_b_statement(compiler, body.get(), for_combined, for_combined)
+            collect_annex_b_statement(compiler, body.get(), for_combined, for_combined, false)
         },
         ast::Stmt::Switch { cases, .. } => {
             let mut switch_lexicals: Vec[string] = Vec::new();
@@ -1329,7 +1404,7 @@ fn collect_annex_b_statement(
             }
         },
         ast::Stmt::Labelled { body, .. } => {
-            collect_annex_b_statement(compiler, body.get(), child_ancestors, child_ancestors)
+            collect_annex_b_statement(compiler, body.get(), child_ancestors, child_ancestors, false)
         },
         _ => (),
     }
@@ -1392,6 +1467,7 @@ fn initialize_var_bindings(compiler: Compiler) -> () {
     let var_scope_index = compiler.var_scope_index.get();
     for index in compiler.var_indices {
         let mut parameter_source: Option[isize] = Option::None;
+        let mut arguments_source = false;
         if var_scope_index > 0 {
             for (name, binding) in compiler.scopes[var_scope_index].bindings.entries() {
                 if binding.index == index {
@@ -1399,7 +1475,9 @@ fn initialize_var_bindings(compiler: Compiler) -> () {
                         Some(parameter) => {
                             parameter_source = Option::Some(parameter.index);
                         },
-                        None => (),
+                        None => if name == "arguments" && compiler.arguments_available {
+                            arguments_source = true;
+                        },
                     }
                 }
             }
@@ -1408,7 +1486,9 @@ fn initialize_var_bindings(compiler: Compiler) -> () {
             Some(source) => {
                 let _ = emit(compiler, bytecode::Instruction::GetLoc(source));
             },
-            None => {
+            None => if arguments_source {
+                let _ = emit(compiler, bytecode::Instruction::PushArguments);
+            } else {
                 let _ = emit(compiler, bytecode::Instruction::Undefined);
             },
         }
@@ -1428,7 +1508,11 @@ fn declare_lexical_statement(compiler: Compiler, statement: ast::Stmt) -> () {
                     let names: Vec[(string, ast::Span)] = Vec::new();
                     collect_parameter_names(declaration.pattern.get(), names);
                     for (name, span) in names {
-                        if dynamic_eval_var_conflicts_current_scope(compiler, name) {
+                        if compiler.var_scope_index.get() > 0
+                            && compiler.scopes.len() - 1 == compiler.var_scope_index.get()
+                            && compiler.parameter_names.contains(name) {
+                            compile_error(compiler, "duplicate declaration of `" + name + "`", span)
+                        } else if dynamic_eval_var_conflicts_current_scope(compiler, name) {
                             compile_error(compiler, "duplicate declaration of `" + name + "`", span)
                         } else {
                             let predeclared = if compiler.script_mode.get()
@@ -1502,6 +1586,10 @@ fn declare_lexical_statement(compiler: Compiler, statement: ast::Stmt) -> () {
         ast::Stmt::ClassDeclaration { name, span, .. } => {
             if name == "" {
                 compile_error(compiler, "class declaration requires a name", span)
+            } else if compiler.var_scope_index.get() > 0
+                && compiler.scopes.len() - 1 == compiler.var_scope_index.get()
+                && compiler.parameter_names.contains(name) {
+                compile_error(compiler, "duplicate declaration of `" + name + "`", span)
             } else if dynamic_eval_var_conflicts_current_scope(compiler, name) {
                 compile_error(compiler, "duplicate declaration of `" + name + "`", span)
             } else {
@@ -1752,7 +1840,31 @@ fn compile_active_finalizers_from(compiler: Compiler, finalizer_depth: isize) ->
         if compiler.finalizers[index].active {
             let suspended = suspend_protected_regions(compiler, index);
             compiler.finalizers[index].active = false;
+            let saved_completion = match compiler.completion_local.get() {
+                Some(completion) => {
+                    let local = new_local(compiler);
+                    let _ = emit(compiler, bytecode::Instruction::GetLoc(completion));
+                    let _ = emit(compiler, bytecode::Instruction::PutLoc(local));
+                    reset_statement_completion(compiler);
+                    Option::Some(local)
+                },
+                None => Option::None,
+            };
             compile_finalizer_kind(compiler, compiler.finalizers[index].kind);
+            match saved_completion {
+                Some(local) => {
+                    let _ = emit(compiler, bytecode::Instruction::GetLoc(local));
+                    match compiler.completion_local.get() {
+                        Some(completion) => {
+                            let _ = emit(compiler, bytecode::Instruction::PutLoc(completion));
+                        },
+                        None => {
+                            let _ = emit(compiler, bytecode::Instruction::Drop);
+                        },
+                    }
+                },
+                None => (),
+            }
             compiler.finalizers[index].active = true;
             resume_protected_regions(compiler, suspended);
         }
@@ -2279,13 +2391,9 @@ fn compile_identifier(compiler: Compiler, name: string, span: ast::Span) -> () {
     let property = string_constant(compiler, name);
     let misses: Vec[isize] = Vec::new();
     let ends: Vec[isize] = Vec::new();
-    let local_scope = binding_scope_index(compiler, name);
     for binding in compiler.with_bindings {
-        match local_scope {
-            Some(value) => if binding.scope_index <= value {
-                break
-            },
-            None => (),
+        if !with_binding_precedes_identifier(compiler, binding, name) {
+            break
         }
         let target = current_offset(compiler);
         if !misses.is_empty() {
@@ -2318,13 +2426,9 @@ fn compile_with_identifier_callee(compiler: Compiler, name: string, span: ast::S
     let property = string_constant(compiler, name);
     let misses: Vec[isize] = Vec::new();
     let ends: Vec[isize] = Vec::new();
-    let local_scope = binding_scope_index(compiler, name);
     for binding in compiler.with_bindings {
-        match local_scope {
-            Some(value) => if binding.scope_index <= value {
-                break
-            },
-            None => (),
+        if !with_binding_precedes_identifier(compiler, binding, name) {
+            break
         }
         let target = current_offset(compiler);
         if !misses.is_empty() {
@@ -2515,6 +2619,16 @@ fn has_optional_chain(expression: ast::Expr) -> bool {
         ast::Expr::Call { callee, optional, .. } => {
             optional || has_optional_chain(callee.get())
         },
+        _ => false,
+    }
+}
+
+fn call_assignment_target(expression: ast::Expr) -> bool {
+    match expression {
+        ast::Expr::Call { callee, optional, .. } => {
+            !optional && !has_optional_chain(callee.get())
+        },
+        ast::Expr::Parenthesized { expression, .. } => call_assignment_target(expression.get()),
         _ => false,
     }
 }
@@ -3034,10 +3148,12 @@ fn compile_call(
                 let _ = emit(compiler, bytecode::Instruction::Undefined);
             } else if spread {
                 ensure_super_this_capture(compiler);
+                let _ = emit(compiler, bytecode::Instruction::PushSuperConstructor);
                 compile_call_argument_array(compiler, arguments);
                 let _ = emit_at(compiler, bytecode::Instruction::CallSuperArray, call_offset);
             } else {
                 ensure_super_this_capture(compiler);
+                let _ = emit(compiler, bytecode::Instruction::PushSuperConstructor);
                 for argument in arguments {
                     compile_expression(compiler, argument)
                 }
@@ -3287,11 +3403,11 @@ fn compile_construct(compiler: Compiler, callee: ast::Expr, arguments: Vec[ast::
 }
 
 fn compile_plain_identifier_delete(compiler: Compiler, name: string) -> () {
-    if has_dynamic_eval_var(compiler, name) {
+    if lookup_binding(compiler, name).is_some() {
+        let _ = emit(compiler, bytecode::Instruction::PushFalse);
+    } else if has_dynamic_eval_var(compiler, name) {
         let index = string_constant(compiler, name);
         let _ = emit(compiler, bytecode::Instruction::DeleteEval(index));
-    } else if lookup_binding(compiler, name).is_some() {
-        let _ = emit(compiler, bytecode::Instruction::PushFalse);
     } else if lookup_outer_binding(compiler, name).is_some() {
         let depth = outer_binding_environment_depth(compiler, name);
         if depth > 0 {
@@ -3318,13 +3434,9 @@ fn compile_with_identifier_delete(compiler: Compiler, name: string, span: ast::S
     let property = string_constant(compiler, name);
     let misses: Vec[isize] = Vec::new();
     let ends: Vec[isize] = Vec::new();
-    let local_scope = binding_scope_index(compiler, name);
     for binding in compiler.with_bindings {
-        match local_scope {
-            Some(value) => if binding.scope_index <= value {
-                break
-            },
-            None => (),
+        if !with_binding_precedes_identifier(compiler, binding, name) {
+            break
         }
         let target = current_offset(compiler);
         if !misses.is_empty() {
@@ -3455,6 +3567,13 @@ fn compile_delete(compiler: Compiler, argument: ast::Expr) -> () {
             ast::Expr::Super { .. } => true,
             _ => false,
         } {
+            ensure_super_this_capture(compiler);
+            compile_this_value(compiler);
+            let _ = emit(compiler, bytecode::Instruction::Drop);
+            if computed {
+                compile_expression(compiler, property.get());
+                let _ = emit(compiler, bytecode::Instruction::Drop);
+            }
             set_source_offset(compiler, span.start);
             let _ = emit(compiler, bytecode::Instruction::ThrowReferenceError);
         } else if !computed
@@ -3922,13 +4041,9 @@ fn with_identifier_assignment_target(compiler: Compiler, name: string, span: ast
     let _ = emit(compiler, bytecode::Instruction::PutLoc(receiver));
     let misses: Vec[isize] = Vec::new();
     let ends: Vec[isize] = Vec::new();
-    let local_scope = binding_scope_index(compiler, name);
     for binding in compiler.with_bindings {
-        match local_scope {
-            Some(value) => if binding.scope_index <= value {
-                break
-            },
-            None => (),
+        if !with_binding_precedes_identifier(compiler, binding, name) {
+            break
         }
         let target = current_offset(compiler);
         if !misses.is_empty() {
@@ -3963,6 +4078,18 @@ fn prepare_assignment_target(
     fallback_span: ast::Span,
     resolve_property_key: bool,
 ) -> AssignmentTarget {
+    if !compiler_is_strict(compiler) && call_assignment_target(expression) {
+        compile_expression(compiler, expression);
+        let _ = emit(compiler, bytecode::Instruction::Drop);
+        set_source_offset(compiler, fallback_span.start);
+        let _ = emit(compiler, bytecode::Instruction::ThrowReferenceError);
+        return AssignmentTarget {
+            storage: AssignmentStorage::Invalid,
+            writable: false,
+            throws_on_write: false,
+            source_offset: fallback_span.start,
+        }
+    }
     match expression {
         ast::Expr::Identifier { name, span } => {
             validate_strict_identifier(compiler, name, span);
@@ -4303,7 +4430,14 @@ fn store_assignment_target(compiler: Compiler, target: AssignmentTarget) -> () {
             let _ = emit(compiler, bytecode::Instruction::PutLoc(value));
             let _ = emit(compiler, bytecode::Instruction::GetLoc(object));
             let _ = emit(compiler, bytecode::Instruction::GetLoc(value));
-            let _ = emit(compiler, bytecode::Instruction::PutField(property));
+            let _ = emit(
+                compiler,
+                if compiler_is_strict(compiler) {
+                    bytecode::Instruction::PutFieldStrict(property)
+                } else {
+                    bytecode::Instruction::PutField(property)
+                },
+            );
             let _ = emit(compiler, bytecode::Instruction::GetLoc(value));
         },
         AssignmentStorage::Element { object, property } => {
@@ -4312,7 +4446,14 @@ fn store_assignment_target(compiler: Compiler, target: AssignmentTarget) -> () {
             let _ = emit(compiler, bytecode::Instruction::GetLoc(object));
             let _ = emit(compiler, bytecode::Instruction::GetLoc(property));
             let _ = emit(compiler, bytecode::Instruction::GetLoc(value));
-            let _ = emit(compiler, bytecode::Instruction::PutArrayEl);
+            let _ = emit(
+                compiler,
+                if compiler_is_strict(compiler) {
+                    bytecode::Instruction::PutArrayElStrict
+                } else {
+                    bytecode::Instruction::PutArrayEl
+                },
+            );
             let _ = emit(compiler, bytecode::Instruction::GetLoc(value));
         },
         AssignmentStorage::WithIdentifier { receiver, property, name, span } => {
@@ -4884,7 +5025,14 @@ fn compile_expression_with_inferred_name(compiler: Compiler, expression: ast::Ex
             let _ = emit(compiler, bytecode::Instruction::PushConst(index));
         },
         ast::Expr::Class { name: None, heritage, elements, span } => {
-            compile_class_expression(compiler, Option::Some(name), heritage, elements, span)
+            compile_class_value(
+                compiler,
+                Option::Some(name),
+                heritage,
+                elements,
+                span,
+                Option::None,
+            )
         },
         value => compile_expression(compiler, value),
     }
@@ -5327,8 +5475,29 @@ fn compile_function_declaration(
     if name == "" {
         return
     }
-    if function_body_is_strict(body) && (name == "eval" || name == "arguments") {
-        compile_error(compiler, "invalid strict binding `" + name + "`", span)
+    if emit_var_update {
+        match compiler.block_function_vars.get(span.start) {
+            Some(target) => match compiler.scopes[compiler.scopes.len() - 1].bindings.get(name) {
+                Some(binding) => if match target {
+                    AnnexBVarUpdate::Local(index) => binding.index != index,
+                    _ => true,
+                } {
+                    let _ = emit(compiler, bytecode::Instruction::GetLoc(binding.index));
+                    compile_annex_b_var_update(compiler, target);
+                    return
+                },
+                None => (),
+            },
+            None => (),
+        }
+    }
+    if function_body_is_strict(body) {
+        if strict_reserved_identifier(name) {
+            compile_error(compiler, "reserved word cannot be used as an identifier", span)
+        }
+        if name == "eval" || name == "arguments" {
+            compile_error(compiler, "invalid strict binding `" + name + "`", span)
+        }
     }
     let scope = compiler.scopes[compiler.scopes.len() - 1];
     let binding = match scope.bindings.get(name) {
@@ -5417,6 +5586,10 @@ fn compile_annex_b_var_update(compiler: Compiler, target: AnnexBVarUpdate) -> ()
             let _ = emit(compiler, bytecode::Instruction::SetEval(index));
             let _ = emit(compiler, bytecode::Instruction::Drop);
         },
+        AnnexBVarUpdate::Arguments(index, depth) => {
+            let _ = emit(compiler, bytecode::Instruction::SetEvalOrArguments(index, depth));
+            let _ = emit(compiler, bytecode::Instruction::Drop);
+        },
     }
 }
 
@@ -5456,6 +5629,7 @@ fn compile_default_derived_constructor(parent: Compiler, name: Option[string], s
     );
     compiler_inherit_source(child, parent);
     child.source_name.set(parent.source_name.get());
+    let _ = emit(child, bytecode::Instruction::PushSuperConstructor);
     let _ = emit(child, bytecode::Instruction::PushRest(0));
     let _ = emit(child, bytecode::Instruction::CallSuperArray);
     let _ = emit(child, bytecode::Instruction::Return);
@@ -5478,6 +5652,10 @@ fn compile_default_derived_constructor(parent: Compiler, name: Option[string], s
         false,
     );
     function.set_eval_sites(child.eval_sites);
+    match name {
+        Some(value) => function.set_name(js_string(value)),
+        None => (),
+    }
     append_verifier_errors(child, function, span);
     for error in child.errors {
         parent.errors.push(error)
@@ -5573,7 +5751,19 @@ fn compile_class_field_initializer(
             }
             match element.initializer {
                 Some(value) => if element.computed_name.is_some() {
-                    compile_expression(child, value.get())
+                    if anonymous_function_definition(value.get()) {
+                        let upvalue = upvalue_index(
+                            child,
+                            "$class_key_" + element_index.to_string(),
+                            bytecode::UpvalueSource::Local(computed_key_locals[element_index]),
+                            BindingKind::Const,
+                        );
+                        let _ = emit(child, bytecode::Instruction::GetUpvalue(upvalue));
+                        compile_expression(child, value.get());
+                        let _ = emit(child, bytecode::Instruction::SetFunctionName(0));
+                    } else {
+                        compile_expression(child, value.get())
+                    }
                 } else {
                     compile_expression_with_inferred_name(
                         child,
@@ -5677,7 +5867,19 @@ fn compile_class_static_initializer(
         }
         match element.initializer {
             Some(value) => if element.computed_name.is_some() {
-                compile_expression(child, value.get())
+                if anonymous_function_definition(value.get()) {
+                    let upvalue = upvalue_index(
+                        child,
+                        "$class_static_key",
+                        bytecode::UpvalueSource::Local(computed_key_local),
+                        BindingKind::Const,
+                    );
+                    let _ = emit(child, bytecode::Instruction::GetUpvalue(upvalue));
+                    compile_expression(child, value.get());
+                    let _ = emit(child, bytecode::Instruction::SetFunctionName(0));
+                } else {
+                    compile_expression(child, value.get())
+                }
             } else {
                 compile_expression_with_inferred_name(
                     child,
@@ -5868,10 +6070,7 @@ fn compile_class_value(
             }
         }
     }
-    let class_index = match binding_index {
-        Some(value) => value,
-        None => new_local(compiler),
-    };
+    let class_index = new_local(compiler);
     let constructor = class_constructor_element(elements);
     let (parameters, body, constructor_span) = match constructor {
         Some(element) => (element.parameters, element.body, element.span),
@@ -5922,6 +6121,13 @@ fn compile_class_value(
             },
             None => computed_key_locals.push(-1),
         }
+    }
+    match binding_index {
+        Some(index) => {
+            let _ = emit(compiler, bytecode::Instruction::GetLoc(class_index));
+            let _ = emit(compiler, bytecode::Instruction::PutLoc(index));
+        },
+        None => (),
     }
     let private_key_locals: Vec[isize] = Vec::new();
     let private_method_locals: Vec[isize] = Vec::new();
@@ -6242,44 +6448,44 @@ fn compile_export_default(compiler: Compiler, expression: ast::Expr, local: stri
 
 fn initialize_function_declarations(compiler: Compiler, body: Vec[ast::Stmt]) -> () {
     for statement in body {
-        match statement {
-            ast::Stmt::FunctionDeclaration { name, parameters, body, generator, asynchronous, span } => {
-                compile_function_declaration(
-                    compiler,
-                    name,
-                    parameters,
-                    body,
-                    generator,
-                    asynchronous,
-                    span,
-                    false,
-                )
-            },
-            ast::Stmt::ExportDeclaration { declaration, .. } => match declaration.get() {
-                ast::Stmt::FunctionDeclaration {
-                    name,
-                    parameters,
-                    body,
-                    generator,
-                    asynchronous,
-                    span,
-                } => compile_function_declaration(
-                    compiler,
-                    name,
-                    parameters,
-                    body,
-                    generator,
-                    asynchronous,
-                    span,
-                    false,
-                ),
-                _ => (),
-            },
-            ast::Stmt::ExportDefault { expression, local, hoisted: true, span, .. } => {
-                compile_export_default(compiler, expression.get(), local, span)
-            },
+        initialize_function_declaration_statement(compiler, statement)
+    }
+}
+
+fn initialize_function_declaration_statement(compiler: Compiler, statement: ast::Stmt) -> () {
+    match statement {
+        ast::Stmt::FunctionDeclaration { name, parameters, body, generator, asynchronous, span } => {
+            compile_function_declaration(
+                compiler,
+                name,
+                parameters,
+                body,
+                generator,
+                asynchronous,
+                span,
+                false,
+            )
+        },
+        ast::Stmt::Labelled { body, .. } => {
+            initialize_function_declaration_statement(compiler, body.get())
+        },
+        ast::Stmt::ExportDeclaration { declaration, .. } => match declaration.get() {
+            ast::Stmt::FunctionDeclaration { name, parameters, body, generator, asynchronous, span } => compile_function_declaration(
+                compiler,
+                name,
+                parameters,
+                body,
+                generator,
+                asynchronous,
+                span,
+                false,
+            ),
             _ => (),
-        }
+        },
+        ast::Stmt::ExportDefault { expression, local, hoisted: true, span, .. } => {
+            compile_export_default(compiler, expression.get(), local, span)
+        },
+        _ => (),
     }
 }
 
@@ -6371,7 +6577,8 @@ fn compile_if_branch(compiler: Compiler, statement: ast::Stmt) -> () {
             push_scope(compiler);
             declare_lexical_statement(compiler, statement);
             initialize_lexical_bindings(compiler);
-            compile_statement(compiler, statement);
+            initialize_function_declaration_statement(compiler, statement);
+            compile_body_statements(compiler, Vec::from_array([statement]));
             pop_scope(compiler)
         },
         _ => compile_statement(compiler, statement),
@@ -6473,7 +6680,12 @@ fn compile_for_iteration(
     }
     match initializer {
         Some(value) => {
-            compile_expression(compiler, value.get());
+            match binding_inferred_name(pattern) {
+                Some(name) => {
+                    compile_expression_with_inferred_name(compiler, value.get(), name)
+                },
+                None => compile_expression(compiler, value.get()),
+            }
             compile_binding_pattern(compiler, pattern)
         },
         None => (),
@@ -6658,6 +6870,9 @@ fn compile_switch(compiler: Compiler, discriminant: ast::Expr, cases: Vec[ast::S
     push_scope(compiler);
     declare_switch_lexicals(compiler, cases);
     initialize_lexical_bindings(compiler);
+    for clause in cases {
+        initialize_function_declarations(compiler, clause.consequent)
+    }
     let dispatches: Vec[SwitchJump] = Vec::new();
     let mut default_index: Option[isize] = Option::None;
     let mut case_index = 0;
@@ -6681,7 +6896,7 @@ fn compile_switch(compiler: Compiler, discriminant: ast::Expr, cases: Vec[ast::S
     push_breakable(compiler);
     for clause in cases {
         case_targets.push(current_offset(compiler));
-        compile_body(compiler, clause.consequent)
+        compile_body_statements(compiler, clause.consequent)
     }
     let break_context = pop_breakable(compiler);
     let exit_target = current_offset(compiler);
@@ -6883,7 +7098,10 @@ fn compile_with_statement(compiler: Compiler, object: ast::Expr, body: ast::Stmt
             let _ = emit(compiler, bytecode::Instruction::Drop);
         },
     }
-    compiler.with_bindings.insert(0, WithBinding { name, scope_index: with_scope_index });
+    compiler.with_bindings.insert(
+        0,
+        WithBinding { name, scope_index: with_scope_index, outer_index: -1 },
+    );
     compile_statement(compiler, body);
     let _ = compiler.with_bindings.remove(0);
     pop_scope(compiler)
@@ -7016,14 +7234,24 @@ fn compile_statement(compiler: Compiler, statement: ast::Stmt) -> () {
                 asynchronous,
             )
         },
-        ast::Stmt::ForIn { kind, pattern, initializer, target, object, body, span, .. } => {
+        ast::Stmt::ForIn {
+            kind,
+            pattern,
+            initializer,
+            target,
+            assignment_pattern,
+            object,
+            body,
+            span,
+            ..,
+        } => {
             compile_for_iteration(
                 compiler,
                 kind,
                 pattern.get(),
                 initializer,
                 target,
-                Option::None,
+                assignment_pattern,
                 object.get(),
                 body.get(),
                 span,
@@ -7081,6 +7309,10 @@ fn compile_statement(compiler: Compiler, statement: ast::Stmt) -> () {
 
 fn compile_body(compiler: Compiler, body: Vec[ast::Stmt]) -> () {
     initialize_function_declarations(compiler, body);
+    compile_body_statements(compiler, body)
+}
+
+fn compile_body_statements(compiler: Compiler, body: Vec[ast::Stmt]) -> () {
     for statement in body {
         match statement {
             ast::Stmt::FunctionDeclaration { name, parameters, body, generator, asynchronous, span } => if compiler.block_function_vars.get(
@@ -7416,6 +7648,7 @@ fn compile_array_rest_binding(
     iterator: isize,
     next: isize,
     done: isize,
+    protected_segments: Vec[(isize, isize)],
 ) -> () {
     let array = new_local(compiler);
     let value = new_local(compiler);
@@ -7444,7 +7677,9 @@ fn compile_array_rest_binding(
     let exit_target = current_offset(compiler);
     let _ = patch_jump(compiler, already_done, exit_target);
     let _ = emit(compiler, bytecode::Instruction::GetLoc(array));
-    compile_binding_pattern(compiler, pattern)
+    begin_protected_region(compiler);
+    compile_binding_pattern(compiler, pattern);
+    append_finished_protected_segments(compiler, protected_segments)
 }
 
 fn compile_array_binding_pattern(compiler: Compiler, elements: Vec[ast::ArrayBindingElement]) -> () {
@@ -7459,7 +7694,7 @@ fn compile_array_binding_pattern(compiler: Compiler, elements: Vec[ast::ArrayBin
     compiler.finalizers.push(
         FinallyContext { kind: FinalizerKind::Iterator(iterator), active: true },
     );
-    begin_protected_region(compiler);
+    let protected_segments: Vec[(isize, isize)] = Vec::new();
     for element in elements {
         match element {
             ast::ArrayBindingElement::Hole => {
@@ -7467,15 +7702,23 @@ fn compile_array_binding_pattern(compiler: Compiler, elements: Vec[ast::ArrayBin
                 let _ = emit(compiler, bytecode::Instruction::Drop);
             },
             ast::ArrayBindingElement::Element { pattern, initializer, rest, .. } => if rest {
-                compile_array_rest_binding(compiler, pattern.get(), iterator, next, done)
+                compile_array_rest_binding(
+                    compiler,
+                    pattern.get(),
+                    iterator,
+                    next,
+                    done,
+                    protected_segments,
+                )
             } else {
                 compile_iterator_binding_value(compiler, iterator, next, done);
+                begin_protected_region(compiler);
                 compile_binding_initializer(compiler, initializer, pattern.get());
-                compile_binding_pattern(compiler, pattern.get())
+                compile_binding_pattern(compiler, pattern.get());
+                append_finished_protected_segments(compiler, protected_segments)
             },
         }
     }
-    let protected_segments = finish_protected_region(compiler);
     let _ = compiler.finalizers.pop();
     let _ = emit(compiler, bytecode::Instruction::GetLoc(done));
     let skip_close = emit(compiler, bytecode::Instruction::IfTrue(-1));
@@ -7486,9 +7729,14 @@ fn compile_array_binding_pattern(compiler: Compiler, elements: Vec[ast::ArrayBin
     let handler_target = current_offset(compiler);
     let exception = new_local(compiler);
     let _ = emit(compiler, bytecode::Instruction::PutLoc(exception));
+    let _ = emit(compiler, bytecode::Instruction::GetLoc(done));
+    let direct_throw = emit(compiler, bytecode::Instruction::IfTrue(-1));
     let _ = emit(compiler, bytecode::Instruction::GetLoc(iterator));
     let _ = emit(compiler, bytecode::Instruction::GetLoc(exception));
     let _ = emit(compiler, bytecode::Instruction::IteratorCloseThrow);
+    let _ = emit(compiler, bytecode::Instruction::Throw);
+    let _ = patch_jump(compiler, direct_throw, current_offset(compiler));
+    let _ = emit(compiler, bytecode::Instruction::GetLoc(exception));
     let _ = emit(compiler, bytecode::Instruction::Throw);
     for (start, end) in protected_segments {
         add_exception_handler(compiler, start, end, handler_target)
@@ -7948,10 +8196,14 @@ fn compiler_new(
         parameter_names: collections::HashSet::new(),
         catch_scopes: Vec::new(),
     };
+    let mut outer_index = 0;
     for binding in compiler.outer_bindings {
         if binding.name.starts_with("$with_environment_") {
-            compiler.with_bindings.push(WithBinding { name: binding.name, scope_index: -1 })
+            compiler.with_bindings.push(
+                WithBinding { name: binding.name, scope_index: -1, outer_index },
+            )
         }
+        outer_index += 1;
     }
     match recursive_name {
         Some(name) => {
@@ -8023,7 +8275,7 @@ fn module_binding_index(compiler: Compiler, name: string, span: ast::Span) -> is
 
 fn push_module_export(compiler: Compiler, exports: Vec[ModuleExport], value: ModuleExport) -> () {
     for current in exports {
-        if value.exported != "*" && current.exported == value.exported {
+        if !value.star && !current.star && current.exported == value.exported {
             compile_error(compiler, "duplicate module export `" + value.exported + "`", value.span);
             return
         }
@@ -8047,6 +8299,7 @@ fn collect_module_declaration_exports(
                         exports,
                         ModuleExport {
                             exported: name,
+                            star: false,
                             source: Option::None,
                             imported: name,
                             local_index: module_binding_index(compiler, name, span),
@@ -8066,6 +8319,7 @@ fn collect_module_declaration_exports(
             exports,
             ModuleExport {
                 exported: name,
+                star: false,
                 source: Option::None,
                 imported: name,
                 local_index: module_binding_index(compiler, name, span),
@@ -8189,6 +8443,7 @@ fn collect_module_metadata(compiler: Compiler, body: Vec[ast::Stmt]) -> (
                         exports,
                         ModuleExport {
                             exported: specifier.exported,
+                            star: false,
                             source,
                             imported: specifier.local,
                             local_index: match source {
@@ -8213,6 +8468,7 @@ fn collect_module_metadata(compiler: Compiler, body: Vec[ast::Stmt]) -> (
                 exports,
                 ModuleExport {
                     exported: "default",
+                    star: false,
                     source: Option::None,
                     imported: local,
                     local_index: module_binding_index(compiler, local, span),
@@ -8225,6 +8481,7 @@ fn collect_module_metadata(compiler: Compiler, body: Vec[ast::Stmt]) -> (
                 exports,
                 ModuleExport {
                     exported: "*",
+                    star: true,
                     source: Option::Some(source),
                     imported: "*",
                     local_index: -1,
@@ -8249,6 +8506,7 @@ fn collect_module_metadata(compiler: Compiler, body: Vec[ast::Stmt]) -> (
                     exports,
                     ModuleExport {
                         exported,
+                        star: false,
                         source: Option::None,
                         imported: local,
                         local_index: module_binding_index(compiler, local, span),
@@ -8735,9 +8993,13 @@ pub fn compile_dynamic_function(
         false,
     );
     parent.allow_unknown_globals.set(true);
+    compiler_set_source(
+        parent,
+        dynamic_function_prefix(kind) + " anonymous() {\n" + body_source + "\n}",
+    );
     let function = compile_nested_function(
         parent,
-        Option::Some("anonymous"),
+        Option::None,
         parameters,
         body,
         span,
@@ -8750,6 +9012,7 @@ pub fn compile_dynamic_function(
         generator,
         asynchronous,
     );
+    function.set_name(js_string("anonymous"));
     function.set_definition_location(bytecode::SourceLocation { line: 1, column: 2 });
     function.set_source_text(
         js_string(

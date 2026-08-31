@@ -399,6 +399,7 @@ fn scan_identifier_escape(source: string, slash: isize) -> IdentifierEscapeScan 
     if digit_start < source.byte_len() && source.byte_get(digit_start) == b'{' {
         let mut index = digit_start + 1;
         let mut count = 0;
+        let mut significant = 0;
         let mut codepoint = 0.to_u32();
         let mut valid = true;
         while index < source.byte_len() && source.byte_get(index) != b'}'
@@ -406,10 +407,13 @@ fn scan_identifier_escape(source: string, slash: isize) -> IdentifierEscapeScan 
             match hex_value(source.byte_get(index)) {
                 Some(value) => {
                     count += 1;
-                    if count <= 6 {
-                        codepoint = codepoint * 16 + value;
-                    } else {
-                        valid = false;
+                    if value != 0 || significant > 0 {
+                        significant += 1;
+                        if significant <= 6 {
+                            codepoint = codepoint * 16 + value;
+                        } else {
+                            valid = false;
+                        }
                     }
                 },
                 None => {
@@ -642,18 +646,24 @@ fn unicode_escape_value(source: string, slash: isize) -> Option[(u32, isize)] {
     if source.byte_get(start) == b'{' {
         let mut index = start + 1;
         let mut count = 0;
+        let mut significant = 0;
         let mut value = 0.to_u32();
         while index < source.byte_len() && source.byte_get(index) != b'}' {
             match hex_value(source.byte_get(index)) {
                 Some(digit) => {
-                    value = value * 16 + digit;
                     count += 1;
+                    if digit != 0 || significant > 0 {
+                        significant += 1;
+                        if significant <= 6 {
+                            value = value * 16 + digit;
+                        }
+                    }
                 },
                 None => return Option::None,
             }
             index += 1;
         }
-        if index < source.byte_len() && count > 0 && count <= 6 && value <= 1114111 {
+        if index < source.byte_len() && count > 0 && significant <= 6 && value <= 1114111 {
             Option::Some((value, index + 1))
         } else {
             Option::None
@@ -751,13 +761,19 @@ fn scan_unicode_escape(
     if start < source.byte_len() && source.byte_get(start) == b'{' {
         let mut index = start + 1;
         let mut count = 0;
+        let mut significant = 0;
         let mut codepoint = 0.to_u32();
         while index < source.byte_len() && source.byte_get(index) != b'}'
             && hex_value(source.byte_get(index)).is_some() {
             match hex_value(source.byte_get(index)) {
                 Some(value) => {
-                    codepoint = codepoint * 16 + value;
                     count += 1;
+                    if value != 0 || significant > 0 {
+                        significant += 1;
+                        if significant <= 6 {
+                            codepoint = codepoint * 16 + value;
+                        }
+                    }
                 },
                 None => (),
             }
@@ -768,7 +784,7 @@ fn scan_unicode_escape(
             index
         } else {
             let end = index + 1;
-            if count == 0 || count > 6 || codepoint > 1114111 {
+            if count == 0 || significant > 6 || codepoint > 1114111 {
                 push_error(errors, "invalid Unicode escape", slash, end)
             } else {
                 match if codepoint >= 0xd800 && codepoint <= 0xdbff {

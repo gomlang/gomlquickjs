@@ -628,6 +628,33 @@ fn assignment_target(value: ast::Expr) -> bool {
     }
 }
 
+fn call_assignment_target(value: ast::Expr) -> bool {
+    match value {
+        ast::Expr::Call { callee, optional, .. } => {
+            !optional && !has_optional_chain(callee.get())
+        },
+        ast::Expr::Parenthesized { expression, .. } => call_assignment_target(expression.get()),
+        _ => false,
+    }
+}
+
+fn valid_assignment_target(parser: Parser, value: ast::Expr) -> bool {
+    assignment_target(value) || !current_context(parser).strict && call_assignment_target(value)
+}
+
+fn valid_assignment_operator_target(
+    parser: Parser,
+    value: ast::Expr,
+    operator: ast::AssignmentOperator,
+) -> bool {
+    assignment_target(value)
+        || operator != ast::AssignmentOperator::LogicalAnd
+            && operator != ast::AssignmentOperator::LogicalOr
+            && operator != ast::AssignmentOperator::NullishCoalescing
+            && !current_context(parser).strict
+            && call_assignment_target(value)
+}
+
 fn has_optional_chain(value: ast::Expr) -> bool {
     match value {
         ast::Expr::Member { object, optional, .. } => {
@@ -1187,7 +1214,8 @@ fn parse_arrow_function(
             _ => current_token(parser).span.start,
         }
     } else {
-        let expression = if is_expression_boundary(current_kind(parser)) {
+        let expression = if is_expression_boundary(current_kind(parser))
+            && !identifier_allowed(parser, current_token(parser)) {
             error_expr(parser, "expected arrow function body")
         } else {
             parse_assignment_expression(parser)
@@ -1582,7 +1610,8 @@ fn parse_object_accessor(parser: Parser) -> Option[ast::ObjectProperty] {
         ast::Expr::Function { parameters, .. } => if kind == ast::ObjectPropertyKind::Getter
             && !parameters.is_empty() {
             report(parser, "getter must not have parameters", convert_span(modifier.span))
-        } else if kind == ast::ObjectPropertyKind::Setter && parameters.len() != 1 {
+        } else if kind == ast::ObjectPropertyKind::Setter
+            && (parameters.len() != 1 || parameters[0].rest) {
             report(parser, "setter must have exactly one parameter", convert_span(modifier.span))
         },
         _ => (),
@@ -2252,6 +2281,10 @@ fn parse_call(parser: Parser, callee: ast::Expr, optional: bool) -> ast::Expr {
 }
 
 fn parse_postfix(parser: Parser, initial: ast::Expr) -> ast::Expr {
+    match initial {
+        ast::Expr::Arrow { .. } => return initial,
+        _ => (),
+    }
     let mut expression = initial;
     let mut optional_chain = false;
     let mut done = false;
@@ -2375,7 +2408,7 @@ fn parse_postfix(parser: Parser, initial: ast::Expr) -> ast::Expr {
     match update_operator(current_kind(parser)) {
         Some(operator) => if !current_token(parser).line_break_before {
             let token = bump(parser);
-            if !assignment_target(expression) {
+            if !valid_assignment_target(parser, expression) {
                 report(parser, "invalid update target", convert_span(token.span))
             }
             expression = ast::Expr::Update {
@@ -2499,7 +2532,7 @@ fn parse_prefix(parser: Parser) -> ast::Expr {
         Some(operator) => {
             let token = bump(parser);
             let argument = parse_prefix(parser);
-            if !assignment_target(argument) {
+            if !valid_assignment_target(parser, argument) {
                 report(parser, "invalid update target", convert_span(token.span))
             }
             let end = expr_end(argument);
@@ -3074,7 +3107,7 @@ fn parse_assignment_expression(parser: Parser) -> ast::Expr {
     match assignment_operator(current_kind(parser)) {
         Some(operator) => {
             let token = bump(parser);
-            if !assignment_target(left) {
+            if !valid_assignment_operator_target(parser, left, operator) {
                 report(parser, "invalid assignment target", convert_span(token.span))
             }
             let right = if is_expression_boundary(current_kind(parser)) {
@@ -4019,7 +4052,7 @@ fn parse_class_element(parser: Parser) -> Option[ast::ClassElement] {
     pop_context(parser);
     if kind == ast::ClassElementKind::Getter && !parameters.is_empty() {
         report(parser, "getter must not have parameters", ast::span(start, name_end))
-    } else if kind == ast::ClassElementKind::Setter && parameters.len() != 1 {
+    } else if kind == ast::ClassElementKind::Setter && (parameters.len() != 1 || parameters[0].rest) {
         report(parser, "setter must have exactly one parameter", ast::span(start, name_end))
     }
     let body: Vec[ast::Stmt] = Vec::new();
@@ -4460,6 +4493,7 @@ fn parse_for_statement(parser: Parser) -> ast::Stmt {
                     pattern: Ref::new(pattern),
                     initializer: Option::Some(Ref::new(initialized)),
                     target: Option::None,
+                    assignment_pattern: Option::None,
                     object: Ref::new(object),
                     body: Ref::new(body),
                     span: ast::span(start, end),
@@ -4534,6 +4568,7 @@ fn parse_for_statement(parser: Parser) -> ast::Stmt {
                     pattern: Ref::new(pattern),
                     initializer: Option::None,
                     target: Option::None,
+                    assignment_pattern: Option::None,
                     object: Ref::new(source),
                     body: Ref::new(body),
                     span: ast::span(start, end),
@@ -4557,32 +4592,68 @@ fn parse_for_statement(parser: Parser) -> ast::Stmt {
             let saved_errors = parser.errors.len();
             let assignment_pattern = parse_assignment_pattern(parser);
             let separator = current_token(parser);
-            if separator.kind == lexer::TokenKind::Identifier && separator.value == "of"
-                && !separator.has_escape {
+            let for_of = separator.kind == lexer::TokenKind::Identifier && separator.value == "of"
+                && !separator.has_escape;
+            let for_in = separator.kind == lexer::TokenKind::InKeyword && !separator.has_escape;
+            if for_of || for_in {
+                if asynchronous && for_in {
+                    report(parser, "`for await` only supports `of`", convert_span(separator.span))
+                }
                 bump(parser);
-                let iterable = if at(parser, lexer::TokenKind::RParen) || at_eof(parser) {
-                    error_expr(parser, "expected iterable expression")
-                } else {
+                let source = if at(parser, lexer::TokenKind::RParen) || at_eof(parser) {
+                    error_expr(
+                        parser,
+                        if for_of {
+                            "expected iterable expression"
+                        } else {
+                            "expected object expression"
+                        },
+                    )
+                } else if for_of {
                     parse_assignment_expression(parser)
+                } else {
+                    parse_expression(parser)
                 };
-                let _ = finish_right_paren(parser, "expected `)` after for-of clauses");
+                let _ = finish_right_paren(
+                    parser,
+                    if for_of {
+                        "expected `)` after for-of clauses"
+                    } else {
+                        "expected `)` after for-in clauses"
+                    },
+                );
                 let body = parse_iteration_body(parser);
                 let end = stmt_end(body);
-                return ast::Stmt::ForOf {
-                    kind: ast::VariableKind::Var,
-                    name: "",
-                    pattern: Ref::new(
-                        ast::BindingPattern::Identifier {
-                            name: "",
-                            span: ast::assignment_pattern_span(assignment_pattern),
-                        },
-                    ),
-                    target: Option::None,
-                    assignment_pattern: Option::Some(Ref::new(assignment_pattern)),
-                    iterable: Ref::new(iterable),
-                    body: Ref::new(body),
-                    asynchronous,
-                    span: ast::span(start, end),
+                let pattern = Ref::new(
+                    ast::BindingPattern::Identifier {
+                        name: "",
+                        span: ast::assignment_pattern_span(assignment_pattern),
+                    },
+                );
+                return if for_of {
+                    ast::Stmt::ForOf {
+                        kind: ast::VariableKind::Var,
+                        name: "",
+                        pattern,
+                        target: Option::None,
+                        assignment_pattern: Option::Some(Ref::new(assignment_pattern)),
+                        iterable: Ref::new(source),
+                        body: Ref::new(body),
+                        asynchronous,
+                        span: ast::span(start, end),
+                    }
+                } else {
+                    ast::Stmt::ForIn {
+                        kind: ast::VariableKind::Var,
+                        name: "",
+                        pattern,
+                        initializer: Option::None,
+                        target: Option::None,
+                        assignment_pattern: Option::Some(Ref::new(assignment_pattern)),
+                        object: Ref::new(source),
+                        body: Ref::new(body),
+                        span: ast::span(start, end),
+                    }
                 }
             } else {
                 parser.index.set(saved);
@@ -4618,7 +4689,7 @@ fn parse_for_statement(parser: Parser) -> ast::Stmt {
                     ast::expr_span(expression),
                 )
             }
-            if !assignment_target(expression) {
+            if !valid_assignment_target(parser, expression) {
                 report(parser, "invalid for-of assignment target", ast::expr_span(expression))
             }
             bump(parser);
@@ -4648,7 +4719,7 @@ fn parse_for_statement(parser: Parser) -> ast::Stmt {
             if asynchronous {
                 report(parser, "`for await` only supports `of`", ast::expr_span(expression))
             }
-            if !assignment_target(expression) {
+            if !valid_assignment_target(parser, expression) {
                 report(parser, "invalid for-in assignment target", ast::expr_span(expression))
             }
             bump(parser);
@@ -4677,6 +4748,7 @@ fn parse_for_statement(parser: Parser) -> ast::Stmt {
                 ),
                 initializer: Option::None,
                 target: Option::Some(Ref::new(expression)),
+                assignment_pattern: Option::None,
                 object: Ref::new(object),
                 body: Ref::new(body),
                 span: ast::span(start, end),
@@ -5729,6 +5801,9 @@ fn parse_pass(
         )
     }
     let body: Vec[ast::Stmt] = Vec::new();
+    if function_body_has_strict_directive(parser) {
+        set_current_context_strict(parser)
+    }
     let mut directive_prologue = true;
     while !at_eof(parser) {
         let before = parser.index.get();

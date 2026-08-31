@@ -219,11 +219,7 @@ fn arraybuffer_index_at_depth(context: vm::Context, value: runtime::Value, depth
     vm::VmError,
 ] {
     let number = arraybuffer_index_number_at_depth(context, value, depth)?;
-    if number > 2147483647.0 {
-        Result::Err(function_range_error("index is out of range"))
-    } else {
-        Result::Ok(num::parse_int_structured(dtoa::number_to_string(number)).unwrap_or(0))
-    }
+    Result::Ok(num::parse_int_structured(dtoa::number_to_string(number)).unwrap_or(0))
 }
 
 fn optional_index_at_depth(
@@ -4688,14 +4684,7 @@ fn typed_array_set_shared(
     arguments: Vec[runtime::Value],
     depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
-    let (target_value, _) = typed_array_receiver(context, this_value)?;
-    let offset = if arguments.len() > 1 {
-        typed_array_offset(context, arguments[1], depth)?
-    } else {
-        0
-    };
-    let (_, target_length) = typed_array_receiver(context, target_value)?;
-    let target_object = match target_value {
+    let target_object = match this_value {
         runtime::Value::Object(value) => value,
         _ => return Result::Err(function_vm_error("TypedArray method requires a TypedArray")),
     };
@@ -4703,6 +4692,13 @@ fn typed_array_set_shared(
         Some(value) => value,
         None => return Result::Err(function_vm_error("TypedArray method requires a TypedArray")),
     };
+    let target_length = typed_array_view_length(target);
+    let offset = if arguments.len() > 1 {
+        typed_array_offset(context, arguments[1], depth)?
+    } else {
+        0
+    };
+    let _ = typed_array_receiver(context, this_value)?;
     let source = argument(arguments, 0);
     match source {
         runtime::Value::Object(object) => match runtime::typed_array_view(context.heap(), object) {
@@ -4736,6 +4732,226 @@ fn typed_array_validate_mapper(mapper: runtime::Value) -> Result[(), vm::VmError
             Result::Err(function_vm_error("TypedArray.from mapper is not callable"))
         },
         _ => Result::Err(function_vm_error("TypedArray.from mapper is not callable")),
+    }
+}
+
+struct TypedArrayCollectedValues {
+    value: runtime::Value,
+    length: isize,
+}
+
+fn typed_array_iterator_method(context: vm::Context, source: runtime::Value, depth: isize) -> Result[
+    Option[runtime::Value],
+    vm::VmError,
+] {
+    match source {
+        runtime::Value::Undefined | runtime::Value::Null => {
+            return Result::Err(function_vm_error("TypedArray.from requires an input value"))
+        },
+        _ => (),
+    }
+    let symbol = match context.iterator_symbol() {
+        Some(value) => value,
+        None => return Result::Err(function_vm_error("iterator symbol is not installed")),
+    };
+    let method = context.read_property_at_depth(source, runtime::Value::Symbol(symbol), depth)?;
+    match method {
+        runtime::Value::Undefined | runtime::Value::Null => Result::Ok(Option::None),
+        runtime::Value::Object(object) => if object.is_callable() {
+            Result::Ok(Option::Some(method))
+        } else {
+            Result::Err(function_vm_error("iterator method is not callable"))
+        },
+        _ => Result::Err(function_vm_error("iterator method is not callable")),
+    }
+}
+
+fn typed_array_collect_iterator_values(
+    context: vm::Context,
+    source: runtime::Value,
+    method: runtime::Value,
+    depth: isize,
+) -> Result[TypedArrayCollectedValues, vm::VmError] {
+    let array = match runtime::new_array(context.heap(), 0) {
+        Ok(value) => runtime::Value::Object(value),
+        Err(value) => return Result::Err(function_vm_error(value.message)),
+    };
+    array_from_with_root(
+        context,
+        array,
+        || {
+            let iterator = context.invoke_with_this_at_depth(method, Vec::new(), source, depth)?;
+            match iterator {
+                runtime::Value::Object(_) => (),
+                _ => return Result::Err(function_vm_error("iterator result is not an object")),
+            }
+            array_from_with_root(
+                context,
+                iterator,
+                || {
+                    let next = context.read_property_at_depth(
+                        iterator,
+                        runtime::Value::String(js_string("next")),
+                        depth,
+                    )?;
+                    match next {
+                        runtime::Value::Object(object) => if !object.is_callable() {
+                            return Result::Err(function_vm_error("iterator next is not callable"))
+                        },
+                        _ => return Result::Err(function_vm_error("iterator next is not callable")),
+                    }
+                    let mut index = 0;
+                    while index < ARRAY_FROM_LIMIT {
+                        let result = context.invoke_with_this_at_depth(
+                            next,
+                            Vec::new(),
+                            iterator,
+                            depth,
+                        )?;
+                        match result {
+                            runtime::Value::Object(_) => (),
+                            _ => return Result::Err(
+                                function_vm_error("iterator next result is not an object"),
+                            ),
+                        }
+                        let done = context.read_property_at_depth(
+                            result,
+                            runtime::Value::String(js_string("done")),
+                            depth,
+                        )?;
+                        if runtime::to_boolean(done) {
+                            return Result::Ok(
+                                TypedArrayCollectedValues { value: array, length: index },
+                            )
+                        }
+                        let value = context.read_property_at_depth(
+                            result,
+                            runtime::Value::String(js_string("value")),
+                            depth,
+                        )?;
+                        context.create_data_property_at_depth(
+                            array,
+                            runtime::Value::Int(index.to_i32()),
+                            value,
+                            depth,
+                        )?;
+                        index += 1;
+                    }
+                    Result::Err(
+                        function_range_error("TypedArray.from input exceeds implementation limit"),
+                    )
+                },
+            )
+        },
+    )
+}
+
+fn typed_array_from_collected_values(
+    context: vm::Context,
+    constructor: runtime::Value,
+    collected: TypedArrayCollectedValues,
+    mapper: runtime::Value,
+    this_argument: runtime::Value,
+    depth: isize,
+) -> Result[runtime::Value, vm::VmError] {
+    array_from_with_root(
+        context,
+        collected.value,
+        || {
+            let target = typed_array_intrinsic_create(context, constructor, collected.length, depth)?;
+            array_from_with_root(
+                context,
+                target,
+                || {
+                    let mut index = 0;
+                    while index < collected.length {
+                        let value = context.read_property_at_depth(
+                            collected.value,
+                            runtime::Value::Int(index.to_i32()),
+                            depth,
+                        )?;
+                        let mapped = array_from_map(
+                            context,
+                            mapper,
+                            this_argument,
+                            value,
+                            index,
+                            depth,
+                        )?;
+                        typed_array_write_value(context, target, index, mapped, depth)?;
+                        index += 1;
+                    }
+                    Result::Ok(target)
+                },
+            )
+        },
+    )
+}
+
+fn typed_array_from_array_like(
+    context: vm::Context,
+    constructor: runtime::Value,
+    source: runtime::Value,
+    mapper: runtime::Value,
+    this_argument: runtime::Value,
+    depth: isize,
+) -> Result[runtime::Value, vm::VmError] {
+    let length = array_iterator_length(context, source, depth)?;
+    if length > ARRAY_FROM_LIMIT {
+        return Result::Err(
+            function_range_error("TypedArray.from input exceeds implementation limit"),
+        )
+    }
+    let target = typed_array_intrinsic_create(context, constructor, length, depth)?;
+    array_from_with_root(
+        context,
+        target,
+        || {
+            let mut index = 0;
+            while index < length {
+                let value = context.read_property_at_depth(
+                    source,
+                    runtime::Value::Int(index.to_i32()),
+                    depth,
+                )?;
+                let mapped = array_from_map(context, mapper, this_argument, value, index, depth)?;
+                typed_array_write_value(context, target, index, mapped, depth)?;
+                index += 1;
+            }
+            Result::Ok(target)
+        },
+    )
+}
+
+fn typed_array_from(
+    context: vm::Context,
+    constructor: runtime::Value,
+    source: runtime::Value,
+    mapper: runtime::Value,
+    this_argument: runtime::Value,
+    depth: isize,
+) -> Result[runtime::Value, vm::VmError] {
+    typed_array_validate_mapper(mapper)?;
+    match typed_array_iterator_method(context, source, depth)? {
+        Some(method) => {
+            let collected = typed_array_collect_iterator_values(context, source, method, depth)?;
+            typed_array_from_collected_values(
+                context,
+                constructor,
+                collected,
+                mapper,
+                this_argument,
+                depth,
+            )
+        },
+        None => typed_array_from_array_like(
+            context,
+            constructor,
+            source,
+            mapper,
+            this_argument,
+            depth,
+        ),
     }
 }
 
@@ -4831,6 +5047,7 @@ fn typed_array_to_locale_string(
     arguments: Vec[runtime::Value],
     depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
+    let _ = arguments;
     let (object, length) = typed_array_receiver(context, this_value)?;
     let mut output = js_string("");
     let mut index = 0;
@@ -4847,7 +5064,7 @@ fn typed_array_to_locale_string(
                     runtime::Value::String(js_string("toLocaleString")),
                     depth,
                 )?;
-                let localized = context.invoke_with_this_at_depth(method, arguments, value, depth)?;
+                let localized = context.invoke_with_this_at_depth(method, Vec::new(), value, depth)?;
                 let text = match string_value_at_depth(context, localized, depth)? {
                     runtime::Value::String(value) => value,
                     _ => return Result::Err(function_vm_error("localized value is not a string")),
@@ -6022,13 +6239,11 @@ fn install_shared_typed_array(context: vm::Context, install: ArrayBufferInstall)
             "TypedArray.from",
             1,
             |this_value, arguments, depth| {
-                let mapper = argument(arguments, 1);
-                typed_array_validate_mapper(mapper)?;
-                typed_array_from_values_shared(
+                typed_array_from(
                     context,
                     this_value,
-                    typed_array_collect_values(context, argument(arguments, 0), depth)?,
-                    mapper,
+                    argument(arguments, 0),
+                    argument(arguments, 1),
                     argument(arguments, 2),
                     depth,
                 )
@@ -6604,6 +6819,15 @@ fn atomic_read(context: vm::Context, target: AtomicTarget, index: isize, depth: 
     runtime::Value,
     vm::VmError,
 ] {
+    match target.value {
+        runtime::Value::Object(object) => if runtime::is_typed_array_detached(
+            context.heap(),
+            object,
+        ) {
+            return Result::Err(function_vm_error("Atomics target buffer is detached"))
+        },
+        _ => return Result::Err(function_vm_error("Atomics target is not a TypedArray")),
+    }
     context.read_property_at_depth(target.value, runtime::Value::Int(index.to_i32()), depth)
 }
 
@@ -6614,6 +6838,15 @@ fn atomic_write(
     value: runtime::Value,
     depth: isize,
 ) -> Result[(), vm::VmError] {
+    match target.value {
+        runtime::Value::Object(object) => if runtime::is_typed_array_detached(
+            context.heap(),
+            object,
+        ) {
+            return Result::Err(function_vm_error("Atomics target buffer is detached"))
+        },
+        _ => return Result::Err(function_vm_error("Atomics target is not a TypedArray")),
+    }
     if context.reflect_set_at_depth(
         target.value,
         runtime::Value::Int(index.to_i32()),

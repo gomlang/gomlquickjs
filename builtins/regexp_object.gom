@@ -133,12 +133,28 @@ fn regexp_source(pattern: runtime::JsString) -> runtime::JsString {
     }
     let output: Vec[u16] = Vec::with_capacity(pattern.len());
     let mut index = 0;
+    let mut escaped = false;
+    let mut in_class = false;
     while index < pattern.len() {
         let value = pattern.get(index);
-        if value == 47 || value == 10 || value == 13 || value == 0x2028 || value == 0x2029 {
+        if value == 10 || value == 13 || value == 0x2028 || value == 0x2029 {
+            if escaped {
+                let _ = output.pop();
+            }
+            append_source_escape(output, value)
+        } else if value == 47 && !escaped && !in_class {
             append_source_escape(output, value)
         } else {
             output.push(value)
+        }
+        if escaped {
+            escaped = false;
+        } else if value == 92 {
+            escaped = true;
+        } else if value == 91 {
+            in_class = true;
+        } else if value == 93 {
+            in_class = false;
         }
         index += 1;
     }
@@ -947,7 +963,7 @@ fn regexp_match_at_depth(
     input_value: runtime::Value,
     depth: isize,
 ) -> Result[(RegExpState, runtime::JsString, Option[LocatedMatch]), vm::VmError] {
-    let (object, state) = match regexp_state(states, this_value) {
+    let (object, _) = match regexp_state(states, this_value) {
         Ok(value) => value,
         Err(value) => return Result::Err(function_native_error(value)),
     };
@@ -955,8 +971,12 @@ fn regexp_match_at_depth(
         runtime::Value::String(value) => value,
         _ => return Result::Err(function_vm_error("RegExp input is not a string")),
     };
-    let indexed = state.global || state.sticky;
     let converted_last_index = regexp_last_index_at_depth(context, object, input.len(), depth)?;
+    let state = match states.get(object) {
+        Some(value) => value,
+        None => return Result::Err(function_vm_error("RegExp state was invalidated")),
+    };
+    let indexed = state.global || state.sticky;
     let last_index = if indexed {
         converted_last_index
     } else {
@@ -992,6 +1012,7 @@ fn regexp_match_at_depth(
 fn regexp_execute_at_depth(
     context: vm::Context,
     states: HashMap[runtime::ObjectId, RegExpState],
+    last_match: Option[Ref[runtime::JsString]],
     this_value: runtime::Value,
     arguments: Vec[runtime::Value],
     depth: isize,
@@ -1004,9 +1025,15 @@ fn regexp_execute_at_depth(
         depth,
     )?;
     match found {
-        Some(found) => match regexp_match_array(context.heap(), input, found, state.has_indices) {
-            Ok(value) => Result::Ok(value),
-            Err(value) => Result::Err(function_native_error(value)),
+        Some(found) => {
+            match last_match {
+                Some(value) => value.set(input.slice(found.start, found.end)),
+                None => (),
+            }
+            match regexp_match_array(context.heap(), input, found, state.has_indices) {
+                Ok(value) => Result::Ok(value),
+                Err(value) => Result::Err(function_native_error(value)),
+            }
         },
         None => Result::Ok(runtime::Value::Null),
     }
@@ -1047,6 +1074,7 @@ fn regexp_exec_at_depth(
                                 regexp_execute_at_depth(
                                     context,
                                     states,
+                                    Option::None,
                                     receiver,
                                     Vec::from_array([input]),
                                     depth,
@@ -1055,6 +1083,7 @@ fn regexp_exec_at_depth(
                             _ => regexp_execute_at_depth(
                                 context,
                                 states,
+                                Option::None,
                                 receiver,
                                 Vec::from_array([input]),
                                 depth,
@@ -1080,6 +1109,7 @@ fn regexp_exec_at_depth(
 fn regexp_test_at_depth(
     context: vm::Context,
     states: HashMap[runtime::ObjectId, RegExpState],
+    last_match: Ref[runtime::JsString],
     builtin_exec: runtime::Value,
     this_value: runtime::Value,
     arguments: Vec[runtime::Value],
@@ -1103,13 +1133,19 @@ fn regexp_test_at_depth(
                     exec,
                     || {
                         if runtime::same_value(exec, builtin_exec) {
-                            let (_, _, found) = regexp_match_at_depth(
+                            let (_, matched_input, found) = regexp_match_at_depth(
                                 context,
                                 states,
                                 this_value,
                                 input,
                                 depth,
                             )?;
+                            match found {
+                                Some(value) => {
+                                    last_match.set(matched_input.slice(value.start, value.end))
+                                },
+                                None => (),
+                            }
                             return Result::Ok(runtime::Value::Bool(found.is_some()))
                         }
                         let result = match exec {
@@ -1124,6 +1160,7 @@ fn regexp_test_at_depth(
                                 regexp_execute_at_depth(
                                     context,
                                     states,
+                                    Option::None,
                                     this_value,
                                     Vec::from_array([input]),
                                     depth,
@@ -1132,6 +1169,7 @@ fn regexp_test_at_depth(
                             _ => regexp_execute_at_depth(
                                 context,
                                 states,
+                                Option::None,
                                 this_value,
                                 Vec::from_array([input]),
                                 depth,
@@ -1272,6 +1310,7 @@ fn install_regexp_runtime(context: vm::Context) -> Result[RegExpInstall, Builtin
         Err(value) => return Result::Err(regexp_builtin_error(value.message)),
     };
     let states: HashMap[runtime::ObjectId, RegExpState] = HashMap::new();
+    let last_match = Ref::new(js_string(""));
     let cache: HashMap[RegExpCacheKey, regexp::Regex] = HashMap::new();
     context.add_external_edge_provider(|| regexp_gc_edges(context.heap(), states));
     let flags_getter = allocate_vm_function(
@@ -1309,14 +1348,21 @@ fn install_regexp_runtime(context: vm::Context) -> Result[RegExpInstall, Builtin
         context,
         "RegExp.prototype.exec",
         |this_value, arguments, depth| {
-            regexp_execute_at_depth(context, states, this_value, arguments, depth)
+            regexp_execute_at_depth(
+                context,
+                states,
+                Option::Some(last_match),
+                this_value,
+                arguments,
+                depth,
+            )
         },
     )?;
     let test = allocate_vm_function(
         context,
         "RegExp.prototype.test",
         |this_value, arguments, depth| {
-            regexp_test_at_depth(context, states, exec, this_value, arguments, depth)
+            regexp_test_at_depth(context, states, last_match, exec, this_value, arguments, depth)
         },
     )?;
     let compile_method = allocate_vm_function(
@@ -1374,6 +1420,18 @@ fn install_regexp_runtime(context: vm::Context) -> Result[RegExpInstall, Builtin
         Err(value) => return Result::Err(regexp_builtin_error(value.kind.debug())),
     }
     let constructor_object = function_object(constructor, "RegExp")?;
+    let last_match_getter = allocate_function(
+        context,
+        "get RegExp.lastMatch",
+        |heap, this_value, arguments| {
+            let _ = heap;
+            let _ = this_value;
+            let _ = arguments;
+            Result::Ok(runtime::Value::String(last_match.get()))
+        },
+    )?;
+    define_regexp_getter(heap, constructor_object, "lastMatch", last_match_getter)?;
+    define_regexp_getter(heap, constructor_object, "$&", last_match_getter)?;
     define_value(
         heap,
         constructor_object,
