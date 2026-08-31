@@ -5864,17 +5864,201 @@ fn typed_array_sort_values(
     callback: runtime::Value,
     depth: isize,
 ) -> Result[(), vm::VmError] {
-    let mut index = 1;
-    while index < values.len() {
-        let value = values[index];
-        let mut position = index;
-        while position > 0
-            && typed_array_compare(context, callback, values[position - 1], value, depth)? > 0 {
-            values[position] = values[position - 1];
-            position -= 1;
+    if values.len() < 2 {
+        return Result::Ok(())
+    } else {};
+    match callback {
+        runtime::Value::Undefined => typed_array_sort_numbers(context, values, depth)?,
+        _ => typed_array_sort_with_callback(context, values, callback, depth)?,
+    };
+    Result::Ok(())
+}
+
+fn typed_array_number_value(number: f64) -> runtime::Value {
+    let negative_zero = number == 0.0 && 1.0 / number < 0.0;
+    if !negative_zero && number == math::trunc(number) && number >= -2147483648.0
+        && number <= 2147483647.0 {
+        runtime::Value::Int(
+            num::parse_int_structured(dtoa::number_to_string(number)).unwrap_or(0).to_i32(),
+        )
+    } else {
+        runtime::Value::Float(number)
+    }
+}
+
+fn typed_array_sort_numbers(context: vm::Context, values: Vec[runtime::Value], depth: isize) -> Result[
+    (),
+    vm::VmError,
+] {
+    let mut bigint = false;
+    let mut numbers: Vec[f64] = Vec::new();
+    for value in values {
+        match value {
+            runtime::Value::BigInt(_) => {
+                bigint = true;
+            },
+            _ => {
+                let number = runtime::primitive_to_number(value).unwrap_or(0.0);
+                numbers.push(number)
+            },
         }
-        values[position] = value;
+    }
+    if bigint {
+        return typed_array_sort_with_callback(context, values, runtime::Value::Undefined, depth)
+    } else {};
+    typed_array_merge_sort_numbers(numbers);
+    let mut index = 0;
+    for number in numbers {
+        values[index] = typed_array_number_value(number);
         index += 1;
+    }
+    Result::Ok(())
+}
+
+fn typed_array_number_less(left: f64, right: f64) -> bool {
+    if math::is_nan(left) {
+        if math::is_nan(right) {
+            false
+        } else {
+            false
+        }
+    } else if math::is_nan(right) {
+        true
+    } else if left < right {
+        true
+    } else if left > right {
+        false
+    } else if left == 0.0 && right == 0.0 {
+        let left_sign = 1.0 / left;
+        let right_sign = 1.0 / right;
+        left_sign < right_sign
+    } else {
+        false
+    }
+}
+
+fn typed_array_merge_sort_numbers(values: Vec[f64]) -> () {
+    if values.len() < 2 {
+        return
+    } else {};
+    let aux: Vec[f64] = Vec::new();
+    let mut width = 1;
+    while width < values.len() {
+        let mut start = 0;
+        while start < values.len() {
+            let mid = if start + width < values.len() {
+                start + width
+            } else {
+                values.len()
+            };
+            let end = if start + width * 2 < values.len() {
+                start + width * 2
+            } else {
+                values.len()
+            };
+            if mid < end {
+                let mut index = 0;
+                while index < end - start {
+                    aux.push(values[start + index]);
+                    index += 1;
+                }
+                let mut left = 0;
+                let mut right = mid - start;
+                let mut position = start;
+                while left < mid - start && right < end - start {
+                    if !typed_array_number_less(aux[right], aux[left]) {
+                        values[position] = aux[left];
+                        left += 1;
+                    } else {
+                        values[position] = aux[right];
+                        right += 1;
+                    };
+                    position += 1;
+                }
+                while left < mid - start {
+                    values[position] = aux[left];
+                    left += 1;
+                    position += 1;
+                }
+                while right < end - start {
+                    values[position] = aux[right];
+                    right += 1;
+                    position += 1;
+                }
+                let mut clear = 0;
+                while clear < end - start {
+                    let _ = aux.pop();
+                    clear += 1;
+                }
+            } else {};
+            start = end;
+        }
+        width *= 2;
+    }
+}
+
+fn typed_array_sort_with_callback(
+    context: vm::Context,
+    values: Vec[runtime::Value],
+    callback: runtime::Value,
+    depth: isize,
+) -> Result[(), vm::VmError] {
+    if values.len() < 2 {
+        return Result::Ok(())
+    } else {};
+    let aux: Vec[runtime::Value] = Vec::new();
+    let mut width = 1;
+    while width < values.len() {
+        let mut start = 0;
+        while start < values.len() {
+            let mid = if start + width < values.len() {
+                start + width
+            } else {
+                values.len()
+            };
+            let end = if start + width * 2 < values.len() {
+                start + width * 2
+            } else {
+                values.len()
+            };
+            if mid < end {
+                let mut index = 0;
+                while index < end - start {
+                    aux.push(values[start + index]);
+                    index += 1;
+                }
+                let mut left = 0;
+                let mut right = mid - start;
+                let mut position = start;
+                while left < mid - start && right < end - start {
+                    if typed_array_compare(context, callback, aux[left], aux[right], depth)? <= 0 {
+                        values[position] = aux[left];
+                        left += 1;
+                    } else {
+                        values[position] = aux[right];
+                        right += 1;
+                    };
+                    position += 1;
+                }
+                while left < mid - start {
+                    values[position] = aux[left];
+                    left += 1;
+                    position += 1;
+                }
+                while right < end - start {
+                    values[position] = aux[right];
+                    right += 1;
+                    position += 1;
+                }
+                let mut clear = 0;
+                while clear < end - start {
+                    let _ = aux.pop();
+                    clear += 1;
+                }
+            } else {};
+            start = end;
+        }
+        width *= 2;
     }
     Result::Ok(())
 }
@@ -5896,24 +6080,116 @@ fn typed_array_sort(
         } else {},
         _ => return Result::Err(function_vm_error("TypedArray comparator is not callable")),
     };
-    let values: Vec[runtime::Value] = Vec::with_capacity(length);
-    let mut index = 0;
-    while index < length {
-        values.push(array_copy_read(context, source, index, depth)?);
-        index += 1;
-    }
-    typed_array_sort_values(context, values, callback, depth)?;
     let target = if copy {
         typed_array_intrinsic_create(context, constructor, length, depth)?
     } else {
         source
     };
-    index = 0;
-    while index < length {
-        typed_array_write_value(context, target, index, values[index], depth)?;
-        index += 1;
+    let source_object = match source {
+        runtime::Value::Object(object) => object,
+        _ => return Result::Err(function_vm_error("TypedArray method requires a TypedArray")),
+    };
+    let target_object = match target {
+        runtime::Value::Object(object) => object,
+        _ => return Result::Err(function_vm_error("TypedArray method requires a TypedArray")),
+    };
+    let numeric_fast = match callback {
+        runtime::Value::Undefined => match runtime::typed_array_view(context.heap(), source_object) {
+            Some(runtime::TypedArrayView::Numeric(view)) => Option::Some(view),
+            _ => Option::None,
+        },
+        _ => Option::None,
+    };
+    let float_fast = match callback {
+        runtime::Value::Undefined => match runtime::typed_array_view(context.heap(), source_object) {
+            Some(runtime::TypedArrayView::Float64(view)) => Option::Some(view),
+            _ => Option::None,
+        },
+        _ => Option::None,
+    };
+    let numeric_target = match numeric_fast {
+        Some(_) => match runtime::typed_array_view(context.heap(), target_object) {
+            Some(runtime::TypedArrayView::Numeric(view)) => Option::Some(view),
+            _ => Option::None,
+        },
+        None => Option::None,
+    };
+    let float_target = match float_fast {
+        Some(_) => match runtime::typed_array_view(context.heap(), target_object) {
+            Some(runtime::TypedArrayView::Float64(view)) => Option::Some(view),
+            _ => Option::None,
+        },
+        None => Option::None,
+    };
+    match numeric_fast {
+        Some(view) => {
+            let mut numbers: Vec[f64] = Vec::with_capacity(length);
+            let mut index = 0;
+            while index < length {
+                match view.get(index) {
+                    Ok(value) => numbers.push(value),
+                    Err(_) => return Result::Err(function_vm_error("typed array read failed")),
+                };
+                index += 1;
+            }
+            typed_array_merge_sort_numbers(numbers);
+            let target_view = match numeric_target {
+                Some(view) => view,
+                None => return Result::Err(function_vm_error("typed array write failed")),
+            };
+            index = 0;
+            for number in numbers {
+                match target_view.set(index, number) {
+                    Ok(()) => (),
+                    Err(_) => return Result::Err(function_vm_error("typed array write failed")),
+                };
+                index += 1;
+            }
+            Result::Ok(target)
+        },
+        None => match float_fast {
+            Some(view) => {
+                let mut numbers: Vec[f64] = Vec::with_capacity(length);
+                let mut index = 0;
+                while index < length {
+                    match view.get(index) {
+                        Ok(value) => numbers.push(value),
+                        Err(_) => return Result::Err(function_vm_error("typed array read failed")),
+                    };
+                    index += 1;
+                }
+                typed_array_merge_sort_numbers(numbers);
+                let target_view = match float_target {
+                    Some(view) => view,
+                    None => return Result::Err(function_vm_error("typed array write failed")),
+                };
+                index = 0;
+                for number in numbers {
+                    match target_view.set(index, number) {
+                        Ok(()) => (),
+                        Err(_) => return Result::Err(function_vm_error("typed array write failed")),
+                    };
+                    index += 1;
+                }
+                Result::Ok(target)
+            },
+            None => {
+                let values: Vec[runtime::Value] = Vec::with_capacity(length);
+                let mut index = 0;
+                while index < length {
+                    values.push(array_copy_read(context, source, index, depth)?);
+                    index += 1;
+                }
+                typed_array_sort_values(context, values, callback, depth)?;
+                index = 0;
+                while index < length {
+                    typed_array_write_value(context, target, index, values[index], depth)?;
+                    index += 1;
+                }
+                Result::Ok(target)
+            },
+        },
     }
-    Result::Ok(target)
 }
 
 fn typed_array_copy_change(

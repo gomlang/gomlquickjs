@@ -1645,7 +1645,26 @@ fn update_argument_mapping(target: Object, key: PropertyKey, descriptor: Propert
     }
 }
 
+pub fn is_typed_array_variable_length(heap: Heap, object: ObjectId) -> bool {
+    match typed_array_view(heap, object) {
+        Some(TypedArrayView::Uint8(value)) => value.buffer().is_resizable()
+            || value.buffer().is_growable() && value.is_length_tracking(),
+        Some(TypedArrayView::Int32(value)) => value.buffer().is_resizable()
+            || value.buffer().is_growable() && value.is_length_tracking(),
+        Some(TypedArrayView::Float64(value)) => value.buffer().is_resizable()
+            || value.buffer().is_growable() && value.is_length_tracking(),
+        Some(TypedArrayView::Numeric(value)) => value.buffer().is_resizable()
+            || value.buffer().is_growable() && value.is_length_tracking(),
+        Some(TypedArrayView::BigInt(value)) => value.buffer().is_resizable()
+            || value.buffer().is_growable() && value.is_length_tracking(),
+        None => false,
+    }
+}
+
 pub fn prevent_extensions(heap: Heap, object: ObjectId) -> bool {
+    if is_typed_array_variable_length(heap, object) {
+        return false
+    } else {};
     match heap.get(object) {
         Some(target) => {
             target.prevent_extensions();
@@ -1697,6 +1716,9 @@ pub fn is_module_namespace(heap: Heap, object: ObjectId) -> bool {
 }
 
 pub fn seal_object(heap: Heap, object: ObjectId, frozen: bool) -> bool {
+    if is_typed_array_variable_length(heap, object) {
+        return false
+    } else {};
     let target = match heap.get(object) {
         Some(value) => value,
         None => return false,
