@@ -7,6 +7,7 @@ use gomlang::quickjs::mathx;
 use gomlang::quickjs::runtime;
 use gomlang::quickjs::vm;
 use std::bytes;
+use std::collections;
 use std::env;
 use std::fs;
 use std::num;
@@ -34,8 +35,8 @@ struct OsState {
     peers: HashMap[isize, isize],
     read_handlers: HashMap[isize, runtime::Value],
     write_handlers: HashMap[isize, runtime::Value],
-    read_scheduled: HashMap[isize, bool],
-    write_scheduled: HashMap[isize, bool],
+    read_scheduled: collections::HashSet[isize],
+    write_scheduled: collections::HashSet[isize],
     environment: HashMap[string, string],
     time_origin: time::Instant,
     directory: Ref[string],
@@ -57,8 +58,8 @@ fn new_os_state(buffers: HashMap[runtime::ObjectId, arraybuffer::ArrayBuffer]) -
         peers: HashMap::new(),
         read_handlers: HashMap::new(),
         write_handlers: HashMap::new(),
-        read_scheduled: HashMap::new(),
-        write_scheduled: HashMap::new(),
+        read_scheduled: collections::HashSet::new(),
+        write_scheduled: collections::HashSet::new(),
         environment,
         time_origin: time::Instant::now(),
         directory: Ref::new(env::current_dir_structured().unwrap_or(".")),
@@ -396,21 +397,21 @@ fn os_handler(state: OsState, descriptor: isize, read: bool) -> Option[runtime::
 
 fn os_handler_scheduled(state: OsState, descriptor: isize, read: bool) -> bool {
     if read {
-        state.read_scheduled.get(descriptor).is_some()
+        state.read_scheduled.contains(descriptor)
     } else {
-        state.write_scheduled.get(descriptor).is_some()
+        state.write_scheduled.contains(descriptor)
     }
 }
 
 fn os_set_handler_scheduled(state: OsState, descriptor: isize, read: bool, value: bool) -> () {
     if read {
         if value {
-            state.read_scheduled.set(descriptor, true)
+            let _ = state.read_scheduled.insert(descriptor);
         } else {
             let _ = state.read_scheduled.remove(descriptor);
         }
     } else if value {
-        state.write_scheduled.set(descriptor, true)
+        let _ = state.write_scheduled.insert(descriptor);
     } else {
         let _ = state.write_scheduled.remove(descriptor);
     }

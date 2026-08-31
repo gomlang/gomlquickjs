@@ -9,6 +9,7 @@ use gomlang::quickjs::promise;
 use gomlang::quickjs::runtime;
 use gomlang::quickjs::uri;
 use gomlang::quickjs::vm;
+use std::collections;
 use std::fs;
 use std::io;
 use std::math;
@@ -28,11 +29,11 @@ type NativeBuiltin = (runtime::Heap, runtime::Value, Vec[runtime::Value]) -> Res
 
 struct TimerState {
     next_id: Ref[isize],
-    active: HashMap[isize, bool],
+    active: collections::HashSet[isize],
 }
 
 fn new_timer_state() -> TimerState {
-    TimerState { next_id: Ref::new(1), active: HashMap::new() }
+    TimerState { next_id: Ref::new(1), active: collections::HashSet::new() }
 }
 
 const MATH_RANDOM_MULTIPLIER: u64 = 2685821657736338717;
@@ -981,7 +982,7 @@ fn global_set_timeout(
     }
     let timer_id = state.next_id.get();
     state.next_id.set(timer_id + 1);
-    state.active.set(timer_id, true);
+    let _ = state.active.insert(timer_id);
     let queued_arguments: Vec[runtime::Value] = Vec::from_array([callback]);
     let mut index = 2;
     while index < arguments.len() {
@@ -994,7 +995,7 @@ fn global_set_timeout(
         0,
         |this_value, arguments, depth| {
             let _ = this_value;
-            if state.active.get(timer_id).is_none() {
+            if !state.active.contains(timer_id) {
                 Result::Ok(runtime::Value::Undefined)
             } else {
                 let _ = state.active.remove(timer_id);

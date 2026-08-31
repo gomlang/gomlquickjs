@@ -440,7 +440,7 @@ struct GeneratorRuntime {
     async_function_runner: Ref[Option[AsyncFunctionRunner]],
     async_generator_runner: Ref[Option[AsyncGeneratorRunner]],
     async_from_sync_iterator_factory: Ref[Option[AsyncFromSyncIteratorFactory]],
-    async_roots: HashMap[runtime::ObjectId, bool],
+    async_roots: collections::HashSet[runtime::ObjectId],
 }
 
 impl GeneratorRuntime {
@@ -458,7 +458,7 @@ impl GeneratorRuntime {
             async_function_runner: Ref::new(Option::None),
             async_generator_runner: Ref::new(Option::None),
             async_from_sync_iterator_factory: Ref::new(Option::None),
-            async_roots: HashMap::new(),
+            async_roots: collections::HashSet::new(),
         }
     }
 }
@@ -932,7 +932,7 @@ impl Context {
             push_generator_frame_roots(values, frame);
             edges.push(runtime::GcEdge { owner, values })
         }
-        for (generator, _) in self.generators_value.async_roots.entries() {
+        for generator in self.generators_value.async_roots.to_vec() {
             roots.push(runtime::Value::Object(generator))
         }
         for (owner, closure) in self.functions_value.entries() {
@@ -1574,7 +1574,7 @@ impl Context {
         };
         if self.heap_value.contains(promise)
             && self.generators_value.states.get(generator).is_some() {
-            self.generators_value.async_roots[generator] = true;
+            let _ = self.generators_value.async_roots.insert(generator);
             Result::Ok(())
         } else {
             Result::Err(error(-1, VmErrorKind::TypeError("cannot link async function frame")))

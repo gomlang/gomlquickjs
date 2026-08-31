@@ -7,6 +7,7 @@ use gomlang::quickjs::parser;
 use gomlang::quickjs::regexp;
 use gomlang::quickjs::runtime;
 use gomlang::quickjs::vm;
+use std::collections;
 use std::num;
 use std::text;
 
@@ -199,7 +200,7 @@ struct Compiler {
     global_declaration_offsets: HashMap[string, isize],
     runtime_eval_environment: bool,
     block_function_vars: HashMap[isize, AnnexBVarUpdate],
-    parameter_names: HashMap[string, bool],
+    parameter_names: collections::HashSet[string],
     catch_scopes: Vec[(isize, bool)],
 }
 
@@ -1102,7 +1103,7 @@ fn declare_annex_b_function(
     if name == "arguments" && compiler.arguments_available {
         return
     }
-    if compiler.parameter_names.get(name).is_some() {
+    if compiler.parameter_names.contains(name) {
         return
     }
     if ancestors.contains(name) {
@@ -7218,15 +7219,13 @@ fn initialize_parameter_bindings(compiler: Compiler) -> () {
 
 fn validate_unique_parameter_names(compiler: Compiler, parameters: Vec[ast::FunctionParameter]) -> () {
     let names: Vec[(string, ast::Span)] = Vec::new();
-    let seen: HashMap[string, bool] = HashMap::new();
+    let seen: collections::HashSet[string] = collections::HashSet::new();
     for parameter in parameters {
         collect_parameter_names(parameter.pattern.get(), names)
     }
     for (name, span) in names {
-        if seen.get(name).is_some() {
+        if !seen.insert(name) {
             compile_error(compiler, "duplicate parameter `" + name + "`", span)
-        } else {
-            seen[name] = true;
         }
     }
 }
@@ -7244,13 +7243,12 @@ fn mapped_argument_locals(
     for _ in parameters {
         mapped.push(-1)
     }
-    let seen: HashMap[string, bool] = HashMap::new();
+    let seen: collections::HashSet[string] = collections::HashSet::new();
     let mut index = parameters.len();
     while index > 0 {
         index -= 1;
         match parameters[index].pattern.get() {
-            ast::BindingPattern::Identifier { name, .. } => if seen.get(name).is_none() {
-                seen[name] = true;
+            ast::BindingPattern::Identifier { name, .. } => if seen.insert(name) {
                 match compiler.scopes[0].bindings.get(name) {
                     Some(binding) => {
                         mapped[index] = binding.index;
@@ -7964,7 +7962,7 @@ fn compiler_new(
         global_declaration_offsets: HashMap::new(),
         runtime_eval_environment,
         block_function_vars: HashMap::new(),
-        parameter_names: HashMap::new(),
+        parameter_names: collections::HashSet::new(),
         catch_scopes: Vec::new(),
     };
     for binding in compiler.outer_bindings {
@@ -7995,7 +7993,7 @@ fn compiler_new(
         let names: Vec[(string, ast::Span)] = Vec::new();
         collect_parameter_names(parameter.pattern.get(), names);
         for (name, _) in names {
-            compiler.parameter_names[name] = true;
+            let _ = compiler.parameter_names.insert(name);
         }
     }
     declare_parameter_bindings(compiler, parameters);
