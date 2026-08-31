@@ -153,6 +153,7 @@ pub struct Token {
 pub struct LexResult {
     pub tokens: Vec[Token],
     pub errors: Vec[LexError],
+    pub html_comment: bool,
 }
 
 struct StringScan {
@@ -183,6 +184,7 @@ struct NumberScan {
 struct TriviaScan {
     end: isize,
     line_break: bool,
+    html_comment: bool,
 }
 
 struct BlockCommentScan {
@@ -1401,16 +1403,20 @@ fn scan_block_comment(source: string, start: isize) -> BlockCommentScan {
 
 fn scan_trivia(source: string, start: isize, errors: Vec[LexError]) -> TriviaScan {
     let mut index = start;
-    let mut line_break = false;
+    let mut line_break = start == 0;
+    let mut comment_since_line_start = false;
+    let mut html_comment = false;
     let mut scanning = true;
     while index < source.byte_len() && scanning {
         let width = whitespace_width(source, index);
         if width > 0 {
             if line_terminator_width(source, index) > 0 {
                 line_break = true;
+                comment_since_line_start = false;
             } else {};
             index += width;
         } else if text::starts_with_at(source, index, "//") {
+            comment_since_line_start = true;
             index = scan_line_comment_end(source, index);
         } else if text::starts_with_at(source, index, "/*") {
             let comment_start = index;
@@ -1419,12 +1425,29 @@ fn scan_trivia(source: string, start: isize, errors: Vec[LexError]) -> TriviaSca
             line_break = line_break || scanned.line_break;
             if !scanned.closed {
                 push_error(errors, "unterminated block comment", comment_start, index)
-            } else {}
+            } else {};
+            if !scanned.line_break {
+                comment_since_line_start = true;
+            } else {};
+        } else if text::starts_with_at(source, index, "<!--") {
+            html_comment = true;
+            index = scan_html_comment_end(source, index, 4);
+        } else if line_break && text::starts_with_at(source, index, "-->") {
+            html_comment = true;
+            index = scan_html_comment_end(source, index, 3);
         } else {
             scanning = false;
         }
     }
-    TriviaScan { end: index, line_break }
+    TriviaScan { end: index, line_break, html_comment }
+}
+
+fn scan_html_comment_end(source: string, start: isize, width: isize) -> isize {
+    let mut index = start + width;
+    while index < source.byte_len() && line_terminator_width(source, index) == 0 {
+        index = advance_character(source, index);
+    }
+    index
 }
 
 fn scan_regexp(tables: unicode::IdentifierTables, source: string, start: isize) -> RegExpScan {
@@ -1837,8 +1860,12 @@ pub fn lex_with_forced_divisions(source: string, forced_divisions: collections::
         0
     };
     let mut eof_line_break = false;
+    let mut html_comment = false;
     while index < source.byte_len() {
         let trivia = scan_trivia(source, index, errors);
+        if trivia.html_comment {
+            html_comment = true;
+        } else {};
         index = trivia.end;
         eof_line_break = trivia.line_break;
         if index < source.byte_len() {
@@ -1892,7 +1919,7 @@ pub fn lex_with_forced_divisions(source: string, forced_divisions: collections::
         source.byte_len(),
         eof_line_break,
     );
-    LexResult { tokens, errors }
+    LexResult { tokens, errors, html_comment }
 }
 
 pub fn lex(source: string) -> LexResult {

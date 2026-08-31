@@ -26,6 +26,7 @@ struct Parser {
     index: Ref[isize],
     errors: Vec[ParseError],
     module_goal: bool,
+    no_in: Ref[bool],
     contexts: Vec[ParseContext],
     contextual_divisions: Vec[isize],
     contextual_division_offsets: collections::HashSet[isize],
@@ -694,11 +695,14 @@ fn mixed_nullish(left: ast::Expr, operator: ast::BinaryOperator, right: ast::Exp
 
 fn parse_parenthesized(parser: Parser) -> ast::Expr {
     let start = bump(parser).span.start;
+    let saved_no_in = parser.no_in.get();
+    parser.no_in.set(false);
     let expression = if at(parser, lexer::TokenKind::RParen) {
         error_expr(parser, "expected expression")
     } else {
         parse_expression(parser)
     };
+    parser.no_in.set(saved_no_in);
     let end = finish_right_paren(parser, "expected `)`");
     ast::Expr::Parenthesized { expression: Ref::new(expression), span: ast::span(start, end) }
 }
@@ -1484,11 +1488,14 @@ fn parse_object_method(parser: Parser, start: isize, generator: bool, asynchrono
 
 fn parse_computed_object_property(parser: Parser) -> Option[ast::ObjectProperty] {
     let open = bump(parser);
+    let saved_no_in = parser.no_in.get();
+    parser.no_in.set(false);
     let key = if !at(parser, lexer::TokenKind::RBracket) && !at_eof(parser) {
         parse_assignment_expression(parser)
     } else {
         error_expr(parser, "expected computed property name")
     };
+    parser.no_in.set(saved_no_in);
     let bracket_end = finish_right_bracket(parser, expr_end(key));
     let method = at(parser, lexer::TokenKind::LParen);
     let value = if at(parser, lexer::TokenKind::Colon) {
@@ -1548,11 +1555,14 @@ fn parse_object_accessor(parser: Parser) -> Option[ast::ObjectProperty] {
     let modifier = bump(parser);
     let key = if at(parser, lexer::TokenKind::LBracket) {
         bump(parser);
+        let saved_no_in = parser.no_in.get();
+        parser.no_in.set(false);
         let value = if !at(parser, lexer::TokenKind::RBracket) && !at_eof(parser) {
             parse_assignment_expression(parser)
         } else {
             error_expr(parser, "expected computed accessor name")
         };
+        parser.no_in.set(saved_no_in);
         let _ = finish_right_bracket(parser, expr_end(value));
         ast::ObjectPropertyKey::Computed(Ref::new(value))
     } else {
@@ -2001,6 +2011,8 @@ fn parse_dynamic_import(parser: Parser) -> ast::Expr {
         }
     } else {};
     bump(parser);
+    let saved_no_in = parser.no_in.get();
+    parser.no_in.set(false);
     let specifier = if at(parser, lexer::TokenKind::RParen) {
         error_expr(parser, "expected module specifier")
     } else {
@@ -2017,6 +2029,7 @@ fn parse_dynamic_import(parser: Parser) -> ast::Expr {
             } else {}
         } else {}
     } else {};
+    parser.no_in.set(saved_no_in);
     let end = finish_right_paren(parser, "expected `)` after dynamic import");
     ast::Expr::DynamicImport {
         specifier: Ref::new(specifier),
@@ -2192,14 +2205,22 @@ fn parse_call(parser: Parser, callee: ast::Expr, optional: bool) -> ast::Expr {
                         || at(parser, lexer::TokenKind::RParen) {
                         error_expr(parser, "expected spread argument")
                     } else {
-                        parse_assignment_expression(parser)
+                        let saved_no_in = parser.no_in.get();
+                        parser.no_in.set(false);
+                        let value = parse_assignment_expression(parser);
+                        parser.no_in.set(saved_no_in);
+                        value
                     };
                     ast::Expr::Spread {
                         argument: Ref::new(value),
                         span: ast::span(spread.span.start, expr_end(value)),
                     }
                 } else {
-                    parse_assignment_expression(parser)
+                    let saved_no_in = parser.no_in.get();
+                    parser.no_in.set(false);
+                    let value = parse_assignment_expression(parser);
+                    parser.no_in.set(saved_no_in);
+                    value
                 };
                 end = expr_end(argument);
                 arguments.push(argument);
@@ -2537,6 +2558,8 @@ fn parse_precedence(parser: Parser, minimum: isize) -> ast::Expr {
     while !done {
         if current_token(parser).line_break_before && block_arrow(left) {
             done = true;
+        } else if current_kind(parser) == lexer::TokenKind::InKeyword && parser.no_in.get() {
+            done = true;
         } else {
             match infix_info(current_kind(parser)) {
                 Some(info) => if info.precedence < minimum {
@@ -2611,7 +2634,11 @@ fn parse_conditional_expression(parser: Parser) -> ast::Expr {
         let consequent = if at(parser, lexer::TokenKind::Colon) {
             error_expr(parser, "expected expression after `?`")
         } else {
-            parse_assignment_expression(parser)
+            let saved_no_in = parser.no_in.get();
+            parser.no_in.set(false);
+            let value = parse_assignment_expression(parser);
+            parser.no_in.set(saved_no_in);
+            value
         };
         if at(parser, lexer::TokenKind::Colon) {
             bump(parser);
@@ -3455,11 +3482,7 @@ fn collect_switch_lexical_statement_names(statement: ast::Stmt, names: Vec[(stri
                 collect_binding_pattern_names(declaration.pattern.get(), names)
             }
         } else {},
-        ast::Stmt::FunctionDeclaration { name, span, .. } | ast::Stmt::ClassDeclaration {
-            name,
-            span,
-            ..,
-        } => names.push((name, span)),
+        ast::Stmt::ClassDeclaration { name, span, .. } => names.push((name, span)),
         _ => (),
     }
 }
@@ -3479,9 +3502,16 @@ fn collect_block_lexical_statement_names(statement: ast::Stmt, names: Vec[(strin
 
 fn validate_switch_declarations(parser: Parser, cases: Vec[ast::SwitchCase]) -> () {
     let names: Vec[(string, ast::Span)] = Vec::new();
+    let functions: Vec[(string, ast::Span, bool)] = Vec::new();
     for clause in cases {
         for statement in clause.consequent {
-            collect_switch_lexical_statement_names(statement, names)
+            collect_switch_lexical_statement_names(statement, names);
+            match statement {
+                ast::Stmt::FunctionDeclaration { name, span, generator, asynchronous, .. } => {
+                    functions.push((name, span, !generator && !asynchronous))
+                },
+                _ => (),
+            }
         }
     }
     let seen: Vec[string] = Vec::new();
@@ -3500,6 +3530,26 @@ fn validate_switch_declarations(parser: Parser, cases: Vec[ast::SwitchCase]) -> 
         if conflicts {
             report(parser, "switch lexical declaration conflicts with var `" + name + "`", span)
         } else {}
+    }
+    let seen_functions: Vec[(string, bool)] = Vec::new();
+    for (name, span, ordinary) in functions {
+        for (lexical_name, _) in names {
+            if lexical_name == name {
+                report(parser, "duplicate switch lexical declaration `" + name + "`", span)
+            } else {}
+        }
+        for clause in cases {
+            if statement_list_var_declares_name(clause.consequent, name) {
+                report(parser, "switch lexical declaration conflicts with var `" + name + "`", span)
+            } else {}
+        }
+        for (previous_name, previous_ordinary) in seen_functions {
+            if previous_name == name
+                && (current_context(parser).strict || !ordinary || !previous_ordinary) {
+                report(parser, "duplicate switch function declaration `" + name + "`", span)
+            } else {}
+        }
+        seen_functions.push((name, ordinary))
     }
 }
 
@@ -3861,11 +3911,14 @@ fn parse_class_element(parser: Parser) -> Option[ast::ClassElement] {
     let mut name_end = name_token.span.end;
     let computed_name = if name_token.kind == lexer::TokenKind::LBracket {
         bump(parser);
+        let saved_no_in = parser.no_in.get();
+        parser.no_in.set(false);
         let expression = if at(parser, lexer::TokenKind::RBracket) {
             error_expr(parser, "expected computed class element name")
         } else {
             parse_assignment_expression(parser)
         };
+        parser.no_in.set(saved_no_in);
         name_end = finish_right_bracket(parser, expr_end(expression));
         Option::Some(Ref::new(expression))
     } else {
@@ -4368,44 +4421,61 @@ fn parse_for_statement(parser: Parser) -> ast::Stmt {
         if kind_token.kind == lexer::TokenKind::VarKeyword && binding_pattern_is_identifier(pattern)
             && at(parser, lexer::TokenKind::Assign) {
             bump(parser);
+            parser.no_in.set(true);
             let initialized = parse_assignment_expression(parser);
-            match split_for_in(initialized) {
-                Some(parts) => {
-                    if asynchronous {
-                        report(
-                            parser,
-                            "`for await` only supports `of`",
-                            ast::expr_span(parts.target),
-                        )
-                    } else {};
-                    let name = match pattern {
-                        ast::BindingPattern::Identifier { name, .. } => name,
-                        _ => "",
-                    };
-                    let _ = finish_right_paren(parser, "expected `)` after for-in clauses");
-                    let body = parse_iteration_body(parser);
-                    let end = stmt_end(body);
-                    return ast::Stmt::ForIn {
-                        kind: ast::VariableKind::Var,
-                        name,
-                        pattern: Ref::new(pattern),
-                        initializer: Option::Some(Ref::new(parts.target)),
-                        target: Option::None,
-                        object: Ref::new(parts.object),
-                        body: Ref::new(body),
-                        span: ast::span(start, end),
-                    }
-                },
-                None => if current_token(parser).kind == lexer::TokenKind::Identifier
-                    && current_token(parser).value == "of"
-                    && !current_token(parser).has_escape {
+            parser.no_in.set(false);
+            if at(parser, lexer::TokenKind::InKeyword) {
+                if current_context(parser).strict {
                     report(
                         parser,
-                        "initializer is not allowed in a for-of declaration",
+                        "initializer is not allowed in a for-in declaration in strict mode",
                         ast::expr_span(initialized),
                     )
-                } else {},
-            }
+                } else {};
+                if asynchronous {
+                    report(parser, "`for await` only supports `of`", ast::expr_span(initialized))
+                } else {};
+                bump(parser);
+                let mut object = if at(parser, lexer::TokenKind::RParen) || at_eof(parser) {
+                    error_expr(parser, "expected expression after `in`")
+                } else {
+                    parse_assignment_expression(parser)
+                };
+                while at(parser, lexer::TokenKind::Comma) {
+                    bump(parser);
+                    let element = parse_assignment_expression(parser);
+                    let span = ast::span(ast::expr_span(object).start, ast::expr_span(element).end);
+                    object = ast::Expr::Sequence {
+                        expressions: Vec::from_array([Ref::new(object), Ref::new(element)]),
+                        span,
+                    };
+                }
+                let name = match pattern {
+                    ast::BindingPattern::Identifier { name, .. } => name,
+                    _ => "",
+                };
+                let _ = finish_right_paren(parser, "expected `)` after for-in clauses");
+                let body = parse_iteration_body(parser);
+                let end = stmt_end(body);
+                return ast::Stmt::ForIn {
+                    kind: ast::VariableKind::Var,
+                    name,
+                    pattern: Ref::new(pattern),
+                    initializer: Option::Some(Ref::new(initialized)),
+                    target: Option::None,
+                    object: Ref::new(object),
+                    body: Ref::new(body),
+                    span: ast::span(start, end),
+                }
+            } else if current_token(parser).kind == lexer::TokenKind::Identifier
+                && current_token(parser).value == "of"
+                && !current_token(parser).has_escape {
+                report(
+                    parser,
+                    "initializer is not allowed in a for-of declaration",
+                    ast::expr_span(initialized),
+                )
+            } else {}
         } else {};
         let separator = current_token(parser);
         let for_of = separator.kind == lexer::TokenKind::Identifier && separator.value == "of"
@@ -4525,7 +4595,9 @@ fn parse_for_statement(parser: Parser) -> ast::Stmt {
             }
         } else {};
         let lhs_token = current_token(parser);
+        parser.no_in.set(true);
         let expression = parse_expression(parser);
+        parser.no_in.set(false);
         if forbidden_yield_in_for_initializer(expression) {
             report(
                 parser,
@@ -4575,35 +4647,44 @@ fn parse_for_statement(parser: Parser) -> ast::Stmt {
                 span: ast::span(start, end),
             }
         } else {};
-        match split_for_in(expression) {
-            Some(parts) => {
-                if asynchronous {
-                    report(parser, "`for await` only supports `of`", ast::expr_span(expression))
-                } else {};
-                if !assignment_target(parts.target) {
-                    report(parser, "invalid for-in assignment target", ast::expr_span(parts.target))
-                } else {};
-                let _ = finish_right_paren(parser, "expected `)` after for-in clauses");
-                let body = parse_iteration_body(parser);
-                let end = stmt_end(body);
-                return ast::Stmt::ForIn {
-                    kind: ast::VariableKind::Var,
-                    name: "",
-                    pattern: Ref::new(
-                        ast::BindingPattern::Identifier {
-                            name: "",
-                            span: ast::expr_span(parts.target),
-                        },
-                    ),
-                    initializer: Option::None,
-                    target: Option::Some(Ref::new(parts.target)),
-                    object: Ref::new(parts.object),
-                    body: Ref::new(body),
-                    span: ast::span(start, end),
-                }
-            },
-            None => (),
-        };
+        if at(parser, lexer::TokenKind::InKeyword) {
+            if asynchronous {
+                report(parser, "`for await` only supports `of`", ast::expr_span(expression))
+            } else {};
+            if !assignment_target(expression) {
+                report(parser, "invalid for-in assignment target", ast::expr_span(expression))
+            } else {};
+            bump(parser);
+            let mut object = if at(parser, lexer::TokenKind::RParen) || at_eof(parser) {
+                error_expr(parser, "expected expression after `in`")
+            } else {
+                parse_assignment_expression(parser)
+            };
+            while at(parser, lexer::TokenKind::Comma) {
+                bump(parser);
+                let element = parse_assignment_expression(parser);
+                let span = ast::span(ast::expr_span(object).start, ast::expr_span(element).end);
+                object = ast::Expr::Sequence {
+                    expressions: Vec::from_array([Ref::new(object), Ref::new(element)]),
+                    span,
+                };
+            }
+            let _ = finish_right_paren(parser, "expected `)` after for-in clauses");
+            let body = parse_iteration_body(parser);
+            let end = stmt_end(body);
+            return ast::Stmt::ForIn {
+                kind: ast::VariableKind::Var,
+                name: "",
+                pattern: Ref::new(
+                    ast::BindingPattern::Identifier { name: "", span: ast::expr_span(expression) },
+                ),
+                initializer: Option::None,
+                target: Option::Some(Ref::new(expression)),
+                object: Ref::new(object),
+                body: Ref::new(body),
+                span: ast::span(start, end),
+            }
+        } else {};
         let expression_start = ast::expr_span(expression).start;
         let end = consume_for_semicolon(parser, expr_end(expression));
         Option::Some(
@@ -5607,6 +5688,7 @@ fn parser_from_lexed(
         index: Ref::new(0),
         errors,
         module_goal,
+        no_in: Ref::new(false),
         contextual_divisions: Vec::new(),
         contextual_division_offsets: collections::HashSet::new(),
         contexts: Vec::from_array(
@@ -5634,6 +5716,7 @@ fn parse_pass(
     new_target_allowed: bool,
     strict: bool,
 ) -> ParsePass {
+    let html_comment = value.html_comment;
     let parser = parser_from_lexed(
         value,
         module_goal,
@@ -5642,6 +5725,13 @@ fn parse_pass(
         new_target_allowed,
         strict,
     );
+    if html_comment && module_goal {
+        report(
+            parser,
+            "HTML comments are not allowed in module code",
+            convert_span(current_token(parser).span),
+        )
+    } else {};
     let body: Vec[ast::Stmt] = Vec::new();
     let mut directive_prologue = true;
     while !at_eof(parser) {

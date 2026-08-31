@@ -832,17 +832,27 @@ fn parse_character_escape(parser: Parser, offset: isize, in_class: bool) -> Resu
             Result::Ok(117)
         }
     } else if value == 99 {
-        let control = match parser_advance(parser) {
-            Some(control) => control,
-            None => return Result::Err(regex_error("unterminated control escape", offset)),
+        let control = parser_current(parser);
+        let valid = match control {
+            Some(control) => (control >= 65 && control <= 90) || (control >= 97 && control <= 122)
+                || in_class && !unicode_mode(parser.flags.get())
+                    && ((control >= 48 && control <= 57) || control == 95),
+            None => false,
         };
-        if (control >= 65 && control <= 90) || (control >= 97 && control <= 122) {
-            Result::Ok((control & 31).to_u32())
-        } else if in_class && !unicode_mode(parser.flags.get())
-            && ((control >= 48 && control <= 57) || control == 95) {
-            Result::Ok((control & 31).to_u32())
+        if valid {
+            parser_advance(parser);
+            match control {
+                Some(control) => Result::Ok((control & 31).to_u32()),
+                None => Result::Err(regex_error("unterminated control escape", offset)),
+            }
+        } else if !unicode_mode(parser.flags.get()) {
+            parser.index.set(parser.index.get() - 1);
+            Result::Ok(92)
         } else {
-            Result::Err(regex_error("invalid control escape", offset))
+            match control {
+                Some(_) => Result::Err(regex_error("invalid control escape", offset)),
+                None => Result::Err(regex_error("unterminated control escape", offset)),
+            }
         }
     } else if value == 48 {
         if unicode_mode(parser.flags.get())
@@ -1416,13 +1426,23 @@ fn parse_class(parser: Parser, offset: isize) -> Result[isize, RegexError] {
                                 first_offset,
                             )?
                         },
-                        ClassUnit::Set(_) => {
+                        ClassUnit::Set(values) => if unicode_mode(parser.flags.get()) {
                             return Result::Err(
                                 regex_error(
                                     "character class escape cannot end a range",
                                     first_offset,
                                 ),
                             )
+                        } else {
+                            range.union_with(values);
+                            add_parser_class_range(
+                                parser,
+                                range,
+                                first_value,
+                                first_value,
+                                first_offset,
+                            )?;
+                            add_parser_class_range(parser, range, 45, 45, parser.index.get() - 1)?
                         },
                     },
                 }
@@ -1660,17 +1680,6 @@ fn parse_atom(parser: Parser) -> Result[isize, RegexError] {
                             Result::Ok(parser_push_node(parser, Node::Literal(value)))
                         },
                     }
-                } else if current == 99 && !unicode_mode(parser.flags.get())
-                    && match parser_peek(parser, 1) {
-                        Some(next) => !((next >= 65 && next <= 90) || (next >= 97 && next <= 122)),
-                        None => true,
-                    } {
-                    parser_advance(parser);
-                    let slash = parser_push_node(parser, Node::Literal(92));
-                    let letter = parser_push_node(parser, Node::Literal(99));
-                    Result::Ok(
-                        parser_push_node(parser, Node::Sequence(Vec::from_array([slash, letter]))),
-                    )
                 } else {
                     let escaped = parse_escaped_code_point(parser, offset, false)?;
                     Result::Ok(parser_push_node(parser, Node::Literal(escaped)))
