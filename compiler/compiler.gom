@@ -87,6 +87,7 @@ struct OuterBinding {
     source: bytecode::UpvalueSource,
     kind: BindingKind,
     declaration_target: bool,
+    catch_binding: bool,
     environment_depth: isize,
 }
 
@@ -198,6 +199,9 @@ struct Compiler {
     global_var_kinds: HashMap[string, bytecode::ScriptBindingKind],
     global_declaration_offsets: HashMap[string, isize],
     runtime_eval_environment: bool,
+    block_function_vars: HashMap[isize, AnnexBVarUpdate],
+    parameter_names: HashMap[string, bool],
+    catch_scopes: Vec[(isize, bool)],
 }
 
 enum AssignmentStorage {
@@ -257,6 +261,12 @@ struct AssignmentTarget {
     writable: bool,
     throws_on_write: bool,
     source_offset: isize,
+}
+
+enum AnnexBVarUpdate {
+    Local(isize),
+    Upvalue(isize),
+    EvalVar(isize),
 }
 
 enum ExcludedBindingKey {
@@ -793,6 +803,7 @@ fn visible_bindings(compiler: Compiler) -> Vec[OuterBinding] {
                         source: bytecode::UpvalueSource::Local(binding.index),
                         kind: binding.kind,
                         declaration_target: scope_index >= compiler.var_scope_index.get(),
+                        catch_binding: catch_scope_binding(compiler, scope_index),
                         environment_depth: if compiler.runtime_eval_environment
                             && scope_index < compiler.var_scope_index.get() {
                             compiler.var_scope_index.get() - scope_index
@@ -826,6 +837,7 @@ fn visible_bindings(compiler: Compiler) -> Vec[OuterBinding] {
                     } else {
                         outer.declaration_target
                     },
+                    catch_binding: outer.catch_binding,
                     environment_depth: current_eval_environment_depth(compiler)
                         + outer.environment_depth,
                 },
@@ -851,6 +863,7 @@ fn arrow_outer_bindings(compiler: Compiler) -> Vec[OuterBinding] {
             source: this_source,
             kind: BindingKind::Const,
             declaration_target: false,
+            catch_binding: false,
             environment_depth: 0,
         },
     );
@@ -871,6 +884,7 @@ fn arrow_outer_bindings(compiler: Compiler) -> Vec[OuterBinding] {
                 source,
                 kind: BindingKind::Var,
                 declaration_target: false,
+                catch_binding: false,
                 environment_depth: if compiler.lexical_arguments {
                     outer_binding_environment_depth(compiler, "$arguments")
                 } else {
@@ -900,6 +914,7 @@ fn current_eval_bindings(compiler: Compiler) -> Vec[bytecode::EvalBinding] {
                     && binding.kind != BindingKind::NamedFunction,
                 named_function: binding.kind == BindingKind::NamedFunction,
                 declaration_target: binding.declaration_target,
+                catch_binding: binding.catch_binding,
                 environment_depth: binding.environment_depth,
             },
         )
@@ -913,6 +928,7 @@ fn current_eval_bindings(compiler: Compiler) -> Vec[bytecode::EvalBinding] {
                 writable: false,
                 named_function: false,
                 declaration_target: false,
+                catch_binding: false,
                 environment_depth: 0,
             },
         )
@@ -926,6 +942,7 @@ fn current_eval_bindings(compiler: Compiler) -> Vec[bytecode::EvalBinding] {
                 writable: false,
                 named_function: false,
                 declaration_target: false,
+                catch_binding: false,
                 environment_depth: 0,
             },
         )
@@ -939,6 +956,7 @@ fn current_eval_bindings(compiler: Compiler) -> Vec[bytecode::EvalBinding] {
                 writable: false,
                 named_function: false,
                 declaration_target: false,
+                catch_binding: false,
                 environment_depth: 0,
             },
         )
@@ -952,6 +970,7 @@ fn current_eval_bindings(compiler: Compiler) -> Vec[bytecode::EvalBinding] {
                 writable: false,
                 named_function: false,
                 declaration_target: false,
+                catch_binding: false,
                 environment_depth: 0,
             },
         )
@@ -965,6 +984,7 @@ fn current_eval_bindings(compiler: Compiler) -> Vec[bytecode::EvalBinding] {
                 writable: false,
                 named_function: false,
                 declaration_target: false,
+                catch_binding: false,
                 environment_depth: 0,
             },
         )
@@ -978,6 +998,7 @@ fn current_eval_bindings(compiler: Compiler) -> Vec[bytecode::EvalBinding] {
                 writable: false,
                 named_function: false,
                 declaration_target: false,
+                catch_binding: false,
                 environment_depth: 0,
             },
         )
@@ -1066,7 +1087,7 @@ fn declare_var_pattern(compiler: Compiler, pattern: ast::BindingPattern) -> () {
                 record_global_var(compiler, name, bytecode::ScriptBindingKind::Var, span)
             } else if compiler.direct_eval.get() && !compiler_is_strict(compiler) {
                 match lookup_outer_binding(compiler, name) {
-                    Some(binding) => if binding.declaration_target {
+                    Some(binding) => if binding.declaration_target && !binding.catch_binding {
                         if binding.kind != BindingKind::Var {
                             compile_error(compiler, "duplicate declaration of `" + name + "`", span)
                         } else {}
@@ -1099,6 +1120,104 @@ fn declare_var_pattern(compiler: Compiler, pattern: ast::BindingPattern) -> () {
 
 fn declare_var(compiler: Compiler, declaration: ast::VariableDeclarator) -> () {
     declare_var_pattern(compiler, declaration.pattern.get())
+}
+
+fn lexical_binding(kind: BindingKind) -> bool {
+    kind != BindingKind::Var
+}
+
+fn catch_scope_binding(compiler: Compiler, scope_index: isize) -> bool {
+    for (index, _) in compiler.catch_scopes {
+        if index == scope_index {
+            return true
+        } else {}
+    }
+    false
+}
+
+fn catch_scope_simple_binding(compiler: Compiler, scope_index: isize) -> bool {
+    for (index, simple) in compiler.catch_scopes {
+        if index == scope_index {
+            return simple
+        } else {}
+    }
+    false
+}
+
+fn annex_b_var_scope_write_target(compiler: Compiler, name: string, span: ast::Span) -> Option[
+    AnnexBVarUpdate,
+] {
+    let var_scope_index = compiler.var_scope_index.get();
+    if compiler.script_mode.get() && var_scope_index == 0 {
+        record_global_var(compiler, name, bytecode::ScriptBindingKind::Var, span);
+        Option::Some(AnnexBVarUpdate::EvalVar(string_constant(compiler, name)))
+    } else if compiler.direct_eval.get() {
+        match lookup_outer_binding(compiler, name) {
+            Some(binding) => if binding.declaration_target && !binding.catch_binding {
+                match resolve_upvalue(compiler, name) {
+                    Some((index, _)) => Option::Some(AnnexBVarUpdate::Upvalue(index)),
+                    None => Option::None,
+                }
+            } else {
+                add_dynamic_eval_var(compiler, name, bytecode::EvalDeclarationKind::Var, span);
+                Option::Some(AnnexBVarUpdate::EvalVar(string_constant(compiler, name)))
+            },
+            None => {
+                add_dynamic_eval_var(compiler, name, bytecode::EvalDeclarationKind::Var, span);
+                Option::Some(AnnexBVarUpdate::EvalVar(string_constant(compiler, name)))
+            },
+        }
+    } else {
+        match compiler.scopes[var_scope_index].bindings.get(name) {
+            Some(binding) => Option::Some(AnnexBVarUpdate::Local(binding.index)),
+            None => {
+                let index = new_local(compiler);
+                compiler.scopes[var_scope_index].bindings.set(
+                    name,
+                    Binding { name, index, kind: BindingKind::Var, span },
+                );
+                compiler.var_indices.push(index);
+                Option::Some(AnnexBVarUpdate::Local(index))
+            },
+        }
+    }
+}
+
+fn declare_annex_b_function(
+    compiler: Compiler,
+    name: string,
+    span: ast::Span,
+    ancestors: Vec[string],
+) -> () {
+    if compiler_is_strict(compiler) || compiler.module_mode.get() {
+        return
+    } else {};
+    if name == "arguments" && compiler.arguments_available {
+        return
+    } else {};
+    if compiler.parameter_names.get(name).is_some() {
+        return
+    } else {};
+    if ancestors.contains(name) {
+        return
+    } else {};
+    if compiler.direct_eval.get() {
+        match lookup_outer_binding(compiler, name) {
+            Some(binding) => if binding.declaration_target && !binding.catch_binding {
+                if binding.kind != BindingKind::Var {
+                    compile_error(compiler, "duplicate declaration of `" + name + "`", span);
+                    return
+                } else {}
+            } else {},
+            None => (),
+        }
+    } else {};
+    match annex_b_var_scope_write_target(compiler, name, span) {
+        Some(target) => {
+            compiler.block_function_vars[span.start] = target;
+        },
+        None => (),
+    }
 }
 
 fn collect_var_statement(compiler: Compiler, statement: ast::Stmt) -> () {
@@ -1180,6 +1299,204 @@ fn collect_var_body(compiler: Compiler, body: Vec[ast::Stmt]) -> () {
     }
 }
 
+fn collect_annex_b_body(compiler: Compiler, body: Vec[ast::Stmt], ancestors: Vec[string]) -> () {
+    collect_annex_b_body_level(compiler, body, ancestors, true)
+}
+
+fn collect_annex_b_body_level(
+    compiler: Compiler,
+    body: Vec[ast::Stmt],
+    ancestors: Vec[string],
+    top_level: bool,
+) -> () {
+    let lexicals: Vec[string] = Vec::new();
+    let functions: Vec[string] = Vec::new();
+    for statement in body {
+        match statement {
+            ast::Stmt::FunctionDeclaration { name, generator, asynchronous, .. } => {
+                if name == "" {} else if top_level {} else if generator || asynchronous {
+                    lexicals.push(name)
+                } else {
+                    functions.push(name)
+                }
+            },
+            _ => collect_block_lexical_names(compiler, statement, lexicals),
+        }
+    }
+    let combined = merge_lexical_names(ancestors, lexicals);
+    let child_combined = merge_lexical_names(combined, functions);
+    for statement in body {
+        match statement {
+            ast::Stmt::FunctionDeclaration { .. } if top_level => (),
+            _ => collect_annex_b_statement(compiler, statement, combined, child_combined),
+        }
+    }
+}
+
+fn collect_annex_b_statement(
+    compiler: Compiler,
+    statement: ast::Stmt,
+    ancestors: Vec[string],
+    child_ancestors: Vec[string],
+) -> () {
+    match statement {
+        ast::Stmt::FunctionDeclaration { name, span, generator, asynchronous, .. } => {
+            if !generator && !asynchronous {
+                declare_annex_b_function(compiler, name, span, ancestors)
+            } else {}
+        },
+        ast::Stmt::Block { body, .. } => collect_annex_b_body_level(
+            compiler,
+            body,
+            child_ancestors,
+            false,
+        ),
+        ast::Stmt::If { consequent, alternate, .. } => {
+            collect_annex_b_statement(compiler, consequent.get(), child_ancestors, child_ancestors);
+            match alternate {
+                Some(value) => {
+                    collect_annex_b_statement(
+                        compiler,
+                        value.get(),
+                        child_ancestors,
+                        child_ancestors,
+                    );
+                },
+                None => (),
+            }
+        },
+        ast::Stmt::While { body, .. } | ast::Stmt::DoWhile { body, .. } | ast::Stmt::With {
+            body,
+            ..,
+        } => {
+            collect_annex_b_statement(compiler, body.get(), child_ancestors, child_ancestors)
+        },
+        ast::Stmt::For { initializer, body, .. } => {
+            let mut initializer_lexicals: Vec[string] = Vec::new();
+            match initializer {
+                Some(value) => collect_annex_b_statement_lexicals(
+                    compiler,
+                    value.get(),
+                    initializer_lexicals,
+                ),
+                None => (),
+            };
+            let for_combined = merge_lexical_names(child_ancestors, initializer_lexicals);
+            collect_annex_b_statement(compiler, body.get(), for_combined, for_combined)
+        },
+        ast::Stmt::ForOf { kind, pattern, body, .. } | ast::Stmt::ForIn { kind, pattern, body, .. } => {
+            let mut iteration_lexicals: Vec[string] = Vec::new();
+            if kind != ast::VariableKind::Var {
+                collect_pattern_lexical_names(compiler, pattern.get(), iteration_lexicals)
+            } else {};
+            let for_combined = merge_lexical_names(child_ancestors, iteration_lexicals);
+            collect_annex_b_statement(compiler, body.get(), for_combined, for_combined)
+        },
+        ast::Stmt::Switch { cases, .. } => {
+            let mut switch_lexicals: Vec[string] = Vec::new();
+            for clause in cases {
+                for case_statement in clause.consequent {
+                    match case_statement {
+                        ast::Stmt::FunctionDeclaration { .. } => (),
+                        _ => collect_block_lexical_names(compiler, case_statement, switch_lexicals),
+                    }
+                }
+            }
+            let switch_combined = merge_lexical_names(child_ancestors, switch_lexicals);
+            for clause in cases {
+                collect_annex_b_body_level(compiler, clause.consequent, switch_combined, false)
+            }
+        },
+        ast::Stmt::Try { block, handler, finalizer, .. } => {
+            collect_annex_b_body_level(compiler, block, child_ancestors, false);
+            match handler {
+                Some(value) => {
+                    let mut catch_lexicals: Vec[string] = Vec::new();
+                    match value.pattern {
+                        Some(pattern) => {
+                            if !parameter_pattern_is_identifier(pattern.get()) {
+                                collect_pattern_lexical_names(
+                                    compiler,
+                                    pattern.get(),
+                                    catch_lexicals,
+                                )
+                            } else {}
+                        },
+                        None => (),
+                    }
+                    let catch_combined = merge_lexical_names(child_ancestors, catch_lexicals);
+                    collect_annex_b_body_level(compiler, value.body, catch_combined, false)
+                },
+                None => (),
+            };
+            match finalizer {
+                Some(value) => collect_annex_b_body_level(compiler, value, child_ancestors, false),
+                None => (),
+            }
+        },
+        ast::Stmt::Labelled { body, .. } => {
+            collect_annex_b_statement(compiler, body.get(), child_ancestors, child_ancestors)
+        },
+        _ => (),
+    }
+}
+
+fn merge_lexical_names(ancestors: Vec[string], lexicals: Vec[string]) -> Vec[string] {
+    let mut combined: Vec[string] = Vec::new();
+    for name in ancestors {
+        combined.push(name)
+    }
+    for name in lexicals {
+        if !combined.contains(name) {
+            combined.push(name)
+        } else {}
+    }
+    combined
+}
+
+fn collect_block_lexical_names(compiler: Compiler, statement: ast::Stmt, names: Vec[string]) -> () {
+    match statement {
+        ast::Stmt::VariableDeclaration { kind, declarations, .. } => if kind
+            != ast::VariableKind::Var {
+            for declaration in declarations {
+                collect_pattern_lexical_names(compiler, declaration.pattern.get(), names)
+            }
+        } else {},
+        ast::Stmt::ClassDeclaration { name, .. } => if name != "" {
+            names.push(name)
+        } else {},
+        _ => (),
+    }
+}
+
+fn collect_annex_b_statement_lexicals(compiler: Compiler, statement: ast::Stmt, names: Vec[string]) -> () {
+    match statement {
+        ast::Stmt::VariableDeclaration { kind, declarations, .. } => if kind
+            != ast::VariableKind::Var {
+            for declaration in declarations {
+                collect_pattern_lexical_names(compiler, declaration.pattern.get(), names)
+            }
+        } else {},
+        ast::Stmt::ClassDeclaration { name, .. } => if name != "" {
+            names.push(name)
+        } else {},
+        ast::Stmt::FunctionDeclaration { .. } => (),
+        _ => (),
+    }
+}
+
+fn collect_pattern_lexical_names(
+    compiler: Compiler,
+    pattern: ast::BindingPattern,
+    names: Vec[string],
+) -> () {
+    let collected: Vec[(string, ast::Span)] = Vec::new();
+    collect_parameter_names(pattern, collected);
+    for (name, _) in collected {
+        names.push(name)
+    }
+}
+
 fn initialize_var_bindings(compiler: Compiler) -> () {
     let var_scope_index = compiler.var_scope_index.get();
     for index in compiler.var_indices {
@@ -1249,7 +1566,8 @@ fn declare_lexical_statement(compiler: Compiler, statement: ast::Stmt) -> () {
                 validate_strict_identifier(compiler, name, span);
                 record_global_var(compiler, name, bytecode::ScriptBindingKind::Function, span)
             } else {
-                match compiler.scopes[compiler.scopes.len() - 1].bindings.get(name) {
+                let scope_index = compiler.scopes.len() - 1;
+                match compiler.scopes[scope_index].bindings.get(name) {
                     Some(binding) => {
                         validate_strict_identifier(compiler, name, span);
                         if binding.kind == BindingKind::Var
@@ -1257,9 +1575,11 @@ fn declare_lexical_statement(compiler: Compiler, statement: ast::Stmt) -> () {
                             compile_error(compiler, "duplicate declaration of `" + name + "`", span)
                         }
                     },
-                    None => if compiler.direct_eval.get() && !compiler_is_strict(compiler) {
+                    None => if scope_index > compiler.var_scope_index.get() {
+                        let _ = declare_current(compiler, name, BindingKind::Var, span);
+                    } else if compiler.direct_eval.get() && !compiler_is_strict(compiler) {
                         match lookup_outer_binding(compiler, name) {
-                            Some(binding) => if binding.declaration_target {
+                            Some(binding) => if binding.declaration_target && !binding.catch_binding {
                                 if binding.kind != BindingKind::Var {
                                     compile_error(
                                         compiler,
@@ -4548,6 +4868,8 @@ fn compile_nested_function(
         let _ = emit(child, bytecode::Instruction::EnterEvalEnvironment);
     } else {};
     collect_var_body(child, body);
+    let annex_b_ancestors: Vec[string] = Vec::new();
+    collect_annex_b_body(child, body, annex_b_ancestors);
     declare_lexical_body(child, body);
     initialize_lexical_bindings(child);
     initialize_var_bindings(child);
@@ -5109,6 +5431,7 @@ fn compile_function_declaration(
     generator: bool,
     asynchronous: bool,
     span: ast::Span,
+    emit_var_update: bool,
 ) -> () {
     if name == "" {
         return
@@ -5150,7 +5473,19 @@ fn compile_function_declaration(
     let _ = emit(compiler, bytecode::Instruction::PushConst(index));
     match binding {
         Some(value) => {
+            let var_update = if emit_var_update {
+                compiler.block_function_vars.get(span.start)
+            } else {
+                Option::None
+            };
+            if var_update.is_some() {
+                let _ = emit(compiler, bytecode::Instruction::Dup);
+            } else {};
             let _ = emit(compiler, bytecode::Instruction::PutLoc(value.index));
+            match var_update {
+                Some(target) => compile_annex_b_var_update(compiler, target),
+                None => (),
+            }
         },
         None => if name == "arguments" && compiler.arguments_available {
             let index = string_constant(compiler, name);
@@ -5175,6 +5510,21 @@ fn compile_function_declaration(
                     let _ = emit(compiler, bytecode::Instruction::Drop);
                 },
             }
+        },
+    }
+}
+
+fn compile_annex_b_var_update(compiler: Compiler, target: AnnexBVarUpdate) -> () {
+    match target {
+        AnnexBVarUpdate::Local(index) => {
+            let _ = emit(compiler, bytecode::Instruction::PutLoc(index));
+        },
+        AnnexBVarUpdate::Upvalue(index) => {
+            let _ = emit(compiler, bytecode::Instruction::PutUpvalue(index));
+        },
+        AnnexBVarUpdate::EvalVar(index) => {
+            let _ = emit(compiler, bytecode::Instruction::SetEval(index));
+            let _ = emit(compiler, bytecode::Instruction::Drop);
         },
     }
 }
@@ -5973,6 +6323,7 @@ fn compile_export_default(compiler: Compiler, expression: ast::Expr, local: stri
                 generator,
                 asynchronous,
                 span,
+                false,
             );
             return
         } else {},
@@ -6010,6 +6361,7 @@ fn initialize_function_declarations(compiler: Compiler, body: Vec[ast::Stmt]) ->
                     generator,
                     asynchronous,
                     span,
+                    false,
                 )
             },
             ast::Stmt::ExportDeclaration { declaration, .. } => match declaration.get() {
@@ -6028,6 +6380,7 @@ fn initialize_function_declarations(compiler: Compiler, body: Vec[ast::Stmt]) ->
                     generator,
                     asynchronous,
                     span,
+                    false,
                 ),
                 _ => (),
             },
@@ -6107,17 +6460,30 @@ fn compile_if(
     reset_statement_completion(compiler);
     compile_expression(compiler, test);
     let false_branch = emit(compiler, bytecode::Instruction::IfFalse(-1));
-    compile_statement(compiler, consequent);
+    compile_if_branch(compiler, consequent);
     match alternate {
         Some(value) => {
             let end_branch = emit(compiler, bytecode::Instruction::Goto(-1));
             let _ = patch_jump(compiler, false_branch, current_offset(compiler));
-            compile_statement(compiler, value.get());
+            compile_if_branch(compiler, value.get());
             let _ = patch_jump(compiler, end_branch, current_offset(compiler));
         },
         None => {
             let _ = patch_jump(compiler, false_branch, current_offset(compiler));
         },
+    }
+}
+
+fn compile_if_branch(compiler: Compiler, statement: ast::Stmt) -> () {
+    match statement {
+        ast::Stmt::FunctionDeclaration { .. } => {
+            push_scope(compiler);
+            declare_lexical_statement(compiler, statement);
+            initialize_lexical_bindings(compiler);
+            compile_statement(compiler, statement);
+            pop_scope(compiler)
+        },
+        _ => compile_statement(compiler, statement),
     }
 }
 
@@ -6453,6 +6819,11 @@ fn add_exception_handler(compiler: Compiler, start: isize, end: isize, target: i
 
 fn compile_catch(compiler: Compiler, clause: ast::CatchClause) -> () {
     push_scope(compiler);
+    let catch_simple = match clause.pattern {
+        Some(pattern) => parameter_pattern_is_identifier(pattern.get()),
+        None => false,
+    };
+    compiler.catch_scopes.push((compiler.scopes.len() - 1, catch_simple));
     match clause.pattern {
         Some(pattern) => {
             if compiler_is_strict(compiler) {
@@ -6474,6 +6845,7 @@ fn compile_catch(compiler: Compiler, clause: ast::CatchClause) -> () {
     declare_lexical_body(compiler, clause.body);
     initialize_lexical_bindings(compiler);
     compile_body(compiler, clause.body);
+    let _ = compiler.catch_scopes.pop();
     pop_scope(compiler)
 }
 
@@ -6710,6 +7082,7 @@ fn compile_statement(compiler: Compiler, statement: ast::Stmt) -> () {
                 generator,
                 asynchronous,
                 span,
+                true,
             )
         },
         ast::Stmt::ClassDeclaration { name, heritage, elements, span } => {
@@ -6819,7 +7192,20 @@ fn compile_body(compiler: Compiler, body: Vec[ast::Stmt]) -> () {
     initialize_function_declarations(compiler, body);
     for statement in body {
         match statement {
-            ast::Stmt::FunctionDeclaration { .. } => (),
+            ast::Stmt::FunctionDeclaration { name, parameters, body, generator, asynchronous, span } => if compiler.block_function_vars.get(
+                span.start,
+            ).is_some() {
+                compile_function_declaration(
+                    compiler,
+                    name,
+                    parameters,
+                    body,
+                    generator,
+                    asynchronous,
+                    span,
+                    true,
+                )
+            } else {},
             _ => compile_statement(compiler, statement),
         }
     }
@@ -7670,6 +8056,9 @@ fn compiler_new(
         global_var_kinds: HashMap::new(),
         global_declaration_offsets: HashMap::new(),
         runtime_eval_environment,
+        block_function_vars: HashMap::new(),
+        parameter_names: HashMap::new(),
+        catch_scopes: Vec::new(),
     };
     for binding in compiler.outer_bindings {
         if binding.name.starts_with("$with_environment_") {
@@ -7685,6 +8074,7 @@ fn compiler_new(
                     source: bytecode::UpvalueSource::Closure,
                     kind: BindingKind::NamedFunction,
                     declaration_target: false,
+                    catch_binding: false,
                     environment_depth: 0,
                 },
             );
@@ -7693,6 +8083,13 @@ fn compiler_new(
     };
     for _ in 0..parameter_count {
         let _ = new_local(compiler);
+    }
+    for parameter in parameters {
+        let names: Vec[(string, ast::Span)] = Vec::new();
+        collect_parameter_names(parameter.pattern.get(), names);
+        for (name, _) in names {
+            compiler.parameter_names[name] = true;
+        }
     }
     declare_parameter_bindings(compiler, parameters);
     compiler
@@ -8020,6 +8417,8 @@ fn compile_module_program_with_source(program: ast::Program, source: string, sou
         None => -1,
     };
     collect_var_body(compiler, program.body);
+    let annex_b_ancestors: Vec[string] = Vec::new();
+    collect_annex_b_body(compiler, program.body, annex_b_ancestors);
     declare_lexical_body(compiler, program.body);
     initialize_lexical_bindings(compiler);
     let (imports, exports) = collect_module_metadata(compiler, program.body);
@@ -8158,6 +8557,8 @@ fn compile_program_with_source(
         Option::None
     };
     collect_var_body(compiler, program.body);
+    let annex_b_ancestors: Vec[string] = Vec::new();
+    collect_annex_b_body(compiler, program.body, annex_b_ancestors);
     declare_lexical_body(compiler, program.body);
     initialize_lexical_bindings(compiler);
     initialize_var_bindings(compiler);
@@ -8328,7 +8729,7 @@ fn dynamic_parameters(kind: vm::FunctionKind, source: string) -> Result[
     Vec[ast::FunctionParameter],
     Vec[CompileError],
 ] {
-    let parsed = parser::parse(dynamic_function_prefix(kind) + " anonymous(\n" + source + "\n) {}");
+    let parsed = parser::parse(dynamic_function_prefix(kind) + " anonymous(" + source + "\n) {}");
     let errors = dynamic_parse_errors(parsed);
     if !errors.is_empty() {
         return Result::Err(errors)
@@ -8553,6 +8954,7 @@ fn compile_dynamic_eval(source_value: runtime::JsString, bindings: Vec[bytecode:
                     BindingKind::Const
                 },
                 declaration_target: binding.declaration_target,
+                catch_binding: binding.catch_binding,
                 environment_depth: binding.environment_depth,
             },
         )
@@ -8593,6 +8995,8 @@ fn compile_dynamic_eval(source_value: runtime::JsString, bindings: Vec[bytecode:
     let completion = new_local(compiler);
     compiler.completion_local.set(Option::Some(completion));
     collect_var_body(compiler, parsed.program.body);
+    let annex_b_ancestors: Vec[string] = Vec::new();
+    collect_annex_b_body(compiler, parsed.program.body, annex_b_ancestors);
     declare_lexical_body(compiler, parsed.program.body);
     initialize_lexical_bindings(compiler);
     initialize_var_bindings(compiler);
