@@ -349,7 +349,7 @@ fn function_to_string_preserves_source_and_formats_native_callables() -> () {
         execute_source_with_builtins(
             "function ordinary(a){return a+1;} let arrow=x=>x; let object={m(a){return a;}}; class C{constructor(a){this.a=a;} static s(){} get x(){return 1;}} let getter=Object.getOwnPropertyDescriptor(C.prototype,'x').get; return [ordinary.toString(),arrow.toString(),object.m.toString(),C.toString(),C.s.toString(),getter.toString(),Function('a','return a + 1;').toString(),ordinary.bind(null).toString(),Math.max.toString(),Function.prototype.toString()].join('|');",
         ),
-        "function ordinary(a){return a+1;}|x=>x|m(a){return a;}|class C{constructor(a){this.a=a;} static s(){} get x(){return 1;}}|s(){}|get x(){return 1;}|function anonymous(a\n) {\nreturn a + 1;\n}|function () {\n    [native code]\n}|function () {\n    [native code]\n}|function () {\n    [native code]\n}",
+        "function ordinary(a){return a+1;}|x=>x|m(a){return a;}|class C{constructor(a){this.a=a;} static s(){} get x(){return 1;}}|s(){}|get x(){return 1;}|function anonymous(a\n) {\nreturn a + 1;\n}|function () {\n    [native code]\n}|function max() {\n    [native code]\n}|function () {\n    [native code]\n}",
     );
     expect_string(
         execute_source_with_builtins(
@@ -429,7 +429,7 @@ fn builtin_metadata_batch_matches_quickjs_descriptors() -> () {
 #[test]
 fn dynamic_function_constructor_compiles_parameters_body_and_construction() -> () {
     match execute_source_with_builtins(
-        "globalThis.offset = 3; let order = ''; let first = {toString() { order += 'p'; return 'left'; }}; let body = {toString() { order += 'b'; return 'return left * right + globalThis.offset;'; }}; let multiply = Function(first, 'right = 2', body); let Constructor = new Function('value', 'this.value = value;'); let instance = new Constructor(9); let recursive = Function('value', 'return value < 2 ? 1 : value * anonymous(value - 1);'); let globalLookup = Function('return externalDynamicName;'); globalThis.externalDynamicName = 17; let parameterSyntax = false; try { Function(') {}; return function escaped('); } catch (error) { parameterSyntax = error instanceof SyntaxError; } let bodySyntax = false; try { Function('return )'); } catch (error) { bodySyntax = error instanceof SyntaxError; } let symbolFailed = false; try { Function(Symbol('bad')); } catch (error) { symbolFailed = error instanceof TypeError; } return multiply(4) === 11 && multiply.length === 1 && multiply.name === 'anonymous' && order === 'pb' && instance.value === 9 && instance instanceof Constructor && recursive(5) === 120 && globalLookup() === 17 && parameterSyntax && bodySyntax && symbolFailed;",
+        "globalThis.offset = 3; let order = ''; let first = {toString() { order += 'p'; return 'left'; }}; let body = {toString() { order += 'b'; return 'return left * right + globalThis.offset;'; }}; let multiply = Function(first, 'right = 2', body); let Constructor = new Function('value', 'this.value = value;'); let instance = new Constructor(9); let anonymousIsAbsent = Function('return typeof anonymous;')() === 'undefined'; let globalLookup = Function('return externalDynamicName;'); globalThis.externalDynamicName = 17; let parameterSyntax = false; try { Function(') {}; return function escaped('); } catch (error) { parameterSyntax = error instanceof SyntaxError; } let bodySyntax = false; try { Function('return )'); } catch (error) { bodySyntax = error instanceof SyntaxError; } let symbolFailed = false; try { Function(Symbol('bad')); } catch (error) { symbolFailed = error instanceof TypeError; } return multiply(4) === 11 && multiply.length === 1 && multiply.name === 'anonymous' && order === 'pb' && instance.value === 9 && instance instanceof Constructor && anonymousIsAbsent && globalLookup() === 17 && parameterSyntax && bodySyntax && symbolFailed;",
     ) {
         runtime::Value::Bool(value) => testing::assert(value),
         _ => testing::fail("expected dynamic Function result"),
@@ -735,6 +735,16 @@ fn array_from_closes_iterator_when_mapping_abruptly_completes() -> () {
     ) {
         runtime::Value::Bool(value) => testing::assert(value),
         _ => testing::fail("expected Array.from iterator close result"),
+    }
+}
+
+#[test]
+fn array_from_does_not_close_iterator_for_iterator_step_errors() -> () {
+    match execute_source_with_builtins(
+        "let closes = 0; function check(next) { let iterable = {[Symbol.iterator]() { return {next, return() { closes += 1; return {}; }}; }}; try { Array.from(iterable); } catch (error) { return true; } return false; } let token = {}; let nextFailed = check(function() { throw token; }); let resultFailed = check(function() { return 1; }); let doneFailed = check(function() { return {get done() { throw token; }}; }); let valueFailed = check(function() { return {done: false, get value() { throw token; }}; }); return nextFailed && resultFailed && doneFailed && valueFailed && closes === 0;",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected Array.from iterator step errors without closing"),
     }
 }
 
@@ -1501,6 +1511,16 @@ fn direct_eval_and_default_parameters_use_separate_linked_environments() -> () {
 }
 
 #[test]
+fn initializes_body_var_arguments_from_the_parameter_environment() -> () {
+    match execute_source_with_builtins(
+        "function inspect(capture = () => arguments) { var arguments; let same = arguments === capture(); arguments = 0; return same && arguments !== capture(); } return inspect();",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected shadowing body arguments binding"),
+    }
+}
+
+#[test]
 fn direct_eval_arguments_declarations_follow_parameter_environment_bindings() -> () {
     match execute_source_with_builtins(
         "let allowed = (p = eval('var arguments = 3')) => arguments; let blocked = (arguments, p = eval('var arguments')) => {}; let rejected = false; try { blocked(); } catch (error) { rejected = error instanceof SyntaxError; } return allowed() === 3 && rejected;",
@@ -1943,6 +1963,16 @@ fn initializes_default_and_rest_parameters_from_original_arguments() -> () {
 }
 
 #[test]
+fn allows_sloppy_let_rest_parameter_names() -> () {
+    match execute_source_with_builtins(
+        "let arrow = (...let) => let + 42; function ordinary(value, ...let) { return let + value; } return arrow(1) === '142' && ordinary(0, 42) === '420';",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected sloppy let rest parameter names"),
+    }
+}
+
+#[test]
 fn initializes_nested_array_and_object_parameter_bindings() -> () {
     match execute_source_with_builtins(
         "function collect([first = 1, , {value: renamed = 3} = {}, ...tail] = []) { let capture = () => renamed; return [first, capture(), tail.length, tail[0], tail[1]].join(','); } return collect([undefined, 99, {}, 4, 5]) === '1,3,2,4,5' && collect() === '1,3,0,,' && collect.length === 0;",
@@ -1969,6 +1999,16 @@ fn closes_parameter_iterators_on_completion_and_abrupt_binding() -> () {
     ) {
         runtime::Value::Bool(value) => testing::assert(value),
         _ => testing::fail("expected iterator parameter binding result"),
+    }
+}
+
+#[test]
+fn skips_binding_iterator_close_when_next_throws() -> () {
+    match execute_source_with_builtins(
+        "let closes = 0; let token = {}; let iterable = {[Symbol.iterator]() { return {next() { throw token; }, return() { closes += 1; return {}; }}; }}; let preserved = false; try { let [value] = iterable; } catch (error) { preserved = error === token; } return preserved && closes === 0;",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected binding iterator next failure"),
     }
 }
 
@@ -2033,6 +2073,12 @@ fn executes_object_destructuring_assignment_with_computed_keys_and_rest() -> () 
     ) {
         runtime::Value::Bool(value) => testing::assert(value),
         _ => testing::fail("expected object destructuring assignment result"),
+    }
+    match execute_source_with_builtins(
+        "let target; for ({__proto__: target} in {value: 1}) {} return target === String.prototype;",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected for-in object destructuring assignment result"),
     }
 }
 
@@ -2307,6 +2353,26 @@ fn infers_names_for_literal_class_field_initializers() -> () {
 }
 
 #[test]
+fn infers_names_for_computed_class_field_initializers() -> () {
+    match execute_source_with_builtins(
+        "class C { ['first'] = () => {}\n['second'] = async () => {}; static [1] = async function () {}; } let value = new C(); return value.first.name === 'first' && value.second.name === 'second' && C[1].name === '1';",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected computed class field function names"),
+    }
+}
+
+#[test]
+fn infers_anonymous_function_names_in_for_in_initializers() -> () {
+    match execute_source_with_builtins(
+        "for (var value = function () {} in {}) {} return value.name === 'value';",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected for-in initializer function name"),
+    }
+}
+
+#[test]
 fn dynamic_eval_preserves_class_field_initializer_early_error_context() -> () {
     match execute_source_with_builtins(
         "let argumentsError = false; class C { value = eval('arguments'); } try { new C(); } catch (error) { argumentsError = error instanceof SyntaxError; } class D { value = eval('new.target'); } let directNewTarget = new D().value === undefined; let indirectError = false; try { (0, eval)('new.target'); } catch (error) { indirectError = error instanceof SyntaxError; } return argumentsError && directNewTarget && indirectError;",
@@ -2467,6 +2533,36 @@ fn regexp_to_string_and_compile_follow_quickjs_state_transitions() -> () {
 }
 
 #[test]
+fn regexp_exec_reloads_state_after_last_index_conversion() -> () {
+    match execute_source_with_builtins(
+        "let matching = /a/; matching.lastIndex = {valueOf() { matching.compile(/b/g); return 0; }}; let first = matching.exec('b'); let matched = first[0] === 'b' && matching.lastIndex === 1; let nonmatching = /a/y; nonmatching.lastIndex = {valueOf() { nonmatching.compile(/b/); nonmatching.lastIndex = 9; return 0; }}; let second = nonmatching.exec('a'); return matched && second === null && nonmatching.lastIndex === 9;",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected recompiled RegExp state"),
+    }
+}
+
+#[test]
+fn creates_fresh_function_objects_for_each_expression_evaluation() -> () {
+    match execute_source_with_builtins(
+        "let values = []; for (let index = 0; index < 2; index += 1) { values.push(function() {}); } return values[0] !== values[1];",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected fresh function objects"),
+    }
+}
+
+#[test]
+fn preserves_nested_dynamic_function_source_text() -> () {
+    match execute_source_with_builtins(
+        "let value = Function(\"function nested () { return nested.caller; } return nested;\")(); return value.toString() === 'function nested () { return nested.caller; }';",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected nested dynamic function source"),
+    }
+}
+
+#[test]
 fn executes_regexp_inline_modifier_groups_with_local_scope() -> () {
     match execute_source_with_builtins(
         "let local = /^a(?i:b[cd])e$/; let removed = new RegExp('^a(?-i:b)c$', 'i'); let nested = /^(?i:a(?-i:b)c)$/; return local.test('aBCe') && !local.test('ABCE') && removed.test('AbC') && !removed.test('ABC') && /(?s:.)/.test('\\n') && /(?m:^a$)/.test('x\\na\\ny') && /^(?i:(a)\\1)$/.test('aA') && nested.test('AbC') && !nested.test('ABC');",
@@ -2613,6 +2709,16 @@ fn executes_regexp_literals_and_preserves_division_contexts() -> () {
     ) {
         runtime::Value::Bool(value) => testing::assert(value),
         _ => testing::fail("expected RegExp literal execution result"),
+    }
+}
+
+#[test]
+fn regexp_last_match_tracks_builtin_exec() -> () {
+    match execute_source_with_builtins(
+        "let before = RegExp.lastMatch; /y/g.exec('y'); let afterExec = RegExp.lastMatch; let alias = RegExp['$&']; /z/.test('z'); return before === '' && afterExec === 'y' && alias === 'y' && RegExp.lastMatch === 'z' && RegExp['$&'] === 'z';",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected RegExp lastMatch tracking"),
     }
 }
 
@@ -2941,6 +3047,16 @@ fn iterator_helpers_match_quickjs_validation_return_and_descriptor_edges() -> ()
 }
 
 #[test]
+fn iterator_from_wrappers_forward_raw_next_results_and_validate_receivers() -> () {
+    match execute_source_with_builtins(
+        "let prototypeCalls = 0; let source = new Proxy({next() { return 7; }}, {getPrototypeOf(target) { prototypeCalls += 1; return Reflect.getPrototypeOf(target); }}); let wrapper = Iterator.from(source); let raw = wrapper.next(); let next = wrapper.next; let rejected = false; try { next.call({}); } catch (error) { rejected = error instanceof TypeError; } return raw === 7 && rejected && prototypeCalls === 1;",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected Iterator.from wrapper semantics"),
+    }
+}
+
+#[test]
 fn array_copying_methods_preserve_source_and_observe_getters_in_spec_order() -> () {
     match execute_source_with_builtins(
         "let order = ''; let prototype = {get 0() { order += 'a'; return 'p0'; }, get 1() { order += 'b'; return 'p1'; }}; let source = [,,3]; Object.setPrototypeOf(source, prototype); let reversed = Array.prototype.toReversed.call(source); let reverseOrder = order; order = ''; let replaced = Array.prototype.with.call(source, -2, 'x'); let withOrder = order; order = ''; let spliced = Array.prototype.toSpliced.call(source, 1, 1, 'x', 'y'); let spliceOrder = order; let copied = Array.prototype.toSpliced.call(source); let shortened = Array.prototype.toSpliced.call(source, 1); let defaultSorted = [10, 2, undefined, 1].toSorted(); let comparisons = 0; let numericSorted = [undefined, 2, 1].toSorted(function(left, right) { comparisons += 1; return left - right; }); let stable = [{key: 1, id: 'a'}, {key: 1, id: 'b'}, {key: 0, id: 'c'}].toSorted(function(left, right) { return left.key - right.key; }); let range = false; try { [1].with(2, 0); } catch (error) { range = error instanceof RangeError; } return reversed.join(',') === '3,p1,p0' && reverseOrder === 'ba' && replaced.join(',') === 'p0,x,3' && withOrder === 'a' && spliced.join(',') === 'p0,x,y,3' && spliceOrder === 'a' && copied.join(',') === 'p0,p1,3' && shortened.join(',') === 'p0' && defaultSorted[0] === 1 && defaultSorted[1] === 10 && defaultSorted[2] === 2 && defaultSorted[3] === undefined && numericSorted[0] === 1 && numericSorted[1] === 2 && numericSorted[2] === undefined && comparisons === 1 && stable.map(function(value) { return value.id; }).join(',') === 'c,a,b' && Object.hasOwn(reversed, 1) && Object.hasOwn(replaced, 0) && !Object.hasOwn(source, 0) && source.length === 3 && range;",
@@ -3101,6 +3217,16 @@ fn date_setters_read_the_date_value_before_converting_arguments() -> () {
 }
 
 #[test]
+fn date_setters_convert_every_provided_argument_before_rejecting_nan() -> () {
+    match execute_source_with_builtins(
+        "let order = ''; let marker = {valueOf() { order += 'x'; return 1; }}; let result = new Date(0).setUTCFullYear(NaN, marker, marker); let invalid = new Date(NaN); let second = invalid.setUTCSeconds(NaN, marker); return Number.isNaN(result) && Number.isNaN(second) && order === 'xxx';",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected complete Date setter argument conversion"),
+    }
+}
+
+#[test]
 fn date_prototype_parsing_recovery_and_time_clip_boundaries_match_ecmascript() -> () {
     match execute_source_with_builtins(
         "let brand = false; try { Date.prototype.getTime(); } catch (error) { brand = error instanceof TypeError; } let zero = new Date(0); let invalid = new Date(NaN); let recovered = invalid.setFullYear(2016); let expected = new Date(2016, 0).getTime(); let timeZoneMinutes = new Date(0).getTimezoneOffset() * -1; let edge = new Date(1970, 0, 100000001, 0, timeZoneMinutes - 60, 0, 0); return brand && Object.prototype.toString.call(Date.prototype) === '[object Object]' && Date.parse(zero.toUTCString()) === 0 && recovered === expected && invalid.getTime() === expected && edge.toISOString().endsWith('Z');",
@@ -3131,12 +3257,12 @@ fn maps_non_strict_arguments_to_simple_parameters() -> () {
 }
 
 #[test]
-fn hides_unsupported_legacy_caller_properties_on_non_strict_functions() -> () {
+fn exposes_legacy_non_strict_function_caller_and_arguments() -> () {
     match execute_source_with_builtins(
-        "function outer(flag) { if (flag) return true; return inner(); } function inner() { let direct = arguments.callee.caller; let indirect = arguments.callee.arguments; return direct === undefined && indirect === undefined && Object.getOwnPropertyDescriptor(arguments.callee, 'caller') === undefined; } return outer(false);",
+        "function outer(flag) { if (flag) return true; return inner(4); } function inner(value) { let direct = arguments.callee.caller; let indirect = arguments.callee.arguments; return direct === outer && indirect === arguments && indirect[0] === 4 && Object.getOwnPropertyDescriptor(arguments.callee, 'caller') === undefined; } let result = outer(false); return result && inner.arguments === null && inner.caller === null;",
     ) {
         runtime::Value::Bool(value) => testing::assert(value),
-        _ => testing::fail("expected unsupported legacy function properties to be hidden"),
+        _ => testing::fail("expected legacy function reflection result"),
     }
 }
 
@@ -3197,6 +3323,14 @@ fn rejects_duplicate_and_strict_non_simple_parameters() -> () {
     match compile("let object = {method(a, a) { return a; }};") {
         Err(errors) => testing::assert(has_message(errors, "duplicate parameter")),
         Ok(_) => testing::fail("expected method duplicate parameter diagnostic"),
+    }
+    match compile("function conflict(a = 0) { let a; }") {
+        Err(errors) => testing::assert(has_message(errors, "duplicate declaration")),
+        Ok(_) => testing::fail("expected parameter and body lexical conflict"),
+    }
+    match compile("function allowed(a = 0) { var a; }") {
+        Ok(_) => (),
+        Err(_) => testing::fail("expected parameter and var redeclaration"),
     }
 }
 
@@ -3912,7 +4046,7 @@ fn named_function_expression_assignments_follow_strictness_and_eval() -> () {
 #[test]
 fn deleting_super_property_throws_reference_error_at_runtime() -> () {
     match execute_source_with_builtins(
-        "let caught = false; let value = {method() { try { delete super.field; } catch (error) { caught = error instanceof ReferenceError; } }}; value.method(); return caught;",
+        "let caught = false; let evaluated = 0; let value = {method() { try { delete super[++evaluated]; } catch (error) { caught = error instanceof ReferenceError; } }}; value.method(); let uninitialized = false; class Base {} class Derived extends Base { constructor() { try { delete super[(evaluated += 10, 0)]; } catch (error) { uninitialized = error instanceof ReferenceError; } super(); } } new Derived(); return caught && uninitialized && evaluated === 1;",
     ) {
         runtime::Value::Bool(value) => testing::assert(value),
         _ => testing::fail("expected super deletion error result"),
@@ -4020,6 +4154,12 @@ fn with_statement_evaluates_object_and_executes_body() -> () {
             Err(value) => testing::fail(value.debug()),
         },
         _ => testing::fail("expected nested with environment result"),
+    }
+    match execute_source_with_builtins(
+        "let result; with ({eval, value: -1000}) { result = function() { var value = 1; return eval('value + 1'); }; } return result() === 2;",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected direct eval local binding result"),
     }
     match compile("'use strict'; with ({}) {}") {
         Err(errors) => testing::assert(errors.len() > 0),
@@ -4204,6 +4344,16 @@ fn proxy_define_property_preserves_descriptor_field_presence() -> () {
     ) {
         runtime::Value::Bool(value) => testing::assert(value),
         _ => testing::fail("expected exact Proxy descriptor fields"),
+    }
+}
+
+#[test]
+fn proxy_define_property_orders_descriptor_fields_canonically() -> () {
+    match execute_source_with_builtins(
+        "let names = ''; let proxy = new Proxy({}, {defineProperty(target, key, descriptor) { names = Object.getOwnPropertyNames(descriptor).join(','); return true; }}); Object.defineProperty(proxy, 'value', {configurable: true, set: function() {}}); return names === 'set,configurable';",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected canonical Proxy descriptor field order"),
     }
 }
 
@@ -4528,6 +4678,16 @@ fn dynamic_special_function_constructors_execute_and_honor_new_target() -> () {
 }
 
 #[test]
+fn dynamic_function_constructors_parse_before_reading_new_target_prototype() -> () {
+    match execute_source_with_builtins(
+        "let called = 0; let newTarget = Object.defineProperty(function() {}.bind(), 'prototype', {get() { called += 1; return null; }}); let constructors = [Function, Object.getPrototypeOf(async function() {}).constructor, Object.getPrototypeOf(function*() {}).constructor, Object.getPrototypeOf(async function*() {}).constructor]; let syntaxErrors = 0; for (let constructor of constructors) { try { Reflect.construct(constructor, ['@error'], newTarget); } catch (error) { if (error instanceof SyntaxError) syntaxErrors += 1; } } return syntaxErrors === 4 && called === 0;",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected dynamic Function parsing before prototype lookup"),
+    }
+}
+
+#[test]
 fn for_await_iterates_async_sources_and_assimilates_sync_values() -> () {
     match execute_source_with_builtins(
         "let asyncIndex = 0; let asyncReceiver = true; let asyncSource = {[Symbol.asyncIterator]() { return this; }, next() { asyncReceiver = asyncReceiver && this === asyncSource; asyncIndex += 1; return Promise.resolve({value: asyncIndex, done: asyncIndex > 2}); }}; let result = ''; let syncLeft = 0; let syncRight = 0; for ([syncLeft, syncRight] of [[7, 8]]) {} async function collect() { let values = []; let left = 0; let right = 0; for await (let value of asyncSource) values.push(value); for await (let value of [Promise.resolve(3), {then(resolve) { resolve(4); }}]) values.push(value); for await ([left, right] of [[5, 6]]) {} return values.join(',') + ':' + left + ',' + right; } collect().then(value => result = value); Promise.drainJobs(); return asyncReceiver && asyncIndex === 3 && result === '1,2,3,4:5,6' && syncLeft === 7 && syncRight === 8;",
@@ -4590,10 +4750,20 @@ fn switch_resets_completion_and_scopes_case_block_lexicals_after_the_discriminan
 #[test]
 fn try_preserves_completion_and_validates_inherited_strict_catch_bindings() -> () {
     match execute_source_with_builtins(
-        "let values = eval('1; try { 2; } catch (error) {}') === 2 && eval('1; try {} catch (error) { 2; }') === undefined && eval('1; try { throw 0; } catch (error) { 3; }') === 3 && eval('1; try { 4; } finally { 5; }') === 4 && eval('1; do { try { 6; } finally { 7; break; } } while (false)') === 7 && eval('1; do { try { 6; } finally { break; } } while (false)') === undefined; let strictCatch = function() { 'use strict'; try { eval('try {} catch (eval) {}'); } catch (error) { return error instanceof SyntaxError; } return false; }; return values && strictCatch();",
+        "let values = eval('1; try { 2; } catch (error) {}') === 2 && eval('1; try {} catch (error) { 2; }') === undefined && eval('1; try { throw 0; } catch (error) { 3; }') === 3 && eval('1; try { 4; } finally { 5; }') === 4 && eval('1; do { try { 6; } finally { 7; break; } } while (false)') === 7 && eval('1; do { try { 6; } finally { break; } } while (false)') === undefined && eval('while (true) { try { 8; break; } finally { 9; } }') === 8 && eval('while (true) { try { break; } finally { 9; } }') === undefined; let strictCatch = function() { 'use strict'; try { eval('try {} catch (eval) {}'); } catch (error) { return error instanceof SyntaxError; } return false; }; return values && strictCatch();",
     ) {
         runtime::Value::Bool(value) => testing::assert(value),
         _ => testing::fail("expected try completion and strict catch binding behavior"),
+    }
+}
+
+#[test]
+fn annex_b_block_functions_override_arguments_and_survive_eval_deletion() -> () {
+    match execute_source_with_builtins(
+        "function replaceArguments() { { function arguments() { return 1; } } return typeof arguments === 'function' && arguments() === 1; } function preserveArguments() { { function arguments() {} let inner = arguments; } return typeof arguments === 'object'; } function replaceIfFunction() { if (true) function value() { return 3; } return value() === 3; } function createEvalFunction() { eval('delete q; { function q() { return 2; } if (delete q) throw 1; }'); return q(); } return replaceArguments() && preserveArguments() && replaceIfFunction() && createEvalFunction() === 2;",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected Annex B block function bindings"),
     }
 }
 
@@ -5403,6 +5573,26 @@ fn proxy_internal_methods_forward_through_prototypes_and_nested_targets() -> () 
 }
 
 #[test]
+fn global_identifier_access_preserves_the_global_receiver_through_proxy_prototypes() -> () {
+    expect_bool(
+        execute_source_with_builtins(
+            "let global = globalThis; let original = Object.getPrototypeOf(global); let gets = 0; let sets = 0; Object.setPrototypeOf(global, new Proxy(original, {has(target, key) { return key === 'proxyGlobalBinding' || Reflect.has(target, key); }, get(target, key, receiver) { gets += 1; if (receiver !== global) throw 'receiver'; return Reflect.get(target, key, receiver); }, set(target, key, value, receiver) { sets += 1; if (receiver !== global) throw 'receiver'; return Reflect.set(target, key, value, receiver); }})); let before = proxyGlobalBinding; proxyGlobalBinding = 12; Object.setPrototypeOf(global, original); delete global.proxyGlobalBinding; return before === undefined && gets === 1 && sets === 1;",
+        ),
+        true,
+    )
+}
+
+#[test]
+fn sloppy_call_assignment_targets_throw_after_calling_only_the_target() -> () {
+    expect_bool(
+        execute_source_with_builtins(
+            "let calls = 0; let rightCalls = 0; function target() { calls += 1; return {valueOf() { throw 'converted'; }}; } function right() { rightCalls += 1; return 1; } let caught = 0; try { target() = right(); } catch (error) { if (error instanceof ReferenceError) caught += 1; } try { target() += right(); } catch (error) { if (error instanceof ReferenceError) caught += 1; } try { target()++; } catch (error) { if (error instanceof ReferenceError) caught += 1; } try { for (target() of [1]) {} } catch (error) { if (error instanceof ReferenceError) caught += 1; } return caught === 4 && calls === 4 && rightCalls === 0;",
+        ),
+        true,
+    )
+}
+
+#[test]
 fn json_uses_observable_proxy_and_boxed_primitive_operations() -> () {
     expect_bool(
         execute_source_with_builtins(
@@ -5437,6 +5627,46 @@ fn math_special_values_preserve_ecmascript_results() -> () {
     expect_bool(
         execute_source_with_builtins(
             "let large = 2 / Number.EPSILON - 1; return Number.isNaN(Math.pow(1, NaN)) && Number.isNaN(Math.pow(-1, Infinity)) && Number.isNaN(1 ** NaN) && 1 / Math.round(-0.25) === -Infinity && Math.round(0.5 - Number.EPSILON / 4) === 0 && Math.round(large) === large && Math.log10(1000) === 3;",
+        ),
+        true,
+    )
+}
+
+#[test]
+fn atomics_revalidate_buffers_after_observable_argument_conversions() -> () {
+    expect_bool(
+        execute_source_with_builtins(
+            "function check(callback) { let buffer = new ArrayBuffer(4); let target = new Int32Array(buffer); let bad = {valueOf() { buffer.transfer(); return 0; }}; try { callback(target, bad); } catch (error) { return error instanceof TypeError; } return false; } return check((target, bad) => Atomics.load(target, bad)) && check((target, bad) => Atomics.store(target, 0, bad)) && check((target, bad) => Atomics.compareExchange(target, 0, bad, 0));",
+        ),
+        true,
+    )
+}
+
+#[test]
+fn typed_array_from_constructs_array_like_targets_before_reading_elements() -> () {
+    expect_bool(
+        execute_source_with_builtins(
+            "let log = ''; function Target(length) { log += 'C'; return new Int8Array(length); } let source = {get length() { log += 'l'; return 1; }, get 0() { log += '0'; return 7; }}; let result = Int8Array.from.call(Target, source); return log === 'lC0' && result[0] === 7;",
+        ),
+        true,
+    )
+}
+
+#[test]
+fn typed_array_set_orders_detachment_checks_around_observable_conversions() -> () {
+    expect_bool(
+        execute_source_with_builtins(
+            "let firstBuffer = new ArrayBuffer(4); let first = new Int32Array(firstBuffer); firstBuffer.transfer(); let token = {}; let offsetWon = false; try { first.set(null, {valueOf() { throw token; }}); } catch (error) { offsetWon = error === token; } let secondBuffer = new ArrayBuffer(4); let second = new Int32Array(secondBuffer); second.set({get length() { secondBuffer.transfer(); return 0; }}); return offsetWon && second.length === 0;",
+        ),
+        true,
+    )
+}
+
+#[test]
+fn typed_array_to_locale_string_passes_no_element_arguments() -> () {
+    expect_bool(
+        execute_source_with_builtins(
+            "let count = -1; let original = Number.prototype.toLocaleString; Number.prototype.toLocaleString = function() { count = arguments.length; return 'ok'; }; let result = new Int8Array(1).toLocaleString({}, {}); Number.prototype.toLocaleString = original; return result === 'ok' && count === 0;",
         ),
         true,
     )

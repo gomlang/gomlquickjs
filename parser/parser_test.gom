@@ -934,10 +934,12 @@ fn rejects_invalid_for_of_heads() -> () {
 }
 
 #[test]
-fn parses_literal_member_targets_in_for_of_assignment_patterns() -> () {
-    let result = parse("for ([{}.value, [0].value] of source) {} for ({x: {}.value} of source) {}");
+fn parses_literal_member_targets_in_iteration_assignment_patterns() -> () {
+    let result = parse(
+        "for ([{}.value, [0].value] of source) {} for ({x: {}.value} of source) {} for ({__proto__: target} in source) {}",
+    );
     testing::assert_eq(result.errors.len(), 0);
-    testing::assert_eq(result.program.body.len(), 2);
+    testing::assert_eq(result.program.body.len(), 3);
     match result.program.body[0] {
         ast::Stmt::ForOf { assignment_pattern: Some(_), .. } => (),
         _ => testing::fail("expected array assignment pattern"),
@@ -945,6 +947,10 @@ fn parses_literal_member_targets_in_for_of_assignment_patterns() -> () {
     match result.program.body[1] {
         ast::Stmt::ForOf { assignment_pattern: Some(_), .. } => (),
         _ => testing::fail("expected object assignment pattern"),
+    }
+    match result.program.body[2] {
+        ast::Stmt::ForIn { assignment_pattern: Some(_), .. } => (),
+        _ => testing::fail("expected for-in object assignment pattern"),
     }
 }
 
@@ -967,7 +973,7 @@ fn parses_for_of_assignment_targets() -> () {
     let result = parse(
         "for (value of values) total += value; for (target[index()] of values) {} for (value() of values) tail();",
     );
-    testing::assert_eq(result.errors.len(), 1);
+    testing::assert_eq(result.errors.len(), 0);
     match result.program.body[0] {
         ast::Stmt::ForOf { target: Some(target), .. } => assert_identifier(target.get(), "value"),
         _ => testing::fail("expected identifier for-of assignment target"),
@@ -979,7 +985,24 @@ fn parses_for_of_assignment_targets() -> () {
         },
         _ => testing::fail("expected indexed for-of statement"),
     }
+    match result.program.body[2] {
+        ast::Stmt::ForOf { target: Some(target), .. } => match target.get() {
+            ast::Expr::Call { .. } => (),
+            _ => testing::fail("expected legacy call for-of assignment target"),
+        },
+        _ => testing::fail("expected legacy call for-of statement"),
+    }
     testing::assert_eq(result.program.body.len(), 3)
+}
+
+#[test]
+fn limits_legacy_call_assignment_targets_to_non_logical_operations() -> () {
+    let legacy = parse("target() = 1; target() += 1; target()++; for (target() of values) {}");
+    testing::assert_eq(legacy.errors.len(), 0);
+    let logical = parse("target() &&= 1; target() ||= 1; target() ??= 1;");
+    testing::assert_eq(logical.errors.len(), 3);
+    let destructuring = parse("[target() = 1] = values;");
+    testing::assert(!destructuring.errors.is_empty())
 }
 
 #[test]
@@ -1802,6 +1825,25 @@ fn parses_instance_and_static_public_class_fields() -> () {
 }
 
 #[test]
+fn separates_arrow_class_fields_at_line_breaks() -> () {
+    let result = parse("class Fields { ['first'] = () => {}\n['second'] = async () => {} };");
+    testing::assert_eq(result.errors.len(), 0);
+    match result.program.body[0] {
+        ast::Stmt::ClassDeclaration { elements, .. } => {
+            testing::assert_eq(elements.len(), 2);
+            match elements[0].initializer {
+                Some(value) => match value.get() {
+                    ast::Expr::Arrow { .. } => (),
+                    _ => testing::fail("expected arrow initializer"),
+                },
+                None => testing::fail("expected first initializer"),
+            }
+        },
+        _ => testing::fail("expected class fields"),
+    }
+}
+
+#[test]
 fn parses_class_static_initialization_blocks_and_rejects_return() -> () {
     let result = parse(
         "class Blocks { static { let value = 1; function read() { return value; } this.value = read(); } static {} }",
@@ -1957,6 +1999,8 @@ fn rejects_legacy_numeric_literals_in_strict_code() -> () {
 #[test]
 fn rejects_legacy_string_escapes_throughout_strict_function_bodies() -> () {
     testing::assert(parse_script("'\\1'; '\\8';").errors.is_empty());
+    testing::assert(!parse_script("'\\1'; 'use strict';").errors.is_empty());
+    testing::assert(!parse_eval("'\\1'; 'use strict';", false, false, false).errors.is_empty());
     testing::assert(!parse_script("'use strict'; '\\1';").errors.is_empty());
     testing::assert(!parse_script("'use strict'; '\\8';").errors.is_empty());
     testing::assert(!parse_script("function invalid() { '\\1'; 'use strict'; }").errors.is_empty());
@@ -2362,10 +2406,11 @@ fn tagged_templates_preserve_invalid_escape_raw_and_undefined_cooked() -> () {
 
 #[test]
 fn diagnoses_invalid_object_accessor_parameters() -> () {
-    let result = parse("return {get value(input) {}, set value() {}};");
-    testing::assert_eq(result.errors.len(), 2);
+    let result = parse("return {get value(input) {}, set value() {}, set rest(...values) {}};");
+    testing::assert_eq(result.errors.len(), 3);
     testing::assert_eq(result.errors[0].message, "getter must not have parameters");
-    testing::assert_eq(result.errors[1].message, "setter must have exactly one parameter")
+    testing::assert_eq(result.errors[1].message, "setter must have exactly one parameter");
+    testing::assert_eq(result.errors[2].message, "setter must have exactly one parameter")
 }
 
 #[test]

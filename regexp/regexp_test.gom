@@ -202,6 +202,11 @@ fn unicode_identity_escapes_only_allow_grammar_punctuators() -> () {
     for pattern in Vec::from_array(["\\^", "\\/", "[\\-]"]) {
         testing::assert(compile_utf8_with_flags(pattern, "u").is_ok())
     }
+    for terminator in Vec::from_array([10, 13, 0x2028, 0x2029]) {
+        let pattern = runtime::JsString::from_code_units(Vec::from_array([92, terminator]));
+        testing::assert(compile(pattern).is_ok());
+        testing::assert(compile_with_flags(pattern, "u").is_err())
+    }
     testing::assert(compile_utf8_with_flags("[\\!\\#]", "v").is_ok())
 }
 
@@ -695,6 +700,29 @@ fn unicode_mode_preserves_lone_surrogates_and_rejects_out_of_range_escapes() -> 
     let lone = runtime::JsString::from_code_units(Vec::from_array([0xd800.to_u16()]));
     testing::assert(expect_regex(compile_utf8_with_flags("^.$", "u")).is_match(lone));
     testing::assert(expect_regex(compile_utf8_with_flags("^\\uD800$", "u")).is_match(lone));
+    let pair_and_trail = runtime::JsString::from_code_units(
+        Vec::from_array([0xd83d.to_u16(), 0xdc38.to_u16(), 0xdc38.to_u16()]),
+    );
+    testing::assert(
+        !expect_regex(compile_utf8_with_flags("^\\u{D83D}\\u{DC38}+$", "u")).is_match(
+            pair_and_trail,
+        ),
+    );
+    let captured_lead_pair = runtime::JsString::from_code_units(
+        Vec::from_array(
+            [
+                0xd834.to_u16(),
+                98.to_u16(),
+                97.to_u16(),
+                114.to_u16(),
+                0xd834.to_u16(),
+                0xdc00.to_u16(),
+            ],
+        ),
+    );
+    testing::assert(
+        !expect_regex(compile_utf8_with_flags("^(.+)bar\\1", "u")).is_match(captured_lead_pair),
+    );
     match compile_utf8_with_flags("\\u{110000}", "u") {
         Result::Err(error) => testing::assert_eq(
             error.message,

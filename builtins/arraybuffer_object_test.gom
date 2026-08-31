@@ -309,6 +309,31 @@ fn data_view_wrapper_preserves_aliasing_endianness_and_bounds() -> () {
 }
 
 #[test]
+fn data_view_checks_detachment_after_valid_large_indices() -> () {
+    let context = vm::Context::new(runtime::Heap::new());
+    let install = arraybuffer_expect_install(install_arraybuffer(context));
+    let buffer = arraybuffer_construct(
+        context,
+        install.array_buffer,
+        Vec::from_array([runtime::Value::Int(1)]),
+    );
+    let view = arraybuffer_construct(context, install.data_view, Vec::from_array([buffer]));
+    match install.detach_array_buffer(buffer) {
+        Ok(()) => (),
+        Err(value) => testing::fail(value),
+    }
+    match arraybuffer_invoke_method(
+        context,
+        view,
+        "getInt8",
+        Vec::from_array([runtime::Value::Float(9007199254740991.0)]),
+    ) {
+        Err(vm::VmError { kind: vm::VmErrorKind::TypeError(_), .. }) => (),
+        _ => testing::fail("expected detached DataView error after ToIndex"),
+    }
+}
+
+#[test]
 fn uint8_array_wrapper_supports_get_set_and_aliasing_subarray() -> () {
     let context = vm::Context::new(runtime::Heap::new());
     let install = arraybuffer_expect_install(install_arraybuffer(context));
