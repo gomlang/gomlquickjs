@@ -465,15 +465,14 @@ impl GeneratorRuntime {
 
 pub type HostTask = (isize) -> Result[(), VmError];
 
-enum HostJob {
-    Callback {
-        callback: runtime::Value,
-        arguments: Vec[runtime::Value],
-    },
-    Task {
-        callback: HostTask,
-        roots: Vec[runtime::Value],
-    },
+struct HostCallbackJob {
+    callback: runtime::Value,
+    arguments: Vec[runtime::Value],
+}
+
+struct PendingHostTask {
+    callback: HostTask,
+    roots: Vec[runtime::Value],
 }
 
 enum StepResult {
@@ -566,7 +565,8 @@ pub struct Context {
     dynamic_module_loader_value: Ref[Option[DynamicModuleLoader]],
     promise_capability_factory_value: Ref[Option[HostPromiseCapabilityFactory]],
     active_frames_value: Vec[ActiveFrame],
-    host_jobs_value: Vec[HostJob],
+    host_callbacks_value: collections::Deque[HostCallbackJob],
+    host_tasks_value: collections::Deque[PendingHostTask],
     microtask_drainer_value: Ref[Option[MicrotaskDrainer]],
     microtask_pending_value: Ref[Option[MicrotaskPending]],
     generators_value: GeneratorRuntime,
@@ -758,7 +758,8 @@ impl Context {
             dynamic_module_loader_value: Ref::new(Option::None),
             promise_capability_factory_value: Ref::new(Option::None),
             active_frames_value: Vec::new(),
-            host_jobs_value: Vec::new(),
+            host_callbacks_value: collections::Deque::new(),
+            host_tasks_value: collections::Deque::new(),
             microtask_drainer_value: Ref::new(Option::None),
             microtask_pending_value: Ref::new(Option::None),
             generators_value: GeneratorRuntime::new(),
@@ -914,18 +915,28 @@ impl Context {
         for frame in self.active_frames_value {
             push_active_frame_roots(roots, frame)
         }
-        for job in self.host_jobs_value {
-            match job {
-                HostJob::Callback { callback, arguments } => {
-                    roots.push(callback);
-                    for value in arguments {
+        let mut job_index = 0;
+        while job_index < self.host_callbacks_value.len() {
+            match self.host_callbacks_value.get(job_index) {
+                Some(job) => {
+                    roots.push(job.callback);
+                    for value in job.arguments {
                         roots.push(value)
                     }
                 },
-                HostJob::Task { roots: values, .. } => for value in values {
+                None => (),
+            }
+            job_index += 1;
+        }
+        job_index = 0;
+        while job_index < self.host_tasks_value.len() {
+            match self.host_tasks_value.get(job_index) {
+                Some(job) => for value in job.roots {
                     roots.push(value)
                 },
+                None => (),
             }
+            job_index += 1;
         }
         for (owner, frame) in self.generators_value.states.entries() {
             let values: Vec[runtime::Value] = Vec::new();
@@ -1042,7 +1053,7 @@ impl Context {
         match callback {
             runtime::Value::Object(object) => if object.is_callable()
                 && self.heap_value.contains(object) {
-                self.host_jobs_value.push(HostJob::Callback { callback, arguments });
+                self.host_callbacks_value.push_back(HostCallbackJob { callback, arguments });
                 Result::Ok(())
             } else {
                 Result::Err(error(-1, VmErrorKind::TypeError("host job callback is not callable")))
@@ -1052,7 +1063,7 @@ impl Context {
     }
 
     pub fn enqueue_host_task(self: Context, callback: HostTask, roots: Vec[runtime::Value]) -> () {
-        self.host_jobs_value.push(HostJob::Task { callback, roots })
+        self.host_tasks_value.push_back(PendingHostTask { callback, roots })
     }
 
     pub fn set_microtask_queue(self: Context, drainer: MicrotaskDrainer, pending: MicrotaskPending) -> () {
@@ -1074,29 +1085,15 @@ impl Context {
         }
     }
 
-    fn pending_host_task_index(self: Context) -> Option[isize] {
-        let mut index = 0;
-        while index < self.host_jobs_value.len() {
-            match self.host_jobs_value[index] {
-                HostJob::Task { .. } => return Option::Some(index),
-                HostJob::Callback { .. } => (),
-            }
-            index += 1;
-        }
-        Option::None
-    }
-
     fn run_host_tasks_at_depth(self: Context, depth: isize, limit: isize) -> Result[isize, VmError] {
         let mut count = 0;
         while count < limit {
-            let index = match self.pending_host_task_index() {
-                Some(index) => index,
+            let job = match self.host_tasks_value.pop_front() {
+                Some(job) => job,
                 None => break,
             };
-            match self.host_jobs_value.remove(index) {
-                HostJob::Task { callback, .. } => callback(depth)?,
-                HostJob::Callback { .. } => (),
-            }
+            let callback = job.callback;
+            callback(depth)?;
             count += 1;
             count += self.run_finalization_jobs_at_depth(depth);
             count += self.run_microtasks();
@@ -1111,19 +1108,17 @@ impl Context {
         if self.job_checkpoint_requested() {
             return Result::Ok(count)
         }
-        while !self.host_jobs_value.is_empty() && count < 16777216 {
-            let job = self.host_jobs_value.remove(0);
-            match job {
-                HostJob::Callback { callback, arguments } => {
-                    let _ = self.invoke_with_this_at_depth(
-                        callback,
-                        arguments,
-                        runtime::Value::Undefined,
-                        depth,
-                    )?;
-                },
-                HostJob::Task { callback, .. } => callback(depth)?,
-            }
+        while !self.host_callbacks_value.is_empty() && count < 16777216 {
+            let job = match self.host_callbacks_value.pop_front() {
+                Some(job) => job,
+                None => break,
+            };
+            let _ = self.invoke_with_this_at_depth(
+                job.callback,
+                job.arguments,
+                runtime::Value::Undefined,
+                depth,
+            )?;
             count += 1;
             count += self.run_finalization_jobs_at_depth(depth);
             count += self.run_microtasks();
