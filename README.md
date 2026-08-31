@@ -47,7 +47,9 @@ character classes, shorthand complements, and Unicode word boundaries.
 String case conversion and NFC, NFD, NFKC, and NFKD normalization use generated upstream
 QuickJS Unicode tables, including multi-code-point mappings and contextual final sigma.
 Legacy non-Unicode patterns implement Annex B decimal, octal, and identity escapes while
-Unicode mode rejects ambiguous numeric escapes.
+Unicode mode rejects ambiguous numeric escapes; invalid `\c` control escapes fall back to a
+literal backslash followed by `c` in non-Unicode mode, and character class escapes may end
+non-Unicode ranges as a union with the range dash.
 RegExp match arrays expose null-prototype named `groups`, and String match, matchAll,
 search, replace, replaceAll, and split dispatch to
 well-known symbol protocols and RegExp state with captures, callback replacements,
@@ -80,13 +82,25 @@ global lexical environment with TDZ, mutable `let`, immutable `const`, nondeleta
 QuickJS-compatible global var and function descriptors, atomic declaration checks, and runtime
 identity checks that distinguish direct eval from a shadowing callable. Sloppy direct and indirect
 global eval also preflight var and function declarations atomically before updating configurable
-global properties. A qjs
+global properties. Annex B block-level function declarations in sloppy function, global, and eval
+code create function-scoped or global var bindings (initialized to `undefined` at instantiation)
+that are updated when the declaration statement executes, with block-local bindings initialized at
+block entry, shared switch-case function declarations, catch-clause exemptions for simple
+identifier bindings, early-error skips for enclosing lexical declarations, strict, parameter, and
+`arguments` skips, and unconditional var-environment updates at evaluation; the same extension
+applies to `if`-statement function declarations through implicit branch scopes. Sloppy `for-in`
+heads accept `var` initializers evaluated once before enumeration, with Annex B no-`in` parsing
+that keeps `in` inside parenthesized, conditional-consequent, and call-argument positions while
+treating the first top-level `in` as the clause separator. HTML-like comments (`<!--` anywhere in
+script code, `-->` at line starts) are recognized by the lexer.
+A qjs
 command, native shortest-roundtrip ECMAScript number conversion, exact fixed,
 exponential, precision, and 2–36 radix Number formatting, and a strict
 UTF-16 JSON codec with reviver source contexts, VM-aware replacers, indentation,
 accessors, toJSON dispatch, and raw JSON values are also available. URI percent encoding, UTC/ISO Date
 arithmetic, SameValueZero Map/Set storage, resizable ArrayBuffer resizing and transfer,
 growable SharedArrayBuffer storage, length-tracking and recoverable fixed typed-array views,
+variable-length typed-array views reject `preventExtensions`, `seal`, and `freeze`,
 DataView memory primitives including 64-bit BigInt access, and QuickJS version-5 binary object serialization
 are implemented natively. BJSON covers atom tables, IEEE numbers, UTF-16 strings, BigInt,
 ordinary and array objects, Date and primitive wrappers, ArrayBuffer and typed-array views,
@@ -130,7 +144,8 @@ constructor-only invocation, derived-instance prototype preservation, ArrayBuffe
 the shared `%TypedArray%` constructor and prototype inheritance topology, Uint8Array Base64 and Hex
 construction, encoding, and partial-write decoding,
 at/join/search, in-place fill/copy/reverse/sort, callback/reduce, species-aware map/filter/slice,
-and toReversed/toSorted/with copying algorithms,
+and toReversed/toSorted/with copying algorithms, with stable bottom-up merge sorts for Array and
+TypedArray (including a raw numeric fast path that preserves -0 and NaN ordering),
 UTC and TZif-backed host-local Date instances with construction, DST-aware field access and mutation,
 fixed QuickJS locale formatting, ISO and JSON conversion, URI and legacy escape functions,
 Math.random, performance.now, qjs scriptArgs, print, console.log, JSON.parse, and JSON.stringify.
@@ -193,7 +208,10 @@ harness setup separately in the same realm, and executes script and module async
 through a realm-local `$DONE` callback after draining Promise and host jobs. Parse, resolution,
 and runtime negatives require matching phases and error types; module errors retain structured
 runtime types instead of inferring them from diagnostic text. Fixture files, unsupported proposal
-features, blocking-host cases, and Intl402 paths are skipped before execution. The runner does not
+features (matching the upstream feature skip list, including `joint-iteration`, `legacy-regexp`,
+`arbitrary-module-namespace-names`, and `canonical-tz`), blocking-host cases, and Intl402 paths
+are skipped before execution. The `$DONE` callback is redefinable so harness helpers such as
+`asyncTest` can install their own bookkeeping before calling the original. The runner does not
 yet provide a wall-clock timeout for indefinitely pending async tests. Harness `var` and function
 declarations persist through the global object, while top-level harness `let`, `const`, and `class`
 declarations persist through the realm's global lexical environment and are visible to subsequent
