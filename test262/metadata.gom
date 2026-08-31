@@ -1,5 +1,6 @@
 package test262;
 
+use std::collections;
 use std::text;
 
 #[derive(PartialEq, Eq, Debug)]
@@ -65,14 +66,9 @@ fn error(line: isize, message: string) -> MetadataError {
     MetadataError { line, message }
 }
 
-fn push_unique(values: Vec[string], value: string) -> () {
-    if value == "" {} else {
-        for current in values {
-            if current == value {
-                return ()
-            }
-        }
-        values.push(value)
+fn push_unique(values: collections::IndexSet[string], value: string) -> () {
+    if value != "" {
+        let _ = values.insert(value);
     }
 }
 
@@ -100,14 +96,17 @@ fn parse_list_item(value: string) -> string {
     strip_quotes(without_comma)
 }
 
-fn parse_inline_list(value: string, line: isize) -> Result[Vec[string], MetadataError] {
+fn parse_inline_list(value: string, line: isize) -> Result[
+    collections::IndexSet[string],
+    MetadataError,
+] {
     let trimmed = text::trim(value);
     if trimmed.byte_len() < 2 || trimmed.byte_get(0) != b'['
         || trimmed.byte_get(trimmed.byte_len() - 1) != b']' {
         return Result::Err(error(line, "expected an inline list"))
     }
     let body = trimmed.byte_slice(1, trimmed.byte_len() - 1);
-    let result: Vec[string] = Vec::new();
+    let result: collections::IndexSet[string] = collections::IndexSet::new();
     if text::trim(body) == "" {
         return Result::Ok(result)
     }
@@ -121,20 +120,23 @@ fn parse_inline_list(value: string, line: isize) -> Result[Vec[string], Metadata
     Result::Ok(result)
 }
 
-fn append_values(target: Vec[string], values: Vec[string]) -> () {
+fn append_values(target: collections::IndexSet[string], values: collections::IndexSet[string]) -> () {
     for value in values {
         push_unique(target, value)
     }
 }
 
-fn list_target(field: ListField, includes: Vec[string], flags: Vec[string], features: Vec[string]) -> Vec[
-    string,
-] {
+fn list_target(
+    field: ListField,
+    includes: collections::IndexSet[string],
+    flags: collections::IndexSet[string],
+    features: collections::IndexSet[string],
+) -> collections::IndexSet[string] {
     match field {
         ListField::Includes => includes,
         ListField::Flags => flags,
         ListField::Features => features,
-        ListField::None => Vec::new(),
+        ListField::None => collections::IndexSet::new(),
     }
 }
 
@@ -180,9 +182,9 @@ pub fn source_variants(metadata: Metadata) -> Vec[SourceVariant] {
 }
 
 fn parse_metadata(value: string) -> Result[Metadata, MetadataError] {
-    let includes: Vec[string] = Vec::new();
-    let flags: Vec[string] = Vec::new();
-    let features: Vec[string] = Vec::new();
+    let includes: collections::IndexSet[string] = collections::IndexSet::new();
+    let flags: collections::IndexSet[string] = collections::IndexSet::new();
+    let features: collections::IndexSet[string] = collections::IndexSet::new();
     let mut list_field = ListField::None;
     let mut in_negative = false;
     let mut negative_phase: Option[NegativePhase] = Option::None;
@@ -264,7 +266,13 @@ fn parse_metadata(value: string) -> Result[Metadata, MetadataError] {
         (None, Some(_)) => return Result::Err(error(0, "negative metadata is missing phase")),
         (Some(_), None) => return Result::Err(error(0, "negative metadata is missing type")),
     };
-    let provisional = Metadata { includes, flags, features, negative, asynchronous: false };
+    let provisional = Metadata {
+        includes: includes.to_vec(),
+        flags: flags.to_vec(),
+        features: features.to_vec(),
+        negative,
+        asynchronous: false,
+    };
     Result::Ok(Metadata { asynchronous: has_flag(provisional, "async"), ..provisional })
 }
 

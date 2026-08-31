@@ -16,7 +16,7 @@ pub struct RegexError {
     pub offset: isize,
 }
 
-#[derive(PartialEq, Eq, Debug)]
+#[derive(Hash, PartialEq, Eq, Debug)]
 pub struct RegexCapture {
     pub start: isize,
     pub end: isize,
@@ -1907,7 +1907,7 @@ pub fn compile_utf8_with_flags(pattern: string, flags: string) -> Result[Regex, 
     compile_with_flags(runtime::JsString::from_utf8(bytes.slice(0, bytes.len())), flags)
 }
 
-#[derive(PartialEq, Eq)]
+#[derive(Hash, PartialEq, Eq)]
 struct MatchState {
     position: isize,
     captures: Vec[Option[RegexCapture]],
@@ -2051,7 +2051,7 @@ enum RepeatWork {
     Accept(MatchState),
 }
 
-#[derive(PartialEq, Eq)]
+#[derive(Hash, PartialEq, Eq)]
 struct RepeatVisit {
     count: isize,
     state: MatchState,
@@ -2059,7 +2059,7 @@ struct RepeatVisit {
 
 fn repeat_push_explore(
     work: collections::Stack[RepeatWork],
-    visited: Vec[RepeatVisit],
+    visited: collections::HashSet[RepeatVisit],
     visited_positions: collections::BitSet,
     fast_positions: bool,
     minimum: isize,
@@ -2074,12 +2074,9 @@ fn repeat_push_explore(
         return
     }
     let visit = RepeatVisit { count, state };
-    for current in visited {
-        if current == visit {
-            return
-        }
+    if !visited.insert(visit) {
+        return
     }
-    visited.push(visit);
     work.push(RepeatWork::Explore(count, state))
 }
 
@@ -2111,7 +2108,7 @@ fn match_repeat(
 ) -> Vec[MatchState] {
     let output: Vec[MatchState] = Vec::new();
     let work: collections::Stack[RepeatWork] = collections::Stack::new();
-    let visited: Vec[RepeatVisit] = Vec::new();
+    let visited: collections::HashSet[RepeatVisit] = collections::HashSet::new();
     let visited_positions = collections::BitSet::new();
     let accepted_positions = collections::BitSet::new();
     let fast_positions = maximum.is_none() && !node_contains_capture(regex, child)
