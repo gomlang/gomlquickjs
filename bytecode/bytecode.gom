@@ -311,6 +311,7 @@ pub struct Function {
     definition_location_value: Ref[Option[SourceLocation]],
     source_name_value: Ref[Option[runtime::JsString]],
     source_text_value: Ref[Option[runtime::JsString]],
+    verification_max_stack_value: Ref[Option[isize]],
 }
 
 impl Function {
@@ -481,6 +482,7 @@ impl Function {
             definition_location_value: Ref::new(Option::None),
             source_name_value: Ref::new(Option::None),
             source_text_value: Ref::new(Option::None),
+            verification_max_stack_value: Ref::new(Option::None),
         }
     }
 
@@ -577,7 +579,8 @@ impl Function {
     }
 
     pub fn set_eval_sites(self: Function, sites: Vec[Vec[EvalBinding]]) -> () {
-        self.eval_sites_value.set(sites)
+        self.eval_sites_value.set(sites);
+        self.verification_max_stack_value.set(Option::None)
     }
 
     pub fn eval_site(self: Function, index: isize) -> Option[Vec[EvalBinding]] {
@@ -611,7 +614,8 @@ impl Function {
 
     pub fn set_arguments_semantics(self: Function, strict: bool, mapped_arguments: Vec[isize]) -> () {
         self.strict_value.set(strict);
-        self.mapped_arguments_value.set(mapped_arguments)
+        self.mapped_arguments_value.set(mapped_arguments);
+        self.verification_max_stack_value.set(Option::None)
     }
 
     pub fn strict(self: Function) -> bool {
@@ -660,7 +664,8 @@ impl Function {
     }
 
     pub fn set_generator_return_handlers(self: Function, handlers: Vec[GeneratorReturnHandler]) -> () {
-        self.generator_return_handlers_value.set(handlers)
+        self.generator_return_handlers_value.set(handlers);
+        self.verification_max_stack_value.set(Option::None)
     }
 
     pub fn generator_return_handlers(self: Function) -> Vec[GeneratorReturnHandler] {
@@ -720,6 +725,19 @@ impl Function {
 
     pub fn source_text(self: Function) -> Option[runtime::JsString] {
         self.source_text_value.get()
+    }
+
+    pub fn verification(self: Function) -> VerifyResult {
+        match self.verification_max_stack_value.get() {
+            Some(max_stack) => VerifyResult { max_stack, errors: Vec::new() },
+            None => {
+                let result = verify(self);
+                if result.errors.is_empty() {
+                    self.verification_max_stack_value.set(Option::Some(result.max_stack))
+                }
+                result
+            },
+        }
     }
 }
 

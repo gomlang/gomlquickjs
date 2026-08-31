@@ -7482,7 +7482,7 @@ fn initialize_call_locals(
     arguments: Vec[runtime::Value],
     offset: isize,
 ) -> Result[Vec[Ref[runtime::Value]], VmError] {
-    let verification = bytecode::verify(function);
+    let verification = function.verification();
     if !verification.errors.is_empty() {
         Result::Err(error(offset, VmErrorKind::VerificationFailed(verification.errors)))
     } else {
@@ -7559,6 +7559,7 @@ fn evaluate_source(
     arguments: isize,
     bindings: Vec[bytecode::EvalBinding],
 ) -> Result[runtime::Value, VmError] {
+    update_active_frame_offset(machine, offset);
     let values = pop_arguments(machine, offset, arguments)?;
     let source = if values.is_empty() {
         runtime::Value::Undefined
@@ -7623,6 +7624,7 @@ fn evaluate_source(
 }
 
 fn push_dynamic_import(machine: Machine, offset: isize) -> Result[(), VmError] {
+    update_active_frame_offset(machine, offset);
     let referrer = pop(machine, offset)?;
     let options = pop(machine, offset)?;
     let specifier = pop(machine, offset)?;
@@ -7764,7 +7766,7 @@ fn create_generator(
         Ok(value) => value,
         Err(value) => return Result::Err(error(offset, VmErrorKind::TypeError(value.message))),
     };
-    let verification = bytecode::verify(function);
+    let verification = function.verification();
     if !verification.errors.is_empty() {
         return Result::Err(error(offset, VmErrorKind::VerificationFailed(verification.errors)))
     }
@@ -7938,6 +7940,13 @@ fn with_machine_roots[T](
     result
 }
 
+fn update_active_frame_offset(machine: Machine, offset: isize) -> () {
+    let length = machine.active_frames.len();
+    if length > 0 {
+        machine.active_frames[length - 1].offset.set(offset)
+    }
+}
+
 fn call_value_with_mode(
     machine: Machine,
     offset: isize,
@@ -7947,6 +7956,7 @@ fn call_value_with_mode(
     constructing: bool,
     new_target: Option[runtime::Value],
 ) -> Result[runtime::Value, VmError] {
+    update_active_frame_offset(machine, offset);
     let roots: Vec[runtime::Value] = Vec::with_capacity(arguments.len() + 3);
     roots.push(callee);
     roots.push(this_value);
@@ -8393,6 +8403,7 @@ fn construct_value_with_new_target(
     arguments: Vec[runtime::Value],
     new_target: runtime::Value,
 ) -> Result[runtime::Value, VmError] {
+    update_active_frame_offset(machine, offset);
     let roots: Vec[runtime::Value] = Vec::with_capacity(arguments.len() + 2);
     roots.push(callee);
     roots.push(new_target);
@@ -9435,7 +9446,7 @@ fn execute_initialized(
     dynamic_module_loader: Ref[Option[DynamicModuleLoader]],
     depth: isize,
 ) -> Result[runtime::Value, VmError] {
-    let verification = bytecode::verify(function);
+    let verification = function.verification();
     if !verification.errors.is_empty() {
         return Result::Err(error(-1, VmErrorKind::VerificationFailed(verification.errors)))
     }
@@ -9527,9 +9538,6 @@ fn execute_machine(machine: Machine) -> Result[runtime::Value, VmError] {
 fn execute_machine_from(machine: Machine, start: isize) -> Result[ExecutionResult, VmError] {
     let mut offset = start;
     while offset >= 0 && offset < machine.function.code_len() {
-        if !machine.active_frames.is_empty() {
-            machine.active_frames[machine.active_frames.len() - 1].offset.set(offset);
-        }
         let instruction = match machine.function.instruction(offset) {
             Some(value) => value,
             None => return Result::Err(error(offset, VmErrorKind::InvalidJump(offset))),
@@ -9913,7 +9921,7 @@ impl Context {
         runtime::Value,
         VmError,
     ] {
-        let verification = bytecode::verify(function);
+        let verification = function.verification();
         if !verification.errors.is_empty() {
             return Result::Err(error(-1, VmErrorKind::VerificationFailed(verification.errors)))
         }
@@ -9940,7 +9948,7 @@ impl Context {
         runtime::Value,
         VmError,
     ] {
-        let verification = bytecode::verify(function);
+        let verification = function.verification();
         if !verification.errors.is_empty() {
             return Result::Err(error(-1, VmErrorKind::VerificationFailed(verification.errors)))
         }
@@ -10152,7 +10160,7 @@ impl Context {
         } else if initial_locals.len() > function.local_count() {
             return Result::Err(error(-1, VmErrorKind::InvalidLocal(initial_locals.len() - 1)))
         }
-        let verification = bytecode::verify(function);
+        let verification = function.verification();
         if !verification.errors.is_empty() {
             return Result::Err(error(-1, VmErrorKind::VerificationFailed(verification.errors)))
         }
