@@ -704,6 +704,7 @@ fn outer_binding_environment_depth(compiler: Compiler, name: string) -> isize {
 
 fn visible_bindings(compiler: Compiler) -> Vec[OuterBinding] {
     let bindings: Vec[OuterBinding] = Vec::new();
+    let names: collections::HashSet[string] = collections::HashSet::new();
     let mut scope_index = compiler.scopes.len();
     while scope_index > 0 {
         scope_index -= 1;
@@ -711,13 +712,7 @@ fn visible_bindings(compiler: Compiler) -> Vec[OuterBinding] {
             if is_global_lexical_binding(compiler, binding) {
                 continue
             }
-            let mut found = false;
-            for current in bindings {
-                if current.name == name {
-                    found = true;
-                }
-            }
-            if !found {
+            if names.insert(name) {
                 bindings.push(
                     OuterBinding {
                         name,
@@ -740,13 +735,7 @@ fn visible_bindings(compiler: Compiler) -> Vec[OuterBinding] {
         if outer.name == "$this" || outer.name == "$arguments" {
             continue
         }
-        let mut found = false;
-        for current in bindings {
-            if current.name == outer.name {
-                found = true;
-            }
-        }
-        if !found {
+        if names.insert(outer.name) {
             let index = upvalue_index(compiler, outer.name, outer.source, outer.kind);
             bindings.push(
                 OuterBinding {
@@ -1088,7 +1077,7 @@ fn declare_annex_b_function(
     compiler: Compiler,
     name: string,
     span: ast::Span,
-    ancestors: Vec[string],
+    ancestors: collections::IndexSet[string],
 ) -> () {
     if compiler_is_strict(compiler) || compiler.module_mode.get() {
         return
@@ -1200,14 +1189,18 @@ fn collect_var_body(compiler: Compiler, body: Vec[ast::Stmt]) -> () {
     }
 }
 
-fn collect_annex_b_body(compiler: Compiler, body: Vec[ast::Stmt], ancestors: Vec[string]) -> () {
+fn collect_annex_b_body(
+    compiler: Compiler,
+    body: Vec[ast::Stmt],
+    ancestors: collections::IndexSet[string],
+) -> () {
     collect_annex_b_body_level(compiler, body, ancestors, true)
 }
 
 fn collect_annex_b_body_level(
     compiler: Compiler,
     body: Vec[ast::Stmt],
-    ancestors: Vec[string],
+    ancestors: collections::IndexSet[string],
     top_level: bool,
 ) -> () {
     let lexicals: Vec[string] = Vec::new();
@@ -1237,8 +1230,8 @@ fn collect_annex_b_body_level(
 fn collect_annex_b_statement(
     compiler: Compiler,
     statement: ast::Stmt,
-    ancestors: Vec[string],
-    child_ancestors: Vec[string],
+    ancestors: collections::IndexSet[string],
+    child_ancestors: collections::IndexSet[string],
 ) -> () {
     match statement {
         ast::Stmt::FunctionDeclaration { name, span, generator, asynchronous, .. } => {
@@ -1342,15 +1335,12 @@ fn collect_annex_b_statement(
     }
 }
 
-fn merge_lexical_names(ancestors: Vec[string], lexicals: Vec[string]) -> Vec[string] {
-    let mut combined: Vec[string] = Vec::new();
-    for name in ancestors {
-        combined.push(name)
-    }
+fn merge_lexical_names(ancestors: collections::IndexSet[string], lexicals: Vec[string]) -> collections::IndexSet[
+    string,
+] {
+    let combined = collections::IndexSet::from_vec(ancestors.to_vec());
     for name in lexicals {
-        if !combined.contains(name) {
-            combined.push(name)
-        }
+        let _ = combined.insert(name);
     }
     combined
 }
@@ -4769,7 +4759,7 @@ fn compile_nested_function(
         let _ = emit(child, bytecode::Instruction::EnterEvalEnvironment);
     }
     collect_var_body(child, body);
-    let annex_b_ancestors: Vec[string] = Vec::new();
+    let annex_b_ancestors: collections::IndexSet[string] = collections::IndexSet::new();
     collect_annex_b_body(child, body, annex_b_ancestors);
     declare_lexical_body(child, body);
     initialize_lexical_bindings(child);
@@ -8315,7 +8305,7 @@ fn compile_module_program_with_source(program: ast::Program, source: string, sou
         None => -1,
     };
     collect_var_body(compiler, program.body);
-    let annex_b_ancestors: Vec[string] = Vec::new();
+    let annex_b_ancestors: collections::IndexSet[string] = collections::IndexSet::new();
     collect_annex_b_body(compiler, program.body, annex_b_ancestors);
     declare_lexical_body(compiler, program.body);
     initialize_lexical_bindings(compiler);
@@ -8455,7 +8445,7 @@ fn compile_program_with_source(
         Option::None
     };
     collect_var_body(compiler, program.body);
-    let annex_b_ancestors: Vec[string] = Vec::new();
+    let annex_b_ancestors: collections::IndexSet[string] = collections::IndexSet::new();
     collect_annex_b_body(compiler, program.body, annex_b_ancestors);
     declare_lexical_body(compiler, program.body);
     initialize_lexical_bindings(compiler);
@@ -8893,7 +8883,7 @@ fn compile_dynamic_eval(source_value: runtime::JsString, bindings: Vec[bytecode:
     let completion = new_local(compiler);
     compiler.completion_local.set(Option::Some(completion));
     collect_var_body(compiler, parsed.program.body);
-    let annex_b_ancestors: Vec[string] = Vec::new();
+    let annex_b_ancestors: collections::IndexSet[string] = collections::IndexSet::new();
     collect_annex_b_body(compiler, parsed.program.body, annex_b_ancestors);
     declare_lexical_body(compiler, parsed.program.body);
     initialize_lexical_bindings(compiler);

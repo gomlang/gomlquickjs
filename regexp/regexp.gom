@@ -523,12 +523,7 @@ fn class_set_empty() -> ClassSet {
 }
 
 fn class_set_contains_string(values: Vec[runtime::JsString], value: runtime::JsString) -> bool {
-    for current in values {
-        if current == value {
-            return true
-        }
-    }
-    false
+    collections::binary_search_by(values, |current| class_string_compare(current, value)).is_some()
 }
 
 fn class_set_add_string(values: Vec[runtime::JsString], value: runtime::JsString) -> () {
@@ -1939,18 +1934,11 @@ fn with_capture(state: MatchState, index: isize, value: Option[RegexCapture]) ->
     MatchState { position: state.position, captures }
 }
 
-fn append_unique(target: Vec[MatchState], value: MatchState) -> () {
-    let mut index = 0;
-    while index < target.len() {
-        if target[index] == value {
-            return
-        }
-        index += 1;
-    }
-    target.push(value)
+fn append_unique(target: collections::IndexSet[MatchState], value: MatchState) -> () {
+    let _ = target.insert(value);
 }
 
-fn append_unique_all(target: Vec[MatchState], source: Vec[MatchState]) -> () {
+fn append_unique_all(target: collections::IndexSet[MatchState], source: Vec[MatchState]) -> () {
     let mut index = 0;
     while index < source.len() {
         append_unique(target, source[index]);
@@ -2081,14 +2069,14 @@ fn repeat_push_explore(
 }
 
 fn repeat_accept(
-    output: Vec[MatchState],
+    output: collections::IndexSet[MatchState],
     accepted_positions: collections::BitSet,
     fast_positions: bool,
     state: MatchState,
 ) -> () {
     if fast_positions {
         if accepted_positions.insert(state.position) {
-            output.push(state)
+            let _ = output.insert(state);
         }
     } else {
         append_unique(output, state)
@@ -2106,7 +2094,7 @@ fn match_repeat(
     start: MatchState,
     backward: bool,
 ) -> Vec[MatchState] {
-    let output: Vec[MatchState] = Vec::new();
+    let output: collections::IndexSet[MatchState] = collections::IndexSet::new();
     let work: collections::Stack[RepeatWork] = collections::Stack::new();
     let visited: collections::HashSet[RepeatVisit] = collections::HashSet::new();
     let visited_positions = collections::BitSet::new();
@@ -2159,7 +2147,7 @@ fn match_repeat(
             None => (),
         }
     }
-    output
+    output.to_vec()
 }
 
 fn match_sequence(
@@ -2173,7 +2161,7 @@ fn match_sequence(
     let mut positions = Vec::from_array([start]);
     let mut child_index = 0;
     while child_index < children.len() && !positions.is_empty() {
-        let next: Vec[MatchState] = Vec::new();
+        let next: collections::IndexSet[MatchState] = collections::IndexSet::new();
         let mut position_index = 0;
         let node_index = if backward {
             children.len() - child_index - 1
@@ -2194,7 +2182,7 @@ fn match_sequence(
             );
             position_index += 1;
         }
-        positions = next;
+        positions = next.to_vec();
         child_index += 1;
     }
     positions
@@ -2486,7 +2474,7 @@ fn class_set_string_outcomes(
     state: MatchState,
     backward: bool,
 ) -> Vec[MatchState] {
-    let output: Vec[MatchState] = Vec::new();
+    let output: collections::IndexSet[MatchState] = collections::IndexSet::new();
     let available = if backward {
         state.position
     } else {
@@ -2541,7 +2529,7 @@ fn class_set_string_outcomes(
             length -= 1;
         }
     }
-    output
+    output.to_vec()
 }
 
 fn class_string_compare_input(
@@ -2892,14 +2880,8 @@ fn match_node_direction_flags(
             }
         },
         Node::ClassSet(range, strings, maximum) => {
-            let output = class_set_string_outcomes(
-                regex,
-                flags,
-                strings,
-                maximum,
-                input,
-                state,
-                backward,
+            let output = collections::IndexSet::from_vec(
+                class_set_string_outcomes(regex, flags, strings, maximum, input, state, backward),
             );
             let available = if backward {
                 state.position > 0
@@ -2926,13 +2908,13 @@ fn match_node_direction_flags(
                     )
                 }
             }
-            output
+            output.to_vec()
         },
         Node::Sequence(children) => {
             match_sequence(regex, flags, children, input, state, backward)
         },
         Node::Alternation(branches) => {
-            let output: Vec[MatchState] = Vec::new();
+            let output: collections::IndexSet[MatchState] = collections::IndexSet::new();
             let mut index = 0;
             while index < branches.len() {
                 append_unique_all(
@@ -2948,7 +2930,7 @@ fn match_node_direction_flags(
                 );
                 index += 1;
             }
-            output
+            output.to_vec()
         },
         Node::Repeat(child, minimum, maximum, greedy) => {
             match_repeat(regex, flags, child, minimum, maximum, greedy, input, state, backward)

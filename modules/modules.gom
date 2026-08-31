@@ -1304,15 +1304,6 @@ fn async_module_argument(arguments: Vec[runtime::Value]) -> runtime::Value {
     }
 }
 
-fn record_vector_contains(records: Vec[Ref[ModuleRecord]], expected: Ref[ModuleRecord]) -> bool {
-    for record in records {
-        if record.get().path == expected.get().path {
-            return true
-        }
-    }
-    false
-}
-
 fn push_requested_dependency(
     record: Ref[ModuleRecord],
     source: string,
@@ -1500,8 +1491,12 @@ fn mark_async_evaluation(loader: Loader, record: Ref[ModuleRecord]) -> () {
     loader.next_async_timestamp.set(loader.next_async_timestamp.get() + 1)
 }
 
-fn insert_async_record(records: Vec[Ref[ModuleRecord]], record: Ref[ModuleRecord]) -> () {
-    if record_vector_contains(records, record) {
+fn insert_async_record(
+    records: Vec[Ref[ModuleRecord]],
+    paths: collections::HashSet[string],
+    record: Ref[ModuleRecord],
+) -> () {
+    if !paths.insert(record.get().path) {
         return
     }
     let mut index = 0;
@@ -1512,9 +1507,13 @@ fn insert_async_record(records: Vec[Ref[ModuleRecord]], record: Ref[ModuleRecord
     records.insert(index, record)
 }
 
-fn gather_available_ancestors(module: Ref[ModuleRecord], records: Vec[Ref[ModuleRecord]]) -> () {
+fn gather_available_ancestors(
+    module: Ref[ModuleRecord],
+    records: Vec[Ref[ModuleRecord]],
+    paths: collections::HashSet[string],
+) -> () {
     for parent in module.get().async_parents {
-        if record_vector_contains(records, parent)
+        if paths.contains(parent.get().path)
             || cycle_root(parent).get().state.get() == ModuleState::Errored {
             continue
         }
@@ -1524,27 +1523,32 @@ fn gather_available_ancestors(module: Ref[ModuleRecord], records: Vec[Ref[Module
             )
         }
         if parent.get().pending_async_dependencies.get() == 0 {
-            insert_async_record(records, parent);
+            insert_async_record(records, paths, parent);
             if !parent.get().compiled.function.asynchronous() {
-                gather_available_ancestors(parent, records)
+                gather_available_ancestors(parent, records, paths)
             }
         }
     }
 }
 
-fn collect_rejection_order(record: Ref[ModuleRecord], records: Vec[Ref[ModuleRecord]]) -> () {
-    if record_vector_contains(records, record) || record.get().state.get() == ModuleState::Errored {
+fn collect_rejection_order(
+    record: Ref[ModuleRecord],
+    records: Vec[Ref[ModuleRecord]],
+    paths: collections::HashSet[string],
+) -> () {
+    if record.get().state.get() == ModuleState::Errored || !paths.insert(record.get().path) {
         return
     }
     records.push(record);
     for parent in record.get().async_parents {
-        collect_rejection_order(parent, records)
+        collect_rejection_order(parent, records, paths)
     }
 }
 
 fn async_module_rejected(loader: Loader, record: Ref[ModuleRecord], arguments: Vec[runtime::Value]) -> () {
     let records: Vec[Ref[ModuleRecord]] = Vec::new();
-    collect_rejection_order(record, records);
+    let paths: collections::HashSet[string] = collections::HashSet::new();
+    collect_rejection_order(record, records, paths);
     reject_module(record, async_module_argument(arguments), record.get().path, Option::None);
     for current in records {
         settle_dynamic_import_waiters(loader, current, false)
@@ -1601,7 +1605,8 @@ fn async_module_fulfilled(loader: Loader, module: Ref[ModuleRecord]) -> () {
     module.get().state.set(ModuleState::Evaluated);
     settle_dynamic_import_waiters(loader, module, true);
     let records: Vec[Ref[ModuleRecord]] = Vec::new();
-    gather_available_ancestors(module, records);
+    let paths: collections::HashSet[string] = collections::HashSet::new();
+    gather_available_ancestors(module, records, paths);
     for record in records {
         if record.get().state.get() == ModuleState::Errored
             || cycle_root(record).get().state.get() == ModuleState::Errored {
