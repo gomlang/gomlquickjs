@@ -4,6 +4,7 @@ use gomlang::quickjs::bytecode;
 use gomlang::quickjs::promise;
 use gomlang::quickjs::runtime;
 use gomlang::quickjs::vm;
+use std::collections;
 
 fn promise_object_state(states: HashMap[runtime::ObjectId, promise::Promise], value: runtime::Value) -> Result[
     promise::Promise,
@@ -37,7 +38,7 @@ fn promise_object_new_capability(context: vm::Context, constructor: runtime::Val
 ] {
     if !vm::is_constructor(context, constructor) {
         return Result::Err(function_vm_error("Promise capability constructor is not constructable"))
-    } else {};
+    }
     let resolve = Ref::new(runtime::Value::Undefined);
     let reject = Ref::new(runtime::Value::Undefined);
     let executor = match allocate_vm_function_with_length(
@@ -290,7 +291,7 @@ fn promise_object_settlement_value(heap: runtime::Heap, settlement: promise::Pro
                 true,
             )?
         },
-    };
+    }
     Result::Ok(runtime::Value::Object(object))
 }
 
@@ -403,7 +404,7 @@ fn promise_object_resolve_capability(
             promise::PromiseFailure::TypeError("promise cannot resolve itself"),
         );
         return
-    } else {};
+    }
     match promise_object_resolution(context, heap, states, prototype, value) {
         Ok(resolution) => {
             let _ = capability.resolve(resolution);
@@ -585,7 +586,7 @@ fn promise_object_async_resume(
                 Err(error) => {
                     let _ = capability.reject(error);
                 },
-            };
+            }
             return
         },
         Ok(vm::GeneratorCompletion::Yield(_)) => {
@@ -642,7 +643,7 @@ fn promise_object_async_resume(
                 Err(error) => {
                     let _ = capability.reject(promise::PromiseFailure::TypeError(error.message));
                 },
-            };
+            }
             Result::Ok(promise::value(runtime::Value::Undefined))
         },
     );
@@ -668,7 +669,7 @@ fn promise_object_async_resume(
                 Err(error) => {
                     let _ = capability.reject(promise::PromiseFailure::TypeError(error.message));
                 },
-            };
+            }
             Result::Ok(promise::value(runtime::Value::Undefined))
         },
     );
@@ -722,7 +723,7 @@ struct AsyncGeneratorRequest {
 }
 
 struct AsyncGeneratorState {
-    requests: Vec[AsyncGeneratorRequest],
+    requests: collections::Deque[AsyncGeneratorRequest],
     running: Ref[bool],
     promise_constructor: Ref[runtime::Value],
 }
@@ -770,9 +771,16 @@ fn async_generator_update_roots(
     state: AsyncGeneratorState,
 ) -> () {
     let roots: Vec[runtime::Value] = Vec::new();
-    for request in state.requests {
-        roots.push(request.value);
-        roots.push(request.promise_value)
+    let mut request_index = 0;
+    while request_index < state.requests.len() {
+        match state.requests.get(request_index) {
+            Some(request) => {
+                roots.push(request.value);
+                roots.push(request.promise_value)
+            },
+            None => (),
+        }
+        request_index += 1;
     }
     context.set_generator_request_roots(generator, roots)
 }
@@ -788,7 +796,7 @@ fn async_generator_iteration_result(heap: runtime::Heap, value: runtime::Value, 
     match define_data(heap, object, runtime::string_property_key("value"), value, true, true, true) {
         Ok(()) => (),
         Err(error) => return Result::Err(promise::PromiseFailure::TypeError(error.message)),
-    };
+    }
     match define_data(
         heap,
         object,
@@ -821,9 +829,12 @@ fn async_generator_process(
     };
     if state.running.get() || state.requests.is_empty() {
         return
-    } else {};
+    }
     state.running.set(true);
-    let request = state.requests[0];
+    let request = match state.requests.front() {
+        Some(value) => value,
+        None => return,
+    };
     match request.kind {
         AsyncGeneratorRequestKind::Return => async_generator_await_resume(
             context,
@@ -865,13 +876,13 @@ fn async_generator_finish(
     match generators.get(object) {
         Some(state) => {
             if !state.requests.is_empty() {
-                let _ = state.requests.remove(0);
-            } else {};
+                let _ = state.requests.pop_front();
+            }
             state.running.set(false);
             async_generator_update_roots(context, generator, state);
             if state.requests.is_empty() {
                 context.release_async_function(generator)
-            } else {};
+            }
             async_generator_process(
                 context,
                 promise_states,
@@ -917,7 +928,7 @@ fn async_generator_resolve(
         Err(error) => {
             let _ = request.capability.reject(error);
         },
-    };
+    }
     async_generator_finish(context, promise_states, queue, promise_prototype, generators, generator)
 }
 
@@ -968,7 +979,7 @@ fn async_generator_await_resume(
                     request,
                     promise::PromiseFailure::TypeError(error.message),
                 ),
-            };
+            }
             Result::Ok(promise::value(runtime::Value::Undefined))
         },
     );
@@ -998,7 +1009,7 @@ fn async_generator_await_resume(
                     request,
                     promise::PromiseFailure::TypeError(error.message),
                 ),
-            };
+            }
             Result::Ok(promise::value(runtime::Value::Undefined))
         },
     );
@@ -1055,7 +1066,7 @@ fn async_generator_await_yield(
                     request,
                     promise::PromiseFailure::TypeError(error.message),
                 ),
-            };
+            }
             Result::Ok(promise::value(runtime::Value::Undefined))
         },
     );
@@ -1085,81 +1096,7 @@ fn async_generator_await_yield(
                     request,
                     promise::PromiseFailure::TypeError(error.message),
                 ),
-            };
-            Result::Ok(promise::value(runtime::Value::Undefined))
-        },
-    );
-    let _ = promise.then_with_roots(
-        on_fulfilled,
-        on_rejected,
-        Vec::from_array([generator, request.value, request.promise_value]),
-    );
-}
-
-fn async_generator_await_return(
-    context: vm::Context,
-    promise_states: HashMap[runtime::ObjectId, promise::Promise],
-    queue: promise::JobQueue,
-    promise_prototype: runtime::ObjectId,
-    generators: HashMap[runtime::ObjectId, AsyncGeneratorState],
-    generator: runtime::Value,
-    request: AsyncGeneratorRequest,
-    returned: runtime::Value,
-) -> () {
-    let promise = async_generator_awaited_promise(
-        context,
-        promise_states,
-        queue,
-        promise_prototype,
-        generators,
-        generator,
-        returned,
-        request.depth,
-    );
-    let on_fulfilled: Option[
-        (promise::PromiseFulfillment) -> Result[promise::PromiseResolution, promise::PromiseFailure],
-    ] = Option::Some(
-        |fulfillment| {
-            match promise_object_fulfillment_value(context.heap(), fulfillment) {
-                Ok(value) => async_generator_resolve(
-                    context,
-                    promise_states,
-                    queue,
-                    promise_prototype,
-                    generators,
-                    generator,
-                    request,
-                    value,
-                    true,
-                ),
-                Err(error) => async_generator_reject(
-                    context,
-                    promise_states,
-                    queue,
-                    promise_prototype,
-                    generators,
-                    generator,
-                    request,
-                    promise::PromiseFailure::TypeError(error.message),
-                ),
-            };
-            Result::Ok(promise::value(runtime::Value::Undefined))
-        },
-    );
-    let on_rejected: Option[
-        (promise::PromiseFailure) -> Result[promise::PromiseResolution, promise::PromiseFailure],
-    ] = Option::Some(
-        |failure| {
-            async_generator_reject(
-                context,
-                promise_states,
-                queue,
-                promise_prototype,
-                generators,
-                generator,
-                request,
-                failure,
-            );
+            }
             Result::Ok(promise::value(runtime::Value::Undefined))
         },
     );
@@ -1283,17 +1220,17 @@ fn async_generator_enqueue(
     };
     match generators.get(object) {
         Some(state) => {
-            state.requests.push(
+            state.requests.push_back(
                 AsyncGeneratorRequest { kind, value, capability, promise_value, depth },
             );
             match context.link_async_function(promise_value, generator) {
                 Ok(()) => (),
                 Err(error) => {
                     let _ = capability.reject(promise_object_vm_failure(error));
-                    let _ = state.requests.pop();
+                    let _ = state.requests.pop_back();
                     return Result::Ok(promise_value)
                 },
-            };
+            }
             async_generator_update_roots(context, generator, state);
             async_generator_process(
                 context,
@@ -1309,7 +1246,7 @@ fn async_generator_enqueue(
                 promise::PromiseFailure::TypeError("async generator receiver is incompatible"),
             );
         },
-    };
+    }
     Result::Ok(promise_value)
 }
 
@@ -1321,7 +1258,7 @@ fn async_generator_runner(
     match generator {
         runtime::Value::Object(value) => {
             generators[value] = AsyncGeneratorState {
-                requests: Vec::new(),
+                requests: collections::Deque::new(),
                 running: Ref::new(false),
                 promise_constructor,
             };
@@ -1408,7 +1345,7 @@ fn promise_object_construct(
         Err(error) => {
             let _ = capability.reject(promise_object_vm_failure(error));
         },
-    };
+    }
     Result::Ok(runtime::Value::Object(receiver))
 }
 
@@ -1421,104 +1358,6 @@ fn promise_object_prepare_constructor(arguments: Vec[runtime::Value], depth: isi
         Result::Ok(arguments)
     } else {
         Result::Err(function_vm_error("Promise executor is not callable"))
-    }
-}
-
-fn promise_object_fulfill_handler(
-    context: vm::Context,
-    states: HashMap[runtime::ObjectId, promise::Promise],
-    prototype: runtime::ObjectId,
-    value: runtime::Value,
-) -> Option[
-    (promise::PromiseFulfillment) -> Result[promise::PromiseResolution, promise::PromiseFailure],
-] {
-    if promise_object_callable(value) {
-        Option::Some(
-            |fulfillment| {
-                let argument_value = match promise_object_fulfillment_value(
-                    context.heap(),
-                    fulfillment,
-                ) {
-                    Ok(value) => value,
-                    Err(error) => {
-                        return Result::Err(promise::PromiseFailure::TypeError(error.message))
-                    },
-                };
-                match promise_object_invoke(context, value, Vec::from_array([argument_value])) {
-                    Ok(result) => {
-                        promise_object_resolution(
-                            context,
-                            context.heap(),
-                            states,
-                            prototype,
-                            result,
-                        )
-                    },
-                    Err(error) => Result::Err(promise_object_vm_failure(error)),
-                }
-            },
-        )
-    } else {
-        Option::None
-    }
-}
-
-fn promise_object_reject_handler(
-    context: vm::Context,
-    states: HashMap[runtime::ObjectId, promise::Promise],
-    prototype: runtime::ObjectId,
-    value: runtime::Value,
-) -> Option[
-    (promise::PromiseFailure) -> Result[promise::PromiseResolution, promise::PromiseFailure],
-] {
-    if promise_object_callable(value) {
-        Option::Some(
-            |failure| {
-                let argument_value = match promise_object_failure_value_with_context(
-                    context,
-                    failure,
-                ) {
-                    Ok(value) => value,
-                    Err(error) => {
-                        return Result::Err(promise::PromiseFailure::TypeError(error.message))
-                    },
-                };
-                match promise_object_invoke(context, value, Vec::from_array([argument_value])) {
-                    Ok(result) => {
-                        promise_object_resolution(
-                            context,
-                            context.heap(),
-                            states,
-                            prototype,
-                            result,
-                        )
-                    },
-                    Err(error) => Result::Err(promise_object_vm_failure(error)),
-                }
-            },
-        )
-    } else {
-        Option::None
-    }
-}
-
-fn promise_object_finally_handler(
-    context: vm::Context,
-    states: HashMap[runtime::ObjectId, promise::Promise],
-    prototype: runtime::ObjectId,
-    value: runtime::Value,
-) -> Option[() -> Result[promise::PromiseResolution, promise::PromiseFailure]] {
-    if promise_object_callable(value) {
-        Option::Some(
-            || match promise_object_invoke(context, value, Vec::new()) {
-                Ok(result) => {
-                    promise_object_resolution(context, context.heap(), states, prototype, result)
-                },
-                Err(error) => Result::Err(promise_object_vm_failure(error)),
-            },
-        )
-    } else {
-        Option::None
     }
 }
 
@@ -1537,7 +1376,7 @@ fn promise_object_species_constructor(
         runtime::Value::Undefined => return Result::Ok(default_constructor),
         runtime::Value::Object(_) => (),
         _ => return Result::Err(function_vm_error("Promise constructor property is not an object")),
-    };
+    }
     let symbol = match context.well_known_symbol(vm::WellKnownSymbolKind::Species) {
         Some(value) => value,
         None => return Result::Ok(default_constructor),
@@ -1596,7 +1435,7 @@ fn promise_object_resolve_reaction(
         }
     } else {
         let _ = promise_object_invoke_capability(context, capability.resolve, value, 0);
-    };
+    }
     promise_object_reaction_result()
 }
 
@@ -1631,7 +1470,7 @@ fn promise_object_reject_reaction(
         }
     } else {
         let _ = promise_object_invoke_capability(context, capability.reject, value, 0);
-    };
+    }
     promise_object_reaction_result()
 }
 
@@ -1763,7 +1602,7 @@ fn promise_object_finally(
     match this_value {
         runtime::Value::Object(_) => (),
         _ => return Result::Err(function_vm_error("Promise.finally receiver is not an object")),
-    };
+    }
     let species = promise_object_species_constructor(context, this_value, constructor.get(), depth)?;
     let handler_value = argument(arguments, 0);
     let (then_finally, catch_finally) = if promise_object_callable(handler_value) {
@@ -1833,7 +1672,7 @@ fn promise_object_static_resolve(
 ) -> Result[runtime::Value, vm::VmError] {
     if !vm::is_constructor(context, this_value) {
         return Result::Err(function_vm_error("Promise.resolve receiver is not a constructor"))
-    } else {};
+    }
     let input = argument(arguments, 0);
     match input {
         runtime::Value::Object(object) => match states.get(object) {
@@ -1845,12 +1684,12 @@ fn promise_object_static_resolve(
                 )?;
                 if runtime::same_value(constructor, this_value) {
                     return Result::Ok(input)
-                } else {}
+                }
             },
             None => (),
         },
         _ => (),
-    };
+    }
     let capability = promise_object_new_capability(context, this_value, depth)?;
     promise_object_invoke_capability(context, capability.resolve, input, depth)?;
     Result::Ok(capability.promise)
@@ -1865,75 +1704,6 @@ fn promise_object_static_reject(
     let capability = promise_object_new_capability(context, this_value, depth)?;
     promise_object_invoke_capability(context, capability.reject, argument(arguments, 0), depth)?;
     Result::Ok(capability.promise)
-}
-
-fn promise_object_array_values(heap: runtime::Heap, input: runtime::Value) -> Result[
-    Vec[runtime::Value],
-    promise::PromiseFailure,
-] {
-    let object = match input {
-        runtime::Value::Object(object) => object,
-        _ => {
-            return Result::Err(
-                promise::PromiseFailure::TypeError("Promise combinators currently require an Array"),
-            )
-        },
-    };
-    match heap.get(object) {
-        Some(value) => match value.kind() {
-            runtime::ObjectKind::Array => (),
-            _ => {
-                return Result::Err(
-                    promise::PromiseFailure::TypeError(
-                        "Promise combinators currently require an Array",
-                    ),
-                )
-            },
-        },
-        None => {
-            return Result::Err(
-                promise::PromiseFailure::TypeError("Promise combinator input is not live"),
-            )
-        },
-    };
-    let length = match runtime::get_property(heap, object, runtime::string_property_key("length")) {
-        Ok(Some(runtime::Value::Int(value))) => if value >= 0 {
-            value.to_isize()
-        } else {
-            return Result::Err(
-                promise::PromiseFailure::TypeError(
-                    "Promise combinator Array length must be an int32",
-                ),
-            )
-        },
-        Ok(_) => {
-            return Result::Err(
-                promise::PromiseFailure::TypeError(
-                    "Promise combinator Array length must be an int32",
-                ),
-            )
-        },
-        Err(error) => return Result::Err(promise::PromiseFailure::TypeError(error.message)),
-    };
-    let values: Vec[runtime::Value] = Vec::with_capacity(length);
-    let mut index = 0;
-    while index < length {
-        match runtime::get_property(heap, object, runtime::string_property_key(index.to_string())) {
-            Ok(Some(value)) => values.push(value),
-            Ok(None) => values.push(runtime::Value::Undefined),
-            Err(error) => return Result::Err(promise::PromiseFailure::TypeError(error.message)),
-        };
-        index += 1;
-    }
-    Result::Ok(values)
-}
-
-fn promise_object_iteration_failure(error: vm::VmError) -> promise::PromiseFailure {
-    match error.kind {
-        vm::VmErrorKind::Thrown(value) => promise::PromiseFailure::Rejection(value),
-        vm::VmErrorKind::TypeError(message) => promise::PromiseFailure::TypeError(message),
-        _ => promise_object_vm_failure(error),
-    }
 }
 
 fn promise_object_iterator_record(context: vm::Context, input: runtime::Value) -> Result[
@@ -1952,144 +1722,6 @@ fn promise_object_iterator_record(context: vm::Context, input: runtime::Value) -
         runtime::Value::Object(_) => iterator_record(context, iterator, 0),
         _ => Result::Err(function_vm_error("iterator result is not an object")),
     }
-}
-
-fn promise_object_iterable_values(context: vm::Context, input: runtime::Value) -> Result[
-    Vec[runtime::Value],
-    promise::PromiseFailure,
-] {
-    if context.iterator_symbol().is_none() {
-        return promise_object_array_values(context.heap(), input)
-    } else {};
-    let record = match promise_object_iterator_record(context, input) {
-        Ok(value) => value,
-        Err(error) => return Result::Err(promise_object_iteration_failure(error)),
-    };
-    let values: Vec[runtime::Value] = Vec::new();
-    loop {
-        match iterator_step(context, record, 0) {
-            Ok(Some(value)) => values.push(value),
-            Ok(None) => return Result::Ok(values),
-            Err(error) => {
-                return Result::Err(promise_object_iteration_failure(error))
-            },
-        }
-    }
-}
-
-fn promise_object_inputs(
-    context: vm::Context,
-    heap: runtime::Heap,
-    states: HashMap[runtime::ObjectId, promise::Promise],
-    queue: promise::JobQueue,
-    prototype: runtime::ObjectId,
-    input: runtime::Value,
-) -> Result[Vec[promise::PromiseResolution], promise::PromiseFailure] {
-    let values = promise_object_iterable_values(context, input)?;
-    let inputs: Vec[promise::PromiseResolution] = Vec::with_capacity(values.len());
-    for value in values {
-        match promise_object_resolution(context, heap, states, prototype, value) {
-            Ok(resolution) => inputs.push(resolution),
-            Err(error) => inputs.push(
-                promise::PromiseResolution::Promise(promise::Promise::rejected(queue, error)),
-            ),
-        }
-    }
-    Result::Ok(inputs)
-}
-
-fn promise_object_normalize_combinator(
-    heap: runtime::Heap,
-    queue: promise::JobQueue,
-    source: promise::Promise,
-) -> promise::Promise {
-    match source.state() {
-        promise::PromiseState::Fulfilled(fulfillment) => {
-            match promise_object_fulfillment_value(heap, fulfillment) {
-                Ok(value) => promise::Promise::fulfilled(queue, value),
-                Err(error) => {
-                    promise::Promise::rejected(
-                        queue,
-                        promise::PromiseFailure::TypeError(error.message),
-                    )
-                },
-            }
-        },
-        promise::PromiseState::Rejected(_) => source,
-        promise::PromiseState::Pending => {
-            let on_fulfilled: Option[
-                (promise::PromiseFulfillment) -> Result[
-                    promise::PromiseResolution,
-                    promise::PromiseFailure,
-                ],
-            ] = Option::Some(
-                |fulfillment| match promise_object_fulfillment_value(heap, fulfillment) {
-                    Ok(value) => Result::Ok(promise::value(value)),
-                    Err(error) => {
-                        Result::Err(promise::PromiseFailure::TypeError(error.message))
-                    },
-                },
-            );
-            let on_rejected: Option[
-                (promise::PromiseFailure) -> Result[
-                    promise::PromiseResolution,
-                    promise::PromiseFailure,
-                ],
-            ] = Option::None;
-            source.then(on_fulfilled, on_rejected)
-        },
-    }
-}
-
-fn promise_object_combinator_result(
-    context: vm::Context,
-    states: HashMap[runtime::ObjectId, promise::Promise],
-    queue: promise::JobQueue,
-    prototype: runtime::ObjectId,
-    input: runtime::Value,
-    operation: string,
-) -> promise::Promise {
-    match promise_object_inputs(context, context.heap(), states, queue, prototype, input) {
-        Ok(inputs) => {
-            let result = if operation == "all" {
-                promise::all(queue, inputs)
-            } else if operation == "race" {
-                promise::race(queue, inputs)
-            } else if operation == "allSettled" {
-                promise::all_settled(queue, inputs)
-            } else {
-                promise::any(queue, inputs)
-            };
-            promise_object_normalize_combinator(context.heap(), queue, result)
-        },
-        Err(error) => promise::Promise::rejected(queue, error),
-    }
-}
-
-fn promise_object_static_combinator(
-    context: vm::Context,
-    states: HashMap[runtime::ObjectId, promise::Promise],
-    queue: promise::JobQueue,
-    prototype: runtime::ObjectId,
-    operation: string,
-    heap: runtime::Heap,
-    this_value: runtime::Value,
-    arguments: Vec[runtime::Value],
-) -> Result[runtime::Value, vm::NativeError] {
-    let _ = this_value;
-    promise_object_wrap(
-        heap,
-        states,
-        prototype,
-        promise_object_combinator_result(
-            context,
-            states,
-            queue,
-            prototype,
-            argument(arguments, 0),
-            operation,
-        ),
-    )
 }
 
 fn promise_object_all_array(heap: runtime::Heap, values: Vec[Option[runtime::Value]]) -> Result[
@@ -2177,7 +1809,7 @@ fn promise_object_static_all(
                             )
                         },
                     }
-                } else {};
+                }
                 return Result::Ok(capability.promise)
             },
             Err(error) => {
@@ -2208,7 +1840,7 @@ fn promise_object_static_all(
                 let _ = this_value;
                 if already_called.get() {
                     return Result::Ok(runtime::Value::Undefined)
-                } else {};
+                }
                 already_called.set(true);
                 values[index] = Option::Some(argument(element_arguments, 0));
                 remaining.set(remaining.get() - 1);
@@ -2219,7 +1851,7 @@ fn promise_object_static_all(
                         promise_object_all_array(context.heap(), values)?,
                         element_depth,
                     )?
-                } else {};
+                }
                 Result::Ok(runtime::Value::Undefined)
             },
         ) {
@@ -2430,7 +2062,7 @@ fn promise_object_static_all_settled(
                             )
                         },
                     }
-                } else {};
+                }
                 return Result::Ok(capability.promise)
             },
             Err(error) => {
@@ -2461,7 +2093,7 @@ fn promise_object_static_all_settled(
                 let _ = this_value;
                 if already_called.get() {
                     return Result::Ok(runtime::Value::Undefined)
-                } else {};
+                }
                 already_called.set(true);
                 values[index] = Option::Some(
                     promise_object_settled_result(
@@ -2478,7 +2110,7 @@ fn promise_object_static_all_settled(
                         promise_object_all_array(context.heap(), values)?,
                         element_depth,
                     )?
-                } else {};
+                }
                 Result::Ok(runtime::Value::Undefined)
             },
         ) {
@@ -2501,7 +2133,7 @@ fn promise_object_static_all_settled(
                 let _ = this_value;
                 if already_called.get() {
                     return Result::Ok(runtime::Value::Undefined)
-                } else {};
+                }
                 already_called.set(true);
                 values[index] = Option::Some(
                     promise_object_settled_result(
@@ -2518,7 +2150,7 @@ fn promise_object_static_all_settled(
                         promise_object_all_array(context.heap(), values)?,
                         element_depth,
                     )?
-                } else {};
+                }
                 Result::Ok(runtime::Value::Undefined)
             },
         ) {
@@ -2676,7 +2308,7 @@ fn promise_object_static_any(
                             )
                         },
                     }
-                } else {};
+                }
                 return Result::Ok(capability.promise)
             },
             Err(error) => {
@@ -2707,7 +2339,7 @@ fn promise_object_static_any(
                 let _ = this_value;
                 if already_called.get() {
                     return Result::Ok(runtime::Value::Undefined)
-                } else {};
+                }
                 already_called.set(true);
                 values[index] = Option::Some(argument(element_arguments, 0));
                 remaining.set(remaining.get() - 1);
@@ -2723,7 +2355,7 @@ fn promise_object_static_any(
                         )?,
                         element_depth,
                     )?
-                } else {};
+                }
                 Result::Ok(runtime::Value::Undefined)
             },
         ) {
@@ -2795,7 +2427,7 @@ fn promise_object_static_try(
                 depth,
             )?
         },
-    };
+    }
     Result::Ok(capability.promise)
 }
 
@@ -2830,7 +2462,7 @@ fn promise_object_with_resolvers(
             runtime::data_descriptor(capability.reject, true, true, true),
         ) {
         return Result::Err(function_vm_error("cannot create Promise.withResolvers result"))
-    } else {};
+    }
     Result::Ok(runtime::Value::Object(result))
 }
 
@@ -2949,10 +2581,10 @@ fn async_from_sync_close(context: vm::Context, iterator: runtime::Value, depth: 
     };
     if async_from_sync_method_missing(method) {
         return
-    } else {};
+    }
     if !promise_object_callable(method) {
         return
-    } else {};
+    }
     let _ = match context.invoke_with_this_at_depth(method, Vec::new(), iterator, depth) {
         Ok(value) => value,
         Err(_) => return,
@@ -3000,7 +2632,7 @@ fn async_from_sync_settle(
         Err(error) => {
             if close_on_rejection {
                 async_from_sync_close(context, iterator, depth)
-            } else {};
+            }
             async_from_sync_reject(capability, error);
             return
         },
@@ -3024,7 +2656,7 @@ fn async_from_sync_settle(
                     let _ = capability.resolve(promise::value(result));
                 },
                 Err(error) => async_from_sync_reject(capability, error),
-            };
+            }
             Result::Ok(promise::value(runtime::Value::Undefined))
         },
     );
@@ -3034,7 +2666,7 @@ fn async_from_sync_settle(
         |failure| {
             if close_on_rejection {
                 async_from_sync_close(context, iterator, depth)
-            } else {};
+            }
             async_from_sync_reject(capability, failure);
             Result::Ok(promise::value(runtime::Value::Undefined))
         },
@@ -3049,7 +2681,7 @@ fn async_from_sync_result(context: vm::Context, result: runtime::Value, depth: i
     match result {
         runtime::Value::Object(_) => (),
         _ => return Result::Err(function_vm_error("sync iterator method result is not an object")),
-    };
+    }
     let done = context.read_property_at_depth(
         result,
         runtime::Value::String(js_string("done")),
@@ -3124,7 +2756,7 @@ fn async_from_sync_method(
     if operation == AsyncFromSyncOperation::Return && async_from_sync_method_missing(method) {
         async_from_sync_resolve_result(context, capability, argument(arguments, 0), true);
         return Result::Ok(promise_value)
-    } else {};
+    }
     if operation == AsyncFromSyncOperation::Throw && async_from_sync_method_missing(method) {
         let return_method = match context.read_property_at_depth(
             state.iterator,
@@ -3144,7 +2776,7 @@ fn async_from_sync_method(
                     promise::PromiseFailure::TypeError("sync iterator return is not callable"),
                 );
                 return Result::Ok(promise_value)
-            } else {};
+            }
             let returned = match context.invoke_with_this_at_depth(
                 return_method,
                 Vec::new(),
@@ -3169,13 +2801,13 @@ fn async_from_sync_method(
                     return Result::Ok(promise_value)
                 },
             }
-        } else {};
+        }
         async_from_sync_reject(
             capability,
             promise::PromiseFailure::TypeError("sync iterator does not provide a throw method"),
         );
         return Result::Ok(promise_value)
-    } else {};
+    }
     if !promise_object_callable(method) {
         async_from_sync_reject(
             capability,
@@ -3190,7 +2822,7 @@ fn async_from_sync_method(
             ),
         );
         return Result::Ok(promise_value)
-    } else {};
+    }
     let result = match context.invoke_with_this_at_depth(
         method,
         async_from_sync_arguments(arguments),
@@ -3264,7 +2896,7 @@ fn install_async_function_kind(
             Ok(()) => (),
             Err(error) => return Result::Err(BuiltinError { message: error.kind.debug() }),
         },
-    };
+    }
     define_to_string_tag(context, prototype, name)?;
     Result::Ok(prototype)
 }
@@ -3337,14 +2969,14 @@ fn install_async_iterator(
                 return Result::Err(
                     BuiltinError { message: "cannot initialize async iterator prototype" },
                 )
-            } else {}
+            }
         },
         None => (),
-    };
+    }
     match context.set_async_iterator_prototypes(prototype, from_sync_prototype) {
         Ok(()) => (),
         Err(error) => return Result::Err(BuiltinError { message: error.kind.debug() }),
-    };
+    }
     context.add_external_edge_provider(|| async_from_sync_gc_edges(context.heap(), states));
     context.set_async_from_sync_iterator_factory(
         |iterator, next, _| {
@@ -3433,7 +3065,7 @@ fn install_async_generator(
     match context.set_async_generator_prototype(prototype) {
         Ok(()) => (),
         Err(error) => return Result::Err(BuiltinError { message: error.kind.debug() }),
-    };
+    }
     context.set_async_generator_runner(
         |generator, _| async_generator_runner(generators, promise_constructor, generator),
     );
@@ -3561,14 +3193,14 @@ pub fn install_promise_with_queue(
     ) {
         Ok(()) => (),
         Err(error) => return Result::Err(BuiltinError { message: error.kind.debug() }),
-    };
+    }
     match context.set_vm_constructor_prepare_callback(
         constructor,
         |arguments, depth| promise_object_prepare_constructor(arguments, depth),
     ) {
         Ok(()) => (),
         Err(error) => return Result::Err(BuiltinError { message: error.kind.debug() }),
-    };
+    }
     constructor_value.set(constructor);
     let constructor_object = function_object(constructor, "Promise")?;
     define_value(heap, prototype, "constructor", constructor, true, true)?;
@@ -3713,10 +3345,10 @@ pub fn install_promise_with_queue(
                 runtime::accessor_descriptor(Option::Some(getter), Option::None, false, true),
             ) {
                 return Result::Err(BuiltinError { message: "cannot define Promise species" })
-            } else {}
+            }
         },
         None => (),
-    };
+    }
     define_value(
         heap,
         constructor_object,

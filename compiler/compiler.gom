@@ -6,7 +6,6 @@ use gomlang::quickjs::dtoa;
 use gomlang::quickjs::parser;
 use gomlang::quickjs::regexp;
 use gomlang::quickjs::runtime;
-use gomlang::quickjs::unicode;
 use gomlang::quickjs::vm;
 use std::num;
 use std::text;
@@ -180,7 +179,7 @@ struct Compiler {
     source: Ref[string],
     source_code_units: Ref[Option[runtime::JsString]],
     source_name: Ref[string],
-    source_location_cache: Ref[Vec[bytecode::SourceLocation]],
+    source_line_index: Ref[Option[text::LineIndex]],
     source_locations: Vec[bytecode::SourceLocation],
     current_source_offset: Ref[isize],
     allow_unknown_globals: Ref[bool],
@@ -290,20 +289,20 @@ fn compiler_is_strict(compiler: Compiler) -> bool {
 fn validate_strict_identifier(compiler: Compiler, name: string, span: ast::Span) -> () {
     if compiler_is_strict(compiler) && name == "yield" {
         compile_error(compiler, "yield cannot be used as an identifier in strict mode", span)
-    } else {}
+    }
 }
 
 fn validate_strict_binding_identifier(compiler: Compiler, name: string, span: ast::Span) -> () {
     validate_strict_identifier(compiler, name, span);
     if compiler_is_strict(compiler) && (name == "eval" || name == "arguments") {
         compile_error(compiler, "invalid strict binding `" + name + "`", span)
-    } else {}
+    }
 }
 
 fn validate_strict_assignment_identifier(compiler: Compiler, name: string, span: ast::Span) -> () {
     if compiler_is_strict(compiler) && (name == "eval" || name == "arguments") {
         compile_error(compiler, "invalid strict assignment target `" + name + "`", span)
-    } else {}
+    }
 }
 
 fn emit(compiler: Compiler, instruction: bytecode::Instruction) -> isize {
@@ -315,109 +314,30 @@ fn emit(compiler: Compiler, instruction: bytecode::Instruction) -> isize {
     offset
 }
 
-fn build_source_location_cache(source: string) -> Vec[bytecode::SourceLocation] {
-    let bytes = source.to_bytes();
-    let input = bytes.slice(0, bytes.len());
-    let locations: Vec[bytecode::SourceLocation] = Vec::with_capacity(bytes.len() + 1);
-    let mut offset = 0;
-    let mut line = 1;
-    let mut column = 1;
-    while offset < bytes.len() {
-        locations.push(bytecode::SourceLocation { line, column });
-        let current = bytes[offset];
-        if current == b'\n' {
-            line += 1;
-            column = 1;
-            offset += 1;
-        } else {
-            match unicode::try_unicode_from_utf8_at(input, offset) {
-                Some(decoded) => {
-                    column += if decoded.code_point() > 0xffff {
-                        2
-                    } else {
-                        1
-                    };
-                    let length = decoded.length();
-                    let mut extra = 1;
-                    while extra < length {
-                        locations.push(bytecode::SourceLocation { line, column });
-                        extra += 1;
-                    }
-                    offset += length;
-                },
-                None => {
-                    column += 1;
-                    offset += 1;
-                },
-            }
-        }
-    }
-    locations.push(bytecode::SourceLocation { line, column });
-    locations
-}
-
 fn compiler_set_source(compiler: Compiler, source: string) -> () {
     compiler.source.set(source);
-    compiler.source_location_cache.set(build_source_location_cache(source))
+    compiler.source_line_index.set(Option::Some(text::LineIndex::new(source)))
 }
 
 fn compiler_inherit_source(child: Compiler, parent: Compiler) -> () {
     child.source.set(parent.source.get());
-    child.source_location_cache.set(parent.source_location_cache.get())
+    child.source_line_index.set(parent.source_line_index.get())
 }
 
 fn compiler_source_location(compiler: Compiler, target: isize) -> bytecode::SourceLocation {
-    let locations = compiler.source_location_cache.get();
-    if locations.is_empty() {
-        return source_location(compiler.source.get(), target)
-    } else {};
-    let index = if target < 0 {
-        0
-    } else if target >= locations.len() {
-        locations.len() - 1
-    } else {
-        target
-    };
-    locations[index]
+    match compiler.source_line_index.get() {
+        Some(index) => indexed_source_location(index, target),
+        None => source_location(compiler.source.get(), target),
+    }
 }
 
 fn source_location(source: string, target: isize) -> bytecode::SourceLocation {
-    let bytes = source.to_bytes();
-    let limit = if target < 0 {
-        0
-    } else if target > bytes.len() {
-        bytes.len()
-    } else {
-        target
-    };
-    let input = bytes.slice(0, bytes.len());
-    let mut offset = 0;
-    let mut line = 1;
-    let mut column = 1;
-    while offset < limit {
-        let current = bytes[offset];
-        if current == b'\n' {
-            line += 1;
-            column = 1;
-            offset += 1;
-        } else {
-            match unicode::try_unicode_from_utf8_at(input, offset) {
-                Some(decoded) => {
-                    column += if decoded.code_point() > 0xffff {
-                        2
-                    } else {
-                        1
-                    };
-                    offset += decoded.length();
-                },
-                None => {
-                    column += 1;
-                    offset += 1;
-                },
-            }
-        }
-    }
-    bytecode::SourceLocation { line, column }
+    indexed_source_location(text::LineIndex::new(source), target)
+}
+
+fn indexed_source_location(index: text::LineIndex, target: isize) -> bytecode::SourceLocation {
+    let position = index.offset_to_line_column(target, text::PositionEncoding::Utf16);
+    bytecode::SourceLocation { line: position.line + 1, column: position.column + 1 }
 }
 
 fn set_source_offset(compiler: Compiler, offset: isize) -> () {
@@ -445,7 +365,7 @@ fn first_source_byte_between(compiler: Compiler, start: isize, end: isize) -> is
         let current = source.byte_get(offset);
         if current != b' ' && current != b'\t' && current != b'\r' && current != b'\n' {
             return offset
-        } else {};
+        }
         offset += 1;
     }
     if start < 0 {
@@ -569,16 +489,16 @@ fn declare_current(compiler: Compiler, name: string, kind: BindingKind, span: as
         && (kind == BindingKind::Let || kind == BindingKind::Const)
         && compiler.global_var_kinds.get(name).is_some() {
         compile_error(compiler, "duplicate declaration of `" + name + "`", span)
-    } else {};
+    }
     let binding = declare_in_scope(compiler, scope_index, name, kind, span);
     match binding {
         Some(value) => if compiler.script_mode.get() && scope_index == 0
             && (kind == BindingKind::Let || kind == BindingKind::Const) {
             compiler.global_lexical_indices[name] = value.index;
             record_global_declaration_offset(compiler, name, span.start);
-        } else {},
+        },
         None => (),
-    };
+    }
     binding
 }
 
@@ -593,7 +513,7 @@ fn record_global_declaration_offset(compiler: Compiler, name: string, offset: is
     match compiler.global_declaration_offsets.get(name) {
         Some(previous) => if offset < previous {
             compiler.global_declaration_offsets[name] = offset;
-        } else {},
+        },
         None => {
             compiler.global_declaration_offsets[name] = offset;
         },
@@ -618,14 +538,14 @@ fn record_global_var(
     match compiler.scopes[0].bindings.get(name) {
         Some(binding) => if binding.kind != BindingKind::Var {
             compile_error(compiler, "duplicate declaration of `" + name + "`", span)
-        } else {},
+        },
         None => (),
-    };
+    }
     match compiler.global_var_kinds.get(name) {
         Some(bytecode::ScriptBindingKind::Function) => (),
         Some(_) => if kind == bytecode::ScriptBindingKind::Function {
             compiler.global_var_kinds[name] = kind;
-        } else {},
+        },
         None => {
             compiler.global_var_kinds[name] = kind;
         },
@@ -732,7 +652,7 @@ fn lookup_outer_binding(compiler: Compiler, name: string) -> Option[OuterBinding
     for binding in compiler.outer_bindings {
         if binding.name == name {
             return Option::Some(binding)
-        } else {}
+        }
     }
     Option::None
 }
@@ -747,7 +667,7 @@ fn upvalue_index(
     while index < compiler.upvalues.len() {
         if compiler.upvalues[index].name == name {
             return index
-        } else {};
+        }
         index += 1;
     }
     compiler.upvalues.push(Upvalue { name, source, kind });
@@ -789,12 +709,12 @@ fn visible_bindings(compiler: Compiler) -> Vec[OuterBinding] {
         for (name, binding) in compiler.scopes[scope_index].bindings.entries() {
             if is_global_lexical_binding(compiler, binding) {
                 continue
-            } else {};
+            }
             let mut found = false;
             for current in bindings {
                 if current.name == name {
                     found = true;
-                } else {}
+                }
             }
             if !found {
                 bindings.push(
@@ -812,18 +732,18 @@ fn visible_bindings(compiler: Compiler) -> Vec[OuterBinding] {
                         },
                     },
                 )
-            } else {}
+            }
         }
     }
     for outer in compiler.outer_bindings {
         if outer.name == "$this" || outer.name == "$arguments" {
             continue
-        } else {};
+        }
         let mut found = false;
         for current in bindings {
             if current.name == outer.name {
                 found = true;
-            } else {}
+            }
         }
         if !found {
             let index = upvalue_index(compiler, outer.name, outer.source, outer.kind);
@@ -842,7 +762,7 @@ fn visible_bindings(compiler: Compiler) -> Vec[OuterBinding] {
                         + outer.environment_depth,
                 },
             )
-        } else {}
+        }
     }
     bindings
 }
@@ -893,7 +813,7 @@ fn arrow_outer_bindings(compiler: Compiler) -> Vec[OuterBinding] {
             },
         ),
         None => (),
-    };
+    }
     bindings
 }
 
@@ -902,7 +822,7 @@ fn current_eval_bindings(compiler: Compiler) -> Vec[bytecode::EvalBinding] {
     for binding in arrow_outer_bindings(compiler) {
         if binding.name == IMPORT_META_BINDING {
             continue
-        } else {};
+        }
         result.push(
             bytecode::EvalBinding {
                 name: binding.name,
@@ -932,7 +852,7 @@ fn current_eval_bindings(compiler: Compiler) -> Vec[bytecode::EvalBinding] {
                 environment_depth: 0,
             },
         )
-    } else {};
+    }
     if compiler.super_call_allowed {
         result.push(
             bytecode::EvalBinding {
@@ -946,7 +866,7 @@ fn current_eval_bindings(compiler: Compiler) -> Vec[bytecode::EvalBinding] {
                 environment_depth: 0,
             },
         )
-    } else {};
+    }
     if compiler.super_property_allowed {
         result.push(
             bytecode::EvalBinding {
@@ -960,7 +880,7 @@ fn current_eval_bindings(compiler: Compiler) -> Vec[bytecode::EvalBinding] {
                 environment_depth: 0,
             },
         )
-    } else {};
+    }
     if compiler.eval_arguments_forbidden.get() {
         result.push(
             bytecode::EvalBinding {
@@ -974,7 +894,7 @@ fn current_eval_bindings(compiler: Compiler) -> Vec[bytecode::EvalBinding] {
                 environment_depth: 0,
             },
         )
-    } else {};
+    }
     if compiler.eval_var_arguments_forbidden.get() {
         result.push(
             bytecode::EvalBinding {
@@ -988,7 +908,7 @@ fn current_eval_bindings(compiler: Compiler) -> Vec[bytecode::EvalBinding] {
                 environment_depth: 0,
             },
         )
-    } else {};
+    }
     if compiler.eval_new_target_allowed.get() {
         result.push(
             bytecode::EvalBinding {
@@ -1002,7 +922,7 @@ fn current_eval_bindings(compiler: Compiler) -> Vec[bytecode::EvalBinding] {
                 environment_depth: 0,
             },
         )
-    } else {};
+    }
     result
 }
 
@@ -1016,7 +936,7 @@ fn has_dynamic_eval_var(compiler: Compiler, name: string) -> bool {
     for current in compiler.dynamic_eval_vars {
         if current == name {
             return true
-        } else {}
+        }
     }
     false
 }
@@ -1029,7 +949,7 @@ fn add_dynamic_eval_var(
 ) -> () {
     if !has_dynamic_eval_var(compiler, name) {
         compiler.dynamic_eval_vars.push(name)
-    } else {};
+    }
     compiler.dynamic_eval_declarations.push(
         DynamicEvalDeclaration { name, kind, offset: span.start },
     )
@@ -1060,7 +980,7 @@ fn dynamic_eval_var_conflicts_current_scope(compiler: Compiler, name: string) ->
 fn ensure_super_this_capture(compiler: Compiler) -> () {
     if compiler.lexical_this {
         let _ = resolve_upvalue(compiler, "$this");
-    } else {}
+    }
 }
 
 fn declare_var_pattern(compiler: Compiler, pattern: ast::BindingPattern) -> () {
@@ -1075,12 +995,12 @@ fn declare_var_pattern(compiler: Compiler, pattern: ast::BindingPattern) -> () {
                 "eval cannot declare `arguments` in parameter initializers",
                 span,
             )
-        } else {};
+        }
         let scope_index = compiler.var_scope_index.get();
         match compiler.scopes[scope_index].bindings.get(name) {
             Some(binding) => if binding.kind != BindingKind::Var {
                 compile_error(compiler, "duplicate declaration of `" + name + "`", span)
-            } else {},
+            },
             None => if name == "arguments" && compiler.arguments_available && scope_index == 0 {} else if script_global_var_scope(
                 compiler,
             ) {
@@ -1090,7 +1010,7 @@ fn declare_var_pattern(compiler: Compiler, pattern: ast::BindingPattern) -> () {
                     Some(binding) => if binding.declaration_target && !binding.catch_binding {
                         if binding.kind != BindingKind::Var {
                             compile_error(compiler, "duplicate declaration of `" + name + "`", span)
-                        } else {}
+                        }
                     } else {
                         add_dynamic_eval_var(
                             compiler,
@@ -1122,24 +1042,11 @@ fn declare_var(compiler: Compiler, declaration: ast::VariableDeclarator) -> () {
     declare_var_pattern(compiler, declaration.pattern.get())
 }
 
-fn lexical_binding(kind: BindingKind) -> bool {
-    kind != BindingKind::Var
-}
-
 fn catch_scope_binding(compiler: Compiler, scope_index: isize) -> bool {
     for (index, _) in compiler.catch_scopes {
         if index == scope_index {
             return true
-        } else {}
-    }
-    false
-}
-
-fn catch_scope_simple_binding(compiler: Compiler, scope_index: isize) -> bool {
-    for (index, simple) in compiler.catch_scopes {
-        if index == scope_index {
-            return simple
-        } else {}
+        }
     }
     false
 }
@@ -1191,27 +1098,27 @@ fn declare_annex_b_function(
 ) -> () {
     if compiler_is_strict(compiler) || compiler.module_mode.get() {
         return
-    } else {};
+    }
     if name == "arguments" && compiler.arguments_available {
         return
-    } else {};
+    }
     if compiler.parameter_names.get(name).is_some() {
         return
-    } else {};
+    }
     if ancestors.contains(name) {
         return
-    } else {};
+    }
     if compiler.direct_eval.get() {
         match lookup_outer_binding(compiler, name) {
             Some(binding) => if binding.declaration_target && !binding.catch_binding {
                 if binding.kind != BindingKind::Var {
                     compile_error(compiler, "duplicate declaration of `" + name + "`", span);
                     return
-                } else {}
-            } else {},
+                }
+            },
             None => (),
         }
-    } else {};
+    }
     match annex_b_var_scope_write_target(compiler, name, span) {
         Some(target) => {
             compiler.block_function_vars[span.start] = target;
@@ -1228,7 +1135,7 @@ fn collect_var_statement(compiler: Compiler, statement: ast::Stmt) -> () {
                 for declaration in declarations {
                     declare_var(compiler, declaration)
                 }
-            } else {}
+            }
         },
         ast::Stmt::If { consequent, alternate, .. } => {
             collect_var_statement(compiler, consequent.get());
@@ -1244,19 +1151,19 @@ fn collect_var_statement(compiler: Compiler, statement: ast::Stmt) -> () {
             match initializer {
                 Some(value) => collect_var_statement(compiler, value.get()),
                 None => (),
-            };
+            }
             collect_var_statement(compiler, body.get())
         },
         ast::Stmt::ForOf { kind, pattern, body, .. } => {
             if kind == ast::VariableKind::Var {
                 declare_var_pattern(compiler, pattern.get())
-            } else {};
+            }
             collect_var_statement(compiler, body.get())
         },
         ast::Stmt::ForIn { kind, pattern, body, .. } => {
             if kind == ast::VariableKind::Var {
                 declare_var_pattern(compiler, pattern.get())
-            } else {};
+            }
             collect_var_statement(compiler, body.get())
         },
         ast::Stmt::DoWhile { body, .. } => collect_var_statement(compiler, body.get()),
@@ -1270,7 +1177,7 @@ fn collect_var_statement(compiler: Compiler, statement: ast::Stmt) -> () {
             match handler {
                 Some(value) => collect_var_body(compiler, value.body),
                 None => (),
-            };
+            }
             match finalizer {
                 Some(value) => collect_var_body(compiler, value),
                 None => (),
@@ -1343,7 +1250,7 @@ fn collect_annex_b_statement(
         ast::Stmt::FunctionDeclaration { name, span, generator, asynchronous, .. } => {
             if !generator && !asynchronous {
                 declare_annex_b_function(compiler, name, span, ancestors)
-            } else {}
+            }
         },
         ast::Stmt::Block { body, .. } => collect_annex_b_body_level(
             compiler,
@@ -1380,7 +1287,7 @@ fn collect_annex_b_statement(
                     initializer_lexicals,
                 ),
                 None => (),
-            };
+            }
             let for_combined = merge_lexical_names(child_ancestors, initializer_lexicals);
             collect_annex_b_statement(compiler, body.get(), for_combined, for_combined)
         },
@@ -1388,7 +1295,7 @@ fn collect_annex_b_statement(
             let mut iteration_lexicals: Vec[string] = Vec::new();
             if kind != ast::VariableKind::Var {
                 collect_pattern_lexical_names(compiler, pattern.get(), iteration_lexicals)
-            } else {};
+            }
             let for_combined = merge_lexical_names(child_ancestors, iteration_lexicals);
             collect_annex_b_statement(compiler, body.get(), for_combined, for_combined)
         },
@@ -1420,7 +1327,7 @@ fn collect_annex_b_statement(
                                     pattern.get(),
                                     catch_lexicals,
                                 )
-                            } else {}
+                            }
                         },
                         None => (),
                     }
@@ -1428,7 +1335,7 @@ fn collect_annex_b_statement(
                     collect_annex_b_body_level(compiler, value.body, catch_combined, false)
                 },
                 None => (),
-            };
+            }
             match finalizer {
                 Some(value) => collect_annex_b_body_level(compiler, value, child_ancestors, false),
                 None => (),
@@ -1449,7 +1356,7 @@ fn merge_lexical_names(ancestors: Vec[string], lexicals: Vec[string]) -> Vec[str
     for name in lexicals {
         if !combined.contains(name) {
             combined.push(name)
-        } else {}
+        }
     }
     combined
 }
@@ -1461,10 +1368,10 @@ fn collect_block_lexical_names(compiler: Compiler, statement: ast::Stmt, names: 
             for declaration in declarations {
                 collect_pattern_lexical_names(compiler, declaration.pattern.get(), names)
             }
-        } else {},
+        },
         ast::Stmt::ClassDeclaration { name, .. } => if name != "" {
             names.push(name)
-        } else {},
+        },
         _ => (),
     }
 }
@@ -1476,10 +1383,10 @@ fn collect_annex_b_statement_lexicals(compiler: Compiler, statement: ast::Stmt, 
             for declaration in declarations {
                 collect_pattern_lexical_names(compiler, declaration.pattern.get(), names)
             }
-        } else {},
+        },
         ast::Stmt::ClassDeclaration { name, .. } => if name != "" {
             names.push(name)
-        } else {},
+        },
         ast::Stmt::FunctionDeclaration { .. } => (),
         _ => (),
     }
@@ -1510,9 +1417,9 @@ fn initialize_var_bindings(compiler: Compiler) -> () {
                         },
                         None => (),
                     }
-                } else {}
+                }
             }
-        } else {};
+        }
         match parameter_source {
             Some(source) => {
                 let _ = emit(compiler, bytecode::Instruction::GetLoc(source));
@@ -1520,7 +1427,7 @@ fn initialize_var_bindings(compiler: Compiler) -> () {
             None => {
                 let _ = emit(compiler, bytecode::Instruction::Undefined);
             },
-        };
+        }
         let _ = emit(compiler, bytecode::Instruction::PutLoc(index));
     }
     for name in compiler.dynamic_eval_vars {
@@ -1550,7 +1457,7 @@ fn declare_lexical_statement(compiler: Compiler, statement: ast::Stmt) -> () {
                         }
                     }
                 }
-            } else {}
+            }
         },
         ast::Stmt::FunctionDeclaration { name, span, .. } => {
             if name == "" {
@@ -1586,7 +1493,7 @@ fn declare_lexical_statement(compiler: Compiler, statement: ast::Stmt) -> () {
                                         "duplicate declaration of `" + name + "`",
                                         span,
                                     )
-                                } else {}
+                                }
                             } else {
                                 add_dynamic_eval_var(
                                     compiler,
@@ -1633,7 +1540,7 @@ fn declare_lexical_statement(compiler: Compiler, statement: ast::Stmt) -> () {
                     );
                 },
                 None => (),
-            };
+            }
             let _ = declare_current(compiler, local, BindingKind::Import, span);
         },
         ast::Stmt::ImportNamed { specifiers, .. } => {
@@ -1693,7 +1600,7 @@ fn initialize_lexical_bindings(compiler: Compiler) -> () {
     for (_, binding) in scope.bindings.entries() {
         if runtime_tdz_binding(binding.kind) {
             let _ = emit(compiler, bytecode::Instruction::InitTdz(binding.index));
-        } else {}
+        }
     }
 }
 
@@ -1760,7 +1667,7 @@ fn compile_loop_jump(compiler: Compiler, is_continue: bool, label: Option[string
     match label {
         Some(value) => validate_strict_identifier(compiler, value, span),
         None => (),
-    };
+    }
     if is_continue {
         let mut selected = Option::None;
         let mut index = compiler.loops.len();
@@ -1769,7 +1676,7 @@ fn compile_loop_jump(compiler: Compiler, is_continue: bool, label: Option[string
             if label.is_none() || compiler.loops[index].label == label {
                 selected = Option::Some(index);
                 break
-            } else {}
+            }
         }
         if selected.is_none() {
             compile_error(compiler, "`continue` is only valid inside a loop", span)
@@ -1787,7 +1694,7 @@ fn compile_loop_jump(compiler: Compiler, is_continue: bool, label: Option[string
             if compiler.breakables[index].label == label {
                 selected = Option::Some(index);
                 break
-            } else {}
+            }
         }
         if selected.is_none() {
             compile_error(compiler, "`break` is only valid inside a loop or switch statement", span)
@@ -1819,7 +1726,7 @@ fn close_protected_segment(compiler: Compiler, index: isize) -> () {
     let end = current_offset(compiler);
     if compiler.protected_regions[index].active && start < end {
         compiler.protected_regions[index].segments.push((start, end))
-    } else {}
+    }
 }
 
 fn finish_protected_region(compiler: Compiler) -> Vec[(isize, isize)] {
@@ -1840,7 +1747,7 @@ fn suspend_protected_regions(compiler: Compiler, finalizer_index: isize) -> Vec[
             close_protected_segment(compiler, index);
             compiler.protected_regions[index].active = false;
             suspended.push(index)
-        } else {};
+        }
         index += 1;
     }
     suspended
@@ -1864,7 +1771,7 @@ fn compile_active_finalizers_from(compiler: Compiler, finalizer_depth: isize) ->
             compile_finalizer_kind(compiler, compiler.finalizers[index].kind);
             compiler.finalizers[index].active = true;
             resume_protected_regions(compiler, suspended);
-        } else {}
+        }
     }
 }
 
@@ -1979,7 +1886,7 @@ fn js_string(value: string) -> runtime::JsString {
 fn set_function_source(function: bytecode::Function, source: string, span: ast::Span) -> () {
     if span.start >= 0 && span.end >= span.start && span.end <= source.byte_len() {
         function.set_source_text(js_string(source.byte_slice(span.start, span.end)))
-    } else {}
+    }
 }
 
 fn append_literal_code_point(output: Vec[u16], code_point: u32) -> () {
@@ -2020,7 +1927,7 @@ fn append_literal_character(output: Vec[u16], raw: string, index: isize) -> isiz
 fn string_literal(raw: string) -> runtime::JsString {
     if raw.byte_len() < 2 {
         return js_string(raw)
-    } else {};
+    }
     let template = raw.byte_get(0) == b'`' || raw.byte_get(0) == b'}';
     let output: Vec[u16] = Vec::with_capacity(raw.byte_len() - 2);
     let limit = if template && raw.byte_len() >= 2 && raw.byte_get(raw.byte_len() - 2) == b'$'
@@ -2185,7 +2092,7 @@ fn parse_radix_float(value: string, start: isize, radix: isize) -> Result[f64, s
     let mut index = start;
     if index >= value.byte_len() {
         return Result::Err("numeric literal has no digits")
-    } else {};
+    }
     while index < value.byte_len() {
         match digit_value(value.byte_get(index)) {
             Some(digit) => if digit < radix {
@@ -2195,7 +2102,7 @@ fn parse_radix_float(value: string, start: isize, radix: isize) -> Result[f64, s
                 return Result::Err("digit is outside numeric literal radix")
             },
             None => return Result::Err("invalid digit in numeric literal"),
-        };
+        }
         index += 1;
     }
     Result::Ok(result)
@@ -2217,10 +2124,10 @@ fn parse_number(value: string) -> Result[(bool, i32, f64), string] {
         match num::parse_uint_radix_structured(normalized, 8) {
             Ok(integer) => if integer <= 2147483647 {
                 return Result::Ok((true, integer.to_i32(), 0.0))
-            } else {},
+            },
             Err(_) => (),
         }
-    } else {};
+    }
     match prefixed_parts(normalized) {
         Some((radix, start)) => match num::parse_uint_radix_structured(
             normalized.byte_slice(start, normalized.byte_len()),
@@ -2269,7 +2176,7 @@ fn parse_bigint(value: string) -> Result[runtime::BigInt, string] {
     let mut normalized = normalized_numeric_text(value);
     if normalized.byte_len() == 0 || normalized.byte_get(normalized.byte_len() - 1) != b'n' {
         return Result::Err("BigInt literal must end in `n`")
-    } else {};
+    }
     normalized = normalized.byte_slice(0, normalized.byte_len() - 1);
     let (radix, start) = match prefixed_parts(normalized) {
         Some(parts) => parts,
@@ -2277,7 +2184,7 @@ fn parse_bigint(value: string) -> Result[runtime::BigInt, string] {
     };
     if start >= normalized.byte_len() {
         return Result::Err("BigInt literal has no digits")
-    } else {};
+    }
     match runtime::BigInt::parse_radix(normalized.byte_slice(start, normalized.byte_len()), radix) {
         Ok(value) => Result::Ok(value),
         Err(value) => Result::Err(value.to_string()),
@@ -2337,7 +2244,7 @@ fn compile_plain_identifier(compiler: Compiler, name: string, span: ast::Span) -
                             },
                             None => (),
                         }
-                    } else {};
+                    }
                     if name == "arguments" && compiler.arguments_available {
                         let name_index = string_constant(compiler, name);
                         let _ = emit(
@@ -2354,7 +2261,7 @@ fn compile_plain_identifier(compiler: Compiler, name: string, span: ast::Span) -
                         return
                     } else {
                         compile_error(compiler, "undefined identifier `" + name + "`", span)
-                    };
+                    }
                     let _ = emit(compiler, bytecode::Instruction::Undefined);
                 },
             }
@@ -2384,7 +2291,7 @@ fn compile_identifier(compiler: Compiler, name: string, span: ast::Span) -> () {
     if compiler.with_bindings.is_empty() {
         compile_plain_identifier(compiler, name, span);
         return
-    } else {};
+    }
     let property = string_constant(compiler, name);
     let misses: Vec[isize] = Vec::new();
     let ends: Vec[isize] = Vec::new();
@@ -2393,13 +2300,13 @@ fn compile_identifier(compiler: Compiler, name: string, span: ast::Span) -> () {
         match local_scope {
             Some(value) => if binding.scope_index <= value {
                 break
-            } else {},
+            },
             None => (),
-        };
+        }
         let target = current_offset(compiler);
         if !misses.is_empty() {
             let _ = patch_jump(compiler, misses[misses.len() - 1], target);
-        } else {};
+        }
         let _ = emit(compiler, bytecode::Instruction::PushConst(property));
         compile_with_binding_value(compiler, binding.name, span);
         let _ = emit(compiler, bytecode::Instruction::WithHasBinding);
@@ -2414,7 +2321,7 @@ fn compile_identifier(compiler: Compiler, name: string, span: ast::Span) -> () {
     let fallback = current_offset(compiler);
     if !misses.is_empty() {
         let _ = patch_jump(compiler, misses[misses.len() - 1], fallback);
-    } else {};
+    }
     compile_plain_identifier(compiler, name, span);
     let end = current_offset(compiler);
     for offset in ends {
@@ -2432,13 +2339,13 @@ fn compile_with_identifier_callee(compiler: Compiler, name: string, span: ast::S
         match local_scope {
             Some(value) => if binding.scope_index <= value {
                 break
-            } else {},
+            },
             None => (),
-        };
+        }
         let target = current_offset(compiler);
         if !misses.is_empty() {
             let _ = patch_jump(compiler, misses[misses.len() - 1], target);
-        } else {};
+        }
         let _ = emit(compiler, bytecode::Instruction::PushConst(property));
         compile_with_binding_value(compiler, binding.name, span);
         let _ = emit(compiler, bytecode::Instruction::WithHasBinding);
@@ -2454,7 +2361,7 @@ fn compile_with_identifier_callee(compiler: Compiler, name: string, span: ast::S
     let fallback = current_offset(compiler);
     if !misses.is_empty() {
         let _ = patch_jump(compiler, misses[misses.len() - 1], fallback);
-    } else {};
+    }
     let _ = emit(compiler, bytecode::Instruction::Undefined);
     compile_plain_identifier(compiler, name, span);
     let end = current_offset(compiler);
@@ -2512,7 +2419,7 @@ fn source_regexp_pattern(compiler: Compiler, span: ast::Span) -> Option[runtime:
     };
     if start < 0 || start >= source.len() || source.get(start) != 47 {
         return Option::None
-    } else {};
+    }
     let pattern_start = start + 1;
     let mut index = pattern_start;
     let mut class = false;
@@ -2560,7 +2467,7 @@ fn compile_regexp_literal(compiler: Compiler, pattern: string, flags: string, sp
             let _ = emit(compiler, bytecode::Instruction::Undefined);
             return
         },
-    };
+    }
     let pattern = add_constant(compiler, bytecode::Constant::String(pattern_value));
     let flags = string_constant(compiler, flags);
     let _ = emit(compiler, bytecode::Instruction::NewRegExp(pattern, flags));
@@ -2660,7 +2567,7 @@ fn emit_optional_chain_test(
             let _ = emit(compiler, bytecode::Instruction::Undefined);
             pushed += 1;
         }
-    };
+    }
     exits.push(emit(compiler, bytecode::Instruction::Goto(-1)));
     let _ = patch_jump(compiler, present, current_offset(compiler));
 }
@@ -2726,12 +2633,12 @@ fn compile_chain_member_access(
             compile_error(compiler, "optional chain cannot start from `super`", span);
             if keep_receiver {
                 let _ = emit(compiler, bytecode::Instruction::Undefined);
-            } else {};
+            }
             let _ = emit(compiler, bytecode::Instruction::Undefined);
         } else {
             if keep_receiver {
                 compile_this_value(compiler)
-            } else {};
+            }
             compile_member(
                 compiler,
                 ast::Expr::Member {
@@ -2747,10 +2654,10 @@ fn compile_chain_member_access(
         compile_chain_value(compiler, object, result_count, short_circuit_true, exits);
         if optional {
             emit_optional_chain_test(compiler, 1, result_count, short_circuit_true, exits)
-        } else {};
+        }
         if keep_receiver {
             let _ = emit(compiler, bytecode::Instruction::Dup);
-        } else {};
+        }
         compile_chain_property(compiler, property, computed, member_offset, span);
     }
 }
@@ -2831,7 +2738,7 @@ fn compile_optional_chain_reference(compiler: Compiler, expression: ast::Expr) -
             let _ = emit(compiler, bytecode::Instruction::Undefined);
             compile_expression(compiler, expression);
         },
-    };
+    }
     patch_optional_chain_exits(compiler, exits);
 }
 
@@ -2926,7 +2833,7 @@ fn compile_member(compiler: Compiler, expression: ast::Expr) -> () {
                         compile_private_name(compiler, name, span)
                     },
                     _ => (),
-                };
+                }
                 let _ = emit_at(compiler, bytecode::Instruction::GetPrivate, member_offset);
             } else if computed {
                 compile_expression(compiler, object.get());
@@ -3088,7 +2995,7 @@ fn compile_chain_call(
             short_circuit_true,
             exits,
         )
-    } else {};
+    }
     let spread = call_arguments_have_spread(arguments);
     compile_call_from_stack(compiler, arguments, spread, method, call_offset);
 }
@@ -3110,7 +3017,7 @@ fn compile_call(
             compile_with_identifier_callee(compiler, "eval", ast::expr_span(callee))
         } else {
             compile_identifier(compiler, "eval", ast::expr_span(callee))
-        };
+        }
         let bindings = current_eval_bindings(compiler);
         let site = add_eval_site(compiler, bindings);
         if spread {
@@ -3125,9 +3032,9 @@ fn compile_call(
                 bytecode::Instruction::Eval(arguments.len(), site, method),
                 call_offset,
             );
-        };
+        }
         return
-    } else {};
+    }
     match callee {
         ast::Expr::Parenthesized { expression, .. } => {
             if parenthesized_has_optional_chain(expression.get()) {
@@ -3204,7 +3111,7 @@ fn compile_call(
                     compile_private_name(compiler, name, span)
                 },
                 _ => (),
-            };
+            }
             let _ = emit(compiler, bytecode::Instruction::GetPrivate);
             if spread {
                 compile_call_argument_array(compiler, arguments);
@@ -3347,7 +3254,7 @@ fn compile_tagged_template(
                     compile_private_name(compiler, name, span)
                 },
                 _ => (),
-            };
+            }
             let _ = emit(compiler, bytecode::Instruction::GetPrivate);
             compile_tagged_arguments(compiler, template_index, substitutions);
             let _ = emit(compiler, bytecode::Instruction::CallMethod(argument_count));
@@ -3432,13 +3339,13 @@ fn compile_with_identifier_delete(compiler: Compiler, name: string, span: ast::S
         match local_scope {
             Some(value) => if binding.scope_index <= value {
                 break
-            } else {},
+            },
             None => (),
-        };
+        }
         let target = current_offset(compiler);
         if !misses.is_empty() {
             let _ = patch_jump(compiler, misses[misses.len() - 1], target);
-        } else {};
+        }
         let _ = emit(compiler, bytecode::Instruction::PushConst(property));
         compile_with_binding_value(compiler, binding.name, span);
         let _ = emit(compiler, bytecode::Instruction::WithHasBinding);
@@ -3451,7 +3358,7 @@ fn compile_with_identifier_delete(compiler: Compiler, name: string, span: ast::S
     let fallback = current_offset(compiler);
     if !misses.is_empty() {
         let _ = patch_jump(compiler, misses[misses.len() - 1], fallback);
-    } else {};
+    }
     compile_plain_identifier_delete(compiler, name);
     let end = current_offset(compiler);
     for offset in ends {
@@ -3473,11 +3380,11 @@ fn compile_optional_chain_member_delete(
     } {
         if optional {
             compile_error(compiler, "optional chain cannot start from `super`", span)
-        } else {};
+        }
         set_source_offset(compiler, span.start);
         let _ = emit(compiler, bytecode::Instruction::ThrowReferenceError);
         return
-    } else {};
+    }
     if !computed
         && match property {
             ast::Expr::PrivateIdentifier { .. } => true,
@@ -3488,12 +3395,12 @@ fn compile_optional_chain_member_delete(
         let _ = emit(compiler, bytecode::Instruction::Drop);
         let _ = emit(compiler, bytecode::Instruction::PushFalse);
         return
-    } else {};
+    }
     let exits: Vec[isize] = Vec::new();
     compile_chain_value(compiler, object, 1, true, exits);
     if optional {
         emit_optional_chain_test(compiler, 1, 1, true, exits)
-    } else {};
+    }
     if computed {
         compile_expression(compiler, property);
         let _ = emit(compiler, bytecode::Instruction::Delete);
@@ -3510,7 +3417,7 @@ fn compile_optional_chain_member_delete(
                 let _ = emit(compiler, bytecode::Instruction::PushFalse);
             },
         }
-    };
+    }
     patch_optional_chain_exits(compiler, exits);
 }
 
@@ -3545,9 +3452,9 @@ fn compile_delete(compiler: Compiler, argument: ast::Expr) -> () {
                 let _ = emit(compiler, bytecode::Instruction::Drop);
                 let _ = emit(compiler, bytecode::Instruction::PushTrue);
             },
-        };
+        }
         return
-    } else {};
+    }
     match argument {
         ast::Expr::Parenthesized { expression, .. } => {
             compile_delete(compiler, expression.get())
@@ -3712,7 +3619,7 @@ fn compile_unary(
                 }
             },
             _ => compile_expression(compiler, argument),
-        };
+        }
         let _ = emit(compiler, bytecode::Instruction::TypeOf);
     } else if operator == ast::UnaryOperator::Void {
         compile_expression(compiler, argument);
@@ -3800,7 +3707,7 @@ fn compile_binary(
                 compile_private_name(compiler, name, span)
             },
             _ => (),
-        };
+        }
         compile_expression(compiler, right);
         let _ = emit(compiler, bytecode::Instruction::HasPrivate);
     } else if operator == ast::BinaryOperator::LogicalAnd
@@ -3847,7 +3754,7 @@ fn local_assignment_target(
             throws_on_write: false,
             source_offset: span.start,
         }
-    } else {};
+    }
     if kind == BindingKind::Import {
         return AssignmentTarget {
             storage: if upvalue {
@@ -3859,7 +3766,7 @@ fn local_assignment_target(
             throws_on_write: true,
             source_offset: span.start,
         }
-    } else {};
+    }
     if runtime_tdz_binding(kind) {
         return AssignmentTarget {
             storage: if upvalue {
@@ -3871,7 +3778,7 @@ fn local_assignment_target(
             throws_on_write: false,
             source_offset: span.start,
         }
-    } else {};
+    }
     let named_function = kind == BindingKind::NamedFunction;
     let writable = kind != BindingKind::Const && !named_function;
     let _ = name;
@@ -4003,7 +3910,7 @@ fn plain_identifier_assignment_target(compiler: Compiler, name: string, span: as
                             throws_on_write: false,
                             source_offset: span.start,
                         }
-                    } else {};
+                    }
                     AssignmentTarget {
                         storage: AssignmentStorage::Eval(index),
                         writable: true,
@@ -4036,13 +3943,13 @@ fn with_identifier_assignment_target(compiler: Compiler, name: string, span: ast
         match local_scope {
             Some(value) => if binding.scope_index <= value {
                 break
-            } else {},
+            },
             None => (),
-        };
+        }
         let target = current_offset(compiler);
         if !misses.is_empty() {
             let _ = patch_jump(compiler, misses[misses.len() - 1], target);
-        } else {};
+        }
         let _ = emit(compiler, bytecode::Instruction::PushConst(property));
         compile_with_binding_value(compiler, binding.name, span);
         let _ = emit(compiler, bytecode::Instruction::WithHasBinding);
@@ -4054,7 +3961,7 @@ fn with_identifier_assignment_target(compiler: Compiler, name: string, span: ast
     let end = current_offset(compiler);
     if !misses.is_empty() {
         let _ = patch_jump(compiler, misses[misses.len() - 1], end);
-    } else {};
+    }
     for offset in ends {
         let _ = patch_jump(compiler, offset, end);
     }
@@ -4093,7 +4000,7 @@ fn prepare_assignment_target(
         ast::Expr::Member { object, property, computed, optional, span } => {
             if optional || has_optional_chain(object.get()) {
                 compile_error(compiler, "optional chain is not an assignment target", span)
-            } else {};
+            }
             let member_offset = first_source_byte_between(
                 compiler,
                 ast::expr_span(object.get()).end,
@@ -4127,7 +4034,7 @@ fn prepare_assignment_target(
                             let _ = emit(compiler, bytecode::Instruction::GetLoc(property_local));
                             let _ = emit(compiler, bytecode::Instruction::ToPropertyKey);
                             let _ = emit(compiler, bytecode::Instruction::PutLoc(property_local));
-                        } else {};
+                        }
                         return AssignmentTarget {
                             storage: AssignmentStorage::SuperElement {
                                 base,
@@ -4138,7 +4045,7 @@ fn prepare_assignment_target(
                             throws_on_write: false,
                             source_offset: member_offset,
                         }
-                    } else {};
+                    }
                     let base = new_local(compiler);
                     let _ = emit(compiler, bytecode::Instruction::PushSuperBase);
                     let _ = emit(compiler, bytecode::Instruction::PutLoc(base));
@@ -4170,7 +4077,7 @@ fn prepare_assignment_target(
                         },
                     }
                 }
-            } else {};
+            }
             let object_local = new_local(compiler);
             compile_expression(compiler, object.get());
             let _ = emit(compiler, bytecode::Instruction::PutLoc(object_local));
@@ -4185,7 +4092,7 @@ fn prepare_assignment_target(
                         compile_private_name(compiler, name, span)
                     },
                     _ => (),
-                };
+                }
                 let _ = emit(compiler, bytecode::Instruction::PutLoc(name_local));
                 AssignmentTarget {
                     storage: AssignmentStorage::Private { object: object_local, name: name_local },
@@ -4204,7 +4111,7 @@ fn prepare_assignment_target(
                     let _ = emit(compiler, bytecode::Instruction::GetLoc(property_local));
                     let _ = emit(compiler, bytecode::Instruction::ToPropertyKey);
                     let _ = emit(compiler, bytecode::Instruction::PutLoc(property_local));
-                } else {};
+                }
                 AssignmentTarget {
                     storage: AssignmentStorage::Element {
                         object: object_local,
@@ -4345,10 +4252,10 @@ fn store_assignment_target(compiler: Compiler, target: AssignmentTarget) -> () {
         set_source_offset(compiler, target.source_offset);
         let _ = emit(compiler, bytecode::Instruction::ThrowTypeError);
         return
-    } else {};
+    }
     if !target.writable && !conditional {
         return
-    } else {};
+    }
     set_source_offset(compiler, target.source_offset);
     match target.storage {
         AssignmentStorage::Tdz => {
@@ -4370,14 +4277,14 @@ fn store_assignment_target(compiler: Compiler, target: AssignmentTarget) -> () {
             if compiler_is_strict(compiler) && compiler.allow_unknown_globals.get() {
                 let _ = emit(compiler, bytecode::Instruction::GetGlobal(index));
                 let _ = emit(compiler, bytecode::Instruction::Drop);
-            } else {};
+            }
             let _ = emit(compiler, bytecode::Instruction::SetGlobal(index));
         },
         AssignmentStorage::Eval(index) => {
             if compiler_is_strict(compiler) {
                 let _ = emit(compiler, bytecode::Instruction::GetEval(index));
                 let _ = emit(compiler, bytecode::Instruction::Drop);
-            } else {};
+            }
             let _ = emit(compiler, bytecode::Instruction::SetEval(index));
         },
         AssignmentStorage::StrictEval { name, resolved } => {
@@ -4531,7 +4438,7 @@ fn compile_logical_assignment(
     match inferred_name {
         Some(name) => compile_expression_with_inferred_name(compiler, right, name),
         None => compile_expression(compiler, right),
-    };
+    }
     store_assignment_target(compiler, target);
     let _ = patch_jump(compiler, branch, current_offset(compiler));
 }
@@ -4554,7 +4461,7 @@ fn compile_assignment(
         match inferred_name {
             Some(name) => compile_expression_with_inferred_name(compiler, right, name),
             None => compile_expression(compiler, right),
-        };
+        }
         store_assignment_target(compiler, target)
     } else if operator == ast::AssignmentOperator::LogicalAnd
         || operator == ast::AssignmentOperator::LogicalOr
@@ -4579,7 +4486,7 @@ fn compile_assignment(
                 None => compile_error(compiler, "compound assignment is not supported", span),
             },
             None => compile_error(compiler, "compound assignment is not supported", span),
-        };
+        }
         store_assignment_target(compiler, target)
     }
 }
@@ -4650,24 +4557,24 @@ fn compile_yield(
 ) -> () {
     if !compiler.generator {
         compile_error(compiler, "yield is only valid in a generator function", span)
-    } else {};
+    }
     if !delegate {
         match argument {
             Some(value) => compile_expression(compiler, value.get()),
             None => {
                 let _ = emit(compiler, bytecode::Instruction::Undefined);
             },
-        };
+        }
         emit_suspension(compiler, false);
         return
-    } else {};
+    }
     match argument {
         Some(value) => compile_expression(compiler, value.get()),
         None => {
             compile_error(compiler, "yield delegation requires an expression", span);
             let _ = emit(compiler, bytecode::Instruction::Undefined);
         },
-    };
+    }
     let _ = emit(
         compiler,
         if compiler.asynchronous {
@@ -4690,14 +4597,14 @@ fn compile_yield(
         let _ = emit(compiler, bytecode::Instruction::IteratorResult);
     } else {
         let _ = emit(compiler, bytecode::Instruction::IteratorNextValue);
-    };
+    }
     let check_done = current_offset(compiler);
     let done = emit(compiler, bytecode::Instruction::IfTrue(-1));
     let yield_value = current_offset(compiler);
     let value = string_constant(compiler, "value");
     if compiler.asynchronous {
         let _ = emit(compiler, bytecode::Instruction::GetField(value));
-    } else {};
+    }
     let yield_offset = emit(compiler, bytecode::Instruction::YieldRaw);
     let _ = emit(compiler, bytecode::Instruction::PutLoc(received));
     let _ = emit(compiler, bytecode::Instruction::GetLoc(iterator));
@@ -4709,7 +4616,7 @@ fn compile_yield(
         let _ = emit(compiler, bytecode::Instruction::IteratorResult);
     } else {
         let _ = emit(compiler, bytecode::Instruction::IteratorNextValue);
-    };
+    }
     let _ = emit(compiler, bytecode::Instruction::Goto(check_done));
     let throw_target = current_offset(compiler);
     let _ = emit(compiler, bytecode::Instruction::PutLoc(received));
@@ -4721,7 +4628,7 @@ fn compile_yield(
         let _ = emit(compiler, bytecode::Instruction::IteratorThrowResult);
     } else {
         let _ = emit(compiler, bytecode::Instruction::IteratorThrow);
-    };
+    }
     let _ = emit(compiler, bytecode::Instruction::Goto(check_done));
     let return_target = current_offset(compiler);
     let return_missing = if compiler.asynchronous {
@@ -4747,7 +4654,7 @@ fn compile_yield(
         let _ = emit(compiler, bytecode::Instruction::IteratorResult);
     } else {
         let _ = emit(compiler, bytecode::Instruction::IteratorReturn);
-    };
+    }
     let return_done = emit(compiler, bytecode::Instruction::IfTrue(-1));
     let _ = emit(compiler, bytecode::Instruction::Goto(yield_value));
     let _ = patch_jump(compiler, done, current_offset(compiler));
@@ -4764,7 +4671,7 @@ fn compile_yield(
         emit_suspension(compiler, true);
         let _ = emit(compiler, bytecode::Instruction::PutLoc(completion));
         let _ = patch_jump(compiler, present, current_offset(compiler));
-    } else {};
+    }
     compile_return_finalizers(compiler);
     let _ = emit(compiler, bytecode::Instruction::GetLoc(completion));
     let _ = emit(compiler, bytecode::Instruction::Return);
@@ -4821,7 +4728,7 @@ fn compile_nested_function(
     match name {
         Some(value) => validate_strict_binding_identifier(child, value, span),
         None => (),
-    };
+    }
     compiler_inherit_source(child, parent);
     child.source_name.set(parent.source_name.get());
     child.allow_unknown_globals.set(parent.allow_unknown_globals.get());
@@ -4847,26 +4754,26 @@ fn compile_nested_function(
             "use strict directive is not allowed with a non-simple parameter list",
             span,
         )
-    } else {};
+    }
     if (strict || arrow || !constructable) && simple_parameter_list(parameters) {
         validate_unique_parameter_names(child, parameters)
-    } else {};
+    }
     if class_constructor && !derived_constructor {
         let _ = emit(child, bytecode::Instruction::InitializeInstanceFields);
-    } else {};
+    }
     initialize_parameter_bindings(child);
     compile_parameter_initializers(child, parameters);
     if generator {
         let _ = emit(child, bytecode::Instruction::Undefined);
         let _ = emit(child, bytecode::Instruction::Yield);
         let _ = emit(child, bytecode::Instruction::Drop);
-    } else {};
+    }
     let separate_body_environment = !simple_parameter_list(parameters);
     if separate_body_environment {
         push_scope(child);
         child.var_scope_index.set(child.scopes.len() - 1);
         let _ = emit(child, bytecode::Instruction::EnterEvalEnvironment);
-    } else {};
+    }
     collect_var_body(child, body);
     let annex_b_ancestors: Vec[string] = Vec::new();
     collect_annex_b_body(child, body, annex_b_ancestors);
@@ -4877,7 +4784,7 @@ fn compile_nested_function(
     let _ = emit(child, bytecode::Instruction::ReturnUndef);
     if separate_body_environment {
         pop_scope(child)
-    } else {};
+    }
     let eval_bindings = current_eval_bindings(child);
     let sources: Vec[bytecode::UpvalueSource] = Vec::new();
     for upvalue in child.upvalues {
@@ -4911,7 +4818,7 @@ fn compile_nested_function(
     match name {
         Some(value) => function.set_name(js_string(value)),
         None => (),
-    };
+    }
     append_verifier_errors(child, function, span);
     for error in child.errors {
         parent.errors.push(error)
@@ -5057,9 +4964,9 @@ fn compile_object_property_value(
         match name {
             Some(value) => compile_expression_with_inferred_name(compiler, expression, value),
             None => compile_expression(compiler, expression),
-        };
+        }
         return
-    } else {};
+    }
     match expression {
         ast::Expr::Function { parameters, body, generator, asynchronous, span, .. } => {
             let function = compile_nested_function(
@@ -5080,7 +4987,7 @@ fn compile_object_property_value(
             match name {
                 Some(value) => function.set_name(js_string(value)),
                 None => (),
-            };
+            }
             let index = add_constant(compiler, bytecode::Constant::Function(Ref::new(function)));
             let _ = emit(compiler, bytecode::Instruction::PushConst(index));
             let _ = emit(compiler, bytecode::Instruction::SetFunctionHomeObject);
@@ -5147,7 +5054,7 @@ fn compile_object_literal(compiler: Compiler, properties: Vec[ast::ObjectPropert
                             },
                         ),
                     );
-                };
+                }
                 let instruction = match property.kind {
                     ast::ObjectPropertyKind::Data | ast::ObjectPropertyKind::Prototype | ast::ObjectPropertyKind::Method => {
                         bytecode::Instruction::DefineDataPropertyComputed
@@ -5164,12 +5071,12 @@ fn compile_object_literal(compiler: Compiler, properties: Vec[ast::ObjectPropert
                     compile_expression(compiler, property.value.get());
                     let _ = emit(compiler, bytecode::Instruction::SetObjectPrototype);
                     continue
-                } else {};
+                }
                 let index = string_constant(compiler, name);
                 let _ = emit(compiler, bytecode::Instruction::Dup);
                 if property.kind != ast::ObjectPropertyKind::Data {
                     let _ = emit(compiler, bytecode::Instruction::Dup);
-                } else {};
+                }
                 compile_object_property_value(
                     compiler,
                     property.value.get(),
@@ -5233,13 +5140,13 @@ fn compile_sequence(compiler: Compiler, expressions: Vec[Ref[ast::Expr]]) -> () 
     if expressions.is_empty() {
         let _ = emit(compiler, bytecode::Instruction::Undefined);
         return
-    } else {};
+    }
     let mut index = 0;
     while index < expressions.len() {
         compile_expression(compiler, expressions[index].get());
         if index + 1 < expressions.len() {
             let _ = emit(compiler, bytecode::Instruction::Drop);
-        } else {};
+        }
         index += 1;
     }
 }
@@ -5353,7 +5260,7 @@ fn compile_expression(compiler: Compiler, expression: ast::Expr) -> () {
                 None => {
                     let _ = emit(compiler, bytecode::Instruction::Undefined);
                 },
-            };
+            }
             if lookup_binding(compiler, IMPORT_REFERRER_BINDING).is_some()
                 || lookup_outer_binding(compiler, IMPORT_REFERRER_BINDING).is_some() {
                 compile_plain_identifier(
@@ -5363,7 +5270,7 @@ fn compile_expression(compiler: Compiler, expression: ast::Expr) -> () {
                 )
             } else {
                 let _ = emit(compiler, bytecode::Instruction::Undefined);
-            };
+            }
             let _ = emit(compiler, bytecode::Instruction::DynamicImport);
         },
         ast::Expr::New { callee, arguments, .. } => {
@@ -5435,10 +5342,10 @@ fn compile_function_declaration(
 ) -> () {
     if name == "" {
         return
-    } else {};
+    }
     if function_body_is_strict(body) && (name == "eval" || name == "arguments") {
         compile_error(compiler, "invalid strict binding `" + name + "`", span)
-    } else {};
+    }
     let scope = compiler.scopes[compiler.scopes.len() - 1];
     let binding = match scope.bindings.get(name) {
         Some(value) => Option::Some(value),
@@ -5480,7 +5387,7 @@ fn compile_function_declaration(
             };
             if var_update.is_some() {
                 let _ = emit(compiler, bytecode::Instruction::Dup);
-            } else {};
+            }
             let _ = emit(compiler, bytecode::Instruction::PutLoc(value.index));
             match var_update {
                 Some(target) => compile_annex_b_var_update(compiler, target),
@@ -5535,7 +5442,7 @@ fn class_constructor_element(elements: Vec[ast::ClassElement]) -> Option[ast::Cl
             && !element.private_member
             && element.name == "constructor" {
             return Option::Some(element)
-        } else {}
+        }
     }
     Option::None
 }
@@ -5657,7 +5564,7 @@ fn compile_class_field_initializer(
             };
             let _ = emit(child, instruction);
             count += 1;
-        } else {};
+        }
         element_index += 1;
     }
     element_index = 0;
@@ -5679,7 +5586,7 @@ fn compile_class_field_initializer(
                     BindingKind::Const,
                 );
                 let _ = emit(child, bytecode::Instruction::GetUpvalue(upvalue));
-            } else {};
+            }
             match element.initializer {
                 Some(value) => if element.computed_name.is_some() {
                     compile_expression(child, value.get())
@@ -5697,7 +5604,7 @@ fn compile_class_field_initializer(
                 None => {
                     let _ = emit(child, bytecode::Instruction::Undefined);
                 },
-            };
+            }
             if element.private_member {
                 let _ = emit(child, bytecode::Instruction::DefineThisPrivateField);
             } else if element.computed_name.is_some() {
@@ -5705,9 +5612,9 @@ fn compile_class_field_initializer(
             } else {
                 let name = string_constant(child, class_element_property_name(child, element));
                 let _ = emit(child, bytecode::Instruction::DefineThisField(name));
-            };
+            }
             count += 1;
-        } else {}
+        }
         element_index += 1;
     }
     if count == 0 {
@@ -5783,7 +5690,7 @@ fn compile_class_static_initializer(
                 BindingKind::Const,
             );
             let _ = emit(child, bytecode::Instruction::GetUpvalue(upvalue));
-        } else {};
+        }
         match element.initializer {
             Some(value) => if element.computed_name.is_some() {
                 compile_expression(child, value.get())
@@ -5801,7 +5708,7 @@ fn compile_class_static_initializer(
             None => {
                 let _ = emit(child, bytecode::Instruction::Undefined);
             },
-        };
+        }
         if element.private_member {
             let _ = emit(child, bytecode::Instruction::DefineThisPrivateField);
         } else if element.computed_name.is_some() {
@@ -5816,7 +5723,7 @@ fn compile_class_static_initializer(
         initialize_lexical_bindings(child);
         initialize_var_bindings(child);
         compile_body(child, element.body)
-    };
+    }
     let _ = emit(child, bytecode::Instruction::ReturnUndef);
     let sources: Vec[bytecode::UpvalueSource] = Vec::new();
     for upvalue in child.upvalues {
@@ -5904,7 +5811,7 @@ fn compile_class_private_method_initializer(
             };
             let _ = emit(child, instruction);
             count += 1;
-        } else {};
+        }
         element_index += 1;
     }
     if count == 0 {
@@ -5960,7 +5867,7 @@ fn compile_class_value(
         None => {
             let _ = emit(compiler, bytecode::Instruction::Undefined);
         },
-    };
+    }
     let _ = emit(compiler, bytecode::Instruction::PutLoc(heritage_local));
     push_scope(compiler);
     for element in elements {
@@ -5974,8 +5881,8 @@ fn compile_class_value(
                     },
                     None => (),
                 }
-            } else {}
-        } else {}
+            }
+        }
     }
     let class_index = match binding_index {
         Some(value) => value,
@@ -6042,7 +5949,7 @@ fn compile_class_value(
             }
         } else {
             private_key_locals.push(-1)
-        };
+        }
         private_method_locals.push(-1)
     }
     let mut element_index = 0;
@@ -6056,18 +5963,18 @@ fn compile_class_value(
             && element.name == "constructor" {
             element_index += 1;
             continue
-        } else {};
+        }
         if element.static_member {
             let _ = emit(compiler, bytecode::Instruction::GetLoc(class_index));
         } else {
             let _ = emit(compiler, bytecode::Instruction::GetLoc(prototype));
-        };
+        }
         if element.computed_name.is_some() {
             let _ = emit(
                 compiler,
                 bytecode::Instruction::GetLoc(computed_key_locals[element_index]),
             );
-        } else {};
+        }
         let method = compile_nested_function(
             compiler,
             Option::None,
@@ -6104,7 +6011,7 @@ fn compile_class_value(
                     },
                 ),
             )
-        } else {};
+        }
         let method_index = add_constant(compiler, bytecode::Constant::Function(Ref::new(method)));
         let _ = emit(compiler, bytecode::Instruction::PushConst(method_index));
         if element.private_member {
@@ -6114,7 +6021,7 @@ fn compile_class_value(
             private_method_locals.set(element_index, method_local);
             element_index += 1;
             continue
-        } else {};
+        }
         let instruction = if element.computed_name.is_some() {
             match element.kind {
                 ast::ClassElementKind::Method => bytecode::Instruction::DefineClassMethodComputed,
@@ -6168,7 +6075,7 @@ fn compile_class_value(
             let _ = emit(compiler, bytecode::Instruction::SetClassInstanceInitializer);
         },
         None => (),
-    };
+    }
     match compile_class_private_method_initializer(
         compiler,
         elements,
@@ -6187,7 +6094,7 @@ fn compile_class_value(
             let _ = emit(compiler, bytecode::Instruction::Drop);
         },
         None => (),
-    };
+    }
     let mut static_index = 0;
     for element in elements {
         if element.static_member
@@ -6206,7 +6113,7 @@ fn compile_class_value(
             let _ = emit(compiler, bytecode::Instruction::SetFunctionHomeObject);
             let _ = emit(compiler, bytecode::Instruction::CallMethod(0));
             let _ = emit(compiler, bytecode::Instruction::Drop);
-        } else {};
+        }
         static_index += 1;
     }
     let _ = emit(compiler, bytecode::Instruction::GetLoc(class_index));
@@ -6235,7 +6142,7 @@ fn compile_class_declaration(
                 let _ = emit(compiler, bytecode::Instruction::InitTdz(value.index));
             },
             None => (),
-        };
+        }
         compile_class_value(
             compiler,
             Option::Some(name),
@@ -6251,7 +6158,7 @@ fn compile_class_declaration(
         let name_index = string_constant(compiler, name);
         let _ = emit(compiler, bytecode::Instruction::InitGlobalLexical(name_index));
         return
-    } else {};
+    }
     push_scope(compiler);
     let class_binding = declare_current(compiler, name, BindingKind::TdzConst, span);
     match class_binding {
@@ -6259,7 +6166,7 @@ fn compile_class_declaration(
             let _ = emit(compiler, bytecode::Instruction::InitTdz(value.index));
         },
         None => (),
-    };
+    }
     compile_class_value(
         compiler,
         Option::Some(name),
@@ -6291,7 +6198,7 @@ fn compile_class_expression(
                     let _ = emit(compiler, bytecode::Instruction::InitTdz(current.index));
                 },
                 None => (),
-            };
+            }
             let binding_index = match binding {
                 Some(current) => Option::Some(current.index),
                 None => Option::None,
@@ -6326,9 +6233,9 @@ fn compile_export_default(compiler: Compiler, expression: ast::Expr, local: stri
                 false,
             );
             return
-        } else {},
+        },
         _ => (),
-    };
+    }
     compile_expression_with_inferred_name(
         compiler,
         expression,
@@ -6425,10 +6332,10 @@ fn compile_variable_declaration(
                         "const declaration requires an initializer",
                         declaration.span,
                     )
-                } else {};
+                }
                 let _ = emit(compiler, bytecode::Instruction::Undefined);
                 compile_binding_pattern(compiler, declaration.pattern.get())
-            } else {},
+            },
         }
     }
 }
@@ -6520,7 +6427,7 @@ fn compile_for(
             compile_statement(compiler, value.get())
         },
         None => (),
-    };
+    }
     reset_statement_completion(compiler);
     clone_local_bindings(compiler, iteration_bindings);
     let test_target = current_offset(compiler);
@@ -6543,7 +6450,7 @@ fn compile_for(
             let _ = emit(compiler, bytecode::Instruction::Drop);
         },
         None => (),
-    };
+    }
     let _ = emit(compiler, bytecode::Instruction::Goto(test_target));
     let exit_target = current_offset(compiler);
     match exit_jump {
@@ -6551,7 +6458,7 @@ fn compile_for(
             let _ = patch_jump(compiler, offset, exit_target);
         },
         None => (),
-    };
+    }
     patch_loop_jumps(compiler, break_context, loop_context, exit_target, update_target);
     pop_scope(compiler)
 }
@@ -6575,23 +6482,23 @@ fn compile_for_iteration(
         } else {
             compile_error(compiler, "await is only valid in async functions", span)
         }
-    } else {};
+    }
     push_scope(compiler);
     if kind != ast::VariableKind::Var {
         declare_pattern_bindings(compiler, pattern, BindingKind::Tdz)
-    } else {};
+    }
     match initializer {
         Some(value) => {
             compile_expression(compiler, value.get());
             compile_binding_pattern(compiler, pattern)
         },
         None => (),
-    };
+    }
     reset_statement_completion(compiler);
     compile_expression(compiler, source);
     if kind != ast::VariableKind::Var {
         set_pattern_binding_kind(compiler, pattern, binding_kind(kind))
-    } else {};
+    }
     let enumeration_source = if enumerate {
         let local = new_local(compiler);
         let _ = emit(compiler, bytecode::Instruction::Dup);
@@ -6625,7 +6532,7 @@ fn compile_for_iteration(
                 active: true,
             },
         )
-    } else {};
+    }
     let loop_target = current_offset(compiler);
     let _ = emit(compiler, bytecode::Instruction::GetLoc(iterator_local));
     let _ = emit(compiler, bytecode::Instruction::GetLoc(next_local));
@@ -6635,7 +6542,7 @@ fn compile_for_iteration(
         let _ = emit(compiler, bytecode::Instruction::IteratorResult);
     } else {
         let _ = emit(compiler, bytecode::Instruction::IteratorNext);
-    };
+    }
     let done_jump = emit(compiler, bytecode::Instruction::IfTrue(-1));
     let value_index = string_constant(compiler, "value");
     let _ = emit(compiler, bytecode::Instruction::GetField(value_index));
@@ -6650,17 +6557,17 @@ fn compile_for_iteration(
     };
     if !enumerate {
         begin_protected_region(compiler)
-    } else {};
+    }
     if kind != ast::VariableKind::Var {
         clone_local_bindings(compiler, pattern_binding_indices(compiler, pattern))
-    } else {};
+    }
     match assignment_pattern {
         Some(value) => compile_assignment_pattern(compiler, value.get()),
         None => match target {
             Some(value) => compile_assignment_pattern_target(compiler, value.get(), span),
             None => compile_binding_pattern(compiler, pattern),
         },
-    };
+    }
     if enumerate {
         push_loop(compiler)
     } else {
@@ -6679,7 +6586,7 @@ fn compile_for_iteration(
                 label: Option::None,
             },
         )
-    };
+    }
     compile_statement(compiler, body);
     let protected_segments = if enumerate {
         Vec::new()
@@ -6697,7 +6604,7 @@ fn compile_for_iteration(
             let _ = emit(compiler, bytecode::Instruction::Goto(loop_target));
         },
         None => (),
-    };
+    }
     let done_target = current_offset(compiler);
     let _ = patch_jump(compiler, done_jump, done_target);
     let _ = emit(compiler, bytecode::Instruction::Drop);
@@ -6720,22 +6627,22 @@ fn compile_for_iteration(
             let _ = emit(compiler, bytecode::Instruction::GetLoc(exception_local));
             let _ = emit(compiler, bytecode::Instruction::IteratorCloseThrow);
             let _ = emit(compiler, bytecode::Instruction::Throw);
-        };
+        }
         for (start, end) in protected_segments {
             add_exception_handler(compiler, start, end, handler_target)
         }
-    } else {};
+    }
     let exit_target = current_offset(compiler);
     match skip_handler {
         Some(offset) => {
             let _ = patch_jump(compiler, offset, exit_target);
         },
         None => (),
-    };
+    }
     patch_loop_jumps(compiler, break_context, loop_context, exit_target, loop_target);
     if !enumerate {
         let _ = compiler.finalizers.pop();
-    } else {};
+    }
     pop_scope(compiler)
 }
 
@@ -6782,7 +6689,7 @@ fn compile_switch(compiler: Compiler, discriminant: ast::Expr, cases: Vec[ast::S
             None => {
                 default_index = Option::Some(case_index);
             },
-        };
+        }
         case_index += 1;
     }
     let no_match = emit(compiler, bytecode::Instruction::Goto(-1));
@@ -6804,7 +6711,7 @@ fn compile_switch(compiler: Compiler, discriminant: ast::Expr, cases: Vec[ast::S
         None => {
             let _ = patch_jump(compiler, no_match, exit_target);
         },
-    };
+    }
     for offset in break_context.break_jumps {
         let _ = patch_jump(compiler, offset, exit_target);
     }
@@ -6814,7 +6721,7 @@ fn compile_switch(compiler: Compiler, discriminant: ast::Expr, cases: Vec[ast::S
 fn add_exception_handler(compiler: Compiler, start: isize, end: isize, target: isize) -> () {
     if start < end {
         compiler.exception_handlers.push(bytecode::ExceptionHandler { start, end, target })
-    } else {}
+    }
 }
 
 fn compile_catch(compiler: Compiler, clause: ast::CatchClause) -> () {
@@ -6832,16 +6739,16 @@ fn compile_catch(compiler: Compiler, clause: ast::CatchClause) -> () {
                 for (name, span) in names {
                     if name == "eval" || name == "arguments" {
                         compile_error(compiler, "invalid strict catch binding `" + name + "`", span)
-                    } else {}
+                    }
                 }
-            } else {};
+            }
             declare_pattern_bindings(compiler, pattern.get(), BindingKind::Let);
             compile_binding_pattern(compiler, pattern.get())
         },
         None => {
             let _ = emit(compiler, bytecode::Instruction::Drop);
         },
-    };
+    }
     declare_lexical_body(compiler, clause.body);
     initialize_lexical_bindings(compiler);
     compile_body(compiler, clause.body);
@@ -6887,7 +6794,7 @@ fn compile_try_finally(
             reset_statement_completion(compiler);
             compile_block(compiler, block)
         },
-    };
+    }
     let segments = finish_protected_region(compiler);
     let saved_completion = match compiler.completion_local.get() {
         Some(completion) => {
@@ -6913,7 +6820,7 @@ fn compile_try_finally(
             }
         },
         None => (),
-    };
+    }
     let skip = emit(compiler, bytecode::Instruction::Goto(-1));
     let target = current_offset(compiler);
     let exception_local = new_local(compiler);
@@ -6958,7 +6865,7 @@ fn compile_labelled_statement(compiler: Compiler, label: string, body: ast::Stmt
     push_label_breakable(compiler, label);
     if iteration_statement(body) {
         compiler.pending_loop_label.set(Option::Some(label))
-    } else {};
+    }
     compile_statement(compiler, body);
     compiler.pending_loop_label.set(Option::None);
     let context = pop_breakable(compiler);
@@ -6971,7 +6878,7 @@ fn compile_labelled_statement(compiler: Compiler, label: string, body: ast::Stmt
 fn compile_with_statement(compiler: Compiler, object: ast::Expr, body: ast::Stmt, span: ast::Span) -> () {
     if compiler_is_strict(compiler) {
         compile_error(compiler, "with statement is not allowed in strict mode", span)
-    } else {};
+    }
     reset_statement_completion(compiler);
     compile_expression(compiler, object);
     let _ = emit(compiler, bytecode::Instruction::ToObject);
@@ -6991,7 +6898,7 @@ fn compile_with_statement(compiler: Compiler, object: ast::Expr, body: ast::Stmt
         None => {
             let _ = emit(compiler, bytecode::Instruction::Drop);
         },
-    };
+    }
     compiler.with_bindings.insert(0, WithBinding { name, scope_index: with_scope_index });
     compile_statement(compiler, body);
     let _ = compiler.with_bindings.remove(0);
@@ -7025,14 +6932,14 @@ fn compile_statement(compiler: Compiler, statement: ast::Stmt) -> () {
                         "module import is only supported by module compilation",
                         span,
                     )
-                } else {};
+                }
                 if source == "std" || source == "os" {
                     let source_index = string_constant(compiler, source);
                     let _ = emit(compiler, bytecode::Instruction::GetGlobal(source_index));
                 } else {
                     compile_error(compiler, "unsupported import module `" + source + "`", span);
                     let _ = emit(compiler, bytecode::Instruction::Undefined);
-                };
+                }
                 match compiler.scopes[compiler.scopes.len() - 1].bindings.get(local) {
                     Some(binding) => {
                         let _ = emit(compiler, bytecode::Instruction::PutLoc(binding.index));
@@ -7041,7 +6948,7 @@ fn compile_statement(compiler: Compiler, statement: ast::Stmt) -> () {
                         let _ = emit(compiler, bytecode::Instruction::Drop);
                     },
                 }
-            } else {}
+            }
         },
         ast::Stmt::ImportNamed { span, .. } | ast::Stmt::ImportSideEffect { span, .. } => {
             if !compiler.module_mode.get() {
@@ -7050,21 +6957,21 @@ fn compile_statement(compiler: Compiler, statement: ast::Stmt) -> () {
                     "module import is only supported by module compilation",
                     span,
                 )
-            } else {}
+            }
         },
         ast::Stmt::ExportNamed { span, .. } => if !compiler.module_mode.get() {
             compile_error(compiler, "export is only supported by module compilation", span)
-        } else {},
+        },
         ast::Stmt::ExportDefault { expression, local, hoisted, span, .. } => if compiler.module_mode.get() {
             if !hoisted {
                 compile_export_default(compiler, expression.get(), local, span)
-            } else {}
+            }
         } else {
             compile_error(compiler, "export is only supported by module compilation", span)
         },
         ast::Stmt::ExportAll { span, .. } | ast::Stmt::ExportNamespace { span, .. } => if !compiler.module_mode.get() {
             compile_error(compiler, "export is only supported by module compilation", span)
-        } else {},
+        },
         ast::Stmt::ExportDeclaration { declaration, span } => if compiler.module_mode.get() {
             match declaration.get() {
                 ast::Stmt::FunctionDeclaration { .. } => (),
@@ -7160,13 +7067,13 @@ fn compile_statement(compiler: Compiler, statement: ast::Stmt) -> () {
                 compile_expression(compiler, value.get());
                 if compiler.asynchronous && compiler.generator {
                     emit_suspension(compiler, true)
-                } else {};
+                }
                 if !compiler.finalizers.is_empty() {
                     let local = new_local(compiler);
                     let _ = emit(compiler, bytecode::Instruction::PutLoc(local));
                     compile_return_finalizers(compiler);
                     let _ = emit(compiler, bytecode::Instruction::GetLoc(local));
-                } else {};
+                }
                 let _ = emit(compiler, bytecode::Instruction::Return);
             },
             None => {
@@ -7205,7 +7112,7 @@ fn compile_body(compiler: Compiler, body: Vec[ast::Stmt]) -> () {
                     span,
                     true,
                 )
-            } else {},
+            },
             _ => compile_statement(compiler, statement),
         }
     }
@@ -7223,7 +7130,7 @@ fn simple_parameter_list(parameters: Vec[ast::FunctionParameter]) -> bool {
         if parameter.rest || parameter.initializer.is_some()
             || !parameter_pattern_is_identifier(parameter.pattern.get()) {
             return false
-        } else {}
+        }
     }
     true
 }
@@ -7235,7 +7142,7 @@ fn function_body_is_strict(body: Vec[ast::Stmt]) -> bool {
                 ast::Expr::String { value, raw, .. } => if value == "use strict"
                     && (raw == "\"use strict\"" || raw == "'use strict'") {
                     return true
-                } else {},
+                },
                 _ => return false,
             },
             _ => return false,
@@ -7249,7 +7156,7 @@ fn collect_parameter_names(pattern: ast::BindingPattern, names: Vec[(string, ast
         ast::BindingPattern::Identifier { name, span } => {
             if name != "" {
                 names.push((name, span))
-            } else {}
+            }
         },
         ast::BindingPattern::Array { elements, .. } => {
             for element in elements {
@@ -7292,7 +7199,7 @@ fn declare_parameter_bindings(compiler: Compiler, parameters: Vec[ast::FunctionP
         match compiler.scopes[0].bindings.get(name) {
             Some(_) => if !allow_duplicates {
                 compile_error(compiler, "duplicate parameter `" + name + "`", span)
-            } else {},
+            },
             None => {
                 let index = new_local(compiler);
                 compiler.scopes[0].bindings.set(name, Binding { name, index, kind, span })
@@ -7305,7 +7212,7 @@ fn initialize_parameter_bindings(compiler: Compiler) -> () {
     for (_, binding) in compiler.scopes[0].bindings.entries() {
         if binding.kind == BindingKind::TdzVar {
             let _ = emit(compiler, bytecode::Instruction::InitTdz(binding.index));
-        } else {}
+        }
     }
 }
 
@@ -7332,7 +7239,7 @@ fn mapped_argument_locals(
 ) -> Vec[isize] {
     if strict || arrow || !simple_parameter_list(parameters) {
         return Vec::new()
-    } else {};
+    }
     let mapped: Vec[isize] = Vec::with_capacity(parameters.len());
     for _ in parameters {
         mapped.push(-1)
@@ -7350,7 +7257,7 @@ fn mapped_argument_locals(
                     },
                     None => (),
                 }
-            } else {},
+            },
             _ => (),
         }
     }
@@ -7408,10 +7315,10 @@ fn lexical_statement_binding_indices(compiler: Compiler, statement: ast::Stmt) -
                         indices.push(index)
                     }
                 }
-            } else {}
+            }
         },
         _ => (),
-    };
+    }
     indices
 }
 
@@ -7446,7 +7353,7 @@ fn compile_binding_initializer(
                     compile_expression_with_inferred_name(compiler, value.get(), name)
                 },
                 None => compile_expression(compiler, value.get()),
-            };
+            }
             let _ = patch_jump(compiler, initialized, current_offset(compiler));
         },
     }
@@ -7470,7 +7377,7 @@ fn bind_identifier(compiler: Compiler, name: string, span: ast::Span) -> () {
                     },
                     None => (),
                 }
-            } else {};
+            }
             let _ = emit(compiler, bytecode::Instruction::PutLoc(binding.index));
         },
         None => if name == "arguments" && compiler.arguments_available {
@@ -7624,7 +7531,7 @@ fn prepare_with_binding_target(compiler: Compiler, pattern: ast::BindingPattern)
 ] {
     if compiler.with_bindings.is_empty() {
         return Option::None
-    } else {};
+    }
     match pattern {
         ast::BindingPattern::Identifier { name, span } => {
             let variable = match lookup_binding(compiler, name) {
@@ -7738,7 +7645,7 @@ fn compile_assignment_pattern_initializer(
                     compile_expression_with_inferred_name(compiler, value.get(), name)
                 },
                 None => compile_expression(compiler, value.get()),
-            };
+            }
             let _ = patch_jump(compiler, initialized, current_offset(compiler));
         },
     }
@@ -8037,7 +7944,7 @@ fn compiler_new(
         source: Ref::new(""),
         source_code_units: Ref::new(Option::None),
         source_name: Ref::new("<input>"),
-        source_location_cache: Ref::new(Vec::new()),
+        source_line_index: Ref::new(Option::None),
         source_locations: Vec::new(),
         current_source_offset: Ref::new(0),
         allow_unknown_globals: Ref::new(false),
@@ -8063,7 +7970,7 @@ fn compiler_new(
     for binding in compiler.outer_bindings {
         if binding.name.starts_with("$with_environment_") {
             compiler.with_bindings.push(WithBinding { name: binding.name, scope_index: -1 })
-        } else {}
+        }
     }
     match recursive_name {
         Some(name) => {
@@ -8080,7 +7987,7 @@ fn compiler_new(
             );
         },
         None => (),
-    };
+    }
     for _ in 0..parameter_count {
         let _ = new_local(compiler);
     }
@@ -8101,14 +8008,14 @@ fn compile_parameter_initializers(compiler: Compiler, parameters: Vec[ast::Funct
         || compiler.scopes[0].bindings.get("arguments").is_some();
     if !simple_parameter_list(parameters) && parameter_arguments_binding {
         compiler.eval_var_arguments_forbidden.set(true)
-    } else {};
+    }
     let mut index = 0;
     for parameter in parameters {
         if parameter.rest {
             let _ = emit(compiler, bytecode::Instruction::PushRest(index));
         } else {
             let _ = emit(compiler, bytecode::Instruction::GetLoc(index));
-        };
+        }
         compile_binding_initializer(compiler, parameter.initializer, parameter.pattern.get());
         compile_binding_pattern(compiler, parameter.pattern.get());
         index += 1;
@@ -8138,7 +8045,7 @@ fn push_module_export(compiler: Compiler, exports: Vec[ModuleExport], value: Mod
         if value.exported != "*" && current.exported == value.exported {
             compile_error(compiler, "duplicate module export `" + value.exported + "`", value.span);
             return
-        } else {}
+        }
     }
     exports.push(value)
 }
@@ -8222,7 +8129,7 @@ fn collect_module_metadata(compiler: Compiler, body: Vec[ast::Stmt]) -> (
                         },
                     ),
                     None => (),
-                };
+                }
                 imports.push(
                     ModuleImport {
                         kind: ModuleImportKind::Namespace,
@@ -8248,7 +8155,7 @@ fn collect_module_metadata(compiler: Compiler, body: Vec[ast::Stmt]) -> (
                             span,
                         },
                     )
-                } else {};
+                }
                 for specifier in specifiers {
                     imports.push(
                         ModuleImport {
@@ -8294,7 +8201,7 @@ fn collect_module_metadata(compiler: Compiler, body: Vec[ast::Stmt]) -> (
                         ),
                         None => (),
                     }
-                } else {};
+                }
                 for specifier in specifiers {
                     push_module_export(
                         compiler,
@@ -8426,7 +8333,7 @@ fn compile_module_program_with_source(program: ast::Program, source: string, sou
     for (_, binding) in compiler.scopes[0].bindings.entries() {
         if runtime_tdz_binding(binding.kind) {
             tdz_local_indices.push(binding.index)
-        } else {}
+        }
     }
     initialize_var_bindings(compiler);
     initialize_function_declarations(compiler, program.body);
@@ -8450,7 +8357,7 @@ fn compile_module_program_with_source(program: ast::Program, source: string, sou
     );
     if instantiation_end > 0 {
         compiler.code[0] = bytecode::Instruction::Goto(instantiation_end);
-    } else {};
+    }
     let function = bytecode::Function::new_with_parameters_upvalues_and_handlers(
         compiler.constants,
         compiler.code,
@@ -8568,7 +8475,7 @@ fn compile_program_with_source(
             let _ = emit(compiler, bytecode::Instruction::PutLoc(value));
         },
         None => (),
-    };
+    }
     compile_body(compiler, program.body);
     match completion {
         Some(value) => {
@@ -8578,7 +8485,7 @@ fn compile_program_with_source(
         None => {
             let _ = emit(compiler, bytecode::Instruction::ReturnUndef);
         },
-    };
+    }
     let eval_bindings = current_eval_bindings(compiler);
     let function = bytecode::Function::new_with_parameters_upvalues_and_handlers(
         compiler.constants,
@@ -8593,7 +8500,7 @@ fn compile_program_with_source(
     function.set_eval_bindings(eval_bindings);
     if script_mode {
         function.set_script_bindings(script_bindings(compiler))
-    } else {};
+    }
     function.set_eval_sites(compiler.eval_sites);
     function.set_source_locations(compiler.source_locations);
     function.set_source_name(js_string(compiler.source_name.get()));
@@ -8733,7 +8640,7 @@ fn dynamic_parameters(kind: vm::FunctionKind, source: string) -> Result[
     let errors = dynamic_parse_errors(parsed);
     if !errors.is_empty() {
         return Result::Err(errors)
-    } else {};
+    }
     if parsed.program.body.len() != 1 {
         return Result::Err(
             Vec::from_array(
@@ -8745,7 +8652,7 @@ fn dynamic_parameters(kind: vm::FunctionKind, source: string) -> Result[
                 ],
             ),
         )
-    } else {};
+    }
     match parsed.program.body[0] {
         ast::Stmt::FunctionDeclaration { name, parameters, body, generator, asynchronous, span } => if name
             == "anonymous"
@@ -8783,7 +8690,7 @@ fn dynamic_body(kind: vm::FunctionKind, source: string) -> Result[
     let errors = dynamic_parse_errors(parsed);
     if !errors.is_empty() {
         return Result::Err(errors)
-    } else {};
+    }
     if parsed.program.body.len() != 1 {
         return Result::Err(
             Vec::from_array(
@@ -8795,7 +8702,7 @@ fn dynamic_body(kind: vm::FunctionKind, source: string) -> Result[
                 ],
             ),
         )
-    } else {};
+    }
     match parsed.program.body[0] {
         ast::Stmt::FunctionDeclaration { name, parameters, body, generator, asynchronous, span } => if name
             == "anonymous"
@@ -8932,14 +8839,14 @@ fn compile_dynamic_eval(source_value: runtime::JsString, bindings: Vec[bytecode:
             var_arguments_forbidden = true;
         } else if binding.name == "$new_target_allowed" {
             new_target_allowed = true;
-        } else {};
+        }
         if binding.name == "$strict" || binding.name == "$super_call"
             || binding.name == "$super_property"
             || binding.name == "$arguments_forbidden"
             || binding.name == "$eval_var_arguments_forbidden"
             || binding.name == "$new_target_allowed" {
             continue
-        } else {};
+        }
         outer.push(
             OuterBinding {
                 name: binding.name,
@@ -8968,7 +8875,7 @@ fn compile_dynamic_eval(source_value: runtime::JsString, bindings: Vec[bytecode:
     let errors = dynamic_parse_errors(parsed);
     if !errors.is_empty() {
         return Result::Err(errors)
-    } else {};
+    }
     let strict = inherited_strict || function_body_is_strict(parsed.program.body);
     let compiler = compiler_new(
         Vec::new(),
@@ -9096,7 +9003,7 @@ pub fn install_dynamic_function_compiler(context: vm::Context) -> () {
             if context.heap().live_count() >= next_eval_gc.get() {
                 let stats = context.collect_garbage();
                 next_eval_gc.set(stats.live_after + 2048)
-            } else {};
+            }
             dynamic_eval_compiler(source, bindings)
         },
     );

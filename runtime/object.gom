@@ -153,7 +153,7 @@ fn typed_array_numeric_index(key: PropertyKey) -> Option[TypedArrayNumericIndex]
     };
     if source == "-0" {
         return Option::Some(TypedArrayNumericIndex::Invalid)
-    } else {};
+    }
     let number = match primitive_to_number(Value::String(value)) {
         Ok(value) => value,
         Err(_) => return Option::None,
@@ -376,7 +376,7 @@ pub struct Heap {
     symbol_prototype_value: Ref[Option[ObjectId]],
     weak_entries_value: Vec[Option[WeakEntry]],
     finalization_cells_value: Vec[Option[FinalizationCell]],
-    finalization_jobs_value: Vec[FinalizationJob],
+    finalization_jobs_value: collections::Deque[FinalizationJob],
 }
 
 pub struct GcStats {
@@ -415,24 +415,24 @@ fn make_object(kind: ObjectKind, prototype: Option[ObjectId]) -> Object {
     }
 }
 
-fn enqueue_object(heap: Heap, id: ObjectId, marked: Vec[bool], pending: Vec[ObjectId]) -> () {
+fn enqueue_object(heap: Heap, id: ObjectId, marked: collections::BitSet, pending: Vec[ObjectId]) -> () {
     if heap.identity_value == id.heap_identity_value && id.slot_value >= 0
         && id.slot_value < heap.slots_value.len()
-        && !marked.get(id.slot_value) {
+        && !marked.contains(id.slot_value) {
         match heap.slots_value.get(id.slot_value) {
             HeapSlot::Occupied { generation, .. } => if generation == id.generation_value {
-                marked.set(id.slot_value, true);
+                let _ = marked.insert(id.slot_value);
                 pending.push(id)
-            } else {},
+            },
             HeapSlot::Vacant { .. } => (),
         }
-    } else {}
+    }
 }
 
 fn enqueue_value(
     heap: Heap,
     value: Value,
-    marked: Vec[bool],
+    marked: collections::BitSet,
     symbols: collections::HashSet[u64],
     pending: Vec[ObjectId],
 ) -> () {
@@ -448,7 +448,7 @@ fn enqueue_value(
 fn enqueue_optional_value(
     heap: Heap,
     value: Option[Value],
-    marked: Vec[bool],
+    marked: collections::BitSet,
     symbols: collections::HashSet[u64],
     pending: Vec[ObjectId],
 ) -> () {
@@ -461,7 +461,7 @@ fn enqueue_optional_value(
 fn enqueue_descriptor(
     heap: Heap,
     descriptor: PropertyDescriptor,
-    marked: Vec[bool],
+    marked: collections::BitSet,
     symbols: collections::HashSet[u64],
     pending: Vec[ObjectId],
 ) -> () {
@@ -483,7 +483,7 @@ fn enqueue_descriptor(
 fn enqueue_private_element(
     heap: Heap,
     element: PrivateElement,
-    marked: Vec[bool],
+    marked: collections::BitSet,
     symbols: collections::HashSet[u64],
     pending: Vec[ObjectId],
 ) -> () {
@@ -500,7 +500,7 @@ fn enqueue_private_element(
 
 fn drain_pending(
     heap: Heap,
-    marked: Vec[bool],
+    marked: collections::BitSet,
     symbols: collections::HashSet[u64],
     pending: Vec[ObjectId],
 ) -> () {
@@ -514,14 +514,14 @@ fn drain_pending(
                 match object.prototype_value.get() {
                     Some(prototype) => enqueue_object(heap, prototype, marked, pending),
                     None => (),
-                };
+                }
                 for (key, descriptor) in object.properties_value.entries() {
                     match key {
                         PropertyKey::Symbol(value) => {
                             symbols.insert(value.id());
                         },
                         PropertyKey::String(_) => (),
-                    };
+                    }
                     enqueue_descriptor(heap, descriptor, marked, symbols, pending)
                 }
                 for (name, element) in object.private_elements_value.entries() {
@@ -544,13 +544,13 @@ fn drain_pending(
                 match object.typed_array_value.get() {
                     Some(value) => enqueue_object(heap, value.buffer_object, marked, pending),
                     None => (),
-                };
+                }
                 match object.proxy_value.get() {
                     Some(value) => {
                         match value.target_value.get() {
                             Some(target) => enqueue_object(heap, target, marked, pending),
                             None => (),
-                        };
+                        }
                         match value.handler_value.get() {
                             Some(handler) => enqueue_object(heap, handler, marked, pending),
                             None => (),
@@ -564,10 +564,10 @@ fn drain_pending(
     }
 }
 
-fn marked_object(heap: Heap, id: ObjectId, marked: Vec[bool]) -> bool {
+fn marked_object(heap: Heap, id: ObjectId, marked: collections::BitSet) -> bool {
     if heap.identity_value != id.heap_identity_value || id.slot_value < 0
-        || id.slot_value >= marked.len()
-        || !marked[id.slot_value] {
+        || id.slot_value >= heap.slots_value.len()
+        || !marked.contains(id.slot_value) {
         false
     } else {
         match heap.slots_value[id.slot_value] {
@@ -577,7 +577,12 @@ fn marked_object(heap: Heap, id: ObjectId, marked: Vec[bool]) -> bool {
     }
 }
 
-fn marked_weak_key(heap: Heap, value: Value, marked: Vec[bool], symbols: collections::HashSet[u64]) -> bool {
+fn marked_weak_key(
+    heap: Heap,
+    value: Value,
+    marked: collections::BitSet,
+    symbols: collections::HashSet[u64],
+) -> bool {
     match value {
         Value::Object(object) => marked_object(heap, object, marked),
         Value::Symbol(value) => symbols.contains(value.id()),
@@ -588,7 +593,7 @@ fn marked_weak_key(heap: Heap, value: Value, marked: Vec[bool], symbols: collect
 fn enqueue_conditional_value(
     heap: Heap,
     value: Value,
-    marked: Vec[bool],
+    marked: collections::BitSet,
     symbols: collections::HashSet[u64],
     pending: Vec[ObjectId],
 ) -> bool {
@@ -606,7 +611,7 @@ fn enqueue_conditional_value(
 
 fn mark_conditional_edges(
     heap: Heap,
-    marked: Vec[bool],
+    marked: collections::BitSet,
     symbols: collections::HashSet[u64],
     pending: Vec[ObjectId],
     edges: Vec[GcEdge],
@@ -620,7 +625,7 @@ fn mark_conditional_edges(
                     changed = enqueue_conditional_value(heap, value, marked, symbols, pending)
                         || changed;
                 }
-            } else {}
+            }
         }
         for candidate in heap.weak_entries_value {
             match candidate {
@@ -628,7 +633,7 @@ fn mark_conditional_edges(
                     && marked_weak_key(heap, entry.key, marked, symbols) {
                     changed = enqueue_conditional_value(heap, entry.value, marked, symbols, pending)
                         || changed;
-                } else {},
+                },
                 None => (),
             }
         }
@@ -645,7 +650,7 @@ fn mark_conditional_edges(
                         pending,
                     )
                         || changed;
-                } else {},
+                },
                 None => (),
             }
         }
@@ -656,7 +661,7 @@ fn mark_conditional_edges(
 fn mark_reachable(
     heap: Heap,
     roots: Vec[Value],
-    marked: Vec[bool],
+    marked: collections::BitSet,
     symbols: collections::HashSet[u64],
     edges: Vec[GcEdge],
 ) -> isize {
@@ -666,15 +671,7 @@ fn mark_reachable(
     }
     drain_pending(heap, marked, symbols, pending);
     mark_conditional_edges(heap, marked, symbols, pending, edges);
-    let mut reachable = 0;
-    let mut index = 0;
-    while index < marked.len() {
-        if marked.get(index) {
-            reachable += 1;
-        } else {};
-        index += 1;
-    }
-    reachable
+    marked.len()
 }
 
 impl Heap {
@@ -694,7 +691,7 @@ impl Heap {
             symbol_prototype_value: Ref::new(Option::None),
             weak_entries_value: Vec::new(),
             finalization_cells_value: Vec::new(),
-            finalization_jobs_value: Vec::new(),
+            finalization_jobs_value: collections::Deque::new(),
         }
     }
 
@@ -841,7 +838,7 @@ impl Heap {
                 PrimitivePrototypeKind::Symbol => {
                     self.symbol_prototype_value.set(Option::Some(prototype))
                 },
-            };
+            }
             true
         }
     }
@@ -888,25 +885,20 @@ impl Heap {
 
     pub fn collect_with_edges(self: Heap, roots: Vec[Value], edges: Vec[GcEdge]) -> GcStats {
         let live_before = self.live_count_value.get();
-        let marked: Vec[bool] = Vec::with_capacity(self.slots_value.len());
-        let mut fill = 0;
-        while fill < self.slots_value.len() {
-            marked.push(false);
-            fill += 1;
-        }
+        let marked = collections::BitSet::new();
         let all_roots = roots;
         match self.object_prototype_value.get() {
             Some(value) => all_roots.push(Value::Object(value)),
             None => (),
-        };
+        }
         match self.function_prototype_value.get() {
             Some(value) => all_roots.push(Value::Object(value)),
             None => (),
-        };
+        }
         match self.array_prototype_value.get() {
             Some(value) => all_roots.push(Value::Object(value)),
             None => (),
-        };
+        }
         for prototype in Vec::from_array(
             [
                 self.boolean_prototype_value,
@@ -921,9 +913,16 @@ impl Heap {
                 None => (),
             }
         }
-        for job in self.finalization_jobs_value {
-            all_roots.push(job.callback);
-            all_roots.push(job.held)
+        let mut finalization_job_index = 0;
+        while finalization_job_index < self.finalization_jobs_value.len() {
+            match self.finalization_jobs_value.get(finalization_job_index) {
+                Some(job) => {
+                    all_roots.push(job.callback);
+                    all_roots.push(job.held)
+                },
+                None => (),
+            }
+            finalization_job_index += 1;
         }
         let marked_symbols: collections::HashSet[u64] = collections::HashSet::new();
         let reachable = mark_reachable(self, all_roots, marked, marked_symbols, edges);
@@ -933,7 +932,7 @@ impl Heap {
                 Some(cell) => if !marked_object(self, cell.owner, marked) {
                     self.finalization_cells_value[finalization_index] = Option::None;
                 } else if !marked_weak_key(self, cell.target, marked, marked_symbols) {
-                    self.finalization_jobs_value.push(
+                    self.finalization_jobs_value.push_back(
                         FinalizationJob { callback: cell.callback, held: cell.held },
                     );
                     self.finalization_cells_value[finalization_index] = Option::None;
@@ -957,13 +956,13 @@ impl Heap {
                     );
                 },
                 None => (),
-            };
+            }
             finalization_index += 1;
         }
         let mut collected = 0;
         let mut slot = 0;
         while slot < self.slots_value.len() {
-            if !marked.get(slot) {
+            if !marked.contains(slot) {
                 match self.slots_value.get(slot) {
                     HeapSlot::Occupied { generation, .. } => {
                         self.slots_value.set(
@@ -978,7 +977,7 @@ impl Heap {
                     },
                     HeapSlot::Vacant { .. } => (),
                 }
-            } else {};
+            }
             slot += 1;
         }
         self.live_count_value.set(reachable);
@@ -988,9 +987,9 @@ impl Heap {
                 Some(entry) => if !self.contains(entry.owner)
                     || !marked_weak_key(self, entry.key, marked, marked_symbols) {
                     self.weak_entries_value[weak_index] = Option::None;
-                } else {},
+                },
                 None => (),
-            };
+            }
             weak_index += 1;
         }
         GcStats { live_before, reachable, collected, live_after: reachable }
@@ -1017,9 +1016,9 @@ fn weak_entry_index(heap: Heap, owner: ObjectId, key: Value) -> Option[isize] {
                 heap.weak_entries_value[index] = Option::None;
             } else if entry.owner == owner && same_value_zero(entry.key, key) {
                 return Option::Some(index)
-            } else {},
+            },
             None => (),
-        };
+        }
         index += 1;
     }
     Option::None
@@ -1034,7 +1033,7 @@ pub fn weak_map_set(heap: Heap, owner: ObjectId, key: Value, value: Value) -> bo
                 heap.weak_entries_value[index] = Option::Some(WeakEntry { owner, key, value });
             },
             None => heap.weak_entries_value.push(Option::Some(WeakEntry { owner, key, value })),
-        };
+        }
         true
     }
 }
@@ -1100,9 +1099,9 @@ pub fn weak_ref_deref(heap: Heap, owner: ObjectId) -> Option[Value] {
             match heap.weak_entries_value[index] {
                 Some(entry) => if entry.owner == owner && weak_key_live(heap, entry.key) {
                     return Option::Some(entry.key)
-                } else {},
+                },
                 None => (),
-            };
+            }
             index += 1;
         }
         Option::None
@@ -1151,12 +1150,12 @@ pub fn finalization_unregister(heap: Heap, owner: ObjectId, token: Value) -> Opt
                             && same_value(candidate, token) {
                             heap.finalization_cells_value[index] = Option::None;
                             removed = true;
-                        } else {},
+                        },
                         None => (),
                     }
-                } else {},
+                },
                 None => (),
-            };
+            }
             index += 1;
         }
         Option::Some(removed)
@@ -1165,19 +1164,14 @@ pub fn finalization_unregister(heap: Heap, owner: ObjectId, token: Value) -> Opt
 
 pub fn take_finalization_jobs(heap: Heap) -> Vec[FinalizationJob] {
     let jobs: Vec[FinalizationJob] = Vec::with_capacity(heap.finalization_jobs_value.len());
-    for job in heap.finalization_jobs_value {
+    while let Some(job) = heap.finalization_jobs_value.pop_front() {
         jobs.push(job)
     }
-    heap.finalization_jobs_value.clear();
     jobs
 }
 
 pub fn pop_finalization_job(heap: Heap) -> Option[FinalizationJob] {
-    if heap.finalization_jobs_value.is_empty() {
-        Option::None
-    } else {
-        Option::Some(heap.finalization_jobs_value.remove(0))
-    }
+    heap.finalization_jobs_value.pop_front()
 }
 
 pub fn new_object(heap: Heap, kind: ObjectKind, prototype: Option[ObjectId]) -> Result[
@@ -1190,7 +1184,7 @@ pub fn new_object(heap: Heap, kind: ObjectKind, prototype: Option[ObjectId]) -> 
 pub fn new_proxy(heap: Heap, target: ObjectId, handler: ObjectId) -> Result[ObjectId, TypeError] {
     if !heap.contains(target) || !heap.contains(handler) {
         return Result::Err(TypeError { message: "proxy target and handler must be live objects" })
-    } else {};
+    }
     let (kind, prototype) = match heap.get(target) {
         Some(value) => (value.kind(), value.prototype()),
         None => return Result::Err(TypeError { message: "proxy target is invalid" }),
@@ -1407,7 +1401,7 @@ fn array_length_value(length: isize) -> Value {
 pub fn new_array(heap: Heap, length: isize) -> Result[ObjectId, TypeError] {
     if length < 0 || length > 4294967295 {
         return Result::Err(TypeError { message: "invalid array length" })
-    } else {};
+    }
     let object = new_object(heap, ObjectKind::Array, heap.array_prototype())?;
     if ordinary_define_own_property(
         heap,
@@ -1608,7 +1602,7 @@ fn mapped_descriptor(target: Object, key: PropertyKey, descriptor: PropertyDescr
             PropertyDescriptor::Accessor { .. } => descriptor,
         },
         None => (),
-    };
+    }
     match (argument_index(key), descriptor) {
         (Some(index), PropertyDescriptor::Data { value: _, writable, enumerable, configurable }) => match target.argument_map_value.get(
             index,
@@ -1633,7 +1627,7 @@ fn update_argument_mapping(target: Object, key: PropertyKey, descriptor: Propert
                     cell.set(value);
                     if !writable {
                         let _ = target.argument_map_value.remove(index);
-                    } else {}
+                    }
                 },
                 PropertyDescriptor::Accessor { .. } => {
                     let _ = target.argument_map_value.remove(index);
@@ -1664,7 +1658,7 @@ pub fn is_typed_array_variable_length(heap: Heap, object: ObjectId) -> bool {
 pub fn prevent_extensions(heap: Heap, object: ObjectId) -> bool {
     if is_typed_array_variable_length(heap, object) {
         return false
-    } else {};
+    }
     match heap.get(object) {
         Some(target) => {
             target.prevent_extensions();
@@ -1718,7 +1712,7 @@ pub fn is_module_namespace(heap: Heap, object: ObjectId) -> bool {
 pub fn seal_object(heap: Heap, object: ObjectId, frozen: bool) -> bool {
     if is_typed_array_variable_length(heap, object) {
         return false
-    } else {};
+    }
     let target = match heap.get(object) {
         Some(value) => value,
         None => return false,
@@ -1726,13 +1720,13 @@ pub fn seal_object(heap: Heap, object: ObjectId, frozen: bool) -> bool {
     target.prevent_extensions();
     if frozen && target.module_namespace_bindings_value.len() > 0 {
         return false
-    } else {};
+    }
     match target.typed_array_value.get() {
         Some(value) => if typed_array_length(value.view) > 0 {
             return false
-        } else {},
+        },
         None => (),
-    };
+    }
     let keys = target.properties_value.keys();
     for key in keys {
         match target.properties_value.get(key) {
@@ -1754,18 +1748,18 @@ pub fn object_is_sealed(heap: Heap, object: ObjectId, frozen: bool) -> bool {
     };
     if target.extensible() {
         return false
-    } else {};
+    }
     match target.typed_array_value.get() {
         Some(value) => if typed_array_length(value.view) > 0 {
             return false
-        } else {},
+        },
         None => (),
-    };
+    }
     for descriptor in target.properties_value.values() {
         if descriptor_configurable(descriptor)
             || frozen && descriptor_is_data(descriptor) && descriptor_writable(descriptor) {
             return false
-        } else {}
+        }
     }
     true
 }
@@ -1895,7 +1889,7 @@ fn array_define_length(heap: Heap, object: ObjectId, descriptor: PropertyDescrip
         return ordinary_define_own_property(heap, object, string_property_key("length"), normalized)
     } else if !old_writable {
         return false
-    } else {};
+    }
     let final_writable = descriptor_writable(normalized);
     let temporary = match normalized {
         PropertyDescriptor::Data { value, writable: _, enumerable, configurable } => {
@@ -1905,7 +1899,7 @@ fn array_define_length(heap: Heap, object: ObjectId, descriptor: PropertyDescrip
     };
     if !ordinary_define_own_property(heap, object, string_property_key("length"), temporary) {
         return false
-    } else {};
+    }
     let keys = own_property_keys(heap, object);
     let mut cursor = keys.len();
     while cursor > 0 {
@@ -1928,7 +1922,7 @@ fn array_define_length(heap: Heap, object: ObjectId, descriptor: PropertyDescrip
                         rollback,
                     );
                     return false
-                } else {},
+                },
                 None => (),
             },
             PropertyKey::Symbol(_) => (),
@@ -1972,7 +1966,7 @@ fn array_define_index(
         return false
     } else if index.to_isize() < length {
         return true
-    } else {};
+    }
     ordinary_define_own_property(
         heap,
         object,
@@ -1992,7 +1986,7 @@ fn typed_array_define_numeric_property(
     };
     if typed_array_element(state.view, index).is_none() {
         return false
-    } else {};
+    }
     match descriptor {
         PropertyDescriptor::Data { value, writable, enumerable, configurable } => if writable
             && enumerable
@@ -2020,13 +2014,13 @@ pub fn define_own_property(
     };
     if target.module_namespace_bindings_value.get(key).is_some() {
         return module_namespace_define_own_property(target, key, descriptor)
-    } else {};
+    }
     match target.typed_array_value.get() {
         Some(value) => if typed_array_numeric_index(key).is_some() {
             return typed_array_define_numeric_property(value, key, descriptor)
-        } else {},
+        },
         None => (),
-    };
+    }
     match target.kind() {
         ObjectKind::Array => match key {
             PropertyKey::String(value) => if value
@@ -2047,7 +2041,7 @@ pub fn define_own_property(
 pub fn define_private_field(heap: Heap, object: ObjectId, name: ObjectId, value: Value) -> bool {
     if !heap.contains(name) {
         return false
-    } else {};
+    }
     match heap.get(object) {
         Some(target) => if target.private_elements_value.get(name).is_some() {
             false
@@ -2062,7 +2056,7 @@ pub fn define_private_field(heap: Heap, object: ObjectId, name: ObjectId, value:
 pub fn define_private_method(heap: Heap, object: ObjectId, name: ObjectId, value: Value) -> bool {
     if !heap.contains(name) {
         return false
-    } else {};
+    }
     match heap.get(object) {
         Some(target) => if target.private_elements_value.get(name).is_some() {
             false
@@ -2083,7 +2077,7 @@ pub fn define_private_accessor(
 ) -> bool {
     if !heap.contains(name) {
         return false
-    } else {};
+    }
     match heap.get(object) {
         Some(target) => match target.private_elements_value.get(name) {
             None => {
@@ -2170,7 +2164,7 @@ fn delete_ordinary_property(target: Object, key: PropertyKey) -> bool {
                     let _ = target.argument_map_value.remove(index);
                 },
                 None => (),
-            };
+            }
             true
         } else {
             false
@@ -2187,9 +2181,9 @@ pub fn set_prototype_of(heap: Heap, object: ObjectId, prototype: Option[ObjectId
     match prototype {
         Some(value) => if !heap.contains(value) {
             return false
-        } else {},
+        },
         None => (),
-    };
+    }
     if target.prototype_value.get() == prototype {
         true
     } else if target.immutable_prototype_value.get() {
@@ -2240,7 +2234,7 @@ pub fn get_property(heap: Heap, object: ObjectId, key: PropertyKey) -> Result[
 ] {
     if !heap.contains(object) {
         return Result::Err(invalid_object_error())
-    } else {};
+    }
     let mut cursor = Option::Some(object);
     while cursor.is_some() {
         match cursor {
@@ -2287,7 +2281,7 @@ pub fn get_property_descriptor(heap: Heap, object: ObjectId, key: PropertyKey) -
 ] {
     if !heap.contains(object) {
         return Result::Err(invalid_object_error())
-    } else {};
+    }
     let mut cursor = Option::Some(object);
     while cursor.is_some() {
         match cursor {
@@ -2407,7 +2401,7 @@ pub fn set_property(heap: Heap, object: ObjectId, key: PropertyKey, value: Value
     };
     if target.module_namespace_value.get() {
         return Result::Ok(false)
-    } else {};
+    }
     match target.typed_array_value.get() {
         Some(state) => match typed_array_numeric_index(key) {
             Some(TypedArrayNumericIndex::Index(index)) => {
@@ -2425,7 +2419,7 @@ pub fn set_property(heap: Heap, object: ObjectId, key: PropertyKey, value: Value
             None => (),
         },
         None => (),
-    };
+    }
     let array_length = match target.kind() {
         ObjectKind::Array => key == string_property_key("length"),
         _ => false,
@@ -2446,7 +2440,7 @@ pub fn set_property(heap: Heap, object: ObjectId, key: PropertyKey, value: Value
             },
             _ => Result::Ok(false),
         }
-    } else {};
+    }
     match target.properties_value.get(key) {
         Some(Data { value: _, writable, enumerable, configurable }) => if writable {
             target.properties_value.insert(
@@ -2497,8 +2491,8 @@ fn canonical_array_index(value: JsString) -> Option[u32] {
                 result = result * 10 + (current - 48).to_u64();
                 if result > 4294967294 {
                     return Option::None
-                } else {}
-            };
+                }
+            }
             index += 1;
         }
         Option::Some(result.to_u32())

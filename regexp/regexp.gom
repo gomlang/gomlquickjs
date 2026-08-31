@@ -2,6 +2,7 @@ package regexp;
 
 use gomlang::quickjs::runtime;
 use gomlang::quickjs::unicode;
+use std::collections;
 
 const MAX_NESTING: isize = 256;
 
@@ -197,7 +198,7 @@ fn parse_group_fixed_escape(pattern: runtime::JsString, start: isize) -> Result[
 ] {
     if start + 6 > pattern.len() || pattern.get(start) != 92 || pattern.get(start + 1) != 117 {
         return Result::Err(regex_error("invalid group name escape", start))
-    } else {};
+    }
     let mut value: u32 = 0;
     let mut index = start + 2;
     while index < start + 6 {
@@ -217,7 +218,7 @@ fn parse_group_unicode_escape(pattern: runtime::JsString, start: isize) -> Resul
 ] {
     if start + 2 > pattern.len() || pattern.get(start) != 92 || pattern.get(start + 1) != 117 {
         return Result::Err(regex_error("invalid group name escape", start))
-    } else {};
+    }
     if start + 2 < pattern.len() && pattern.get(start + 2) == 123 {
         let mut value: u32 = 0;
         let mut index = start + 3;
@@ -229,7 +230,7 @@ fn parse_group_unicode_escape(pattern: runtime::JsString, start: isize) -> Resul
             };
             if value > (0x10ffff - digit) / 16 {
                 return Result::Err(regex_error("group name escape is out of range", start))
-            } else {};
+            }
             value = value * 16 + digit;
             any = true;
             index += 1;
@@ -293,7 +294,7 @@ fn parse_group_name(pattern: runtime::JsString, start: isize) -> Result[
             } else {
                 return Result::Ok((runtime::JsString::from_code_units(output), index + 1))
             }
-        } else {};
+        }
         let offset = index;
         let (value, next) = if pattern.get(index) == 92 {
             parse_group_unicode_escape(pattern, index)?
@@ -317,7 +318,7 @@ fn parse_group_name(pattern: runtime::JsString, start: isize) -> Result[
         };
         if !valid {
             return Result::Err(regex_error("invalid group name", offset))
-        } else {};
+        }
         append_group_code_point(output, value, offset)?;
         first = false;
         index = next;
@@ -332,9 +333,9 @@ fn find_capture_names(names: Vec[Option[runtime::JsString]], name: runtime::JsSt
         match names[index] {
             Some(value) => if value == name {
                 matches.push(index)
-            } else {},
+            },
             None => {},
-        };
+        }
         index += 1;
     }
     matches
@@ -345,7 +346,7 @@ fn has_capture_names(names: Vec[Option[runtime::JsString]]) -> bool {
     while index < names.len() {
         if names[index].is_some() {
             return true
-        } else {};
+        }
         index += 1;
     }
     false
@@ -365,7 +366,7 @@ fn capture_metadata(pattern: runtime::JsString) -> Result[CaptureMetadata, Regex
         } else if in_class {
             if current == 93 {
                 in_class = false;
-            } else {};
+            }
             index += 1;
         } else if current == 91 {
             in_class = true;
@@ -379,7 +380,7 @@ fn capture_metadata(pattern: runtime::JsString) -> Result[CaptureMetadata, Regex
                 count += 1;
                 if count > MAX_CAPTURES {
                     return Result::Err(regex_error("too many capture groups", index))
-                } else {};
+                }
                 if named {
                     let (name, end) = parse_group_name(pattern, index + 3)?;
                     let matches = find_capture_names(names, name);
@@ -388,7 +389,7 @@ fn capture_metadata(pattern: runtime::JsString) -> Result[CaptureMetadata, Regex
                         let capture_index = matches[match_index];
                         if name_scopes[capture_index] == alternative_scope {
                             return Result::Err(regex_error("duplicate group name", index + 3))
-                        } else {};
+                        }
                         match_index += 1;
                     }
                     names.push(Option::Some(name));
@@ -398,7 +399,7 @@ fn capture_metadata(pattern: runtime::JsString) -> Result[CaptureMetadata, Regex
                     names.push(Option::None);
                     name_scopes.push(alternative_scope)
                 }
-            } else {};
+            }
             index += 1;
         } else if current == 124 {
             alternative_scope += 1;
@@ -425,12 +426,12 @@ fn parse_decimal_count(parser: Parser) -> Result[isize, RegexError] {
         let current = parser.pattern.get(parser.index.get());
         if !is_decimal_digit(current) {
             break
-        } else {};
+        }
         any = true;
         let digit = (current - 48).to_isize();
         if value > (MAX_REPEAT - digit) / 10 {
             return Result::Err(regex_error("quantifier exceeds implementation limit", start))
-        } else {};
+        }
         value = value * 10 + digit;
         parser.index.set(parser.index.get() + 1)
     }
@@ -477,13 +478,13 @@ fn parse_decimal_escape(parser: Parser, offset: isize) -> Result[DecimalEscape, 
         let current = parser.pattern.get(parser.index.get());
         if !is_decimal_digit(current) {
             break
-        } else {};
+        }
         let digit = (current - 48).to_isize();
         if value > (MAX_CAPTURES - digit) / 10 {
             overflow = true;
         } else if !overflow {
             value = value * 10 + digit;
-        } else {};
+        }
         parser.index.set(parser.index.get() + 1)
     }
     if !overflow && value > 0 && value <= parser.total_captures {
@@ -525,7 +526,7 @@ fn class_set_contains_string(values: Vec[runtime::JsString], value: runtime::JsS
     for current in values {
         if current == value {
             return true
-        } else {}
+        }
     }
     false
 }
@@ -537,7 +538,7 @@ fn class_set_add_string(values: Vec[runtime::JsString], value: runtime::JsString
             index += 1;
         }
         values.insert(index, value)
-    } else {}
+    }
 }
 
 fn class_string_compare(left: runtime::JsString, right: runtime::JsString) -> isize {
@@ -552,7 +553,7 @@ fn class_string_compare(left: runtime::JsString, right: runtime::JsString) -> is
             return 0 - 1
         } else if left.get(index) > right.get(index) {
             return 1
-        } else {};
+        }
         index += 1;
     }
     if left.len() < right.len() {
@@ -569,7 +570,7 @@ fn class_set_max_string_length(strings: Vec[runtime::JsString]) -> isize {
     for value in strings {
         if value.len() > maximum {
             maximum = value.len();
-        } else {}
+        }
     }
     maximum
 }
@@ -577,7 +578,7 @@ fn class_set_max_string_length(strings: Vec[runtime::JsString]) -> isize {
 fn class_set_sort_strings(values: Vec[runtime::JsString]) -> Vec[runtime::JsString] {
     if values.len() <= 1 {
         return values
-    } else {};
+    }
     let middle = values.len() / 2;
     let left: Vec[runtime::JsString] = Vec::with_capacity(middle);
     let right: Vec[runtime::JsString] = Vec::with_capacity(values.len() - middle);
@@ -613,7 +614,7 @@ fn class_set_normalize_strings(values: Vec[runtime::JsString]) -> () {
     for value in sorted {
         if values.is_empty() || values[values.len() - 1] != value {
             values.push(value)
-        } else {}
+        }
     }
 }
 
@@ -630,7 +631,7 @@ fn class_set_intersection(left: ClassSet, right: ClassSet) -> ClassSet {
     for value in left.strings {
         if class_set_contains_string(right.strings, value) {
             strings.push(value)
-        } else {}
+        }
     }
     ClassSet { range: left.range.intersection(right.range), strings }
 }
@@ -640,7 +641,7 @@ fn class_set_difference(left: ClassSet, right: ClassSet) -> ClassSet {
     for value in left.strings {
         if !class_set_contains_string(right.strings, value) {
             strings.push(value)
-        } else {}
+        }
     }
     ClassSet { range: left.range.difference(right.range), strings }
 }
@@ -722,9 +723,9 @@ fn parser_has_hex_digits(parser: Parser, digits: isize) -> bool {
         match parser_peek(parser, index) {
             Some(value) => if hex_digit(value).is_none() {
                 return false
-            } else {},
+            },
             None => return false,
-        };
+        }
         index += 1;
     }
     true
@@ -759,7 +760,7 @@ fn parse_unicode_code_point_escape(parser: Parser, offset: isize) -> Result[u32,
         };
         if value > (0x10ffff - digit) / 16 {
             return Result::Err(regex_error("Unicode code point escape is out of range", offset))
-        } else {};
+        }
         value = value * 16 + digit;
         any = true;
         parser_advance(parser);
@@ -954,7 +955,7 @@ fn parse_property_escape(parser: Parser, offset: isize) -> Result[ClassSet, Rege
         return Result::Err(regex_error("Unicode property escape requires `u` or `v` mode", offset))
     } else if !parser_consume(parser, 123) {
         return Result::Err(regex_error("expected `{` after Unicode property escape", offset))
-    } else {};
+    }
     let start = parser.index.get();
     while !parser_at_end(parser) && parser_current(parser) != Option::Some(125) {
         parser_advance(parser);
@@ -962,7 +963,7 @@ fn parse_property_escape(parser: Parser, offset: isize) -> Result[ClassSet, Rege
     let end = parser.index.get();
     if start == end || !parser_consume(parser, 125) {
         return Result::Err(regex_error("unterminated Unicode property escape", offset))
-    } else {};
+    }
     let name = match parser.pattern.slice(start, end).to_host_string() {
         Ok(value) => value,
         Err(_) => return Result::Err(regex_error("invalid Unicode property name", offset)),
@@ -1003,7 +1004,7 @@ fn parse_property_escape(parser: Parser, offset: isize) -> Result[ClassSet, Rege
                 return Result::Err(regex_error("Unicode string property requires `v` mode", offset))
             } else if negated {
                 return Result::Err(regex_error("cannot negate a Unicode string property", offset))
-            } else {};
+            }
             let result = class_set_empty();
             let scalar_values: Vec[u32] = Vec::new();
             for value in strings {
@@ -1028,7 +1029,7 @@ fn parse_property_escape(parser: Parser, offset: isize) -> Result[ClassSet, Rege
                 while scalar_index < scalar_values.len() && scalar_values[scalar_index] <= last + 1 {
                     if scalar_values[scalar_index] > last {
                         last = scalar_values[scalar_index];
-                    } else {};
+                    }
                     scalar_index += 1;
                 }
                 add_parser_class_range(parser, result.range, first, last, offset)?;
@@ -1052,7 +1053,7 @@ fn add_parser_class_range(
         range.union_with(parser.canonicalizer.canonicalized_range(values))
     } else {
         range.union_with(values)
-    };
+    }
     Result::Ok(())
 }
 
@@ -1073,7 +1074,7 @@ fn append_class_code_point(output: Vec[u16], value: u32) -> () {
 fn canonicalize_class_string(parser: Parser, value: runtime::JsString) -> runtime::JsString {
     if !parser.flags.get().ignore_case {
         return value
-    } else {};
+    }
     let output: Vec[u16] = Vec::with_capacity(value.len());
     let mut index = 0;
     while index < value.len() {
@@ -1152,7 +1153,7 @@ fn parse_v_string_disjunction(parser: Parser, offset: isize) -> Result[ClassSet,
     parser_advance(parser);
     if !parser_consume(parser, 123) {
         return Result::Err(regex_error("expected `{` after `\\q`", offset))
-    } else {};
+    }
     let result = class_set_empty();
     let units: Vec[u16] = Vec::new();
     loop {
@@ -1345,12 +1346,12 @@ fn parse_v_class_value(parser: Parser, offset: isize) -> Result[ClassSet, RegexE
     let mut operation = v_set_operator(parser);
     if operation != 0 && left_count != 1 {
         return Result::Err(regex_error("Unicode set operator requires one left operand", offset))
-    } else {};
+    }
     let selected_operation = operation;
     while operation != 0 {
         if operation != selected_operation {
             return Result::Err(regex_error("cannot mix Unicode set operators", parser.index.get()))
-        } else {};
+        }
         parser_advance(parser);
         parser_advance(parser);
         let (right, count) = parse_v_union(parser)?;
@@ -1358,7 +1359,7 @@ fn parse_v_class_value(parser: Parser, offset: isize) -> Result[ClassSet, RegexE
             return Result::Err(
                 regex_error("Unicode set operator requires one right operand", parser.index.get()),
             )
-        } else {};
+        }
         result = if operation == 1 {
             class_set_intersection(result, right)
         } else {
@@ -1372,7 +1373,7 @@ fn parse_v_class_value(parser: Parser, offset: isize) -> Result[ClassSet, RegexE
         return Result::Err(regex_error("negated Unicode set cannot contain strings", offset))
     } else if negated {
         result.range.invert()
-    } else {};
+    }
     Result::Ok(result)
 }
 
@@ -1385,13 +1386,13 @@ fn parse_v_class(parser: Parser, offset: isize) -> Result[isize, RegexError] {
 fn parse_class(parser: Parser, offset: isize) -> Result[isize, RegexError] {
     if parser.flags.get().unicode_sets {
         return parse_v_class(parser, offset)
-    } else {};
+    }
     let negated = parser_consume(parser, 94);
     let range = unicode::CharRange::new();
     while !parser_at_end(parser) {
         if parser_consume(parser, 93) {
             return Result::Ok(parser_push_node(parser, Node::Class(range, negated)))
-        } else {};
+        }
         let first_offset = parser.index.get();
         let first = parse_class_unit(parser)?;
         match first {
@@ -1402,7 +1403,7 @@ fn parse_class(parser: Parser, offset: isize) -> Result[isize, RegexError] {
                     return Result::Err(
                         regex_error("character class escape cannot begin a range", first_offset),
                     )
-                } else {}
+                }
             },
             ClassUnit::Single(first_value) => if parser_consume(parser, 45) {
                 match parser_current(parser) {
@@ -1480,19 +1481,19 @@ fn inline_flags(parser: Parser, offset: isize) -> Result[RegexFlags, RegexError]
             let index = modifier_index(current);
             if index < 0 || additions[index] || removals[index] {
                 return Result::Err(regex_error("invalid modifiers", offset))
-            } else {};
+            }
             if removing {
                 removals.set(index, true)
             } else {
                 additions.set(index, true)
-            };
+            }
             any = true;
             parser_advance(parser);
         }
     }
     if !any || !parser_consume(parser, 58) {
         return Result::Err(regex_error("invalid modifiers", offset))
-    } else {};
+    }
     let base = parser.flags.get();
     Result::Ok(
         RegexFlags {
@@ -1535,7 +1536,7 @@ fn parse_atom(parser: Parser) -> Result[isize, RegexError] {
     if value == 40 {
         if parser.depth.get() >= MAX_NESTING {
             return Result::Err(regex_error("regular expression nesting limit exceeded", offset))
-        } else {};
+        }
         let mut capturing = true;
         let mut lookahead = false;
         let mut lookbehind = false;
@@ -1569,7 +1570,7 @@ fn parse_atom(parser: Parser) -> Result[isize, RegexError] {
             } else {
                 return Result::Err(regex_error("invalid group", offset))
             }
-        } else {};
+        }
         let capture_index = if capturing {
             let index = parser.capture_count.get() + 1;
             parser.capture_count.set(index);
@@ -1577,13 +1578,13 @@ fn parse_atom(parser: Parser) -> Result[isize, RegexError] {
                 Some(name) => match parser.capture_names[index] {
                     Some(expected) => if name != expected {
                         return Result::Err(regex_error("capture group metadata mismatch", offset))
-                    } else {},
+                    },
                     None => return Result::Err(
                         regex_error("capture group metadata mismatch", offset),
                     ),
                 },
                 None => {},
-            };
+            }
             index
         } else {
             0
@@ -1592,7 +1593,7 @@ fn parse_atom(parser: Parser) -> Result[isize, RegexError] {
         match scoped_flags {
             Some(value) => parser.flags.set(value),
             None => (),
-        };
+        }
         parser.depth.set(parser.depth.get() + 1);
         let child = parse_alternation(parser);
         parser.depth.set(parser.depth.get() - 1);
@@ -1657,7 +1658,7 @@ fn parse_atom(parser: Parser) -> Result[isize, RegexError] {
                     && (unicode_mode(parser.flags.get()) || has_capture_names(parser.capture_names)) {
                     if parser_peek(parser, 1) != Option::Some(60) {
                         return Result::Err(regex_error("expected named backreference", offset))
-                    } else {};
+                    }
                     parser_advance(parser);
                     parser_advance(parser);
                     let (name, end) = parse_group_name(parser.pattern, parser.index.get())?;
@@ -1705,7 +1706,7 @@ fn parser_valid_counted_quantifier_at(parser: Parser, offset: isize) -> bool {
     let mut index = offset + 1;
     if index >= parser.pattern.len() || !is_decimal_digit(parser.pattern.get(index)) {
         return false
-    } else {};
+    }
     while index < parser.pattern.len() && is_decimal_digit(parser.pattern.get(index)) {
         index += 1;
     }
@@ -1744,7 +1745,7 @@ fn parse_counted_quantifier(parser: Parser, offset: isize) -> Result[Quantifier,
             let value = parse_decimal_count(parser)?;
             if !parser_consume(parser, 125) {
                 return Result::Err(regex_error("unterminated counted quantifier", offset))
-            } else {};
+            }
             Option::Some(value)
         }
     } else {
@@ -1756,10 +1757,10 @@ fn parse_counted_quantifier(parser: Parser, offset: isize) -> Result[Quantifier,
                 return Result::Err(
                     regex_error("quantifier maximum is smaller than minimum", offset),
                 )
-            } else {}
+            }
         },
         None => {},
-    };
+    }
     let greedy = !parser_consume(parser, 63);
     Result::Ok(Quantifier { minimum, maximum, greedy })
 }
@@ -1943,7 +1944,7 @@ fn append_unique(target: Vec[MatchState], value: MatchState) -> () {
     while index < target.len() {
         if target[index] == value {
             return
-        } else {};
+        }
         index += 1;
     }
     target.push(value)
@@ -1990,7 +1991,7 @@ fn node_contains_capture(regex: Regex, node: isize) -> bool {
             for child in children {
                 if node_contains_capture(regex, child) {
                     return true
-                } else {}
+                }
             }
             false
         },
@@ -2009,7 +2010,7 @@ fn node_may_match_empty(regex: Regex, node: isize) -> bool {
             for value in strings {
                 if value.len() == 0 {
                     return true
-                } else {}
+                }
             }
             false
         },
@@ -2017,7 +2018,7 @@ fn node_may_match_empty(regex: Regex, node: isize) -> bool {
             for child in children {
                 if !node_may_match_empty(regex, child) {
                     return false
-                } else {}
+                }
             }
             true
         },
@@ -2025,7 +2026,7 @@ fn node_may_match_empty(regex: Regex, node: isize) -> bool {
             for child in children {
                 if node_may_match_empty(regex, child) {
                     return true
-                } else {}
+                }
             }
             false
         },
@@ -2059,25 +2060,24 @@ struct RepeatVisit {
 fn repeat_push_explore(
     work: Vec[RepeatWork],
     visited: Vec[RepeatVisit],
-    visited_positions: Vec[bool],
+    visited_positions: collections::BitSet,
     fast_positions: bool,
     minimum: isize,
     count: isize,
     state: MatchState,
 ) -> () {
     if fast_positions && count >= minimum {
-        if visited_positions[state.position] {
+        if !visited_positions.insert(state.position) {
             return
-        } else {};
-        visited_positions.set(state.position, true);
+        }
         work.push(RepeatWork::Explore(minimum, state));
         return
-    } else {};
+    }
     let visit = RepeatVisit { count, state };
     for current in visited {
         if current == visit {
             return
-        } else {}
+        }
     }
     visited.push(visit);
     work.push(RepeatWork::Explore(count, state))
@@ -2085,15 +2085,14 @@ fn repeat_push_explore(
 
 fn repeat_accept(
     output: Vec[MatchState],
-    accepted_positions: Vec[bool],
+    accepted_positions: collections::BitSet,
     fast_positions: bool,
     state: MatchState,
 ) -> () {
     if fast_positions {
-        if !accepted_positions[state.position] {
-            accepted_positions.set(state.position, true);
+        if accepted_positions.insert(state.position) {
             output.push(state)
-        } else {}
+        }
     } else {
         append_unique(output, state)
     }
@@ -2113,12 +2112,8 @@ fn match_repeat(
     let output: Vec[MatchState] = Vec::new();
     let work: Vec[RepeatWork] = Vec::new();
     let visited: Vec[RepeatVisit] = Vec::new();
-    let visited_positions: Vec[bool] = Vec::with_capacity(input.len() + 1);
-    let accepted_positions: Vec[bool] = Vec::with_capacity(input.len() + 1);
-    for _ in 0..input.len() + 1 {
-        visited_positions.push(false);
-        accepted_positions.push(false)
-    }
+    let visited_positions = collections::BitSet::new();
+    let accepted_positions = collections::BitSet::new();
     let fast_positions = maximum.is_none() && !node_contains_capture(regex, child)
         && !node_may_match_empty(regex, child);
     repeat_push_explore(work, visited, visited_positions, fast_positions, minimum, 0, start);
@@ -2132,10 +2127,10 @@ fn match_repeat(
                 let can_accept = count >= minimum;
                 if !greedy && can_accept {
                     repeat_accept(output, accepted_positions, fast_positions, state)
-                } else {};
+                }
                 if greedy && can_accept {
                     work.push(RepeatWork::Accept(state))
-                } else {};
+                }
                 if count < limit {
                     let reset = clear_node_captures(regex, child, state);
                     let outcomes = match_node_direction_flags(
@@ -2159,10 +2154,10 @@ fn match_repeat(
                                 count + 1,
                                 outcome,
                             )
-                        } else {};
+                        }
                         index -= 1;
                     }
-                } else {}
+                }
             },
             None => (),
         }
@@ -2231,7 +2226,7 @@ fn match_simple_node_position(
     };
     if !available {
         return Option::None
-    } else {};
+    }
     let (actual, width) = if backward {
         input_backward_code_point(input, position, unicode_mode(flags))
     } else {
@@ -2319,7 +2314,7 @@ fn match_simple_repeat_sequence_first(
             ) {
                 Some(value) => return Option::Some(value),
                 None => (),
-            };
+            }
             if count <= minimum {
                 return Option::None
             } else {
@@ -2340,10 +2335,10 @@ fn match_simple_repeat_sequence_first(
             ) {
                 Some(value) => return Option::Some(value),
                 None => (),
-            };
+            }
             if count >= limit {
                 return Option::None
-            } else {};
+            }
             match match_simple_node_position(regex, flags, child, input, position, backward) {
                 Some(next) => {
                     position = next;
@@ -2366,7 +2361,7 @@ fn match_sequence_first_from(
 ) -> Option[MatchState] {
     if child_index >= children.len() {
         return Option::Some(state)
-    } else {};
+    }
     let node_index = if backward {
         children.len() - child_index - 1
     } else {
@@ -2455,7 +2450,7 @@ fn class_string_match_width(
     } {
         if backward && input_position <= 0 || !backward && input_position >= input.len() {
             return Option::None
-        } else {};
+        }
         let (expected_value, expected_width) = if backward {
             input_backward_code_point(expected, expected_position, true)
         } else {
@@ -2524,7 +2519,7 @@ fn class_set_string_outcomes(
                         backward,
                     ).is_some() {
                     matched = true;
-                } else {}
+                }
             }
             matched
         } else {
@@ -2542,7 +2537,7 @@ fn class_set_string_outcomes(
                     captures: state.captures,
                 },
             )
-        } else {};
+        }
         if length == 0 {
             break
         } else {
@@ -2569,7 +2564,7 @@ fn class_string_compare_input(
             return 0 - 1
         } else if value.get(index) > input.get(start + index) {
             return 1
-        } else {};
+        }
         index += 1;
     }
     if value.len() < length {
@@ -2701,7 +2696,7 @@ fn backreference_matches(
                 input.get(position + index).to_u32(),
             ) {
                 return false
-            } else {};
+            }
             index += 1;
         }
         true
@@ -2728,7 +2723,7 @@ fn backward_backreference_matches(
                 input.get(position - index - 1).to_u32(),
             ) {
                 return false
-            } else {};
+            }
             index += 1;
         }
         true
@@ -2766,7 +2761,7 @@ fn match_backreferences(
                 return Vec::new()
             },
             None => {},
-        };
+        }
         index += 1;
     }
     Vec::from_array([state])
@@ -2932,8 +2927,8 @@ fn match_node_direction_flags(
                             captures: state.captures,
                         },
                     )
-                } else {}
-            } else {};
+                }
+            }
             output
         },
         Node::Sequence(children) => {
@@ -3034,22 +3029,6 @@ fn match_node_direction_flags(
     }
 }
 
-fn match_node_direction(
-    regex: Regex,
-    node: isize,
-    input: runtime::JsString,
-    state: MatchState,
-    backward: bool,
-) -> Vec[MatchState] {
-    match_node_direction_flags(regex, regex.flags, node, input, state, backward)
-}
-
-fn match_node(regex: Regex, node: isize, input: runtime::JsString, state: MatchState) -> Vec[
-    MatchState,
-] {
-    match_node_direction(regex, node, input, state, false)
-}
-
 fn match_root_first_with_flags(
     regex: Regex,
     flags: RegexFlags,
@@ -3063,7 +3042,7 @@ fn match_root_first_with_flags(
                 let outcomes = match_node_direction_flags(regex, flags, child, input, state, false);
                 if !outcomes.is_empty() {
                     return Option::Some(outcomes[0])
-                } else {}
+                }
             }
             Option::None
         },
@@ -3114,7 +3093,7 @@ fn match_root_first_with_flags(
 pub fn match_at(regex: Regex, input: runtime::JsString, start: isize) -> Option[RegexMatch] {
     if start < 0 || start > input.len() {
         return Option::None
-    } else {};
+    }
     let initial = MatchState { position: start, captures: empty_captures(regex.capture_count) };
     match match_root_first_with_flags(regex, regex.flags, regex.root, input, initial) {
         Some(outcome) => {
@@ -3132,10 +3111,10 @@ pub fn search(regex: Regex, input: runtime::JsString) -> Option[RegexMatch] {
         match match_at(regex, input, start) {
             Some(value) => return Option::Some(value),
             None => {},
-        };
+        }
         if regex.flags.sticky {
             return Option::None
-        } else {};
+        }
         if unicode_mode(regex.flags) && start < input.len() {
             let (_, width) = input_forward_code_point(input, start, true);
             start += width;

@@ -3,6 +3,7 @@ package builtins;
 use gomlang::quickjs::arraybuffer;
 use gomlang::quickjs::runtime;
 use gomlang::quickjs::vm;
+use std::collections;
 use std::path;
 
 struct WorkerClone {
@@ -10,8 +11,7 @@ struct WorkerClone {
     target_context: vm::Context,
     source_buffers: ArrayBufferInstall,
     target_buffers: ArrayBufferInstall,
-    source_objects: Vec[runtime::ObjectId],
-    target_objects: Vec[Ref[Option[runtime::ObjectId]]],
+    object_slots: HashMap[runtime::ObjectId, Ref[Option[runtime::ObjectId]]],
     depth: isize,
 }
 
@@ -19,7 +19,7 @@ struct WorkerEndpoint {
     context: vm::Context,
     buffers: ArrayBufferInstall,
     handler: Ref[runtime::Value],
-    pending: Vec[runtime::Value],
+    pending: collections::Deque[runtime::Value],
     peer: Ref[Option[WorkerEndpoint]],
 }
 
@@ -28,28 +28,16 @@ fn worker_new_endpoint(context: vm::Context, buffers: ArrayBufferInstall) -> Wor
         context,
         buffers,
         handler: Ref::new(runtime::Value::Undefined),
-        pending: Vec::new(),
+        pending: collections::Deque::new(),
         peer: Ref::new(Option::None),
     }
-}
-
-fn worker_clone_index(clone: WorkerClone, object: runtime::ObjectId) -> Option[isize] {
-    let mut index = 0;
-    while index < clone.source_objects.len() {
-        if clone.source_objects[index] == object {
-            return Option::Some(index)
-        } else {};
-        index += 1;
-    }
-    Option::None
 }
 
 fn worker_clone_slot(clone: WorkerClone, object: runtime::ObjectId) -> Ref[
     Option[runtime::ObjectId],
 ] {
-    clone.source_objects.push(object);
     let slot: Ref[Option[runtime::ObjectId]] = Ref::new(Option::None);
-    clone.target_objects.push(slot);
+    clone.object_slots[object] = slot;
     slot
 }
 
@@ -57,8 +45,8 @@ fn worker_clone_existing(clone: WorkerClone, object: runtime::ObjectId) -> Resul
     Option[runtime::Value],
     vm::VmError,
 ] {
-    match worker_clone_index(clone, object) {
-        Some(index) => match clone.target_objects[index].get() {
+    match clone.object_slots.get(object) {
+        Some(slot) => match slot.get() {
             Some(value) => Result::Ok(Option::Some(runtime::Value::Object(value))),
             None => Result::Err(function_vm_error("unresolved structured clone reference")),
         },
@@ -103,7 +91,7 @@ fn worker_clone_properties(clone: WorkerClone, source: runtime::ObjectId, target
         };
         if !runtime::descriptor_enumerable(descriptor) {
             continue
-        } else {};
+        }
         let value = match runtime::descriptor_value(descriptor) {
             Some(value) => value,
             None => return Result::Err(
@@ -176,9 +164,9 @@ fn worker_clone_array(
                     runtime::string_property_key(index.to_string()),
                     worker_clone_value(clone, value)?,
                 )?
-            } else {},
+            },
             None => (),
-        };
+        }
         index += 1;
     }
     Result::Ok(runtime::Value::Object(target))
@@ -375,7 +363,7 @@ fn worker_clone_boxed(
     };
     if !runtime::set_primitive_value(clone.target_context.heap(), object, value) {
         return Result::Err(function_vm_error("cannot initialize boxed primitive"))
-    } else {};
+    }
     slot.set(Option::Some(object));
     Result::Ok(runtime::Value::Object(object))
 }
@@ -387,29 +375,29 @@ fn worker_clone_object(clone: WorkerClone, source: runtime::ObjectId) -> Result[
     match worker_clone_existing(clone, source)? {
         Some(value) => return Result::Ok(value),
         None => (),
-    };
+    }
     let slot = worker_clone_slot(clone, source);
     match runtime::typed_array_view(clone.source_context.heap(), source) {
         Some(view) => return worker_clone_typed_array(clone, source, view, slot),
         None => (),
-    };
+    }
     match clone.source_buffers.buffer_states.get(source) {
         Some(value) => return worker_clone_buffer(clone, source, value, slot),
         None => (),
-    };
+    }
     match runtime::primitive_value(clone.source_context.heap(), source) {
         Some(value) => return worker_clone_boxed(clone, value, slot),
         None => (),
-    };
+    }
     match clone.source_context.object_builtin_tag(source) {
         Some(value) => match value.to_host_string() {
             Ok(value) => if value == "Date" {
                 return worker_clone_date(clone, source, slot)
-            } else {},
+            },
             Err(_) => (),
         },
         None => (),
-    };
+    }
     let object = match clone.source_context.heap().get(source) {
         Some(value) => value,
         None => return Result::Err(function_vm_error("structured clone source is not live")),
@@ -454,8 +442,7 @@ fn worker_clone_message(
             target_context: target.context,
             source_buffers: source.buffers,
             target_buffers: target.buffers,
-            source_objects: Vec::new(),
-            target_objects: Vec::new(),
+            object_slots: HashMap::new(),
             depth,
         },
         value,
@@ -498,9 +485,9 @@ fn worker_deliver(endpoint: WorkerEndpoint, value: runtime::Value, depth: isize)
     vm::VmError,
 ] {
     if !worker_handler_callable(endpoint) {
-        endpoint.pending.insert(0, value);
+        endpoint.pending.push_front(value);
         return Result::Ok(runtime::Value::Undefined)
-    } else {};
+    }
     endpoint.context.invoke_with_this_at_depth(
         endpoint.handler.get(),
         Vec::from_array([worker_event(endpoint, value)?]),
@@ -512,9 +499,8 @@ fn worker_deliver(endpoint: WorkerEndpoint, value: runtime::Value, depth: isize)
 fn worker_schedule(endpoint: WorkerEndpoint) -> Result[(), vm::VmError] {
     if !worker_handler_callable(endpoint) {
         return Result::Ok(())
-    } else {};
-    while !endpoint.pending.is_empty() {
-        let value = endpoint.pending.remove(0);
+    }
+    while let Some(value) = endpoint.pending.pop_front() {
         let callback = endpoint.context.new_vm_function(
             |_, _, depth| {
                 worker_deliver(endpoint, value, depth)
@@ -535,7 +521,7 @@ fn worker_post_message(endpoint: WorkerEndpoint, arguments: Vec[runtime::Value],
         None => return Result::Err(function_vm_error("Worker port is disconnected")),
     };
     let value = worker_clone_message(endpoint, peer, argument(arguments, 0), depth)?;
-    peer.pending.push(value);
+    peer.pending.push_back(value);
     worker_schedule(peer)?;
     let _ = peer.context.run_pending_jobs_at_depth(depth)?;
     Result::Ok(runtime::Value::Undefined)
@@ -588,7 +574,7 @@ fn worker_port_object(endpoint: WorkerEndpoint) -> Result[runtime::ObjectId, Bui
             runtime::accessor_descriptor(Option::Some(getter), Option::Some(setter), true, true),
         ) {
         return Result::Err(BuiltinError { message: "cannot initialize Worker port" })
-    } else {};
+    }
     Result::Ok(object)
 }
 
@@ -613,7 +599,7 @@ fn worker_source_path(context: vm::Context, value: runtime::Value) -> Result[str
     };
     if path::is_absolute(source) {
         return Result::Ok(path::clean(source))
-    } else {};
+    }
     let base = match context.current_module_path() {
         Some(value) => match path::parent(value) {
             Some(value) => value,
@@ -694,7 +680,7 @@ fn worker_initialize_receiver(
             descriptor,
         ) {
             return Result::Err(function_vm_error("cannot initialize Worker instance"))
-        } else {}
+        }
     }
     match context.load_worker_module(child_context, child_realm.global_object(), module_path) {
         Ok(_) => Result::Ok(runtime::Value::Object(receiver)),
@@ -729,7 +715,7 @@ fn install_worker(context: vm::Context, os_object: runtime::ObjectId, buffers: A
     ) {
         Ok(()) => (),
         Err(error) => return Result::Err(BuiltinError { message: error.kind.debug() }),
-    };
+    }
     let function = function_object(constructor, "Worker")?;
     define_value(
         context.heap(),

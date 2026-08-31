@@ -6,6 +6,7 @@ use gomlang::quickjs::cutils;
 use gomlang::quickjs::runtime;
 use gomlang::quickjs::vm;
 use std::bincode;
+use std::collections;
 
 const BJSON_VERSION: byte = 5;
 
@@ -46,8 +47,9 @@ struct BjsonWriter {
     buffers: ArrayBufferInstall,
     data: cutils::ByteBuffer,
     atoms: Vec[runtime::JsString],
-    objects: Vec[runtime::ObjectId],
-    active: Vec[runtime::ObjectId],
+    atom_indices: HashMap[runtime::JsString, u32],
+    objects: HashMap[runtime::ObjectId, u32],
+    active: collections::HashSet[runtime::ObjectId],
     allow_reference: bool,
     depth: isize,
 }
@@ -93,7 +95,7 @@ fn bjson_write_string(output: cutils::ByteBuffer, value: runtime::JsString) -> (
     while index < value.len() {
         if value.get(index) > 0xff {
             wide = true;
-        } else {};
+        }
         index += 1;
     }
     bjson_append_leb128(
@@ -111,36 +113,25 @@ fn bjson_write_string(output: cutils::ByteBuffer, value: runtime::JsString) -> (
             output.append_u16_le(value.get(index))
         } else {
             output.append_byte(value.get(index).to_u8())
-        };
+        }
         index += 1;
     }
 }
 
 fn bjson_writer_atom(writer: BjsonWriter, value: runtime::JsString) -> u32 {
-    let mut index = 0;
-    while index < writer.atoms.len() {
-        if writer.atoms[index] == value {
-            return (index + 1).to_u32()
-        } else {};
-        index += 1;
+    match writer.atom_indices.get(value) {
+        Some(index) => index,
+        None => {
+            let index = (writer.atoms.len() + 1).to_u32();
+            writer.atoms.push(value);
+            writer.atom_indices[value] = index;
+            index
+        },
     }
-    writer.atoms.push(value);
-    writer.atoms.len().to_u32()
 }
 
 fn bjson_write_atom(writer: BjsonWriter, value: runtime::JsString) -> () {
     bjson_append_leb128(writer.data, bjson_writer_atom(writer, value) << 1)
-}
-
-fn bjson_object_index(values: Vec[runtime::ObjectId], object: runtime::ObjectId) -> Option[isize] {
-    let mut index = 0;
-    while index < values.len() {
-        if values[index] == object {
-            return Option::Some(index)
-        } else {};
-        index += 1;
-    }
-    Option::None
 }
 
 fn bjson_write_float(writer: BjsonWriter, value: f64) -> Result[(), vm::VmError] {
@@ -157,7 +148,7 @@ fn bjson_write_float(writer: BjsonWriter, value: f64) -> Result[(), vm::VmError]
 fn bjson_bigint_bytes(value: bigint::BigInteger) -> Vec[byte] {
     if value.is_zero() {
         return Vec::new()
-    } else {};
+    }
     let limbs = value.abs().limbs();
     let bytes: Vec[byte] = Vec::with_capacity(limbs.len() * 4 + 1);
     for limb in limbs {
@@ -181,14 +172,14 @@ fn bjson_bigint_bytes(value: bigint::BigInteger) -> Vec[byte] {
         }
         if bytes[bytes.len() - 1] & 0x80 == 0 {
             bytes.push(0xff)
-        } else {};
+        }
         while bytes.len() > 1 && bytes[bytes.len() - 1] == 0xff
             && bytes[bytes.len() - 2] & 0x80 != 0 {
             let _ = bytes.pop();
         }
     } else if bytes[bytes.len() - 1] & 0x80 != 0 {
         bytes.push(0)
-    } else {};
+    }
     bytes
 }
 
@@ -253,7 +244,7 @@ fn bjson_object_entries(writer: BjsonWriter, object: runtime::ObjectId) -> Resul
         };
         if !runtime::descriptor_enumerable(descriptor) {
             continue
-        } else {};
+        }
         match runtime::descriptor_value(descriptor) {
             Some(value) => entries.push((name, value)),
             None => return Result::Err(function_vm_error("only value properties are supported")),
@@ -334,7 +325,7 @@ fn bjson_write_array_buffer(writer: BjsonWriter, value: arraybuffer::ArrayBuffer
     if value.is_shared() {
         writer.data.append_byte(BJSON_TAG_SHARED_ARRAY_BUFFER);
         return Result::Err(function_vm_error("shared array buffers are not supported"))
-    } else {};
+    }
     let bytes = match value.to_bytes() {
         Ok(value) => value,
         Err(error) => return Result::Err(function_vm_error(error.to_string())),
@@ -382,24 +373,24 @@ fn bjson_write_object_body(writer: BjsonWriter, object: runtime::ObjectId) -> Re
     match runtime::typed_array_view(writer.context.heap(), object) {
         Some(view) => return bjson_write_typed_array(writer, object, view),
         None => (),
-    };
+    }
     match writer.buffers.buffer_states.get(object) {
         Some(value) => return bjson_write_array_buffer(writer, value),
         None => (),
-    };
+    }
     match runtime::primitive_value(writer.context.heap(), object) {
         Some(value) => return bjson_write_object_value(writer, value),
         None => (),
-    };
+    }
     match writer.context.object_builtin_tag(object) {
         Some(value) => match value.to_host_string() {
             Ok(value) => if value == "Date" {
                 return bjson_write_date(writer, object)
-            } else {},
+            },
             Err(_) => (),
         },
         None => (),
-    };
+    }
     let target = match writer.context.heap().get(object) {
         Some(value) => value,
         None => return Result::Err(function_vm_error("object is no longer live")),
@@ -413,24 +404,26 @@ fn bjson_write_object_body(writer: BjsonWriter, object: runtime::ObjectId) -> Re
 
 fn bjson_write_object(writer: BjsonWriter, object: runtime::ObjectId) -> Result[(), vm::VmError] {
     if writer.allow_reference {
-        match bjson_object_index(writer.objects, object) {
+        match writer.objects.get(object) {
             Some(index) => {
                 writer.data.append_byte(BJSON_TAG_OBJECT_REFERENCE);
-                bjson_append_leb128(writer.data, index.to_u32());
+                bjson_append_leb128(writer.data, index);
                 return Result::Ok(())
             },
-            None => writer.objects.push(object),
+            None => {
+                let index = writer.objects.len().to_u32();
+                writer.objects[object] = index;
+            },
         }
     } else {
-        if bjson_object_index(writer.active, object).is_some() {
+        if !writer.active.insert(object) {
             return Result::Err(function_vm_error("circular reference"))
-        } else {};
-        writer.active.push(object);
-    };
+        }
+    }
     let result = bjson_write_object_body(writer, object);
     if !writer.allow_reference {
-        let _ = writer.active.pop();
-    } else {};
+        let _ = writer.active.remove(object);
+    }
     result
 }
 
@@ -508,7 +501,7 @@ fn bjson_read_leb128(reader: BjsonReader) -> Result[u32, vm::VmError] {
         value |= (current & 0x7f).to_u32() << (index * 7);
         if current & 0x80 == 0 {
             return Result::Ok(value)
-        } else {};
+        }
         index += 1;
     }
     Result::Err(bjson_reader_error(reader, "invalid LEB128 value"))
@@ -526,7 +519,7 @@ fn bjson_read_sleb128(reader: BjsonReader) -> Result[i32, vm::VmError] {
 fn bjson_read_bytes(reader: BjsonReader, length: isize) -> Result[Vec[byte], vm::VmError] {
     if length < 0 || reader.offset.get() < 0 || length > reader.limit - reader.offset.get() {
         return Result::Err(bjson_reader_error(reader, "read after the end of the buffer"))
-    } else {};
+    }
     let values: Vec[byte] = Vec::with_capacity(length);
     let end = reader.offset.get() + length;
     while reader.offset.get() < end {
@@ -549,7 +542,7 @@ fn bjson_read_string(reader: BjsonReader) -> Result[runtime::JsString, vm::VmErr
             units.push(low | (high << 8))
         } else {
             units.push(bjson_read_byte(reader)?.to_u16())
-        };
+        }
         index += 1;
     }
     Result::Ok(runtime::JsString::from_code_units(units))
@@ -559,7 +552,7 @@ fn bjson_read_atom(reader: BjsonReader) -> Result[runtime::JsString, vm::VmError
     let encoded = bjson_read_leb128(reader)?;
     if encoded & 1 != 0 {
         return Result::Ok(js_string((encoded >> 1).to_string()))
-    } else {};
+    }
     let index = (encoded >> 1).to_isize();
     if index < 1 || index > reader.atoms.len() {
         Result::Err(bjson_reader_error(reader, "invalid atom index"))
@@ -587,7 +580,7 @@ fn bjson_read_float(reader: BjsonReader) -> Result[runtime::Value, vm::VmError] 
 fn bjson_bigint_from_bytes(bytes: Vec[byte]) -> bigint::BigInteger {
     if bytes.is_empty() {
         return bigint::BigInteger::zero()
-    } else {};
+    }
     let negative = bytes[bytes.len() - 1] & 0x80 != 0;
     let magnitude: Vec[byte] = Vec::with_capacity(bytes.len());
     for value in bytes {
@@ -602,7 +595,7 @@ fn bjson_bigint_from_bytes(bytes: Vec[byte]) -> bigint::BigInteger {
             carry = next >> 8;
             index += 1;
         }
-    } else {};
+    }
     while magnitude.len() > 1 && magnitude[magnitude.len() - 1] == 0 {
         let _ = magnitude.pop();
     }
@@ -633,7 +626,7 @@ fn bjson_reader_slot(reader: BjsonReader) -> Ref[Option[runtime::ObjectId]] {
     let slot: Ref[Option[runtime::ObjectId]] = Ref::new(Option::None);
     if reader.allow_reference {
         reader.objects.push(slot)
-    } else {};
+    }
     slot
 }
 
@@ -826,7 +819,7 @@ fn bjson_read_object_value(reader: BjsonReader) -> Result[runtime::Value, vm::Vm
     };
     if !runtime::set_primitive_value(reader.context.heap(), object, value) {
         return Result::Err(function_vm_error("cannot initialize boxed primitive"))
-    } else {};
+    }
     bjson_finish_slot(slot, object);
     Result::Ok(runtime::Value::Object(object))
 }
@@ -834,11 +827,11 @@ fn bjson_read_object_value(reader: BjsonReader) -> Result[runtime::Value, vm::Vm
 fn bjson_read_reference(reader: BjsonReader) -> Result[runtime::Value, vm::VmError] {
     if !reader.allow_reference {
         return Result::Err(bjson_reader_error(reader, "object references are not allowed"))
-    } else {};
+    }
     let index = bjson_read_leb128(reader)?.to_isize();
     if index < 0 || index >= reader.objects.len() {
         return Result::Err(bjson_reader_error(reader, "invalid object reference"))
-    } else {};
+    }
     match reader.objects[index].get() {
         Some(value) => Result::Ok(runtime::Value::Object(value)),
         None => Result::Err(bjson_reader_error(reader, "unresolved object reference")),
@@ -874,7 +867,7 @@ fn bjson_read_header(reader: BjsonReader) -> Result[(), vm::VmError] {
     let version = bjson_read_byte(reader)?;
     if version != BJSON_VERSION {
         return Result::Err(bjson_reader_error(reader, "invalid BJSON version"))
-    } else {};
+    }
     let count = bjson_read_leb128(reader)?.to_isize();
     let mut index = 0;
     while index < count {
@@ -924,8 +917,9 @@ fn bjson_write_builtin(
         buffers,
         data: cutils::ByteBuffer::new(),
         atoms: Vec::new(),
-        objects: Vec::new(),
-        active: Vec::new(),
+        atom_indices: HashMap::new(),
+        objects: HashMap::new(),
+        active: collections::HashSet::new(),
         allow_reference,
         depth,
     };
@@ -950,7 +944,7 @@ fn bjson_read_range(
     };
     if offset > bytes.len() {
         return Result::Err(function_vm_error("BJSON offset exceeds buffer length"))
-    } else {};
+    }
     let length = if arguments.len() > 2 {
         arraybuffer_index_at_depth(context, arguments[2], depth)?
     } else {
@@ -958,7 +952,7 @@ fn bjson_read_range(
     };
     if length > bytes.len() - offset {
         return Result::Err(function_vm_error("BJSON length exceeds buffer length"))
-    } else {};
+    }
     Result::Ok((bytes, offset, offset + length))
 }
 

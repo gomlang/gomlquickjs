@@ -1,17 +1,21 @@
 package promise;
 
 use gomlang::quickjs::runtime;
+use std::collections;
 
 pub type PromiseJob = () -> ();
 
 pub struct JobQueue {
-    jobs_value: Vec[PromiseJob],
+    jobs_value: collections::Deque[PromiseJob],
     rejection_tracker_value: Ref[Option[PromiseRejectionTracker]],
 }
 
 impl JobQueue {
     pub fn new() -> JobQueue {
-        JobQueue { jobs_value: Vec::new(), rejection_tracker_value: Ref::new(Option::None) }
+        JobQueue {
+            jobs_value: collections::Deque::new(),
+            rejection_tracker_value: Ref::new(Option::None),
+        }
     }
 
     pub fn len(self: JobQueue) -> isize {
@@ -23,7 +27,7 @@ impl JobQueue {
     }
 
     pub fn enqueue(self: JobQueue, job: PromiseJob) -> () {
-        self.jobs_value.push(job)
+        self.jobs_value.push_back(job)
     }
 
     pub fn set_rejection_tracker(self: JobQueue, tracker: Option[PromiseRejectionTracker]) -> () {
@@ -31,12 +35,12 @@ impl JobQueue {
     }
 
     pub fn run_one(self: JobQueue) -> bool {
-        if self.jobs_value.is_empty() {
-            false
-        } else {
-            let job = self.jobs_value.remove(0);
-            job();
-            true
+        match self.jobs_value.pop_front() {
+            Some(job) => {
+                job();
+                true
+            },
+            None => false,
         }
     }
 
@@ -137,7 +141,7 @@ pub struct Promise {
     identity_value: Ref[bool],
     host_object_root_value: Ref[runtime::Value],
     state_value: Ref[PromiseState],
-    reactions_value: Vec[PromiseReaction],
+    reactions_value: collections::Deque[PromiseReaction],
     queue_value: JobQueue,
     resolution_locked_value: Ref[bool],
     handled_value: Ref[bool],
@@ -156,7 +160,7 @@ fn promise_pending(queue: JobQueue) -> Promise {
         identity_value: Ref::new(false),
         host_object_root_value: Ref::new(runtime::Value::Undefined),
         state_value: Ref::new(PromiseState::Pending),
-        reactions_value: Vec::new(),
+        reactions_value: collections::Deque::new(),
         queue_value: queue,
         resolution_locked_value: Ref::new(false),
         handled_value: Ref::new(false),
@@ -222,8 +226,7 @@ fn enqueue_reaction(queue: JobQueue, reaction: PromiseReaction, input: ReactionI
 }
 
 fn drain_reactions(promise: Promise, input: ReactionInput) -> () {
-    while !promise.reactions_value.is_empty() {
-        let reaction = promise.reactions_value.remove(0);
+    while let Some(reaction) = promise.reactions_value.pop_front() {
         enqueue_reaction(promise.queue_value, reaction, input)
     }
 }
@@ -248,7 +251,7 @@ fn reject_internal(promise: Promise, error: PromiseFailure) -> bool {
                 Some(tracker) => tracker(promise, error, false),
                 None => (),
             }
-        } else {};
+        }
         drain_reactions(promise, ReactionInput::Rejected(error));
         true
     }
@@ -257,7 +260,7 @@ fn reject_internal(promise: Promise, error: PromiseFailure) -> bool {
 fn mark_handled(promise: Promise) -> () {
     if promise.handled_value.get() {
         return
-    } else {};
+    }
     promise.handled_value.set(true);
     match promise.state_value.get() {
         PromiseState::Rejected(error) => match promise.queue_value.rejection_tracker_value.get() {
@@ -278,7 +281,7 @@ fn adopt_promise(target: Promise, source: Promise) -> () {
         roots: Vec::new(),
     };
     match source.state_value.get() {
-        PromiseState::Pending => source.reactions_value.push(reaction),
+        PromiseState::Pending => source.reactions_value.push_back(reaction),
         PromiseState::Fulfilled(value) => {
             enqueue_reaction(source.queue_value, reaction, ReactionInput::Fulfilled(value))
         },
@@ -335,7 +338,7 @@ fn begin_rejection(promise: Promise, error: PromiseFailure) -> bool {
 fn register_reaction(promise: Promise, reaction: PromiseReaction) -> () {
     mark_handled(promise);
     match promise.state_value.get() {
-        PromiseState::Pending => promise.reactions_value.push(reaction),
+        PromiseState::Pending => promise.reactions_value.push_back(reaction),
         PromiseState::Fulfilled(value) => {
             enqueue_reaction(promise.queue_value, reaction, ReactionInput::Fulfilled(value))
         },
@@ -451,11 +454,16 @@ impl Promise {
                 push_fulfillment_gc_values(fulfillment, values)
             },
             PromiseState::Rejected(failure) => push_failure_gc_values(failure, values),
-        };
-        for reaction in self.reactions_value {
-            for value in reaction.roots {
-                values.push(value)
+        }
+        let mut reaction_index = 0;
+        while reaction_index < self.reactions_value.len() {
+            match self.reactions_value.get(reaction_index) {
+                Some(reaction) => for value in reaction.roots {
+                    values.push(value)
+                },
+                None => (),
             }
+            reaction_index += 1;
         }
         values
     }
@@ -532,7 +540,7 @@ fn collect_values(values: Vec[Option[runtime::Value]]) -> Vec[runtime::Value] {
         match values[index] {
             Some(value) => output.push(value),
             None => output.push(runtime::Value::Undefined),
-        };
+        }
         index += 1;
     }
     output
@@ -546,7 +554,7 @@ pub fn all(queue: JobQueue, inputs: Vec[PromiseResolution]) -> Promise {
             PromiseResolution::Fulfillment(PromiseFulfillment::Values(Vec::new())),
         );
         return promise
-    } else {};
+    }
     let values = fill_optional_values(inputs.len());
     let remaining = Ref::new(inputs.len());
     let mut index = 0;
@@ -565,7 +573,7 @@ pub fn all(queue: JobQueue, inputs: Vec[PromiseResolution]) -> Promise {
                                     PromiseFulfillment::Values(collect_values(values)),
                                 ),
                             );
-                        } else {};
+                        }
                         undefined_resolution()
                     },
                     Err(error) => {
@@ -624,7 +632,7 @@ fn collect_settlements(values: Vec[Option[PromiseSettlement]]) -> Vec[PromiseSet
         match values[index] {
             Some(value) => output.push(value),
             None => output.push(PromiseSettlement::Fulfilled(runtime::Value::Undefined)),
-        };
+        }
         index += 1;
     }
     output
@@ -638,7 +646,7 @@ pub fn all_settled(queue: JobQueue, inputs: Vec[PromiseResolution]) -> Promise {
             PromiseResolution::Fulfillment(PromiseFulfillment::Settlements(Vec::new())),
         );
         return promise
-    } else {};
+    }
     let values = fill_optional_settlements(inputs.len());
     let remaining = Ref::new(inputs.len());
     let mut index = 0;
@@ -657,7 +665,7 @@ pub fn all_settled(queue: JobQueue, inputs: Vec[PromiseResolution]) -> Promise {
                                     PromiseFulfillment::Settlements(collect_settlements(values)),
                                 ),
                             );
-                        } else {};
+                        }
                         undefined_resolution()
                     },
                     Err(error) => {
@@ -676,7 +684,7 @@ pub fn all_settled(queue: JobQueue, inputs: Vec[PromiseResolution]) -> Promise {
                                 PromiseFulfillment::Settlements(collect_settlements(values)),
                             ),
                         );
-                    } else {};
+                    }
                     undefined_resolution()
                 },
             ),
@@ -701,7 +709,7 @@ fn collect_failures(values: Vec[Option[PromiseFailure]]) -> Vec[PromiseFailure] 
         match values[index] {
             Some(value) => output.push(value),
             None => output.push(PromiseFailure::Rejection(runtime::Value::Undefined)),
-        };
+        }
         index += 1;
     }
     output
@@ -715,7 +723,7 @@ pub fn any(queue: JobQueue, inputs: Vec[PromiseResolution]) -> Promise {
             PromiseFailure::Aggregate(AggregateFailure { errors: Vec::new() }),
         );
         return promise
-    } else {};
+    }
     let errors = fill_optional_failures(inputs.len());
     let remaining = Ref::new(inputs.len());
     let mut index = 0;
@@ -739,7 +747,7 @@ pub fn any(queue: JobQueue, inputs: Vec[PromiseResolution]) -> Promise {
                                 AggregateFailure { errors: collect_failures(errors) },
                             ),
                         );
-                    } else {};
+                    }
                     undefined_resolution()
                 },
             ),

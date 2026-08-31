@@ -1,6 +1,50 @@
 package collections;
 
 use gomlang::quickjs::runtime;
+use std::math;
+use std::num;
+
+#[derive(Hash, PartialEq, Eq)]
+enum CollectionKey {
+    Undefined,
+    Null,
+    Bool(bool),
+    Number(u64),
+    String(runtime::JsString),
+    Symbol(runtime::Symbol),
+    BigInt(runtime::BigInt),
+    Object(runtime::ObjectId),
+}
+
+fn collection_number_key(value: f64) -> u64 {
+    if value == 0.0 {
+        0
+    } else if math::is_nan(value) {
+        0x7ff8000000000000
+    } else {
+        value.to_bits()
+    }
+}
+
+fn collection_int_number(value: i32) -> f64 {
+    num::parse_float64_structured(value.to_string()).unwrap_or(0.0)
+}
+
+fn collection_key(value: runtime::Value) -> CollectionKey {
+    match value {
+        runtime::Value::Undefined => CollectionKey::Undefined,
+        runtime::Value::Null => CollectionKey::Null,
+        runtime::Value::Bool(value) => CollectionKey::Bool(value),
+        runtime::Value::Int(value) => {
+            CollectionKey::Number(collection_number_key(collection_int_number(value)))
+        },
+        runtime::Value::Float(value) => CollectionKey::Number(collection_number_key(value)),
+        runtime::Value::String(value) => CollectionKey::String(value),
+        runtime::Value::Symbol(value) => CollectionKey::Symbol(value),
+        runtime::Value::BigInt(value) => CollectionKey::BigInt(value),
+        runtime::Value::Object(value) => CollectionKey::Object(value),
+    }
+}
 
 pub struct MapEntry {
     pub key: runtime::Value,
@@ -9,6 +53,7 @@ pub struct MapEntry {
 
 pub struct JsMap {
     entries_value: Vec[Option[MapEntry]],
+    indices_value: HashMap[CollectionKey, isize],
 }
 
 pub fn canonical_key(value: runtime::Value) -> runtime::Value {
@@ -22,37 +67,19 @@ pub fn canonical_key(value: runtime::Value) -> runtime::Value {
     }
 }
 
-fn map_index(entries: Vec[Option[MapEntry]], key: runtime::Value) -> Option[isize] {
-    let mut index = 0;
-    while index < entries.len() {
-        match entries[index] {
-            Some(entry) => if runtime::same_value_zero(entry.key, key) {
-                return Option::Some(index)
-            } else {},
-            None => (),
-        };
-        index += 1;
-    }
-    Option::None
-}
-
 impl JsMap {
     pub fn new() -> JsMap {
-        JsMap { entries_value: Vec::new() }
+        JsMap { entries_value: Vec::new(), indices_value: HashMap::new() }
     }
 
     pub fn size(self: JsMap) -> isize {
-        let mut result = 0;
-        for entry in self.entries_value {
-            if entry.is_some() {
-                result += 1;
-            } else {}
-        }
-        result
+        self.indices_value.len()
     }
 
     pub fn set(self: JsMap, key: runtime::Value, value: runtime::Value) -> () {
-        match map_index(self.entries_value, key) {
+        let key = canonical_key(key);
+        let index_key = collection_key(key);
+        match self.indices_value.get(index_key) {
             Some(index) => {
                 match self.entries_value[index] {
                     Some(entry) => {
@@ -61,14 +88,16 @@ impl JsMap {
                     None => (),
                 }
             },
-            None => self.entries_value.push(
-                Option::Some(MapEntry { key: canonical_key(key), value }),
-            ),
+            None => {
+                let index = self.entries_value.len();
+                self.entries_value.push(Option::Some(MapEntry { key, value }));
+                self.indices_value[index_key] = index;
+            },
         }
     }
 
     pub fn get(self: JsMap, key: runtime::Value) -> Option[runtime::Value] {
-        match map_index(self.entries_value, key) {
+        match self.indices_value.get(collection_key(key)) {
             Some(index) => match self.entries_value[index] {
                 Some(entry) => Option::Some(entry.value),
                 None => Option::None,
@@ -78,11 +107,11 @@ impl JsMap {
     }
 
     pub fn has(self: JsMap, key: runtime::Value) -> bool {
-        map_index(self.entries_value, key).is_some()
+        self.indices_value.contains(collection_key(key))
     }
 
     pub fn delete(self: JsMap, key: runtime::Value) -> bool {
-        match map_index(self.entries_value, key) {
+        match self.indices_value.remove_value(collection_key(key)) {
             Some(index) => {
                 self.entries_value[index] = Option::None;
                 true
@@ -94,6 +123,12 @@ impl JsMap {
     pub fn clear(self: JsMap) -> () {
         let mut index = 0;
         while index < self.entries_value.len() {
+            match self.entries_value[index] {
+                Some(entry) => {
+                    let _ = self.indices_value.remove_value(collection_key(entry.key));
+                },
+                None => (),
+            }
             self.entries_value[index] = Option::None;
             index += 1;
         }
@@ -118,7 +153,7 @@ impl JsMap {
             match self.entries_value[index] {
                 Some(entry) => output.push(MapEntry { key: entry.key, value: entry.value }),
                 None => (),
-            };
+            }
             index += 1;
         }
         output
@@ -131,7 +166,7 @@ impl JsMap {
             match self.entries_value[index] {
                 Some(entry) => output.push(entry.key),
                 None => (),
-            };
+            }
             index += 1;
         }
         output
@@ -144,7 +179,7 @@ impl JsMap {
             match self.entries_value[index] {
                 Some(entry) => output.push(entry.value),
                 None => (),
-            };
+            }
             index += 1;
         }
         output
@@ -153,49 +188,35 @@ impl JsMap {
 
 pub struct JsSet {
     values_value: Vec[Option[runtime::Value]],
-}
-
-fn set_index(values: Vec[Option[runtime::Value]], value: runtime::Value) -> Option[isize] {
-    let mut index = 0;
-    while index < values.len() {
-        match values[index] {
-            Some(candidate) => if runtime::same_value_zero(candidate, value) {
-                return Option::Some(index)
-            } else {},
-            None => (),
-        };
-        index += 1;
-    }
-    Option::None
+    indices_value: HashMap[CollectionKey, isize],
 }
 
 impl JsSet {
     pub fn new() -> JsSet {
-        JsSet { values_value: Vec::new() }
+        JsSet { values_value: Vec::new(), indices_value: HashMap::new() }
     }
 
     pub fn size(self: JsSet) -> isize {
-        let mut result = 0;
-        for value in self.values_value {
-            if value.is_some() {
-                result += 1;
-            } else {}
-        }
-        result
+        self.indices_value.len()
     }
 
     pub fn add(self: JsSet, value: runtime::Value) -> () {
-        if !self.has(value) {
-            self.values_value.push(Option::Some(canonical_key(value)))
-        } else {}
+        let value = canonical_key(value);
+        let index_key = collection_key(value);
+        if self.indices_value.contains(index_key) {
+            return
+        }
+        let index = self.values_value.len();
+        self.values_value.push(Option::Some(value));
+        self.indices_value[index_key] = index;
     }
 
     pub fn has(self: JsSet, value: runtime::Value) -> bool {
-        set_index(self.values_value, value).is_some()
+        self.indices_value.contains(collection_key(value))
     }
 
     pub fn delete(self: JsSet, value: runtime::Value) -> bool {
-        match set_index(self.values_value, value) {
+        match self.indices_value.remove_value(collection_key(value)) {
             Some(index) => {
                 self.values_value[index] = Option::None;
                 true
@@ -207,6 +228,12 @@ impl JsSet {
     pub fn clear(self: JsSet) -> () {
         let mut index = 0;
         while index < self.values_value.len() {
+            match self.values_value[index] {
+                Some(value) => {
+                    let _ = self.indices_value.remove_value(collection_key(value));
+                },
+                None => (),
+            }
             self.values_value[index] = Option::None;
             index += 1;
         }
@@ -231,7 +258,7 @@ impl JsSet {
             match self.values_value[index] {
                 Some(value) => output.push(value),
                 None => (),
-            };
+            }
             index += 1;
         }
         output
