@@ -16,7 +16,7 @@ fn expect_function(value: Result[bytecode::Function, Vec[CompileError]]) -> byte
                 testing::fail("compilation failed without diagnostics")
             } else {
                 testing::fail(errors[0].message)
-            };
+            }
             bytecode::Function::new(
                 Vec::new(),
                 Vec::from_array([bytecode::Instruction::ReturnUndef]),
@@ -47,7 +47,7 @@ fn script_test_context() -> vm::Context {
     match builtins::install(context) {
         Ok(_) => (),
         Err(value) => testing::fail(value.message),
-    };
+    }
     context
 }
 
@@ -65,7 +65,7 @@ fn execute_source_with_builtins_named(source: string, source_name: string) -> ru
     match builtins::install(context) {
         Ok(_) => (),
         Err(value) => testing::fail(value.message),
-    };
+    }
     match context.execute(function) {
         Ok(value) => value,
         Err(error) => {
@@ -82,7 +82,7 @@ fn execute_source_with_builtins_jobs_property(source: string, name: string) -> r
     match builtins::install(context) {
         Ok(_) => (),
         Err(value) => testing::fail(value.message),
-    };
+    }
     let result = match context.execute(function) {
         Ok(value) => value,
         Err(error) => {
@@ -93,7 +93,7 @@ fn execute_source_with_builtins_jobs_property(source: string, name: string) -> r
     match context.run_pending_jobs() {
         Ok(_) => (),
         Err(error) => testing::fail(error.kind.debug()),
-    };
+    }
     let name_bytes = name.to_bytes();
     match context.read_property_at_depth(
         result,
@@ -142,7 +142,7 @@ fn has_message(errors: Vec[CompileError], expected: string) -> bool {
     for error in errors {
         if text::find(error.message, expected).is_some() {
             return true
-        } else {}
+        }
     }
     false
 }
@@ -663,7 +663,7 @@ fn array_spread_expands_arrays_holes_accessors_and_string_code_points() -> () {
     ) {
         runtime::Value::Bool(value) => testing::assert(value),
         _ => testing::fail("expected array spread result"),
-    };
+    }
     match execute_source_with_builtins(
         "try { return [...42]; } catch (error) { return error instanceof TypeError; }",
     ) {
@@ -679,7 +679,7 @@ fn array_spread_consumes_custom_iterators_and_propagates_errors() -> () {
     ) {
         runtime::Value::Bool(value) => testing::assert(value),
         _ => testing::fail("expected custom iterable spread result"),
-    };
+    }
     match execute_source_with_builtins(
         "try { return [...{[Symbol.iterator]: 1}]; } catch (error) { return error instanceof TypeError; }",
     ) {
@@ -976,7 +976,7 @@ fn compiles_string_and_bigint_constants() -> () {
             Err(error) => testing::fail(error.debug()),
         },
         _ => testing::fail("expected string"),
-    };
+    }
     match execute_source("return 0x10n;") {
         runtime::Value::BigInt(value) => {
             testing::assert(!value.negative());
@@ -1033,13 +1033,13 @@ fn executes_bigint_source_arithmetic_and_global_conversion() -> () {
     ) {
         runtime::Value::Bool(value) => testing::assert(value),
         _ => testing::fail("expected BigInt arithmetic result"),
-    };
+    }
     match execute_source(
         "return ((-5n >> 1n) === -3n) && ((1n << 65n) === 36893488147419103232n) && ((-42n ^ 15n) === -39n);",
     ) {
         runtime::Value::Bool(value) => testing::assert(value),
         _ => testing::fail("expected BigInt bitwise result"),
-    };
+    }
     match execute_source_with_builtins(
         "return BigInt('9007199254740993') * 3n === 27021597764222979n;",
     ) {
@@ -1105,7 +1105,7 @@ fn invokes_accessor_getters_setters_and_propagates_thrown_values() -> () {
     ) {
         runtime::Value::Bool(value) => testing::assert(value),
         _ => testing::fail("expected accessor result"),
-    };
+    }
     match execute_source_with_builtins(
         "let object = {}; Object.defineProperty(object, 'value', { get: function() { throw 77; } }); try { return object.value; } catch (error) { return error; }",
     ) {
@@ -1131,13 +1131,13 @@ fn executes_in_and_instanceof_through_prototype_chains() -> () {
     ) {
         runtime::Value::Bool(value) => testing::assert(value),
         _ => testing::fail("expected prototype operator result"),
-    };
+    }
     match execute_source_with_builtins(
         "try { return 'x' in 1; } catch (error) { return error instanceof TypeError; }",
     ) {
         runtime::Value::Bool(value) => testing::assert(value),
         _ => testing::fail("expected in operand TypeError"),
-    };
+    }
     match execute_source_with_builtins(
         "try { return {} instanceof {}; } catch (error) { return error instanceof TypeError; }",
     ) {
@@ -1163,7 +1163,7 @@ fn distinguishes_native_constructors_from_plain_native_functions() -> () {
     ) {
         runtime::Value::Bool(value) => testing::assert(value),
         _ => testing::fail("expected native construction result"),
-    };
+    }
     match execute_source_with_builtins(
         "try { new Symbol('x'); } catch (error) { return error instanceof TypeError; } return false;",
     ) {
@@ -1224,7 +1224,7 @@ fn source_locations_follow_utf16_columns_for_nested_functions_and_operators() ->
             testing::assert_eq(location.column, 1)
         },
         None => testing::fail("expected function definition location"),
-    };
+    }
     let mut found = false;
     let mut offset = 0;
     while offset < nested.code_len() {
@@ -1238,10 +1238,23 @@ fn source_locations_follow_utf16_columns_for_nested_functions_and_operators() ->
                 None => testing::fail("expected multiplication source location"),
             },
             _ => (),
-        };
+        }
         offset += 1;
     }
     testing::assert(found)
+}
+
+#[test]
+fn source_locations_handle_crlf_and_utf16_columns() -> () {
+    let second_line = source_location("😀x\r\néy", 7);
+    testing::assert_eq(second_line.line, 2);
+    testing::assert_eq(second_line.column, 1);
+    let after_wide = source_location("😀x\r\néy", 9);
+    testing::assert_eq(after_wide.line, 2);
+    testing::assert_eq(after_wide.column, 2);
+    let after_cr = source_location("a\rb", 2);
+    testing::assert_eq(after_cr.line, 2);
+    testing::assert_eq(after_cr.column, 1)
 }
 
 #[test]
@@ -1255,7 +1268,7 @@ fn eval_errors_expose_runtime_and_parse_source_positions() -> () {
             Err(value) => testing::fail(value.debug()),
         },
         _ => testing::fail("expected runtime error stack"),
-    };
+    }
     let syntax_stack = execute_source_with_builtins(
         "try { eval(\"\\n  123 a\"); } catch (error) { return error.stack; }",
     );
@@ -1417,7 +1430,7 @@ fn dynamic_eval_declarations_preserve_source_order_and_kind() -> () {
                 testing::fail("dynamic eval compilation failed")
             } else {
                 testing::fail(errors[0].message)
-            };
+            }
             return
         },
     };
@@ -1536,7 +1549,7 @@ fn dynamic_eval_compilation_periodically_collects_unreachable_objects() -> () {
     ) {
         Ok(_) => (),
         Err(value) => testing::fail(value.kind.debug()),
-    };
+    }
     testing::assert(context.heap().live_count() < 4096)
 }
 
@@ -1719,7 +1732,7 @@ fn catches_explicit_values_and_nested_function_exceptions() -> () {
     ) {
         runtime::Value::Bool(value) => testing::assert(value),
         _ => testing::fail("expected thrown object identity"),
-    };
+    }
     expect_int(
         execute_source(
             "let read; try { throw 6; } catch (value) { read = function() { return value; }; } return read();",
@@ -1762,7 +1775,7 @@ fn catches_type_range_and_native_errors() -> () {
             Err(value) => testing::fail(value.debug()),
         },
         _ => testing::fail("expected caught RangeError value"),
-    };
+    }
     expect_string(
         execute_source_with_builtins(
             "try { return JSON.parse('{'); } catch (error) { return error instanceof SyntaxError ? typeof error : 'wrong'; }",
@@ -1966,7 +1979,7 @@ fn reports_parameter_destructuring_type_errors_and_duplicate_bindings() -> () {
     ) {
         runtime::Value::Bool(value) => testing::assert(value),
         _ => testing::fail("expected destructuring failure result"),
-    };
+    }
     match compile("function invalid({value}, value) {}") {
         Err(errors) => testing::assert(has_message(errors, "duplicate parameter `value`")),
         Ok(_) => testing::fail("expected duplicate parameter diagnostic"),
@@ -2766,7 +2779,7 @@ fn captured_lexical_writes_observe_tdz() -> () {
                 emits_tdz_write = true;
             },
             _ => (),
-        };
+        }
         offset += 1;
     }
     testing::assert(emits_tdz_write);
@@ -2774,7 +2787,7 @@ fn captured_lexical_writes_observe_tdz() -> () {
         Some(bytecode::UpvalueSource::Local(index)) => testing::assert_eq(index, 1),
         Some(value) => testing::fail(value.debug()),
         None => testing::fail("expected captured lexical upvalue"),
-    };
+    }
     match execute_source_with_builtins(
         "function outer() { function write() { value = 1; } write(); let value; } try { outer(); } catch (error) { return error instanceof ReferenceError; } return false;",
     ) {
@@ -2816,11 +2829,11 @@ fn compiles_known_global_builtins_to_environment_aware_bytecode() -> () {
     match builtins::install(context) {
         Ok(_) => (),
         Err(value) => testing::fail(value.message),
-    };
+    }
     match context.execute(function) {
         Ok(value) => expect_int(value, 7),
         Err(value) => testing::fail(value.kind.debug()),
-    };
+    }
     let type_function = expect_function(compile("return typeof Math;"));
     match context.execute(type_function) {
         Ok(runtime::Value::String(value)) => match value.to_host_string() {
@@ -3172,15 +3185,15 @@ fn rejects_duplicate_and_strict_non_simple_parameters() -> () {
     match compile("function duplicate(a, a) { 'use strict'; }") {
         Err(errors) => testing::assert(has_message(errors, "duplicate parameter")),
         Ok(_) => testing::fail("expected strict duplicate parameter diagnostic"),
-    };
+    }
     match compile("function defaulted(a = 1) { 'use strict'; }") {
         Err(errors) => testing::assert(has_message(errors, "non-simple parameter list")),
         Ok(_) => testing::fail("expected strict non-simple parameter diagnostic"),
-    };
+    }
     match compile("let arrow = (a, a) => a;") {
         Err(errors) => testing::assert(has_message(errors, "duplicate parameter")),
         Ok(_) => testing::fail("expected arrow duplicate parameter diagnostic"),
-    };
+    }
     match compile("let object = {method(a, a) { return a; }};") {
         Err(errors) => testing::assert(has_message(errors, "duplicate parameter")),
         Ok(_) => testing::fail("expected method duplicate parameter diagnostic"),
@@ -3194,7 +3207,7 @@ fn applies_strict_and_sloppy_this_binding_rules() -> () {
     ) {
         runtime::Value::Bool(value) => testing::assert(value),
         _ => testing::fail("expected this binding result"),
-    };
+    }
     match execute_source_with_builtins(
         "'use strict'; function inherited() { return this; } return this === globalThis && inherited() === undefined;",
     ) {
@@ -3210,7 +3223,7 @@ fn enforces_strict_property_writes_and_deletes() -> () {
     ) {
         runtime::Value::Bool(value) => testing::assert(value),
         _ => testing::fail("expected strict property result"),
-    };
+    }
     match compile("function invalid(binding) { 'use strict'; return delete binding; }") {
         Err(errors) => testing::assert(has_message(errors, "identifier deletion")),
         Ok(_) => testing::fail("expected strict identifier deletion diagnostic"),
@@ -3739,7 +3752,7 @@ fn finalization_registry_uses_active_vm_roots_and_runs_after_gc() -> () {
     match builtins::install(context) {
         Ok(_) => (),
         Err(value) => testing::fail(value.message),
-    };
+    }
     let verify = match context.execute(function) {
         Ok(value) => value,
         Err(error) => {
@@ -3751,7 +3764,7 @@ fn finalization_registry_uses_active_vm_roots_and_runs_after_gc() -> () {
     match jobs {
         Ok(count) => testing::assert_eq(count, 1),
         Err(error) => testing::fail(error.kind.debug()),
-    };
+    }
     let arguments: Vec[runtime::Value] = Vec::new();
     let verification: Result[runtime::Value, vm::VmError] = context.invoke_with_this_at_depth(
         verify,
@@ -3995,7 +4008,7 @@ fn with_statement_evaluates_object_and_executes_body() -> () {
             testing::assert(value == runtime::JsString::from_code_units(Vec::from_array([111, 98])))
         },
         _ => testing::fail("expected with statement result"),
-    };
+    }
     match execute_source_with_builtins(
         "let outer = {x: 'outer', y: 'outer'}; let x = 'local'; eval(\"var z = 'eval-var'\"); let result = ''; with (outer) { result += x + ':' + eval('x'); let nested = function() { let inner = {x: 'inner'}; with (inner) { return x + ':' + y + ':' + z + ':' + eval('x') + ':' + eval('y') + ':' + eval('z') + ':' + eval('eval(\\\"x\\\")'); } }; result += ':' + nested(); } return result;",
     ) {
@@ -4007,7 +4020,7 @@ fn with_statement_evaluates_object_and_executes_body() -> () {
             Err(value) => testing::fail(value.debug()),
         },
         _ => testing::fail("expected nested with environment result"),
-    };
+    }
     match compile("'use strict'; with ({}) {}") {
         Err(errors) => testing::assert(errors.len() > 0),
         Ok(_) => testing::fail("expected strict with error"),
@@ -4249,17 +4262,17 @@ fn await_context_and_async_constructors_report_compile_errors() -> () {
     match compile("await 1;") {
         Ok(_) => testing::fail("expected await context error"),
         Err(_) => (),
-    };
+    }
     match compile("for await (let value of []) {}") {
         Ok(_) => testing::fail("expected for-await context error"),
         Err(errors) => testing::assert(
             has_message(errors, "await is only valid in async functions"),
         ),
-    };
+    }
     match compile_module("for await (let value of []) {}") {
         Ok(_) => (),
         Err(_) => testing::fail("expected module top-level for-await"),
-    };
+    }
     match compile("class Invalid { async constructor() {} }") {
         Ok(_) => testing::fail("expected async constructor error"),
         Err(errors) => testing::assert(has_message(errors, "class constructor cannot be async")),
@@ -4333,7 +4346,7 @@ fn class_strict_context_rejects_yield_and_static_block_await() -> () {
     ) {
         Ok(_) => (),
         Err(_) => testing::fail("expected nested static block await reset"),
-    };
+    }
     match execute_source_with_builtins(
         "let evalRejected = false; try { class EvalProbe { [eval(\"with ({}) {}\")]() {} } } catch (error) { evalRejected = error instanceof SyntaxError; } let assignmentRejected = false; try { class AssignmentProbe { [strictClassMissing = 1]() {} } } catch (error) { assignmentRejected = error instanceof ReferenceError; } return evalRejected && assignmentRejected && typeof strictClassMissing === 'undefined';",
     ) {
@@ -4349,43 +4362,43 @@ fn enforces_contextual_await_yield_early_errors() -> () {
         Err(errors) => if has_message(errors, "yield") {} else {
             testing::fail("expected strict yield diagnostic")
         },
-    };
+    }
     match compile("'use strict'; var \\u0079ield = 1;") {
         Ok(_) => testing::fail("expected escaped strict yield binding error"),
         Err(errors) => if has_message(errors, "yield") {} else {
             testing::fail("expected escaped strict yield diagnostic")
         },
-    };
+    }
     match compile_module("var await = 1;") {
         Ok(_) => testing::fail("expected module await binding error"),
         Err(errors) => if has_message(errors, "reserved word") {} else {
             testing::fail("expected module await reserved word diagnostic")
         },
-    };
+    }
     match compile_module("function nested() { var await = 1; return await; }") {
         Ok(_) => testing::fail("expected nested module await error"),
         Err(errors) => if has_message(errors, "reserved word") {} else {
             testing::fail("expected nested module await reserved word diagnostic")
         },
-    };
+    }
     match compile("async function invalid(value = await 1) {}") {
         Ok(_) => testing::fail("expected await parameter initializer error"),
         Err(errors) => if has_message(errors, "parameter initializer") {} else {
             testing::fail("expected await parameter initializer diagnostic")
         },
-    };
+    }
     match compile("function* invalid(value = yield 1) {}") {
         Ok(_) => testing::fail("expected yield parameter initializer error"),
         Err(errors) => if has_message(errors, "parameter initializer") {} else {
             testing::fail("expected yield parameter initializer diagnostic")
         },
-    };
+    }
     match compile("async function invalid() { return await 2 ** 3; }") {
         Ok(_) => testing::fail("expected await exponentiation error"),
         Err(errors) => if has_message(errors, "left operand") {} else {
             testing::fail("expected await exponentiation left operand diagnostic")
         },
-    };
+    }
     match compile(
         "async function validAwait(value = () => await) { return (await 2) ** 3 + await (2 ** 3); } function* validYield(value = () => yield) { return value; } async function await() {} function* yield() {}",
     ) {
@@ -4891,7 +4904,7 @@ fn builtin_namespace_imports_bind_std_and_os() -> () {
     ) {
         runtime::Value::Bool(value) => testing::assert(value),
         _ => testing::fail("expected builtin namespace import result"),
-    };
+    }
     match compile("import * as value from './missing.js';") {
         Ok(_) => testing::fail("expected unsupported import diagnostic"),
         Err(errors) => testing::assert(has_message(errors, "unsupported import module")),
@@ -4905,14 +4918,14 @@ fn import_meta_requires_module_compilation() -> () {
         Err(errors) => {
             testing::assert(has_message(errors, "import.meta is only valid in module code"))
         },
-    };
+    }
     match compile_module("export const meta = import.meta;") {
         Ok(value) => {
             testing::assert(value.import_meta_index >= 0);
             testing::assert(!value.function.asynchronous())
         },
         Err(_) => testing::fail("expected import.meta module compilation"),
-    };
+    }
     match compile_module("export const value = await Promise.resolve(42);") {
         Ok(value) => testing::assert(value.function.asynchronous()),
         Err(_) => testing::fail("expected top-level await module compilation"),
@@ -4928,7 +4941,7 @@ fn script_global_lexicals_persist_with_tdz_const_closures_and_context_isolation(
     ) {
         Ok(_) => (),
         Err(value) => testing::fail(value.kind.debug()),
-    };
+    }
     expect_int(execute_script_source(context, "read();").unwrap_or(runtime::Value::Undefined), 42);
     expect_int(
         execute_script_source(context, "hidden = 41; read();").unwrap_or(runtime::Value::Undefined),
@@ -4946,31 +4959,31 @@ fn script_global_lexicals_persist_with_tdz_const_closures_and_context_isolation(
             None => testing::fail("missing global object"),
         },
         None => testing::fail("missing global object"),
-    };
+    }
     match execute_script_source(context, "fixed = 3;") {
         Err(vm::VmError { kind: vm::VmErrorKind::TypeError(_), .. }) => (),
         _ => testing::fail("expected const assignment TypeError"),
-    };
+    }
     match execute_script_source(context, "delete hidden;") {
         Ok(runtime::Value::Bool(value)) => testing::assert(!value),
         _ => testing::fail("expected nondeletable lexical binding"),
-    };
+    }
     match execute_script_source(context, "before; let before = 1;") {
         Err(vm::VmError { kind: vm::VmErrorKind::ReferenceError(_), .. }) => (),
         _ => testing::fail("expected global lexical TDZ ReferenceError"),
-    };
+    }
     match execute_script_source(context, "let pending = missingInitializer();") {
         Err(vm::VmError { kind: vm::VmErrorKind::ReferenceError(_), .. }) => (),
         _ => testing::fail("expected failing lexical initializer"),
-    };
+    }
     match execute_script_source(context, "typeof pending;") {
         Err(vm::VmError { kind: vm::VmErrorKind::ReferenceError(_), .. }) => (),
         _ => testing::fail("expected persistent uninitialized lexical binding"),
-    };
+    }
     match execute_script_source(context, "var earlier; let hidden;") {
         Err(vm::VmError { kind: vm::VmErrorKind::SyntaxError(_), .. }) => (),
         _ => testing::fail("expected cross-Script declaration conflict"),
-    };
+    }
     match context.global_object() {
         Some(global) => match context.heap().get(global) {
             Some(value) => testing::assert(
@@ -4979,14 +4992,14 @@ fn script_global_lexicals_persist_with_tdz_const_closures_and_context_isolation(
             None => testing::fail("missing global object"),
         },
         None => testing::fail("missing global object"),
-    };
+    }
     match execute_script_source(
         context,
         "let rooted = {value: 9}; function rootedValue() { return rooted.value; }",
     ) {
         Ok(_) => (),
         Err(value) => testing::fail(value.kind.debug()),
-    };
+    }
     let _ = context.collect_garbage();
     expect_int(
         execute_script_source(context, "rootedValue();").unwrap_or(runtime::Value::Undefined),
@@ -5005,7 +5018,7 @@ fn eval_script_persists_lexicals_while_indirect_and_shadowed_eval_do_not() -> ()
     match execute_script_source(context, "std.evalScript('let persisted = 40; persisted + 2');") {
         Ok(value) => expect_int(value, 42),
         Err(value) => testing::fail(value.kind.debug()),
-    };
+    }
     expect_int(
         execute_script_source(context, "std.evalScript('persisted');").unwrap_or(
             runtime::Value::Undefined,
@@ -5028,7 +5041,7 @@ fn eval_script_persists_lexicals_while_indirect_and_shadowed_eval_do_not() -> ()
     match execute_script_source(context, "let eval = function() { return 7; };") {
         Ok(_) => (),
         Err(value) => testing::fail(value.kind.debug()),
-    };
+    }
     expect_int(
         execute_script_source(context, "eval('var leaked = 1');").unwrap_or(
             runtime::Value::Undefined,
@@ -5054,7 +5067,7 @@ fn eval_script_persists_lexicals_while_indirect_and_shadowed_eval_do_not() -> ()
             None => testing::fail("missing global object"),
         },
         None => testing::fail("missing global object"),
-    };
+    }
     let replaced = script_test_context();
     expect_int(
         execute_script_source(
@@ -5101,7 +5114,7 @@ fn script_var_and_function_descriptors_follow_global_instantiation_rules() -> ()
     match execute_script_source(context, "var createdVar; function createdFunction() {}") {
         Ok(_) => (),
         Err(value) => testing::fail(value.kind.debug()),
-    };
+    }
     let global = match context.global_object() {
         Some(value) => value,
         None => {
@@ -5122,22 +5135,22 @@ fn script_var_and_function_descriptors_follow_global_instantiation_rules() -> ()
             }
         },
         None => testing::fail("missing global object"),
-    };
+    }
     match execute_script_source(context, "delete createdVar;") {
         Ok(runtime::Value::Bool(value)) => testing::assert(!value),
         _ => testing::fail("expected nondeletable Script var"),
-    };
+    }
     match execute_script_source(
         context,
         "Object.defineProperty(globalThis, 'reusable', {value: 1, writable: true, enumerable: false, configurable: true});",
     ) {
         Ok(_) => (),
         Err(value) => testing::fail(value.kind.debug()),
-    };
+    }
     match execute_script_source(context, "var reusable;") {
         Ok(_) => (),
         Err(value) => testing::fail(value.kind.debug()),
-    };
+    }
     match context.heap().get(global).and_then(
         |value| value.own_property(runtime::string_property_key("reusable")),
     ) {
@@ -5150,11 +5163,11 @@ fn script_var_and_function_descriptors_follow_global_instantiation_rules() -> ()
             }
         },
         None => testing::fail("missing reusable property"),
-    };
+    }
     match execute_script_source(context, "let reusable = 2; reusable;") {
         Ok(value) => expect_int(value, 2),
         Err(value) => testing::fail(value.kind.debug()),
-    };
+    }
     expect_int(
         execute_script_source(context, "globalThis.reusable;").unwrap_or(runtime::Value::Undefined),
         1,
@@ -5167,37 +5180,37 @@ fn script_instantiation_checks_conflicts_in_source_declaration_order() -> () {
     match execute_script_source(function_first, "let existing = 1;") {
         Ok(_) => (),
         Err(value) => testing::fail(value.kind.debug()),
-    };
+    }
     match execute_script_source(function_first, "Object.preventExtensions(globalThis);") {
         Ok(_) => (),
         Err(value) => testing::fail(value.kind.debug()),
-    };
+    }
     match execute_script_source(function_first, "function missing() {} let existing;") {
         Err(vm::VmError { kind: vm::VmErrorKind::TypeError(_), .. }) => (),
         _ => testing::fail("expected earlier function declaration TypeError"),
-    };
+    }
     let lexical_first = script_test_context();
     match execute_script_source(lexical_first, "let existing = 1;") {
         Ok(_) => (),
         Err(value) => testing::fail(value.kind.debug()),
-    };
+    }
     match execute_script_source(lexical_first, "Object.preventExtensions(globalThis);") {
         Ok(_) => (),
         Err(value) => testing::fail(value.kind.debug()),
-    };
+    }
     match execute_script_source(lexical_first, "let existing; function missing() {}") {
         Err(vm::VmError { kind: vm::VmErrorKind::SyntaxError(_), .. }) => (),
         _ => testing::fail("expected earlier lexical declaration SyntaxError"),
-    };
+    }
     let nested_var_first = script_test_context();
     match execute_script_source(nested_var_first, "let existing = 1;") {
         Ok(_) => (),
         Err(value) => testing::fail(value.kind.debug()),
-    };
+    }
     match execute_script_source(nested_var_first, "Object.preventExtensions(globalThis);") {
         Ok(_) => (),
         Err(value) => testing::fail(value.kind.debug()),
-    };
+    }
     match execute_script_source(nested_var_first, "if (true) { var nestedMissing; } let existing;") {
         Err(vm::VmError { kind: vm::VmErrorKind::TypeError(_), .. }) => (),
         _ => testing::fail("expected nested var source-order TypeError"),
@@ -5210,7 +5223,7 @@ fn strict_unresolvable_assignment_preserves_the_pre_rhs_reference() -> () {
     match execute_script_source(context, "'use strict'; undeclared = (globalThis.undeclared = 5);") {
         Err(vm::VmError { kind: vm::VmErrorKind::ReferenceError(_), .. }) => (),
         _ => testing::fail("expected unresolved strict assignment ReferenceError"),
-    };
+    }
     expect_int(
         execute_script_source(context, "globalThis.undeclared;").unwrap_or(
             runtime::Value::Undefined,
