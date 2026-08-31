@@ -111,20 +111,6 @@ fn weak_ref_state(states: HashMap[runtime::ObjectId, bool], value: runtime::Valu
     }
 }
 
-fn map_construct(
-    heap: runtime::Heap,
-    states: HashMap[runtime::ObjectId, collections::JsMap],
-    prototype: runtime::ObjectId,
-    this_value: runtime::Value,
-    arguments: Vec[runtime::Value],
-) -> Result[runtime::Value, vm::NativeError] {
-    let _ = this_value;
-    let _ = arguments;
-    let object = allocate_ordinary(heap, Option::Some(prototype))?;
-    states[object] = collections::JsMap::new();
-    Result::Ok(runtime::Value::Object(object))
-}
-
 fn map_get(
     heap: runtime::Heap,
     states: HashMap[runtime::ObjectId, collections::JsMap],
@@ -254,86 +240,6 @@ fn pair_array(heap: runtime::Heap, key: runtime::Value, value: runtime::Value) -
     Result::Ok(runtime::Value::Object(object))
 }
 
-fn map_entries(
-    heap: runtime::Heap,
-    states: HashMap[runtime::ObjectId, collections::JsMap],
-    this_value: runtime::Value,
-    arguments: Vec[runtime::Value],
-) -> Result[runtime::Value, vm::NativeError] {
-    let _ = arguments;
-    let entries = map_state(states, this_value)?.entries();
-    let object = allocate_array(heap, Vec::new(), entries.len())?;
-    let mut index = 0;
-    while index < entries.len() {
-        define_data(
-            heap,
-            object,
-            runtime::string_property_key(index.to_string()),
-            pair_array(heap, entries[index].key, entries[index].value)?,
-            true,
-            true,
-            true,
-        )?;
-        index += 1;
-    }
-    Result::Ok(runtime::Value::Object(object))
-}
-
-fn values_array(heap: runtime::Heap, values: Vec[runtime::Value]) -> Result[
-    runtime::Value,
-    vm::NativeError,
-] {
-    let object = allocate_array(heap, Vec::new(), values.len())?;
-    let mut index = 0;
-    while index < values.len() {
-        define_data(
-            heap,
-            object,
-            runtime::string_property_key(index.to_string()),
-            values[index],
-            true,
-            true,
-            true,
-        )?;
-        index += 1;
-    }
-    Result::Ok(runtime::Value::Object(object))
-}
-
-fn map_keys(
-    heap: runtime::Heap,
-    states: HashMap[runtime::ObjectId, collections::JsMap],
-    this_value: runtime::Value,
-    arguments: Vec[runtime::Value],
-) -> Result[runtime::Value, vm::NativeError] {
-    let _ = arguments;
-    values_array(heap, map_state(states, this_value)?.keys())
-}
-
-fn map_values(
-    heap: runtime::Heap,
-    states: HashMap[runtime::ObjectId, collections::JsMap],
-    this_value: runtime::Value,
-    arguments: Vec[runtime::Value],
-) -> Result[runtime::Value, vm::NativeError] {
-    let _ = arguments;
-    values_array(heap, map_state(states, this_value)?.values())
-}
-
-fn set_construct(
-    heap: runtime::Heap,
-    states: HashMap[runtime::ObjectId, collections::JsSet],
-    prototype: runtime::ObjectId,
-    this_value: runtime::Value,
-    arguments: Vec[runtime::Value],
-) -> Result[runtime::Value, vm::NativeError] {
-    let _ = this_value;
-    let _ = arguments;
-    let object = allocate_ordinary(heap, Option::Some(prototype))?;
-    states[object] = collections::JsSet::new();
-    Result::Ok(runtime::Value::Object(object))
-}
-
 fn set_add(
     heap: runtime::Heap,
     states: HashMap[runtime::ObjectId, collections::JsSet],
@@ -386,16 +292,6 @@ fn set_size(
     let _ = heap;
     let _ = arguments;
     Result::Ok(array_length_value(set_state(states, this_value)?.size()))
-}
-
-fn set_values(
-    heap: runtime::Heap,
-    states: HashMap[runtime::ObjectId, collections::JsSet],
-    this_value: runtime::Value,
-    arguments: Vec[runtime::Value],
-) -> Result[runtime::Value, vm::NativeError] {
-    let _ = arguments;
-    values_array(heap, set_state(states, this_value)?.values())
 }
 
 fn weak_map_get(
@@ -478,7 +374,7 @@ fn weak_map_get_or_insert(
     let key = argument(arguments, 0);
     if !runtime::is_weak_target(context.heap(), key) {
         return Result::Err(function_vm_error("invalid value used as WeakMap key"))
-    } else {};
+    }
     match runtime::weak_map_get(context.heap(), object, key) {
         Some(value) => Result::Ok(value),
         None => {
@@ -592,7 +488,7 @@ fn finalization_registry_register(
         return Result::Err(native_error("FinalizationRegistry target is invalid"))
     } else if runtime::same_value(target, held) {
         return Result::Err(native_error("FinalizationRegistry held value cannot be the target"))
-    } else {};
+    }
     let token = match argument(arguments, 2) {
         runtime::Value::Undefined => Option::None,
         value => if runtime::is_weak_target(heap, value) {
@@ -724,36 +620,6 @@ fn set_collection_gc_edges(
     edges
 }
 
-fn collection_iterator_object(context: vm::Context, next: runtime::Value) -> Result[
-    runtime::Value,
-    vm::VmError,
-] {
-    let iterator = iterator_allocate_object(context)?;
-    if !runtime::define_own_property(
-        context.heap(),
-        iterator,
-        runtime::string_property_key("next"),
-        runtime::data_descriptor(next, true, false, true),
-    ) {
-        return Result::Err(function_vm_error("cannot define collection iterator next"))
-    } else {};
-    let symbol = match context.iterator_symbol() {
-        Some(value) => value,
-        None => return Result::Ok(runtime::Value::Object(iterator)),
-    };
-    let identity = context.new_native_function(array_iterator_identity)?;
-    if !runtime::define_own_property(
-        context.heap(),
-        iterator,
-        runtime::PropertyKey::Symbol(symbol),
-        runtime::data_descriptor(identity, true, false, true),
-    ) {
-        Result::Err(function_vm_error("cannot define collection iterator identity"))
-    } else {
-        Result::Ok(runtime::Value::Object(iterator))
-    }
-}
-
 fn map_iterator_value(context: vm::Context, kind: MapIteratorKind, entry: collections::MapEntry) -> Result[
     runtime::Value,
     vm::VmError,
@@ -802,7 +668,7 @@ fn map_iterator_next(
     };
     if iterator_state.done.get() {
         return array_iterator_result(context, runtime::Value::Undefined, true)
-    } else {};
+    }
     let state = match states.get(iterator_state.source) {
         Some(value) => value,
         None => return Result::Err(function_vm_error("Map iterator has an invalid receiver")),
@@ -868,7 +734,7 @@ fn create_map_iterator(
     };
     if states.get(object).is_none() {
         return Result::Err(function_vm_error("Map method called on incompatible receiver"))
-    } else {};
+    }
     let iterator = match allocate_ordinary(context.heap(), Option::Some(iterator_prototype)) {
         Ok(value) => value,
         Err(value) => return Result::Err(function_vm_error(value.message)),
@@ -928,7 +794,7 @@ fn set_iterator_next(
     };
     if iterator_state.done.get() {
         return array_iterator_result(context, runtime::Value::Undefined, true)
-    } else {};
+    }
     let state = match states.get(iterator_state.source) {
         Some(value) => value,
         None => return Result::Err(function_vm_error("Set iterator has an invalid receiver")),
@@ -994,7 +860,7 @@ fn create_set_iterator(
     };
     if states.get(object).is_none() {
         return Result::Err(function_vm_error("Set method called on incompatible receiver"))
-    } else {};
+    }
     let iterator = match allocate_ordinary(context.heap(), Option::Some(iterator_prototype)) {
         Ok(value) => value,
         Err(value) => return Result::Err(function_vm_error(value.message)),
@@ -1054,7 +920,7 @@ fn map_for_each(
                 )?;
             },
             None => (),
-        };
+        }
         index += 1;
     }
     Result::Ok(runtime::Value::Undefined)
@@ -1089,7 +955,7 @@ fn set_for_each(
                 )?;
             },
             None => (),
-        };
+        }
         index += 1;
     }
     Result::Ok(runtime::Value::Undefined)
@@ -1107,15 +973,15 @@ fn collection_iterator_start(context: vm::Context, source: runtime::Value, depth
     match method {
         runtime::Value::Object(object) => if !object.is_callable() {
             return Result::Err(function_vm_error("iterator method is not callable"))
-        } else {},
+        },
         _ => return Result::Err(function_vm_error("value is not iterable")),
-    };
+    }
     let arguments: Vec[runtime::Value] = Vec::new();
     let iterator = context.invoke_with_this_at_depth(method, arguments, source, depth)?;
     match iterator {
         runtime::Value::Object(_) => (),
         _ => return Result::Err(function_vm_error("iterator result is not an object")),
-    };
+    }
     let next = context.read_property_at_depth(
         iterator,
         runtime::Value::String(js_string("next")),
@@ -1142,7 +1008,7 @@ fn collection_iterator_step(
     match result {
         runtime::Value::Object(_) => (),
         _ => return Result::Err(function_vm_error("iterator next result is not an object")),
-    };
+    }
     let done = context.read_property_at_depth(
         result,
         runtime::Value::String(js_string("done")),
@@ -1258,7 +1124,7 @@ fn map_group_by(
                     function_vm_error(value.to_string()),
                 )
             },
-        };
+        }
         count += 1;
     }
     collection_close_with_error(
@@ -1348,7 +1214,7 @@ fn set_record_iterator(context: vm::Context, record: SetRecord, depth: isize) ->
     match iterator {
         runtime::Value::Object(_) => (),
         _ => return Result::Err(function_vm_error("set-like keys result is not an object")),
-    };
+    }
     let next = set_record_callable(
         context.read_property_at_depth(iterator, runtime::Value::String(js_string("next")), depth)?,
         "next",
@@ -1401,9 +1267,9 @@ fn set_is_disjoint_from(
             match state.value_at(index) {
                 Some(value) => if set_record_has(context, record, value, depth)? {
                     return Result::Ok(runtime::Value::Bool(false))
-                } else {},
+                },
                 None => (),
-            };
+            }
             index += 1;
         }
     } else {
@@ -1414,9 +1280,9 @@ fn set_is_disjoint_from(
                 Some(value) => if state.has(value) {
                     array_from_close(context, started.0, depth)?;
                     return Result::Ok(runtime::Value::Bool(false))
-                } else {},
+                },
                 None => return Result::Ok(runtime::Value::Bool(true)),
-            };
+            }
             count += 1;
         }
         return collection_close_with_error(
@@ -1425,7 +1291,7 @@ fn set_is_disjoint_from(
             depth,
             function_range_error("set-like keys iterator exceeds implementation limit"),
         )
-    };
+    }
     Result::Ok(runtime::Value::Bool(true))
 }
 
@@ -1443,15 +1309,15 @@ fn set_is_subset_of(
     let record = get_set_record(context, argument(arguments, 0), depth)?;
     if state.size() > record.size {
         return Result::Ok(runtime::Value::Bool(false))
-    } else {};
+    }
     let mut index = 0;
     while index < state.slot_len() {
         match state.value_at(index) {
             Some(value) => if !set_record_has(context, record, value, depth)? {
                 return Result::Ok(runtime::Value::Bool(false))
-            } else {},
+            },
             None => (),
-        };
+        }
         index += 1;
     }
     Result::Ok(runtime::Value::Bool(true))
@@ -1471,7 +1337,7 @@ fn set_is_superset_of(
     let record = get_set_record(context, argument(arguments, 0), depth)?;
     if state.size() < record.size {
         return Result::Ok(runtime::Value::Bool(false))
-    } else {};
+    }
     let started = set_record_iterator(context, record, depth)?;
     let mut count = 0;
     while count < ARRAY_FROM_LIMIT {
@@ -1479,9 +1345,9 @@ fn set_is_superset_of(
             Some(value) => if !state.has(value) {
                 array_from_close(context, started.0, depth)?;
                 return Result::Ok(runtime::Value::Bool(false))
-            } else {},
+            },
             None => return Result::Ok(runtime::Value::Bool(true)),
-        };
+        }
         count += 1;
     }
     collection_close_with_error(
@@ -1513,9 +1379,9 @@ fn set_intersection(
             match collection_iterator_step(context, started.0, started.1, depth)? {
                 Some(value) => if state.has(value) {
                     result.1.add(value)
-                } else {},
+                },
                 None => return Result::Ok(result.0),
-            };
+            }
             count += 1;
         }
         collection_close_with_error(
@@ -1530,9 +1396,9 @@ fn set_intersection(
             match state.value_at(index) {
                 Some(value) => if set_record_has(context, record, value, depth)? {
                     result.1.add(value)
-                } else {},
+                },
                 None => (),
-            };
+            }
             index += 1;
         }
         Result::Ok(result.0)
@@ -1559,9 +1425,9 @@ fn set_difference(
             match result.1.value_at(index) {
                 Some(value) => if set_record_has(context, record, value, depth)? {
                     let _ = result.1.delete(value);
-                } else {},
+                },
                 None => (),
-            };
+            }
             index += 1;
         }
         Result::Ok(result.0)
@@ -1574,7 +1440,7 @@ fn set_difference(
                     let _ = result.1.delete(value);
                 },
                 None => return Result::Ok(result.0),
-            };
+            }
             count += 1;
         }
         collection_close_with_error(
@@ -1608,9 +1474,9 @@ fn set_symmetric_difference(
                 let _ = result.1.delete(value);
             } else if !result.1.has(value) {
                 result.1.add(value)
-            } else {},
+            },
             None => return Result::Ok(result.0),
-        };
+        }
         count += 1;
     }
     collection_close_with_error(
@@ -1641,7 +1507,7 @@ fn set_union(
         match collection_iterator_step(context, started.0, started.1, depth)? {
             Some(value) => result.1.add(value),
             None => return Result::Ok(result.0),
-        };
+        }
         count += 1;
     }
     collection_close_with_error(
@@ -1671,7 +1537,7 @@ fn initialize_map(
             return Result::Ok(runtime::Value::Object(object))
         },
         _ => (),
-    };
+    }
     let adder = context.read_property_at_depth(
         this_value,
         runtime::Value::String(js_string("set")),
@@ -1680,9 +1546,9 @@ fn initialize_map(
     match adder {
         runtime::Value::Object(value) => if !value.is_callable() {
             return Result::Err(function_vm_error("Map set method is not callable"))
-        } else {},
+        },
         _ => return Result::Err(function_vm_error("Map set method is not callable")),
-    };
+    }
     let started = collection_iterator_start(context, source, depth)?;
     let iterator = started.0;
     let next = started.1;
@@ -1702,7 +1568,7 @@ fn initialize_map(
                     function_vm_error("Map iterator value is not an object"),
                 )
             },
-        };
+        }
         let key = match context.read_property_at_depth(entry, runtime::Value::Int(0), depth) {
             Ok(value) => value,
             Err(value) => return collection_close_with_error(context, iterator, depth, value),
@@ -1719,7 +1585,7 @@ fn initialize_map(
         ) {
             Ok(_) => (),
             Err(value) => return collection_close_with_error(context, iterator, depth, value),
-        };
+        }
         count += 1;
     }
     collection_close_with_error(
@@ -1749,7 +1615,7 @@ fn initialize_set(
             return Result::Ok(runtime::Value::Object(object))
         },
         _ => (),
-    };
+    }
     let adder = context.read_property_at_depth(
         this_value,
         runtime::Value::String(js_string("add")),
@@ -1758,9 +1624,9 @@ fn initialize_set(
     match adder {
         runtime::Value::Object(value) => if !value.is_callable() {
             return Result::Err(function_vm_error("Set add method is not callable"))
-        } else {},
+        },
         _ => return Result::Err(function_vm_error("Set add method is not callable")),
-    };
+    }
     let started = collection_iterator_start(context, source, depth)?;
     let iterator = started.0;
     let next = started.1;
@@ -1779,7 +1645,7 @@ fn initialize_set(
                 },
             },
             None => return Result::Ok(runtime::Value::Object(object)),
-        };
+        }
         count += 1;
     }
     collection_close_with_error(
@@ -1808,7 +1674,7 @@ fn initialize_weak_map(
             return Result::Ok(runtime::Value::Object(object))
         },
         _ => (),
-    };
+    }
     let adder = context.read_property_at_depth(
         this_value,
         runtime::Value::String(js_string("set")),
@@ -1817,9 +1683,9 @@ fn initialize_weak_map(
     match adder {
         runtime::Value::Object(value) => if !value.is_callable() {
             return Result::Err(function_vm_error("WeakMap set method is not callable"))
-        } else {},
+        },
         _ => return Result::Err(function_vm_error("WeakMap set method is not callable")),
-    };
+    }
     let started = collection_iterator_start(context, source, depth)?;
     let iterator = started.0;
     let next = started.1;
@@ -1839,7 +1705,7 @@ fn initialize_weak_map(
                     function_vm_error("WeakMap iterator value is not an object"),
                 )
             },
-        };
+        }
         let key = match context.read_property_at_depth(entry, runtime::Value::Int(0), depth) {
             Ok(value) => value,
             Err(value) => return collection_close_with_error(context, iterator, depth, value),
@@ -1856,7 +1722,7 @@ fn initialize_weak_map(
         ) {
             Ok(_) => (),
             Err(value) => return collection_close_with_error(context, iterator, depth, value),
-        };
+        }
         count += 1;
     }
     collection_close_with_error(
@@ -1885,7 +1751,7 @@ fn initialize_weak_set(
             return Result::Ok(runtime::Value::Object(object))
         },
         _ => (),
-    };
+    }
     let adder = context.read_property_at_depth(
         this_value,
         runtime::Value::String(js_string("add")),
@@ -1894,9 +1760,9 @@ fn initialize_weak_set(
     match adder {
         runtime::Value::Object(value) => if !value.is_callable() {
             return Result::Err(function_vm_error("WeakSet add method is not callable"))
-        } else {},
+        },
         _ => return Result::Err(function_vm_error("WeakSet add method is not callable")),
-    };
+    }
     let started = collection_iterator_start(context, source, depth)?;
     let iterator = started.0;
     let next = started.1;
@@ -1915,7 +1781,7 @@ fn initialize_weak_set(
                 },
             },
             None => return Result::Ok(runtime::Value::Object(object)),
-        };
+        }
         count += 1;
     }
     collection_close_with_error(
@@ -2101,7 +1967,7 @@ fn install_map(context: vm::Context, iterator_prototype: runtime::ObjectId) -> R
         runtime::accessor_descriptor(Option::Some(size), Option::None, false, true),
     ) {
         return Result::Err(BuiltinError { message: "cannot define Map size" })
-    } else {};
+    }
     let entries = allocate_vm_function(
         context,
         "Map.prototype.entries",
@@ -2175,9 +2041,9 @@ fn install_map(context: vm::Context, iterator_prototype: runtime::ObjectId) -> R
             runtime::data_descriptor(entries, true, false, true),
         ) {
             return Result::Err(BuiltinError { message: "cannot define Map iterator" })
-        } else {},
+        },
         None => (),
-    };
+    }
     let constructor = allocate_vm_function(
         context,
         "Map",
@@ -2216,10 +2082,10 @@ fn install_map(context: vm::Context, iterator_prototype: runtime::ObjectId) -> R
                 runtime::accessor_descriptor(Option::Some(getter), Option::None, false, true),
             ) {
                 return Result::Err(BuiltinError { message: "cannot define Map species" })
-            } else {}
+            }
         },
         None => (),
-    };
+    }
     define_value(heap, prototype, "constructor", constructor, true, true)?;
     define_to_string_tag(context, prototype, "Map")?;
     match context.set_vm_constructor_callback(
@@ -2237,7 +2103,7 @@ fn install_map(context: vm::Context, iterator_prototype: runtime::ObjectId) -> R
     ) {
         Ok(()) => (),
         Err(value) => return Result::Err(BuiltinError { message: value.kind.debug() }),
-    };
+    }
     Result::Ok(MapInstallData { constructor, prototype, states })
 }
 
@@ -2321,7 +2187,7 @@ fn install_set(context: vm::Context, map: MapInstallData, iterator_prototype: ru
         runtime::accessor_descriptor(Option::Some(size), Option::None, false, true),
     ) {
         return Result::Err(BuiltinError { message: "cannot define Set size" })
-    } else {};
+    }
     let values = allocate_vm_function(
         context,
         "Set.prototype.values",
@@ -2462,9 +2328,9 @@ fn install_set(context: vm::Context, map: MapInstallData, iterator_prototype: ru
             runtime::data_descriptor(values, true, false, true),
         ) {
             return Result::Err(BuiltinError { message: "cannot define Set iterator" })
-        } else {},
+        },
         None => (),
-    };
+    }
     let constructor = allocate_vm_function(
         context,
         "Set",
@@ -2503,10 +2369,10 @@ fn install_set(context: vm::Context, map: MapInstallData, iterator_prototype: ru
                 runtime::accessor_descriptor(Option::Some(getter), Option::None, false, true),
             ) {
                 return Result::Err(BuiltinError { message: "cannot define Set species" })
-            } else {}
+            }
         },
         None => (),
-    };
+    }
     define_value(heap, prototype, "constructor", constructor, true, true)?;
     define_to_string_tag(context, prototype, "Set")?;
     match context.set_vm_constructor_callback(
@@ -2524,7 +2390,7 @@ fn install_set(context: vm::Context, map: MapInstallData, iterator_prototype: ru
     ) {
         Ok(()) => (),
         Err(value) => return Result::Err(BuiltinError { message: value.kind.debug() }),
-    };
+    }
     Result::Ok(constructor)
 }
 
@@ -2641,7 +2507,7 @@ fn install_weak_map(context: vm::Context) -> Result[runtime::Value, BuiltinError
     ) {
         Ok(()) => (),
         Err(value) => return Result::Err(BuiltinError { message: value.kind.debug() }),
-    };
+    }
     Result::Ok(constructor)
 }
 
@@ -2714,7 +2580,7 @@ fn install_weak_set(context: vm::Context) -> Result[runtime::Value, BuiltinError
     ) {
         Ok(()) => (),
         Err(value) => return Result::Err(BuiltinError { message: value.kind.debug() }),
-    };
+    }
     Result::Ok(constructor)
 }
 
@@ -2766,7 +2632,7 @@ fn install_weak_ref(context: vm::Context) -> Result[runtime::Value, BuiltinError
     ) {
         Ok(()) => (),
         Err(value) => return Result::Err(BuiltinError { message: value.kind.debug() }),
-    };
+    }
     Result::Ok(constructor)
 }
 
@@ -2824,7 +2690,7 @@ fn install_finalization_registry(context: vm::Context) -> Result[runtime::Value,
         runtime::Value::Object(callback_name),
     ) {
         return Result::Err(BuiltinError { message: "cannot root FinalizationRegistry state" })
-    } else {};
+    }
     define_value(heap, object, "prototype", runtime::Value::Object(prototype), false, false)?;
     define_value(heap, prototype, "constructor", constructor, true, true)?;
     match context.set_vm_constructor_callback(
@@ -2848,7 +2714,7 @@ fn install_finalization_registry(context: vm::Context) -> Result[runtime::Value,
     ) {
         Ok(()) => (),
         Err(value) => return Result::Err(BuiltinError { message: value.kind.debug() }),
-    };
+    }
     Result::Ok(constructor)
 }
 

@@ -66,7 +66,7 @@ fn regexp_gc_edges(heap: runtime::Heap, states: HashMap[runtime::ObjectId, RegEx
     for (object, _) in states.entries() {
         if !heap.contains(object) {
             stale.push(object)
-        } else {}
+        }
     }
     for object in stale {
         let _ = states.remove(object);
@@ -130,7 +130,7 @@ fn append_source_escape(output: Vec[u16], value: u16) -> () {
 fn regexp_source(pattern: runtime::JsString) -> runtime::JsString {
     if pattern.len() == 0 {
         return js_string("(?:)")
-    } else {};
+    }
     let output: Vec[u16] = Vec::with_capacity(pattern.len());
     let mut index = 0;
     while index < pattern.len() {
@@ -139,7 +139,7 @@ fn regexp_source(pattern: runtime::JsString) -> runtime::JsString {
             append_source_escape(output, value)
         } else {
             output.push(value)
-        };
+        }
         index += 1;
     }
     runtime::JsString::from_code_units(output)
@@ -149,28 +149,28 @@ fn canonical_flags(flags: regexp::RegexFlags) -> string {
     let mut output = "";
     if flags.has_indices {
         output += "d";
-    } else {};
+    }
     if flags.global {
         output += "g";
-    } else {};
+    }
     if flags.ignore_case {
         output += "i";
-    } else {};
+    }
     if flags.multiline {
         output += "m";
-    } else {};
+    }
     if flags.dot_all {
         output += "s";
-    } else {};
+    }
     if flags.unicode {
         output += "u";
-    } else {};
+    }
     if flags.unicode_sets {
         output += "v";
-    } else {};
+    }
     if flags.sticky {
         output += "y";
-    } else {};
+    }
     output
 }
 
@@ -203,9 +203,9 @@ fn new_regexp_state_with_cache(
                 match cache {
                     Some(cache) => if cache.len() < 256 {
                         cache[key] = value;
-                    } else {},
+                    },
                     None => (),
-                };
+                }
                 value
             },
             Err(value) => return Result::Err(regexp_compile_error(value)),
@@ -228,13 +228,6 @@ fn new_regexp_state_with_cache(
             sticky: parsed.sticky,
         },
     )
-}
-
-fn new_regexp_state(pattern: runtime::JsString, requested_flags: runtime::JsString) -> Result[
-    RegExpState,
-    vm::NativeError,
-] {
-    new_regexp_state_with_cache(Option::None, pattern, requested_flags)
 }
 
 fn define_regexp_instance(heap: runtime::Heap, object: runtime::ObjectId, state: RegExpState) -> Result[
@@ -273,7 +266,7 @@ fn regexp_is_regexp_at_depth(
             result => return Result::Ok(runtime::to_boolean(result)),
         },
         None => (),
-    };
+    }
     Result::Ok(states.get(object).is_some())
 }
 
@@ -420,7 +413,7 @@ fn regexp_initialize_rooted_instance_at_depth(
     match define_regexp_instance(context.heap(), object, state) {
         Ok(()) => (),
         Err(value) => return Result::Err(function_native_error(value)),
-    };
+    }
     states[object] = state;
     if context.set_object_builtin_tag(object, js_string("RegExp")) {
         Result::Ok(runtime::Value::Object(object))
@@ -467,8 +460,8 @@ fn regexp_constructor_call_at_depth(
         )?;
         if runtime::same_value(pattern_constructor, constructor) {
             return Result::Ok(value)
-        } else {}
-    } else {};
+        }
+    }
     let input = regexp_constructor_input_at_depth(context, states, arguments, is_regexp, depth)?;
     regexp_allocate_instance_at_depth(
         context,
@@ -503,7 +496,7 @@ fn regexp_compile_instance_at_depth(
             match requested_flags {
                 runtime::Value::Undefined => (),
                 _ => return Result::Err(function_vm_error("flags must be undefined")),
-            };
+            }
             state
         },
         None => {
@@ -526,7 +519,7 @@ fn regexp_compile_instance_at_depth(
     match set_regexp_last_index(context.heap(), object, 0) {
         Ok(()) => (),
         Err(value) => return Result::Err(function_native_error(value)),
-    };
+    }
     Result::Ok(runtime::Value::Object(object))
 }
 
@@ -547,7 +540,7 @@ fn regexp_state_property(
         } else {
             return Result::Ok(runtime::Value::Undefined)
         }
-    } else {};
+    }
     let state = match states.get(object) {
         Some(value) => value,
         None => return Result::Err(native_error("RegExp method called on incompatible receiver")),
@@ -583,7 +576,7 @@ fn regexp_flags_at_depth(
     match this_value {
         runtime::Value::Object(_) => (),
         _ => return Result::Err(function_vm_error("RegExp flags getter requires an object")),
-    };
+    }
     let mut output = "";
     for (name, flag) in Vec::from_array(
         [
@@ -605,7 +598,7 @@ fn regexp_flags_at_depth(
             )?,
         ) {
             output += flag;
-        } else {}
+        }
     }
     Result::Ok(runtime::Value::String(js_string(output)))
 }
@@ -620,7 +613,7 @@ fn regexp_to_string_at_depth(
     match this_value {
         runtime::Value::Object(_) => (),
         _ => return Result::Err(function_vm_error("RegExp toString requires an object")),
-    };
+    }
     let source = match string_value_at_depth(
         context,
         context.read_property_at_depth(
@@ -682,31 +675,6 @@ fn regexp_last_index_at_depth(
     let number = match number_value_at_depth(context, value, depth)? {
         runtime::Value::Float(value) => value,
         _ => return Result::Err(function_vm_error("RegExp lastIndex is not numeric")),
-    };
-    if math::is_nan(number) || number <= 0.0 {
-        Result::Ok(0)
-    } else if math::is_infinite(number)
-        || number > num::parse_float64_structured(input_length.to_string()).unwrap_or(0.0) {
-        Result::Ok(input_length + 1)
-    } else {
-        Result::Ok(
-            num::parse_int_structured(dtoa::number_to_string(math::floor(number))).unwrap_or(0),
-        )
-    }
-}
-
-fn regexp_last_index(heap: runtime::Heap, object: runtime::ObjectId, input_length: isize) -> Result[
-    isize,
-    vm::NativeError,
-] {
-    let value = match runtime::get_property(heap, object, runtime::string_property_key("lastIndex")) {
-        Ok(Some(value)) => value,
-        Ok(None) => runtime::Value::Undefined,
-        Err(value) => return Result::Err(native_error(value.message)),
-    };
-    let number = match runtime::primitive_to_number(value) {
-        Ok(value) => value,
-        Err(value) => return Result::Err(native_error(value.message)),
     };
     if math::is_nan(number) || number <= 0.0 {
         Result::Ok(0)
@@ -814,7 +782,7 @@ fn regexp_groups_value(heap: runtime::Heap, input: runtime::JsString, found: Loc
     while name_index < found.capture_names.len() {
         if found.capture_names[name_index].is_some() {
             has_named_captures = true;
-        } else {};
+        }
         name_index += 1;
     }
     if has_named_captures {
@@ -842,10 +810,10 @@ fn regexp_groups_value(heap: runtime::Heap, input: runtime::JsString, found: Loc
                     };
                     if should_define {
                         define_data(heap, groups, key, value, true, true, true)?
-                    } else {}
+                    }
                 },
                 None => {},
-            };
+            }
             index += 1;
         }
         Result::Ok(runtime::Value::Object(groups))
@@ -875,7 +843,7 @@ fn regexp_index_groups_value(heap: runtime::Heap, found: LocatedMatch, values: V
 ] {
     if !string_has_named_captures(found) {
         return Result::Ok(runtime::Value::Undefined)
-    } else {};
+    }
     let groups = match runtime::new_null_prototype_object(heap) {
         Ok(value) => value,
         Err(value) => return Result::Err(native_error(value.message)),
@@ -894,10 +862,10 @@ fn regexp_index_groups_value(heap: runtime::Heap, found: LocatedMatch, values: V
                 };
                 if should_define {
                     define_data(heap, groups, key, values[index], true, true, true)?
-                } else {}
+                }
             },
             None => {},
-        };
+        }
         index += 1;
     }
     Result::Ok(runtime::Value::Object(groups))
@@ -933,7 +901,7 @@ fn regexp_match_array(
                 runtime::Value::String(input.slice(capture.start, capture.end)),
             ),
             None => values.push(runtime::Value::Undefined),
-        };
+        }
         index += 1;
     }
     let object = allocate_array(heap, values, values.len())?;
@@ -968,7 +936,7 @@ fn regexp_match_array(
             true,
             true,
         )?
-    } else {};
+    }
     Result::Ok(runtime::Value::Object(object))
 }
 
@@ -1006,7 +974,7 @@ fn regexp_match_at_depth(
                     Ok(()) => (),
                     Err(value) => return Result::Err(function_native_error(value)),
                 }
-            } else {};
+            }
             Result::Ok((state, input, Option::Some(value)))
         },
         None => {
@@ -1015,7 +983,7 @@ fn regexp_match_at_depth(
                     Ok(()) => (),
                     Err(value) => return Result::Err(function_native_error(value)),
                 }
-            } else {};
+            }
             Result::Ok((state, input, Option::None))
         },
     }
@@ -1143,7 +1111,7 @@ fn regexp_test_at_depth(
                                 depth,
                             )?;
                             return Result::Ok(runtime::Value::Bool(found.is_some()))
-                        } else {};
+                        }
                         let result = match exec {
                             runtime::Value::Object(object) => if object.is_callable() {
                                 context.invoke_with_this_at_depth(
@@ -1276,7 +1244,7 @@ fn regexp_escape_static(
             } else {
                 if regexp_escape_syntax(value) {
                     output.push(92)
-                } else {};
+                }
                 output.push(value)
             }
         } else if value < 256 {
@@ -1291,7 +1259,7 @@ fn regexp_escape_static(
             regexp_escape_hex4(output, value)
         } else {
             output.push(value)
-        };
+        }
         index += 1;
     }
     Result::Ok(runtime::Value::String(runtime::JsString::from_code_units(output)))
@@ -1397,14 +1365,14 @@ fn install_regexp_runtime(context: vm::Context) -> Result[RegExpInstall, Builtin
     ) {
         Ok(()) => (),
         Err(value) => return Result::Err(regexp_builtin_error(value.kind.debug())),
-    };
+    }
     match context.set_vm_constructor_prepare_callback(
         constructor,
         |arguments, depth| regexp_constructor_prepare_at_depth(context, states, arguments, depth),
     ) {
         Ok(()) => (),
         Err(value) => return Result::Err(regexp_builtin_error(value.kind.debug())),
-    };
+    }
     let constructor_object = function_object(constructor, "RegExp")?;
     define_value(
         heap,
@@ -1437,15 +1405,15 @@ fn install_regexp_runtime(context: vm::Context) -> Result[RegExpInstall, Builtin
                 runtime::accessor_descriptor(Option::Some(getter), Option::None, false, true),
             ) {
                 return Result::Err(regexp_builtin_error("cannot define RegExp species"))
-            } else {}
+            }
         },
         None => (),
-    };
+    }
     define_value(heap, prototype, "constructor", constructor, true, true)?;
     match context.set_regexp_constructor(constructor) {
         Ok(()) => (),
         Err(_) => return Result::Err(regexp_builtin_error("cannot register RegExp constructor")),
-    };
+    }
     Result::Ok(RegExpInstall { constructor, prototype, states, exec })
 }
 

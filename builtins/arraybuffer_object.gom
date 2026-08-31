@@ -56,7 +56,7 @@ impl ArrayBufferInstall {
         };
         if buffer.is_detached() {
             return Result::Ok(())
-        } else {};
+        }
         match buffer.detach() {
             Ok(()) => Result::Ok(()),
             Err(value) => Result::Err(value.to_string()),
@@ -173,7 +173,7 @@ fn arraybuffer_integer(value: runtime::Value) -> Result[isize, vm::NativeError] 
         return Result::Ok(0)
     } else if math::is_infinite(number) {
         return Result::Err(native_error("RangeError: integer argument is out of range"))
-    } else {};
+    }
     let integer = math::trunc(number);
     if integer < -2147483648.0 || integer > 2147483647.0 {
         Result::Err(native_error("RangeError: integer argument is out of range"))
@@ -286,14 +286,6 @@ fn float32_value(value: f32) -> runtime::Value {
     runtime::Value::Float(arraybuffer::widen_float32(value))
 }
 
-fn float32_argument(arguments: Vec[runtime::Value], index: isize) -> Result[f32, vm::NativeError] {
-    let number = arraybuffer_number(argument(arguments, index))?;
-    match num::parse_float32_structured(dtoa::number_to_string(number)) {
-        Ok(value) => Result::Ok(value),
-        Err(_) => Result::Err(native_error("cannot convert value to Float32")),
-    }
-}
-
 fn array_buffer_state(
     states: HashMap[runtime::ObjectId, arraybuffer::ArrayBuffer],
     value: runtime::Value,
@@ -389,26 +381,6 @@ fn materialize_array_buffer(
     Result::Ok(object)
 }
 
-fn array_buffer_construct(
-    heap: runtime::Heap,
-    states: HashMap[runtime::ObjectId, arraybuffer::ArrayBuffer],
-    prototype: runtime::ObjectId,
-    this_value: runtime::Value,
-    arguments: Vec[runtime::Value],
-) -> Result[runtime::Value, vm::NativeError] {
-    let _ = this_value;
-    let length = if arguments.is_empty() {
-        0
-    } else {
-        arraybuffer_index(arguments[0])?
-    };
-    let value = match arraybuffer::ArrayBuffer::new(length) {
-        Ok(value) => value,
-        Err(value) => return Result::Err(arraybuffer_native_error(value)),
-    };
-    Result::Ok(runtime::Value::Object(materialize_array_buffer(heap, states, prototype, value)?))
-}
-
 fn array_buffer_construct_vm(
     context: vm::Context,
     states: HashMap[runtime::ObjectId, arraybuffer::ArrayBuffer],
@@ -486,7 +458,7 @@ fn array_buffer_prepare_arguments(
         Some(maximum) => {
             if length > maximum {
                 return Result::Err(function_range_error("maxByteLength is smaller than byteLength"))
-            } else {};
+            }
             runtime::Value::Float(maximum)
         },
         None => runtime::Value::Undefined,
@@ -632,7 +604,7 @@ fn array_buffer_slice_at_depth(
     };
     if source.is_detached() {
         return Result::Err(function_vm_error("ArrayBuffer is detached"))
-    } else {};
+    }
     let source_length = source.byte_length();
     let begin = array_copy_start(
         array_copy_integer(context, argument(arguments, 0), 0, depth)?,
@@ -682,7 +654,7 @@ fn array_buffer_slice_at_depth(
     };
     if target_object == source_object {
         return Result::Err(function_vm_error("ArrayBuffer species returned the source buffer"))
-    } else {};
+    }
     let target = match states.get(target_object) {
         Some(value) => value,
         None => return Result::Err(
@@ -696,7 +668,7 @@ fn array_buffer_slice_at_depth(
     } else if source.is_detached() || begin > source.byte_length()
         || count > source.byte_length() - begin {
         return Result::Err(function_vm_error("ArrayBuffer source changed during slice"))
-    } else {};
+    }
     let source_bytes = match source.to_bytes() {
         Ok(value) => value,
         Err(value) => return Result::Err(function_native_error(arraybuffer_native_error(value))),
@@ -921,7 +893,7 @@ fn install_array_buffer_constructor(context: vm::Context) -> Result[
         Err(_) => return Result::Err(
             BuiltinError { message: "cannot register ArrayBuffer constructor" },
         ),
-    };
+    }
     match context.set_vm_constructor_prepare_callback(
         constructor,
         |arguments, depth| array_buffer_prepare_arguments(context, arguments, depth),
@@ -930,7 +902,7 @@ fn install_array_buffer_constructor(context: vm::Context) -> Result[
         Err(_) => return Result::Err(
             BuiltinError { message: "cannot register ArrayBuffer constructor preparation" },
         ),
-    };
+    }
     define_value(heap, prototype, "constructor", constructor, true, true)?;
     Result::Ok((constructor, prototype, states))
 }
@@ -1046,7 +1018,7 @@ fn install_shared_array_buffer_constructor(
         Err(_) => return Result::Err(
             BuiltinError { message: "cannot register SharedArrayBuffer constructor" },
         ),
-    };
+    }
     match context.set_vm_constructor_prepare_callback(
         constructor,
         |arguments, depth| array_buffer_prepare_arguments(context, arguments, depth),
@@ -1055,7 +1027,7 @@ fn install_shared_array_buffer_constructor(
         Err(_) => return Result::Err(
             BuiltinError { message: "cannot register SharedArrayBuffer constructor preparation" },
         ),
-    };
+    }
     let object = function_object(constructor, "SharedArrayBuffer")?;
     define_value(heap, object, "prototype", runtime::Value::Object(prototype), false, false)?;
     define_value(heap, prototype, "constructor", constructor, true, true)?;
@@ -1081,32 +1053,8 @@ fn install_shared_array_buffer_constructor(
             return Result::Err(BuiltinError { message: "cannot define SharedArrayBuffer species" })
         },
         None => (),
-    };
+    }
     Result::Ok((constructor, prototype))
-}
-
-fn data_view_construct(
-    heap: runtime::Heap,
-    buffer_states: HashMap[runtime::ObjectId, arraybuffer::ArrayBuffer],
-    states: HashMap[runtime::ObjectId, DataViewInstance],
-    prototype: runtime::ObjectId,
-    this_value: runtime::Value,
-    arguments: Vec[runtime::Value],
-) -> Result[runtime::Value, vm::NativeError] {
-    let _ = this_value;
-    let (buffer_object, buffer) = array_buffer_state(buffer_states, argument(arguments, 0))?;
-    let byte_offset = if arguments.len() > 1 {
-        arraybuffer_index(arguments[1])?
-    } else {
-        0
-    };
-    let value = match arraybuffer::DataView::new(buffer, byte_offset, optional_index(arguments, 2)?) {
-        Ok(value) => value,
-        Err(value) => return Result::Err(arraybuffer_native_error(value)),
-    };
-    let object = allocate_ordinary(heap, Option::Some(prototype))?;
-    states[object] = DataViewInstance { value, buffer_object };
-    Result::Ok(runtime::Value::Object(object))
 }
 
 fn data_view_construct_vm(
@@ -1156,17 +1104,17 @@ fn data_view_prepare_arguments(
     };
     if buffer.is_detached() {
         return Result::Err(function_vm_error("DataView buffer is detached"))
-    } else {};
+    }
     let buffer_length = buffer.byte_length();
     if byte_offset > buffer_length {
         return Result::Err(function_range_error("DataView byteOffset is out of range"))
-    } else {};
+    }
     let byte_length = optional_index_at_depth(context, arguments, 2, depth)?;
     let prepared_length = match byte_length {
         Some(value) => {
             if value > buffer_length - byte_offset {
                 return Result::Err(function_range_error("DataView byteLength is out of range"))
-            } else {};
+            }
             runtime::Value::Int(value.to_i32())
         },
         None => runtime::Value::Undefined,
@@ -1211,104 +1159,6 @@ fn data_view_byte_offset(
     let _ = arguments;
     match data_view_state(states, this_value)?.value.byte_offset() {
         Ok(value) => Result::Ok(length_value(value)),
-        Err(value) => Result::Err(arraybuffer_native_error(value)),
-    }
-}
-
-fn data_view_get_int8(
-    heap: runtime::Heap,
-    states: HashMap[runtime::ObjectId, DataViewInstance],
-    this_value: runtime::Value,
-    arguments: Vec[runtime::Value],
-) -> Result[runtime::Value, vm::NativeError] {
-    let _ = heap;
-    match data_view_state(states, this_value)?.value.get_int8(
-        arraybuffer_index(argument(arguments, 0))?,
-    ) {
-        Ok(value) => Result::Ok(runtime::Value::Int(value.to_i32())),
-        Err(value) => Result::Err(arraybuffer_native_error(value)),
-    }
-}
-
-fn data_view_get_uint8(
-    heap: runtime::Heap,
-    states: HashMap[runtime::ObjectId, DataViewInstance],
-    this_value: runtime::Value,
-    arguments: Vec[runtime::Value],
-) -> Result[runtime::Value, vm::NativeError] {
-    let _ = heap;
-    match data_view_state(states, this_value)?.value.get_uint8(
-        arraybuffer_index(argument(arguments, 0))?,
-    ) {
-        Ok(value) => Result::Ok(runtime::Value::Int(value.to_i32())),
-        Err(value) => Result::Err(arraybuffer_native_error(value)),
-    }
-}
-
-fn data_view_get_int16(
-    heap: runtime::Heap,
-    states: HashMap[runtime::ObjectId, DataViewInstance],
-    this_value: runtime::Value,
-    arguments: Vec[runtime::Value],
-) -> Result[runtime::Value, vm::NativeError] {
-    let _ = heap;
-    let index = arraybuffer_index(argument(arguments, 0))?;
-    match data_view_state(states, this_value)?.value.get_int16(
-        index,
-        Option::Some(runtime::to_boolean(argument(arguments, 1))),
-    ) {
-        Ok(value) => Result::Ok(runtime::Value::Int(value.to_i32())),
-        Err(value) => Result::Err(arraybuffer_native_error(value)),
-    }
-}
-
-fn data_view_get_uint16(
-    heap: runtime::Heap,
-    states: HashMap[runtime::ObjectId, DataViewInstance],
-    this_value: runtime::Value,
-    arguments: Vec[runtime::Value],
-) -> Result[runtime::Value, vm::NativeError] {
-    let _ = heap;
-    let index = arraybuffer_index(argument(arguments, 0))?;
-    match data_view_state(states, this_value)?.value.get_uint16(
-        index,
-        Option::Some(runtime::to_boolean(argument(arguments, 1))),
-    ) {
-        Ok(value) => Result::Ok(runtime::Value::Int(value.to_i32())),
-        Err(value) => Result::Err(arraybuffer_native_error(value)),
-    }
-}
-
-fn data_view_get_int32(
-    heap: runtime::Heap,
-    states: HashMap[runtime::ObjectId, DataViewInstance],
-    this_value: runtime::Value,
-    arguments: Vec[runtime::Value],
-) -> Result[runtime::Value, vm::NativeError] {
-    let _ = heap;
-    let index = arraybuffer_index(argument(arguments, 0))?;
-    match data_view_state(states, this_value)?.value.get_int32(
-        index,
-        Option::Some(runtime::to_boolean(argument(arguments, 1))),
-    ) {
-        Ok(value) => Result::Ok(runtime::Value::Int(value)),
-        Err(value) => Result::Err(arraybuffer_native_error(value)),
-    }
-}
-
-fn data_view_get_uint32(
-    heap: runtime::Heap,
-    states: HashMap[runtime::ObjectId, DataViewInstance],
-    this_value: runtime::Value,
-    arguments: Vec[runtime::Value],
-) -> Result[runtime::Value, vm::NativeError] {
-    let _ = heap;
-    let index = arraybuffer_index(argument(arguments, 0))?;
-    match data_view_state(states, this_value)?.value.get_uint32(
-        index,
-        Option::Some(runtime::to_boolean(argument(arguments, 1))),
-    ) {
-        Ok(value) => Result::Ok(uint32_value(value)),
         Err(value) => Result::Err(arraybuffer_native_error(value)),
     }
 }
@@ -1395,81 +1245,6 @@ fn data_view_get_bigint_at_depth(
     }
 }
 
-fn data_view_get_float32(
-    heap: runtime::Heap,
-    states: HashMap[runtime::ObjectId, DataViewInstance],
-    this_value: runtime::Value,
-    arguments: Vec[runtime::Value],
-) -> Result[runtime::Value, vm::NativeError] {
-    let _ = heap;
-    let index = arraybuffer_index(argument(arguments, 0))?;
-    match data_view_state(states, this_value)?.value.get_float32(
-        index,
-        Option::Some(runtime::to_boolean(argument(arguments, 1))),
-    ) {
-        Ok(value) => Result::Ok(float32_value(value)),
-        Err(value) => Result::Err(arraybuffer_native_error(value)),
-    }
-}
-
-fn data_view_get_float16(
-    heap: runtime::Heap,
-    states: HashMap[runtime::ObjectId, DataViewInstance],
-    this_value: runtime::Value,
-    arguments: Vec[runtime::Value],
-) -> Result[runtime::Value, vm::NativeError] {
-    let _ = heap;
-    let index = arraybuffer_index(argument(arguments, 0))?;
-    match data_view_state(states, this_value)?.value.get_float16(
-        index,
-        Option::Some(runtime::to_boolean(argument(arguments, 1))),
-    ) {
-        Ok(value) => Result::Ok(runtime::Value::Float(value)),
-        Err(value) => Result::Err(arraybuffer_native_error(value)),
-    }
-}
-
-fn data_view_get_float64(
-    heap: runtime::Heap,
-    states: HashMap[runtime::ObjectId, DataViewInstance],
-    this_value: runtime::Value,
-    arguments: Vec[runtime::Value],
-) -> Result[runtime::Value, vm::NativeError] {
-    let _ = heap;
-    let index = arraybuffer_index(argument(arguments, 0))?;
-    match data_view_state(states, this_value)?.value.get_float64(
-        index,
-        Option::Some(runtime::to_boolean(argument(arguments, 1))),
-    ) {
-        Ok(value) => Result::Ok(runtime::Value::Float(value)),
-        Err(value) => Result::Err(arraybuffer_native_error(value)),
-    }
-}
-
-fn data_view_set_integer(
-    states: HashMap[runtime::ObjectId, DataViewInstance],
-    this_value: runtime::Value,
-    arguments: Vec[runtime::Value],
-    kind: isize,
-) -> Result[runtime::Value, vm::NativeError] {
-    let state = data_view_state(states, this_value)?.value;
-    let index = arraybuffer_index(argument(arguments, 0))?;
-    let number = arraybuffer_number(argument(arguments, 1))?;
-    let endian = Option::Some(runtime::to_boolean(argument(arguments, 2)));
-    let result = match kind {
-        0 => state.set_int8(index, number),
-        1 => state.set_uint8(index, number),
-        2 => state.set_int16(index, number, endian),
-        3 => state.set_uint16(index, number, endian),
-        4 => state.set_int32(index, number, endian),
-        _ => state.set_uint32(index, number, endian),
-    };
-    match result {
-        Ok(()) => Result::Ok(runtime::Value::Undefined),
-        Err(value) => Result::Err(arraybuffer_native_error(value)),
-    }
-}
-
 fn data_view_set_number_at_depth(
     context: vm::Context,
     states: HashMap[runtime::ObjectId, DataViewInstance],
@@ -1540,81 +1315,6 @@ fn data_view_set_bigint_at_depth(
         Ok(()) => Result::Ok(runtime::Value::Undefined),
         Err(value) => Result::Err(function_native_error(arraybuffer_native_error(value))),
     }
-}
-
-fn data_view_set_float32(
-    heap: runtime::Heap,
-    states: HashMap[runtime::ObjectId, DataViewInstance],
-    this_value: runtime::Value,
-    arguments: Vec[runtime::Value],
-) -> Result[runtime::Value, vm::NativeError] {
-    let _ = heap;
-    let state = data_view_state(states, this_value)?.value;
-    let index = arraybuffer_index(argument(arguments, 0))?;
-    match state.set_float32(
-        index,
-        float32_argument(arguments, 1)?,
-        Option::Some(runtime::to_boolean(argument(arguments, 2))),
-    ) {
-        Ok(()) => Result::Ok(runtime::Value::Undefined),
-        Err(value) => Result::Err(arraybuffer_native_error(value)),
-    }
-}
-
-fn data_view_set_float16(
-    heap: runtime::Heap,
-    states: HashMap[runtime::ObjectId, DataViewInstance],
-    this_value: runtime::Value,
-    arguments: Vec[runtime::Value],
-) -> Result[runtime::Value, vm::NativeError] {
-    let _ = heap;
-    let state = data_view_state(states, this_value)?.value;
-    let index = arraybuffer_index(argument(arguments, 0))?;
-    match state.set_float16(
-        index,
-        arraybuffer_number(argument(arguments, 1))?,
-        Option::Some(runtime::to_boolean(argument(arguments, 2))),
-    ) {
-        Ok(()) => Result::Ok(runtime::Value::Undefined),
-        Err(value) => Result::Err(arraybuffer_native_error(value)),
-    }
-}
-
-fn data_view_set_float64(
-    heap: runtime::Heap,
-    states: HashMap[runtime::ObjectId, DataViewInstance],
-    this_value: runtime::Value,
-    arguments: Vec[runtime::Value],
-) -> Result[runtime::Value, vm::NativeError] {
-    let _ = heap;
-    let state = data_view_state(states, this_value)?.value;
-    let index = arraybuffer_index(argument(arguments, 0))?;
-    match state.set_float64(
-        index,
-        arraybuffer_number(argument(arguments, 1))?,
-        Option::Some(runtime::to_boolean(argument(arguments, 2))),
-    ) {
-        Ok(()) => Result::Ok(runtime::Value::Undefined),
-        Err(value) => Result::Err(arraybuffer_native_error(value)),
-    }
-}
-
-fn define_data_view_method(
-    context: vm::Context,
-    prototype: runtime::ObjectId,
-    name: string,
-    states: HashMap[runtime::ObjectId, DataViewInstance],
-    operation: isize,
-) -> Result[(), BuiltinError] {
-    let function = allocate_function(
-        context,
-        "DataView.prototype." + name,
-        |heap, this_value, arguments| {
-            let _ = heap;
-            data_view_set_integer(states, this_value, arguments, operation)
-        },
-    )?;
-    define_value(context.heap(), prototype, name, function, true, true)
 }
 
 fn install_data_view_constructor(
@@ -1846,7 +1546,7 @@ fn install_data_view_constructor(
         Err(_) => return Result::Err(
             BuiltinError { message: "cannot register DataView constructor" },
         ),
-    };
+    }
     match context.set_vm_constructor_prepare_callback(
         constructor,
         |arguments, depth| {
@@ -1857,7 +1557,7 @@ fn install_data_view_constructor(
         Err(_) => return Result::Err(
             BuiltinError { message: "cannot register DataView constructor preparation" },
         ),
-    };
+    }
     let object = function_object(constructor, "DataView")?;
     define_value(heap, object, "prototype", runtime::Value::Object(prototype), false, false)?;
     define_value(heap, prototype, "constructor", constructor, true, true)?;
@@ -1973,7 +1673,7 @@ fn typed_array_prepare_arguments(
 ) -> Result[Vec[runtime::Value], vm::VmError] {
     if arguments.is_empty() {
         return Result::Ok(arguments)
-    } else {};
+    }
     let first = arguments[0];
     let buffer = match first {
         runtime::Value::Object(object) => match buffer_states.get(object) {
@@ -1996,7 +1696,7 @@ fn typed_array_prepare_arguments(
         return Result::Err(function_vm_error("typed array buffer is detached"))
     } else if offset > buffer.byte_length() {
         return Result::Err(function_range_error("typed array offset is out of range"))
-    } else {};
+    }
     let prepared: Vec[runtime::Value] = Vec::from_array(
         [first, runtime::Value::Int(offset.to_i32())],
     );
@@ -2009,14 +1709,14 @@ fn typed_array_prepare_arguments(
                     return Result::Err(function_vm_error("typed array buffer is detached"))
                 } else if length > (buffer.byte_length() - offset) / element_size {
                     return Result::Err(function_range_error("typed array length is out of range"))
-                } else {};
+                }
                 prepared.push(runtime::Value::Int(length.to_i32()))
             },
         }
     } else if !buffer.is_resizable() && !buffer.is_growable()
         && (buffer.byte_length() - offset) % element_size != 0 {
         return Result::Err(function_range_error("typed array buffer length is not aligned"))
-    } else {};
+    }
     Result::Ok(prepared)
 }
 
@@ -2090,7 +1790,7 @@ fn typed_array_set_values(
 ) -> Result[runtime::Value, vm::VmError] {
     if typed_array_view_detached(view) {
         return Result::Err(function_vm_error("typed array buffer is detached"))
-    } else {};
+    }
     let offset = if arguments.len() > 1 {
         typed_array_offset(context, arguments[1], depth)?
     } else {
@@ -2100,7 +1800,7 @@ fn typed_array_set_values(
     let length = typed_array_view_length(view);
     if offset > length || values.len() > length - offset {
         return Result::Err(function_range_error("typed array source exceeds target length"))
-    } else {};
+    }
     let mut index = 0;
     while index < values.len() {
         typed_array_view_set(
@@ -2199,7 +1899,7 @@ fn uint8_array_construct(
         buffer_object,
     ) {
         return Result::Err(native_error("cannot register Uint8Array instance"))
-    } else {};
+    }
     states[object] = Uint8ArrayInstance { value, buffer_object };
     Result::Ok(runtime::Value::Object(object))
 }
@@ -2234,7 +1934,7 @@ fn uint8_array_from_values(
         match state.value.set(index, typed_array_number(context, values[index], depth)?) {
             Ok(()) => (),
             Err(value) => return Result::Err(function_vm_error(value.to_string())),
-        };
+        }
         index += 1;
     }
     register_typed_array_tag(context, Result::Ok(result), "Uint8Array").map_err(
@@ -2350,22 +2050,6 @@ fn uint8_array_get(
     }
 }
 
-fn uint8_array_set(
-    heap: runtime::Heap,
-    states: HashMap[runtime::ObjectId, Uint8ArrayInstance],
-    this_value: runtime::Value,
-    arguments: Vec[runtime::Value],
-) -> Result[runtime::Value, vm::NativeError] {
-    let _ = heap;
-    match uint8_array_state(states, this_value)?.value.set(
-        arraybuffer_index(argument(arguments, 0))?,
-        arraybuffer_number(argument(arguments, 1))?,
-    ) {
-        Ok(()) => Result::Ok(runtime::Value::Undefined),
-        Err(value) => Result::Err(arraybuffer_native_error(value)),
-    }
-}
-
 fn uint8_array_subarray(
     heap: runtime::Heap,
     states: HashMap[runtime::ObjectId, Uint8ArrayInstance],
@@ -2388,7 +2072,7 @@ fn uint8_array_subarray(
         state.buffer_object,
     ) {
         return Result::Err(native_error("cannot register Uint8Array instance"))
-    } else {};
+    }
     states[object] = Uint8ArrayInstance { value, buffer_object: state.buffer_object };
     Result::Ok(runtime::Value::Object(object))
 }
@@ -2434,7 +2118,7 @@ fn uint8_codec_options(
         ),
         runtime::Value::Object(_) => (),
         _ => return Result::Err(function_vm_error("options must be an object")),
-    };
+    }
     let alphabet = match uint8_codec_string_option(context, value, "alphabet", depth)? {
         None => encoding::Base64Alphabet::Base64,
         Some(value) => if value == js_string("base64") {
@@ -2568,7 +2252,7 @@ fn uint8_array_codec_encode(
     )?;
     if view.is_out_of_bounds() {
         return Result::Err(function_vm_error("Uint8Array is out of bounds"))
-    } else {};
+    }
     let length = view.length();
     let bytes: Vec[byte] = Vec::with_capacity(length);
     let mut index = 0;
@@ -2576,7 +2260,7 @@ fn uint8_array_codec_encode(
         match view.get(index) {
             Ok(value) => bytes.push(value),
             Err(value) => return Result::Err(function_native_error(arraybuffer_native_error(value))),
-        };
+        }
         index += 1;
     }
     let output = if base64 {
@@ -2603,7 +2287,7 @@ fn uint8_codec_result(heap: runtime::Heap, read: isize, written: isize) -> Resul
             runtime::data_descriptor(runtime::Value::Int(value.to_i32()), true, true, true),
         ) {
             return Result::Err(function_vm_error("cannot create codec result"))
-        } else {}
+        }
     }
     Result::Ok(runtime::Value::Object(object))
 }
@@ -2631,7 +2315,7 @@ fn uint8_array_set_from_codec(
     )?;
     if view.is_out_of_bounds() {
         return Result::Err(function_vm_error("Uint8Array is out of bounds"))
-    } else {};
+    }
     let length = view.length();
     let result = if base64 {
         encoding::decode_base64(
@@ -2655,7 +2339,7 @@ fn uint8_array_set_from_codec(
         match view.set(index, int_float(decoded.bytes[index].to_isize())) {
             Ok(()) => (),
             Err(value) => return Result::Err(function_native_error(arraybuffer_native_error(value))),
-        };
+        }
         index += 1;
     }
     match failure {
@@ -2814,7 +2498,7 @@ fn install_uint8_array_constructor(
         Err(_) => return Result::Err(
             BuiltinError { message: "cannot register Uint8Array constructor" },
         ),
-    };
+    }
     install_typed_array_constructor_prepare(context, constructor, buffer_states, 1, "Uint8Array")?;
     let object = function_object(constructor, "Uint8Array")?;
     define_typed_array_bytes(heap, object, prototype, 1)?;
@@ -2993,7 +2677,7 @@ fn int32_array_construct(
         buffer_object,
     ) {
         return Result::Err(native_error("cannot register Int32Array instance"))
-    } else {};
+    }
     states[object] = Int32ArrayInstance { value, buffer_object };
     Result::Ok(runtime::Value::Object(object))
 }
@@ -3028,7 +2712,7 @@ fn int32_array_from_values(
         match state.value.set(index, typed_array_number(context, values[index], depth)?) {
             Ok(()) => (),
             Err(value) => return Result::Err(function_vm_error(value.to_string())),
-        };
+        }
         index += 1;
     }
     register_typed_array_tag(context, Result::Ok(result), "Int32Array").map_err(
@@ -3144,22 +2828,6 @@ fn int32_array_get(
     }
 }
 
-fn int32_array_set(
-    heap: runtime::Heap,
-    states: HashMap[runtime::ObjectId, Int32ArrayInstance],
-    this_value: runtime::Value,
-    arguments: Vec[runtime::Value],
-) -> Result[runtime::Value, vm::NativeError] {
-    let _ = heap;
-    match int32_array_state(states, this_value)?.value.set(
-        arraybuffer_index(argument(arguments, 0))?,
-        arraybuffer_number(argument(arguments, 1))?,
-    ) {
-        Ok(()) => Result::Ok(runtime::Value::Undefined),
-        Err(value) => Result::Err(arraybuffer_native_error(value)),
-    }
-}
-
 fn int32_array_subarray(
     heap: runtime::Heap,
     states: HashMap[runtime::ObjectId, Int32ArrayInstance],
@@ -3182,7 +2850,7 @@ fn int32_array_subarray(
         state.buffer_object,
     ) {
         return Result::Err(native_error("cannot register Int32Array instance"))
-    } else {};
+    }
     states[object] = Int32ArrayInstance { value, buffer_object: state.buffer_object };
     Result::Ok(runtime::Value::Object(object))
 }
@@ -3337,7 +3005,7 @@ fn install_int32_array_constructor(
         Err(_) => return Result::Err(
             BuiltinError { message: "cannot register Int32Array constructor" },
         ),
-    };
+    }
     install_typed_array_constructor_prepare(context, constructor, buffer_states, 4, "Int32Array")?;
     let object = function_object(constructor, "Int32Array")?;
     define_typed_array_bytes(heap, object, prototype, 4)?;
@@ -3452,7 +3120,7 @@ fn float64_array_construct(
         buffer_object,
     ) {
         return Result::Err(native_error("cannot register Float64Array instance"))
-    } else {};
+    }
     states[object] = Float64ArrayInstance { value, buffer_object };
     Result::Ok(runtime::Value::Object(object))
 }
@@ -3487,7 +3155,7 @@ fn float64_array_from_values(
         match state.value.set(index, typed_array_number(context, values[index], depth)?) {
             Ok(()) => (),
             Err(value) => return Result::Err(function_vm_error(value.to_string())),
-        };
+        }
         index += 1;
     }
     register_typed_array_tag(context, Result::Ok(result), "Float64Array").map_err(
@@ -3603,22 +3271,6 @@ fn float64_array_get(
     }
 }
 
-fn float64_array_set(
-    heap: runtime::Heap,
-    states: HashMap[runtime::ObjectId, Float64ArrayInstance],
-    this_value: runtime::Value,
-    arguments: Vec[runtime::Value],
-) -> Result[runtime::Value, vm::NativeError] {
-    let _ = heap;
-    match float64_array_state(states, this_value)?.value.set(
-        arraybuffer_index(argument(arguments, 0))?,
-        arraybuffer_number(argument(arguments, 1))?,
-    ) {
-        Ok(()) => Result::Ok(runtime::Value::Undefined),
-        Err(value) => Result::Err(arraybuffer_native_error(value)),
-    }
-}
-
 fn float64_array_subarray(
     heap: runtime::Heap,
     states: HashMap[runtime::ObjectId, Float64ArrayInstance],
@@ -3641,7 +3293,7 @@ fn float64_array_subarray(
         state.buffer_object,
     ) {
         return Result::Err(native_error("cannot register Float64Array instance"))
-    } else {};
+    }
     states[object] = Float64ArrayInstance { value, buffer_object: state.buffer_object };
     Result::Ok(runtime::Value::Object(object))
 }
@@ -3796,7 +3448,7 @@ fn install_float64_array_constructor(
         Err(_) => return Result::Err(
             BuiltinError { message: "cannot register Float64Array constructor" },
         ),
-    };
+    }
     install_typed_array_constructor_prepare(context, constructor, buffer_states, 8, "Float64Array")?;
     let object = function_object(constructor, "Float64Array")?;
     define_typed_array_bytes(heap, object, prototype, 8)?;
@@ -3925,7 +3577,7 @@ fn numeric_array_construct(
         buffer_object,
     ) {
         return Result::Err(native_error("cannot register " + name + " instance"))
-    } else {};
+    }
     states[object] = NumericArrayInstance { value, buffer_object, name };
     Result::Ok(runtime::Value::Object(object))
 }
@@ -3963,7 +3615,7 @@ fn numeric_array_from_values(
         match state.value.set(index, typed_array_number(context, values[index], depth)?) {
             Ok(()) => (),
             Err(value) => return Result::Err(function_vm_error(value.to_string())),
-        };
+        }
         index += 1;
     }
     register_typed_array_tag(context, Result::Ok(result), name).map_err(function_native_error)
@@ -4075,7 +3727,7 @@ fn numeric_array_subarray(
         state.buffer_object,
     ) {
         return Result::Err(native_error("cannot register " + name + " instance"))
-    } else {};
+    }
     states[object] = NumericArrayInstance { value, buffer_object: state.buffer_object, name };
     Result::Ok(runtime::Value::Object(object))
 }
@@ -4204,7 +3856,7 @@ fn install_numeric_array_constructor(
     ) {
         Ok(()) => (),
         Err(_) => return Result::Err(BuiltinError { message: "cannot register " + name }),
-    };
+    }
     let element_size = match kind {
         arraybuffer::NumericArrayKind::Uint8Clamped | arraybuffer::NumericArrayKind::Int8 => 1,
         arraybuffer::NumericArrayKind::Int16 | arraybuffer::NumericArrayKind::Uint16 | arraybuffer::NumericArrayKind::Float16 => 2,
@@ -4342,7 +3994,7 @@ fn bigint_array_construct(
         buffer_object,
     ) {
         return Result::Err(native_error("cannot register " + name + " instance"))
-    } else {};
+    }
     states[object] = BigIntArrayInstance { value, buffer_object, name };
     Result::Ok(runtime::Value::Object(object))
 }
@@ -4355,12 +4007,12 @@ fn bigint_array_set_values(
 ) -> Result[runtime::Value, vm::VmError] {
     if state.value.buffer().is_detached() {
         return Result::Err(function_vm_error("typed array buffer is detached"))
-    } else {};
+    }
     let values = typed_array_collect_values(context, argument(arguments, 0), depth)?;
     let offset = typed_array_offset(context, argument(arguments, 1), depth)?;
     if offset > state.value.length() || values.len() > state.value.length() - offset {
         return Result::Err(function_range_error("typed array source does not fit"))
-    } else {};
+    }
     let mut index = 0;
     while index < values.len() {
         let converted = bigint_value_at_depth(context, values[index], depth)?;
@@ -4371,7 +4023,7 @@ fn bigint_array_set_values(
         match state.value.set(offset + index, integer) {
             Ok(()) => (),
             Err(value) => return Result::Err(function_native_error(arraybuffer_native_error(value))),
-        };
+        }
         index += 1;
     }
     Result::Ok(runtime::Value::Undefined)
@@ -4415,7 +4067,7 @@ fn bigint_array_from_values(
         match state.value.set(index, integer) {
             Ok(()) => (),
             Err(value) => return Result::Err(function_native_error(arraybuffer_native_error(value))),
-        };
+        }
         index += 1;
     }
     register_typed_array_tag(context, Result::Ok(result), name).map_err(function_native_error)
@@ -4527,7 +4179,7 @@ fn bigint_array_subarray(
         state.buffer_object,
     ) {
         return Result::Err(native_error("cannot register " + name + " instance"))
-    } else {};
+    }
     states[object] = BigIntArrayInstance { value, buffer_object: state.buffer_object, name };
     Result::Ok(runtime::Value::Object(object))
 }
@@ -4651,7 +4303,7 @@ fn install_bigint_array_constructor(
     ) {
         Ok(()) => (),
         Err(_) => return Result::Err(BuiltinError { message: "cannot register " + name }),
-    };
+    }
     install_typed_array_constructor_prepare(context, constructor, buffer_states, 8, name)?;
     let object = function_object(constructor, name)?;
     define_typed_array_bytes(heap, object, prototype, 8)?;
@@ -4730,7 +4382,7 @@ fn typed_array_receiver(context: vm::Context, value: runtime::Value) -> Result[
         return Result::Err(function_vm_error("typed array buffer is detached"))
     } else if runtime::is_typed_array_out_of_bounds(context.heap(), object) {
         return Result::Err(function_vm_error("TypedArray is out of bounds"))
-    } else {};
+    }
     match runtime::typed_array_element_length(context.heap(), object) {
         Some(length) => Result::Ok((value, length)),
         None => Result::Err(function_vm_error("TypedArray method requires a TypedArray")),
@@ -4976,7 +4628,7 @@ fn typed_array_set_from_typed_array(
         return Result::Err(function_vm_error("TypedArray content types do not match"))
     } else if offset > target_length || source_length > target_length - offset {
         return Result::Err(function_range_error("typed array source exceeds target length"))
-    } else {};
+    }
     if typed_array_view_same_element_type(target, source_view) {
         let element_size = typed_array_view_element_size(target);
         let target_buffer = typed_array_view_buffer(target);
@@ -5020,7 +4672,7 @@ fn typed_array_set_from_array_like(
     let source_length = array_iterator_length(context, source_object, depth)?;
     if offset > target_length || source_length > target_length - offset {
         return Result::Err(function_range_error("typed array source exceeds target length"))
-    } else {};
+    }
     let mut index = 0;
     while index < source_length {
         let value = array_copy_read(context, source_object, index, depth)?;
@@ -5155,7 +4807,7 @@ fn typed_array_join(
     while index < length {
         if index > 0 {
             output = output.concat(separator);
-        } else {};
+        }
         let value = array_copy_read(context, object, index, depth)?;
         match value {
             runtime::Value::Undefined | runtime::Value::Null => (),
@@ -5167,7 +4819,7 @@ fn typed_array_join(
                     function_vm_error("element conversion did not produce a string"),
                 ),
             },
-        };
+        }
         index += 1;
     }
     Result::Ok(runtime::Value::String(output))
@@ -5185,7 +4837,7 @@ fn typed_array_to_locale_string(
     while index < length {
         if index > 0 {
             output = output.concat(js_string(","));
-        } else {};
+        }
         let value = array_copy_read(context, object, index, depth)?;
         match value {
             runtime::Value::Undefined | runtime::Value::Null => (),
@@ -5206,10 +4858,10 @@ fn typed_array_to_locale_string(
                             "localized TypedArray string exceeds implementation limit",
                         ),
                     )
-                } else {};
+                }
                 output = output.concat(text);
             },
-        };
+        }
         index += 1;
     }
     Result::Ok(runtime::Value::String(output))
@@ -5232,7 +4884,7 @@ fn typed_array_search(
         } else {
             Result::Ok(runtime::Value::Int(-1))
         }
-    } else {};
+    }
     let mut index = if reverse {
         if arguments.len() < 2 {
             length - 1
@@ -5272,7 +4924,7 @@ fn typed_array_search(
             } else {
                 return Result::Ok(runtime::Value::Int(index.to_i32()))
             }
-        } else {};
+        }
         if reverse {
             index -= 1;
         } else {
@@ -5346,19 +4998,19 @@ fn typed_array_copy_within(
     };
     if count <= 0 {
         return Result::Ok(object)
-    } else {};
+    }
     let (_, current_length) = typed_array_receiver(context, object)?;
     let source_room = current_length - source;
     let target_room = current_length - target;
     if source_room <= 0 || target_room <= 0 {
         return Result::Ok(object)
-    } else {};
+    }
     if count > source_room {
         count = source_room;
-    } else {};
+    }
     if count > target_room {
         count = target_room;
-    } else {};
+    }
     let object_id = match object {
         runtime::Value::Object(value) => value,
         _ => return Result::Err(function_vm_error("TypedArray method requires a TypedArray")),
@@ -5430,7 +5082,7 @@ fn typed_array_fill(
                 match target.set(index, converted) {
                     Ok(()) => (),
                     Err(value) => return Result::Err(function_vm_error(value.to_string())),
-                };
+                }
                 index += 1;
             }
         },
@@ -5449,7 +5101,7 @@ fn typed_array_fill(
                 index += 1;
             }
         },
-    };
+    }
     Result::Ok(object)
 }
 
@@ -5665,10 +5317,10 @@ fn typed_array_map_filter(
         if filter {
             if runtime::to_boolean(mapped) {
                 values.push(value)
-            } else {}
+            }
         } else {
             array_set_value(context, target, index, mapped, depth)?
-        };
+        }
         index += 1;
     }
     if filter {
@@ -5724,7 +5376,7 @@ fn typed_array_slice(
     } else if runtime::is_typed_array_detached(context.heap(), source_object)
         || runtime::is_typed_array_out_of_bounds(context.heap(), source_object) {
         return Result::Err(function_vm_error("TypedArray source is out of bounds"))
-    } else {};
+    }
     let current_length = match runtime::typed_array_element_length(context.heap(), source_object) {
         Some(value) => value,
         None => 0,
@@ -5741,7 +5393,7 @@ fn typed_array_slice(
     };
     if copy_count == 0 {
         return Result::Ok(result)
-    } else {};
+    }
     let result_object = match result {
         runtime::Value::Object(value) => value,
         _ => return Result::Err(function_vm_error("TypedArray result is not an object")),
@@ -5763,7 +5415,7 @@ fn typed_array_slice(
             Ok(()) => return Result::Ok(result),
             Err(value) => return Result::Err(function_vm_error(value.to_string())),
         }
-    } else {};
+    }
     let mut index = 0;
     while index < copy_count {
         array_set_value(
@@ -5866,11 +5518,11 @@ fn typed_array_sort_values(
 ) -> Result[(), vm::VmError] {
     if values.len() < 2 {
         return Result::Ok(())
-    } else {};
+    }
     match callback {
         runtime::Value::Undefined => typed_array_sort_numbers(context, values, depth)?,
         _ => typed_array_sort_with_callback(context, values, callback, depth)?,
-    };
+    }
     Result::Ok(())
 }
 
@@ -5905,7 +5557,7 @@ fn typed_array_sort_numbers(context: vm::Context, values: Vec[runtime::Value], d
     }
     if bigint {
         return typed_array_sort_with_callback(context, values, runtime::Value::Undefined, depth)
-    } else {};
+    }
     typed_array_merge_sort_numbers(numbers);
     let mut index = 0;
     for number in numbers {
@@ -5940,7 +5592,7 @@ fn typed_array_number_less(left: f64, right: f64) -> bool {
 fn typed_array_merge_sort_numbers(values: Vec[f64]) -> () {
     if values.len() < 2 {
         return
-    } else {};
+    }
     let aux: Vec[f64] = Vec::new();
     let mut width = 1;
     while width < values.len() {
@@ -5972,7 +5624,7 @@ fn typed_array_merge_sort_numbers(values: Vec[f64]) -> () {
                     } else {
                         values[position] = aux[right];
                         right += 1;
-                    };
+                    }
                     position += 1;
                 }
                 while left < mid - start {
@@ -5990,7 +5642,7 @@ fn typed_array_merge_sort_numbers(values: Vec[f64]) -> () {
                     let _ = aux.pop();
                     clear += 1;
                 }
-            } else {};
+            }
             start = end;
         }
         width *= 2;
@@ -6005,7 +5657,7 @@ fn typed_array_sort_with_callback(
 ) -> Result[(), vm::VmError] {
     if values.len() < 2 {
         return Result::Ok(())
-    } else {};
+    }
     let aux: Vec[runtime::Value] = Vec::new();
     let mut width = 1;
     while width < values.len() {
@@ -6037,7 +5689,7 @@ fn typed_array_sort_with_callback(
                     } else {
                         values[position] = aux[right];
                         right += 1;
-                    };
+                    }
                     position += 1;
                 }
                 while left < mid - start {
@@ -6055,7 +5707,7 @@ fn typed_array_sort_with_callback(
                     let _ = aux.pop();
                     clear += 1;
                 }
-            } else {};
+            }
             start = end;
         }
         width *= 2;
@@ -6077,9 +5729,9 @@ fn typed_array_sort(
         runtime::Value::Undefined => (),
         runtime::Value::Object(value) => if !value.is_callable() {
             return Result::Err(function_vm_error("TypedArray comparator is not callable"))
-        } else {},
+        },
         _ => return Result::Err(function_vm_error("TypedArray comparator is not callable")),
-    };
+    }
     let target = if copy {
         typed_array_intrinsic_create(context, constructor, length, depth)?
     } else {
@@ -6129,7 +5781,7 @@ fn typed_array_sort(
                 match view.get(index) {
                     Ok(value) => numbers.push(value),
                     Err(_) => return Result::Err(function_vm_error("typed array read failed")),
-                };
+                }
                 index += 1;
             }
             typed_array_merge_sort_numbers(numbers);
@@ -6142,7 +5794,7 @@ fn typed_array_sort(
                 match target_view.set(index, number) {
                     Ok(()) => (),
                     Err(_) => return Result::Err(function_vm_error("typed array write failed")),
-                };
+                }
                 index += 1;
             }
             Result::Ok(target)
@@ -6155,7 +5807,7 @@ fn typed_array_sort(
                     match view.get(index) {
                         Ok(value) => numbers.push(value),
                         Err(_) => return Result::Err(function_vm_error("typed array read failed")),
-                    };
+                    }
                     index += 1;
                 }
                 typed_array_merge_sort_numbers(numbers);
@@ -6168,7 +5820,7 @@ fn typed_array_sort(
                     match target_view.set(index, number) {
                         Ok(()) => (),
                         Err(_) => return Result::Err(function_vm_error("typed array write failed")),
-                    };
+                    }
                     index += 1;
                 }
                 Result::Ok(target)
@@ -6237,7 +5889,7 @@ fn typed_array_copy_change(
     };
     if replace && (replacement_index < 0 || replacement_index >= current_length) {
         return Result::Err(function_range_error("TypedArray index is out of range"))
-    } else {};
+    }
     let target = typed_array_intrinsic_create(context, constructor, length, depth)?;
     let mut index = 0;
     while index < length {
@@ -6255,233 +5907,6 @@ fn typed_array_copy_change(
         index += 1;
     }
     Result::Ok(target)
-}
-
-fn install_typed_array_algorithms(
-    context: vm::Context,
-    prototype: runtime::ObjectId,
-    constructors: TypedArrayConstructors,
-) -> Result[(), BuiltinError] {
-    for (method, operation) in Vec::from_array(
-        [("indexOf", 0), ("lastIndexOf", 1), ("includes", 2)],
-    ) {
-        define_value(
-            context.heap(),
-            prototype,
-            method,
-            allocate_vm_function(
-                context,
-                "TypedArray.prototype." + method,
-                |this_value, arguments, depth| {
-                    typed_array_search(context, this_value, arguments, depth, operation)
-                },
-            )?,
-            true,
-            true,
-        )?
-    }
-    for (method, copy) in Vec::from_array([("fill", false), ("copyWithin", true)]) {
-        define_value(
-            context.heap(),
-            prototype,
-            method,
-            allocate_vm_function(
-                context,
-                "TypedArray.prototype." + method,
-                |this_value, arguments, depth| {
-                    typed_array_mutation(context, this_value, arguments, depth, copy)
-                },
-            )?,
-            true,
-            true,
-        )?
-    }
-    for (method, mode) in Vec::from_array(
-        [
-            ("forEach", ArrayIterationMode::ForEach),
-            ("every", ArrayIterationMode::Every),
-            ("some", ArrayIterationMode::Some),
-            ("find", ArrayIterationMode::Find),
-            ("findIndex", ArrayIterationMode::FindIndex),
-            ("findLast", ArrayIterationMode::FindLast),
-            ("findLastIndex", ArrayIterationMode::FindLastIndex),
-        ],
-    ) {
-        define_value(
-            context.heap(),
-            prototype,
-            method,
-            allocate_vm_function(
-                context,
-                "TypedArray.prototype." + method,
-                |this_value, arguments, depth| {
-                    typed_array_iteration(context, this_value, arguments, depth, mode)
-                },
-            )?,
-            true,
-            true,
-        )?
-    }
-    for (method, reverse) in Vec::from_array([("reduce", false), ("reduceRight", true)]) {
-        define_value(
-            context.heap(),
-            prototype,
-            method,
-            allocate_vm_function(
-                context,
-                "TypedArray.prototype." + method,
-                |this_value, arguments, depth| {
-                    typed_array_reduce(context, this_value, arguments, depth, reverse)
-                },
-            )?,
-            true,
-            true,
-        )?
-    }
-    for (method, filter) in Vec::from_array([("map", false), ("filter", true)]) {
-        define_value(
-            context.heap(),
-            prototype,
-            method,
-            allocate_vm_function(
-                context,
-                "TypedArray.prototype." + method,
-                |this_value, arguments, depth| {
-                    let constructor = typed_array_default_constructor(
-                        context,
-                        this_value,
-                        constructors,
-                    )?;
-                    typed_array_map_filter(
-                        context,
-                        this_value,
-                        arguments,
-                        depth,
-                        constructor,
-                        filter,
-                    )
-                },
-            )?,
-            true,
-            true,
-        )?
-    }
-    define_value(
-        context.heap(),
-        prototype,
-        "slice",
-        allocate_vm_function(
-            context,
-            "TypedArray.prototype.slice",
-            |this_value, arguments, depth| {
-                let constructor = typed_array_default_constructor(context, this_value, constructors)?;
-                typed_array_slice(context, this_value, arguments, depth, constructor)
-            },
-        )?,
-        true,
-        true,
-    )?;
-    for (method, replace) in Vec::from_array([("toReversed", false), ("with", true)]) {
-        define_value(
-            context.heap(),
-            prototype,
-            method,
-            allocate_vm_function(
-                context,
-                "TypedArray.prototype." + method,
-                |this_value, arguments, depth| {
-                    let constructor = typed_array_default_constructor(
-                        context,
-                        this_value,
-                        constructors,
-                    )?;
-                    typed_array_copy_change(
-                        context,
-                        this_value,
-                        arguments,
-                        depth,
-                        constructor,
-                        replace,
-                    )
-                },
-            )?,
-            true,
-            true,
-        )?
-    }
-    for (method, copy) in Vec::from_array([("sort", false), ("toSorted", true)]) {
-        define_value(
-            context.heap(),
-            prototype,
-            method,
-            allocate_vm_function(
-                context,
-                "TypedArray.prototype." + method,
-                |this_value, arguments, depth| {
-                    let constructor = typed_array_default_constructor(
-                        context,
-                        this_value,
-                        constructors,
-                    )?;
-                    typed_array_sort(context, this_value, arguments, depth, constructor, copy)
-                },
-            )?,
-            true,
-            true,
-        )?
-    }
-    define_value(
-        context.heap(),
-        prototype,
-        "at",
-        allocate_vm_function(
-            context,
-            "TypedArray.prototype.at",
-            |this_value, arguments, depth| {
-                typed_array_at(context, this_value, arguments, depth)
-            },
-        )?,
-        true,
-        true,
-    )?;
-    let join = allocate_vm_function(
-        context,
-        "TypedArray.prototype.join",
-        |this_value, arguments, depth| {
-            typed_array_join(context, this_value, arguments, depth)
-        },
-    )?;
-    define_value(context.heap(), prototype, "join", join, true, true)?;
-    define_value(context.heap(), prototype, "toString", join, true, true)?;
-    define_value(
-        context.heap(),
-        prototype,
-        "toLocaleString",
-        allocate_vm_function(
-            context,
-            "TypedArray.prototype.toLocaleString",
-            |this_value, arguments, depth| {
-                typed_array_to_locale_string(context, this_value, arguments, depth)
-            },
-        )?,
-        true,
-        true,
-    )?;
-    define_value(
-        context.heap(),
-        prototype,
-        "reverse",
-        allocate_vm_function(
-            context,
-            "TypedArray.prototype.reverse",
-            |this_value, arguments, depth| {
-                let _ = arguments;
-                typed_array_reverse(context, this_value, depth)
-            },
-        )?,
-        true,
-        true,
-    )
 }
 
 fn define_shared_typed_array_method(
@@ -6521,11 +5946,11 @@ fn normalize_concrete_typed_array(
         return Result::Err(BuiltinError { message: "cannot inherit TypedArray constructor" })
     } else if !runtime::set_prototype_of(heap, prototype, Option::Some(shared_prototype)) {
         return Result::Err(BuiltinError { message: "cannot inherit TypedArray prototype" })
-    } else {};
+    }
     for name in Vec::from_array(["from", "of"]) {
         if !runtime::delete_property(heap, constructor_object, runtime::string_property_key(name)) {
             return Result::Err(BuiltinError { message: "cannot remove concrete TypedArray static" })
-        } else {}
+        }
     }
     for key in runtime::own_property_keys(heap, constructor_object) {
         match key {
@@ -6537,7 +5962,7 @@ fn normalize_concrete_typed_array(
                 return Result::Err(
                     BuiltinError { message: "cannot remove concrete TypedArray symbol" },
                 )
-            } else {},
+            },
             runtime::PropertyKey::String(_) => (),
         }
     }
@@ -6548,7 +5973,7 @@ fn normalize_concrete_typed_array(
             key,
         ) {
             return Result::Err(BuiltinError { message: "cannot normalize TypedArray prototype" })
-        } else {}
+        }
     }
     Result::Ok(())
 }
@@ -6657,10 +6082,10 @@ fn install_shared_typed_array(context: vm::Context, install: ArrayBufferInstall)
                 runtime::accessor_descriptor(Option::Some(getter), Option::None, false, true),
             ) {
                 return Result::Err(BuiltinError { message: "cannot define TypedArray species" })
-            } else {}
+            }
         },
         None => (),
-    };
+    }
     define_arraybuffer_getter(
         heap,
         prototype,
@@ -6950,9 +6375,9 @@ fn install_shared_typed_array(context: vm::Context, install: ArrayBufferInstall)
             runtime::data_descriptor(values, true, false, true),
         ) {
             return Result::Err(BuiltinError { message: "cannot define TypedArray iterator" })
-        } else {},
+        },
         None => return Result::Err(BuiltinError { message: "iterator symbol is not installed" }),
-    };
+    }
     match context.well_known_symbol(vm::WellKnownSymbolKind::ToStringTag) {
         Some(symbol) => {
             let getter = allocate_function_with_length(
@@ -6968,10 +6393,10 @@ fn install_shared_typed_array(context: vm::Context, install: ArrayBufferInstall)
                 runtime::accessor_descriptor(Option::Some(getter), Option::None, false, true),
             ) {
                 return Result::Err(BuiltinError { message: "cannot define TypedArray tag" })
-            } else {}
+            }
         },
         None => (),
-    };
+    }
     mark_constructor(context, constructor, "TypedArray")?;
     for (concrete_constructor, concrete_prototype) in Vec::from_array(
         [
@@ -6998,79 +6423,6 @@ fn install_shared_typed_array(context: vm::Context, install: ArrayBufferInstall)
         )?
     }
     Result::Ok(())
-}
-
-fn install_typed_array_iterator_prototype(
-    context: vm::Context,
-    prototype: runtime::ObjectId,
-    constructor: runtime::Value,
-    name: string,
-    constructors: TypedArrayConstructors,
-) -> Result[(), BuiltinError] {
-    match context.well_known_symbol(vm::WellKnownSymbolKind::Species) {
-        Some(symbol) => {
-            let object = function_object(constructor, name)?;
-            let getter = allocate_function_with_length(
-                context,
-                "get [Symbol.species]",
-                0,
-                array_species_getter,
-            )?;
-            if !runtime::define_own_property(
-                context.heap(),
-                object,
-                runtime::PropertyKey::Symbol(symbol),
-                runtime::accessor_descriptor(Option::Some(getter), Option::None, false, true),
-            ) {
-                return Result::Err(BuiltinError { message: "cannot define TypedArray species" })
-            } else {}
-        },
-        None => (),
-    };
-    install_typed_array_algorithms(context, prototype, constructors)?;
-    let values = allocate_vm_function(
-        context,
-        name + ".prototype.values",
-        |this_value, arguments, depth| {
-            let _ = arguments;
-            let _ = depth;
-            array_create_iterator(context, ArrayIteratorKind::Values, this_value, true)
-        },
-    )?;
-    let keys = allocate_vm_function(
-        context,
-        name + ".prototype.keys",
-        |this_value, arguments, depth| {
-            let _ = arguments;
-            let _ = depth;
-            array_create_iterator(context, ArrayIteratorKind::Keys, this_value, true)
-        },
-    )?;
-    let entries = allocate_vm_function(
-        context,
-        name + ".prototype.entries",
-        |this_value, arguments, depth| {
-            let _ = arguments;
-            let _ = depth;
-            array_create_iterator(context, ArrayIteratorKind::Entries, this_value, true)
-        },
-    )?;
-    define_value(context.heap(), prototype, "values", values, true, true)?;
-    define_value(context.heap(), prototype, "keys", keys, true, true)?;
-    define_value(context.heap(), prototype, "entries", entries, true, true)?;
-    match context.iterator_symbol() {
-        Some(symbol) => if runtime::define_own_property(
-            context.heap(),
-            prototype,
-            runtime::PropertyKey::Symbol(symbol),
-            runtime::data_descriptor(values, true, false, true),
-        ) {
-            Result::Ok(())
-        } else {
-            Result::Err(BuiltinError { message: "cannot define " + name + " iterator" })
-        },
-        None => Result::Err(BuiltinError { message: "iterator symbol is not installed" }),
-    }
 }
 
 fn install_typed_array_iterators(context: vm::Context, install: ArrayBufferInstall) -> Result[
@@ -7134,7 +6486,7 @@ fn atomic_target(context: vm::Context, value: runtime::Value) -> Result[AtomicTa
         return Result::Err(function_vm_error("Atomics target is not an integer TypedArray"))
     } else if runtime::is_typed_array_detached(context.heap(), object) {
         return Result::Err(function_vm_error("Atomics target buffer is detached"))
-    } else {};
+    }
     let length = match runtime::typed_array_element_length(context.heap(), object) {
         Some(value) => value,
         None => return Result::Err(function_vm_error("Atomics target length is invalid")),
@@ -7390,7 +6742,7 @@ fn atomic_compare_exchange(
     let current = atomic_read(context, target, index, depth)?;
     if runtime::same_value(current, expected) {
         atomic_write(context, target, index, replacement, depth)?
-    } else {};
+    }
     Result::Ok(current)
 }
 
@@ -7433,10 +6785,10 @@ fn atomic_wait_target(context: vm::Context, value: runtime::Value, require_share
                 return Result::Err(
                     function_vm_error("Atomics target is not backed by shared memory"),
                 )
-            } else {},
+            },
             _ => return Result::Err(function_vm_error("Atomics target is not a TypedArray")),
         }
-    } else {};
+    }
     Result::Ok(target)
 }
 
@@ -7451,7 +6803,7 @@ fn atomic_notify(
     let _ = atomic_index(context, target, argument(arguments, 1), depth)?;
     if arguments.len() > 2 {
         let _ = atomic_number(context, argument(arguments, 2), depth)?;
-    } else {};
+    }
     Result::Ok(runtime::Value::Int(0))
 }
 
@@ -7467,7 +6819,7 @@ fn atomic_wait(
     let _ = atomic_normalize(context, target, argument(arguments, 2), depth)?;
     if arguments.len() > 3 {
         let _ = atomic_number(context, argument(arguments, 3), depth)?;
-    } else {};
+    }
     Result::Err(function_vm_error("cannot block in this thread"))
 }
 
@@ -7486,10 +6838,10 @@ fn atomic_pause(
             runtime::Value::Float(value) => if !math::is_finite(value)
                 || math::trunc(value) != value {
                 return Result::Err(function_vm_error("Atomics.pause argument must be an integer"))
-            } else {},
+            },
             _ => return Result::Err(function_vm_error("Atomics.pause argument must be an integer")),
         }
-    } else {};
+    }
     Result::Ok(runtime::Value::Undefined)
 }
 
@@ -7720,7 +7072,7 @@ pub fn install_arraybuffer(context: vm::Context) -> Result[ArrayBufferInstall, B
             return Result::Err(BuiltinError { message: "cannot define ArrayBuffer species" })
         },
         None => (),
-    };
+    }
     Result::Ok(
         ArrayBufferInstall {
             array_buffer,

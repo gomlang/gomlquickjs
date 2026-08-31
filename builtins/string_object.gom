@@ -234,7 +234,7 @@ fn string_method_receiver_at_depth(context: vm::Context, value: runtime::Value, 
             return Result::Err(string_vm_type_error("String method called on null or undefined"))
         },
         _ => (),
-    };
+    }
     string_value_at_depth(context, value, depth)
 }
 
@@ -267,7 +267,7 @@ fn string_convert_argument_at_depth(
                     arguments[index] = number_value_at_depth(context, value, depth)?;
                 },
             }
-        } else {},
+        },
         StringArgumentConversion::String(index) => {
             while arguments.len() <= index {
                 arguments.push(runtime::Value::Undefined)
@@ -281,8 +281,8 @@ fn string_convert_argument_at_depth(
                     arguments[index] = string_value_at_depth(context, value, depth)?;
                 },
             }
-        } else {},
-    };
+        },
+    }
     Result::Ok(())
 }
 
@@ -331,7 +331,7 @@ fn string_define_method(
                         }
                     },
                     None => (),
-                };
+                }
                 string_invoke_native_method(context, callback, receiver, arguments)
             },
         )?,
@@ -377,7 +377,7 @@ fn string_define_pad_method(
                         StringArgumentConversion::OptionalString(1),
                         depth,
                     )?
-                } else {};
+                }
                 string_invoke_native_method(context, callback, receiver, arguments)
             },
         )?,
@@ -406,7 +406,7 @@ fn string_define_search_method(
                     return Result::Err(
                         string_vm_type_error(name + " does not accept a regular expression"),
                     )
-                } else {};
+                }
                 string_convert_argument_at_depth(
                     context,
                     arguments,
@@ -427,43 +427,6 @@ fn string_define_search_method(
     )
 }
 
-fn string_pattern(
-    context: vm::Context,
-    states: HashMap[runtime::ObjectId, RegExpState],
-    value: runtime::Value,
-    depth: isize,
-) -> Result[StringPattern, vm::VmError] {
-    match value {
-        runtime::Value::Undefined => match new_regexp_state(js_string(""), js_string("")) {
-            Ok(state) => Result::Ok(StringPattern { state, object: Option::None }),
-            Err(value) => Result::Err(string_vm_native_error(value)),
-        },
-        runtime::Value::Object(object) => match states.get(object) {
-            Some(state) => Result::Ok(StringPattern { state, object: Option::Some(object) }),
-            None => {
-                let pattern = match string_value_at_depth(context, value, depth)? {
-                    runtime::Value::String(value) => value,
-                    _ => return Result::Err(string_vm_type_error("pattern is not a string")),
-                };
-                match new_regexp_state(pattern, js_string("")) {
-                    Ok(state) => Result::Ok(StringPattern { state, object: Option::None }),
-                    Err(value) => Result::Err(string_vm_native_error(value)),
-                }
-            },
-        },
-        value => {
-            let pattern = match string_value_at_depth(context, value, depth)? {
-                runtime::Value::String(value) => value,
-                _ => return Result::Err(string_vm_type_error("pattern is not a string")),
-            };
-            match new_regexp_state(pattern, js_string("")) {
-                Ok(state) => Result::Ok(StringPattern { state, object: Option::None }),
-                Err(value) => Result::Err(string_vm_native_error(value)),
-            }
-        },
-    }
-}
-
 fn string_advance_index(value: runtime::JsString, index: isize, unicode: bool) -> isize {
     if unicode && index + 1 < value.len() && runtime::is_high_surrogate(value.get(index))
         && runtime::is_low_surrogate(value.get(index + 1)) {
@@ -473,82 +436,13 @@ fn string_advance_index(value: runtime::JsString, index: isize, unicode: bool) -
     }
 }
 
-fn string_set_last_index(heap: runtime::Heap, object: Option[runtime::ObjectId], value: isize) -> Result[
-    (),
-    vm::VmError,
-] {
-    match object {
-        Some(object) => match set_regexp_last_index(heap, object, value) {
-            Ok(()) => Result::Ok(()),
-            Err(value) => Result::Err(string_vm_native_error(value)),
-        },
-        None => Result::Ok(()),
-    }
-}
-
-fn string_find_matches(
-    heap: runtime::Heap,
-    pattern: StringPattern,
-    input: runtime::JsString,
-    all: bool,
-) -> Result[LocatedMatches, vm::VmError] {
-    let matches: Vec[LocatedMatch] = Vec::new();
-    if all {
-        string_set_last_index(heap, pattern.object, 0)?;
-    } else {};
-    let mut offset = if !all && pattern.state.sticky {
-        match pattern.object {
-            Some(object) => match regexp_last_index(heap, object, input.len()) {
-                Ok(value) => value,
-                Err(value) => return Result::Err(string_vm_native_error(value)),
-            },
-            None => 0,
-        }
-    } else {
-        0
-    };
-    while offset <= input.len() {
-        let found = match find_regexp_match(pattern.state, input, offset) {
-            Ok(value) => value,
-            Err(value) => return Result::Err(string_vm_native_error(value)),
-        };
-        match found {
-            Some(found) => {
-                let start = found.start;
-                let end = found.end;
-                matches.push(found);
-                if !all {
-                    if pattern.state.sticky {
-                        string_set_last_index(heap, pattern.object, end)?
-                    } else {};
-                    return Result::Ok(matches)
-                } else if end == start {
-                    offset = string_advance_index(input, end, pattern.state.unicode);
-                } else {
-                    offset = end;
-                }
-            },
-            None => {
-                if all || pattern.state.sticky {
-                    string_set_last_index(heap, pattern.object, 0)?
-                } else {};
-                return Result::Ok(matches)
-            },
-        }
-    }
-    if all {
-        string_set_last_index(heap, pattern.object, 0)?
-    } else {};
-    Result::Ok(matches)
-}
-
 fn string_append_slice(output: Vec[u16], value: runtime::JsString, start: isize, end: isize) -> Result[
     (),
     vm::VmError,
 ] {
     if end - start > STRING_LENGTH_LIMIT - output.len() {
         return Result::Err(string_vm_range_error("string length limit exceeded"))
-    } else {};
+    }
     let mut index = start;
     while index < end {
         output.push(value.get(index));
@@ -573,7 +467,7 @@ fn string_has_named_captures(found: LocatedMatch) -> bool {
     while index < found.capture_names.len() {
         if found.capture_names[index].is_some() {
             return true
-        } else {};
+        }
         index += 1;
     }
     false
@@ -587,13 +481,13 @@ fn string_named_capture_index(found: LocatedMatch, name: runtime::JsString) -> i
             Some(value) => if value == name {
                 if first < 0 {
                     first = index;
-                } else {};
+                }
                 if found.captures[index].is_some() {
                     return index
-                } else {}
-            } else {},
+                }
+            },
             None => {},
-        };
+        }
         index += 1;
     }
     first
@@ -645,7 +539,7 @@ fn string_replacement_text(
                     let capture = string_named_capture_index(found, name);
                     if capture >= 0 {
                         string_append_capture(output, input, found.captures[capture])?
-                    } else {};
+                    }
                     index = end + 1;
                 } else {
                     output.push(36);
@@ -655,10 +549,10 @@ fn string_replacement_text(
                 output.push(36);
                 index += 1;
             }
-        };
+        }
         if output.len() > STRING_LENGTH_LIMIT {
             return Result::Err(string_vm_range_error("string length limit exceeded"))
-        } else {}
+        }
     }
     Result::Ok(runtime::JsString::from_code_units(output))
 }
@@ -683,9 +577,9 @@ fn string_numeric_capture(replacement: runtime::JsString, index: isize, capture_
             let combined = first * 10 + (second - 48).to_isize();
             if combined >= 1 && combined < capture_count {
                 return Option::Some((combined, 3))
-            } else {}
-        } else {}
-    } else {};
+            }
+        }
+    }
     if first >= 1 && first < capture_count {
         Option::Some((first, 2))
     } else {
@@ -754,7 +648,7 @@ fn string_dynamic_replacement_text(
                             },
                             _ => (),
                         },
-                    };
+                    }
                     index = end + 1;
                 } else {
                     output.push(36);
@@ -764,10 +658,10 @@ fn string_dynamic_replacement_text(
                 output.push(36);
                 index += 1;
             }
-        };
+        }
         if output.len() > STRING_LENGTH_LIMIT {
             return Result::Err(string_vm_range_error("string length limit exceeded"))
-        } else {}
+        }
     }
     Result::Ok(runtime::JsString::from_code_units(output))
 }
@@ -793,7 +687,7 @@ fn string_dynamic_replacement(
         match named_captures {
             runtime::Value::Undefined => (),
             value => arguments.push(value),
-        };
+        }
         let result = context.invoke_with_this_at_depth(
             replacement,
             arguments,
@@ -867,7 +761,7 @@ fn string_replacement(
                     runtime::Value::String(input.slice(value.start, value.end)),
                 ),
                 None => arguments.push(runtime::Value::Undefined),
-            };
+            }
             index += 1;
         }
         arguments.push(runtime::Value::Int(found.start.to_i32()));
@@ -878,7 +772,7 @@ fn string_replacement(
                 Err(value) => return Result::Err(string_vm_native_error(value)),
             };
             arguments.push(groups)
-        } else {};
+        }
         let result = context.invoke_with_this_at_depth(
             replacement,
             arguments,
@@ -976,7 +870,7 @@ fn string_concat(heap: runtime::Heap, this_value: runtime::Value, arguments: Vec
         let next = value_string(heap, arguments[index])?;
         if next.len() > STRING_LENGTH_LIMIT || result.len() > STRING_LENGTH_LIMIT - next.len() {
             return Result::Err(native_error("RangeError: string length limit exceeded"))
-        } else {};
+        }
         result = result.concat(next);
         index += 1;
     }
@@ -1099,7 +993,7 @@ fn string_repeat(heap: runtime::Heap, this_value: runtime::Value, arguments: Vec
     let count_value = number_argument(arguments, 0)?;
     if count_value == infinity() || count_value == -infinity() {
         return Result::Err(native_error("RangeError: invalid string repetition count"))
-    } else {};
+    }
     let count = if math::is_nan(count_value) {
         0
     } else if count_value <= -1.0 {
@@ -1138,13 +1032,13 @@ fn string_pad(
     if math::is_nan(target_value) || target_value <= int_float(value.len())
         || target_value == -infinity() {
         return Result::Ok(string_value(value))
-    } else {};
+    }
     let fill = string_pad_fill(heap, arguments)?;
     if fill.len() == 0 {
         return Result::Ok(string_value(value))
     } else if target_value == infinity() || target_value > int_float(STRING_LENGTH_LIMIT) {
         return Result::Err(native_error("RangeError: string length limit exceeded"))
-    } else {};
+    }
     let target = string_truncated_int(target_value, 0);
     let result = if start {
         stringx::pad_start(value, target, fill)
@@ -1332,7 +1226,7 @@ fn string_html_attribute(value: runtime::JsString) -> Result[runtime::JsString, 
         if value.get(index) == 34 {
             if output.len() > STRING_LENGTH_LIMIT - replacement.len() {
                 return Result::Err(native_error("RangeError: string length limit exceeded"))
-            } else {};
+            }
             let mut replacement_index = 0;
             while replacement_index < replacement.len() {
                 output.push(replacement.get(replacement_index));
@@ -1341,9 +1235,9 @@ fn string_html_attribute(value: runtime::JsString) -> Result[runtime::JsString, 
         } else {
             if output.len() >= STRING_LENGTH_LIMIT {
                 return Result::Err(native_error("RangeError: string length limit exceeded"))
-            } else {};
+            }
             output.push(value.get(index));
-        };
+        }
         index += 1;
     }
     Result::Ok(runtime::JsString::from_code_units(output))
@@ -1547,7 +1441,7 @@ fn string_regexp_match_at_depth(
                     runtime::Value::String(input),
                     depth,
                 )
-            } else {};
+            }
             let unicode = string_full_unicode_flag(flags);
             string_set_property_at_depth(
                 context,
@@ -1602,7 +1496,7 @@ fn string_regexp_match_at_depth(
                                     unicode,
                                     depth,
                                 )?
-                            } else {};
+                            }
                             Result::Ok(())
                         },
                     )?,
@@ -1646,7 +1540,7 @@ fn string_regexp_search_at_depth(
                     runtime::Value::Int(0),
                     depth,
                 )?
-            } else {};
+            }
             let result = regexp_exec_at_depth(context, states, receiver_root.get(), input, depth)?;
             regexp_with_root(
                 context,
@@ -1665,7 +1559,7 @@ fn string_regexp_search_at_depth(
                             previous_root.get(),
                             depth,
                         )?
-                    } else {};
+                    }
                     match result {
                         runtime::Value::Null => Result::Ok(runtime::Value::Int(-1)),
                         runtime::Value::Object(_) => context.read_property_at_depth(
@@ -1683,67 +1577,6 @@ fn string_regexp_search_at_depth(
     )
 }
 
-fn string_match_internal(
-    context: vm::Context,
-    states: HashMap[runtime::ObjectId, RegExpState],
-    this_value: runtime::Value,
-    arguments: Vec[runtime::Value],
-    depth: isize,
-) -> Result[runtime::Value, vm::VmError] {
-    let input = match string_receiver(context.heap(), this_value) {
-        Ok(value) => value,
-        Err(value) => return Result::Err(string_vm_native_error(value)),
-    };
-    let pattern = string_pattern(context, states, argument(arguments, 0), depth)?;
-    if pattern.state.global {
-        let matches = string_find_matches(context.heap(), pattern, input, true)?;
-        if matches.is_empty() {
-            Result::Ok(runtime::Value::Null)
-        } else {
-            let values: Vec[runtime::Value] = Vec::with_capacity(matches.len());
-            for found in matches {
-                values.push(runtime::Value::String(input.slice(found.start, found.end)))
-            }
-            match allocate_array(context.heap(), values, values.len()) {
-                Ok(value) => Result::Ok(runtime::Value::Object(value)),
-                Err(value) => Result::Err(string_vm_native_error(value)),
-            }
-        }
-    } else {
-        let matches = string_find_matches(context.heap(), pattern, input, false)?;
-        if matches.is_empty() {
-            Result::Ok(runtime::Value::Null)
-        } else {
-            match regexp_match_array(context.heap(), input, matches[0], pattern.state.has_indices) {
-                Ok(value) => Result::Ok(value),
-                Err(value) => Result::Err(string_vm_native_error(value)),
-            }
-        }
-    }
-}
-
-fn string_search_internal(
-    context: vm::Context,
-    states: HashMap[runtime::ObjectId, RegExpState],
-    this_value: runtime::Value,
-    arguments: Vec[runtime::Value],
-    depth: isize,
-) -> Result[runtime::Value, vm::VmError] {
-    let input = match string_receiver(context.heap(), this_value) {
-        Ok(value) => value,
-        Err(value) => return Result::Err(string_vm_native_error(value)),
-    };
-    let pattern = string_pattern(context, states, argument(arguments, 0), depth)?;
-    let found = match find_regexp_match(pattern.state, input, 0) {
-        Ok(value) => value,
-        Err(value) => return Result::Err(string_vm_native_error(value)),
-    };
-    match found {
-        Some(value) => Result::Ok(runtime::Value::Int(value.start.to_i32())),
-        None => Result::Ok(runtime::Value::Int(-1)),
-    }
-}
-
 fn string_literal_matches(input: runtime::JsString, search: runtime::JsString, all: bool) -> Vec[
     LocatedMatch,
 ] {
@@ -1753,7 +1586,7 @@ fn string_literal_matches(input: runtime::JsString, search: runtime::JsString, a
         let start = stringx::index_of(input, search, offset);
         if start < 0 {
             return matches
-        } else {};
+        }
         let end = start + search.len();
         matches.push(
             LocatedMatch {
@@ -1799,7 +1632,7 @@ fn string_replace_internal(
     };
     if matches.is_empty() {
         return Result::Ok(runtime::Value::String(input))
-    } else {};
+    }
     let output: Vec[u16] = Vec::new();
     let mut source_position = 0;
     for found in matches {
@@ -1808,7 +1641,7 @@ fn string_replace_internal(
             let text = string_replacement(context, input, found, replacement, depth)?;
             string_append_slice(output, text, 0, text.len())?;
             source_position = found.end;
-        } else {}
+        }
     }
     string_append_slice(output, input, source_position, input.len())?;
     Result::Ok(runtime::Value::String(runtime::JsString::from_code_units(output)))
@@ -1831,7 +1664,7 @@ fn string_has_default_regexp_exec(
     let key = runtime::string_property_key("exec");
     if current.prototype() != Option::Some(prototype) || current.own_property(key).is_some() {
         return false
-    } else {};
+    }
     let inherited = match context.heap().get(prototype) {
         Some(value) => value.own_property(key),
         None => Option::None,
@@ -1858,7 +1691,7 @@ fn string_regexp_builtin_replace_at_depth(
 ) -> Result[runtime::Value, vm::VmError] {
     if global {
         string_set_property_at_depth(context, receiver, "lastIndex", runtime::Value::Int(0), depth)?
-    } else {};
+    }
     let matches: Vec[LocatedMatch] = Vec::new();
     loop {
         let (_, _, found) = regexp_match_at_depth(
@@ -1876,14 +1709,14 @@ fn string_regexp_builtin_replace_at_depth(
                     break
                 } else if empty {
                     string_advance_regexp_last_index(context, receiver, input, unicode, depth)?
-                } else {}
+                }
             },
             None => break,
         }
     }
     if matches.is_empty() {
         return Result::Ok(runtime::Value::String(input))
-    } else {};
+    }
     let output: Vec[u16] = Vec::new();
     let mut next_source_position = 0;
     for found in matches {
@@ -1900,7 +1733,7 @@ fn string_regexp_builtin_replace_at_depth(
             };
             string_append_slice(output, replacement_text, 0, replacement_text.len())?;
             next_source_position = found.end;
-        } else {}
+        }
     }
     string_append_slice(output, input, next_source_position, input.len())?;
     Result::Ok(runtime::Value::String(runtime::JsString::from_code_units(output)))
@@ -1931,7 +1764,7 @@ fn string_regexp_replace_at_depth(
                 replacement_root.set(
                     string_value_at_depth_with_root(context, replacement_root.get(), depth)?,
                 )
-            } else {};
+            }
             let flags = string_regexp_flags_at_depth(context, receiver_root.get(), depth)?;
             let global = string_global_flag(flags);
             let unicode = if global {
@@ -1956,7 +1789,7 @@ fn string_regexp_replace_at_depth(
                     unicode,
                     depth,
                 )
-            } else {};
+            }
             if global {
                 string_set_property_at_depth(
                     context,
@@ -1965,7 +1798,7 @@ fn string_regexp_replace_at_depth(
                     runtime::Value::Int(0),
                     depth,
                 )?
-            } else {};
+            }
             string_with_roots(
                 context,
                 |result_roots| {
@@ -1983,7 +1816,7 @@ fn string_regexp_replace_at_depth(
                                 let result_root = string_add_root(context, result_roots, result);
                                 if !global {
                                     break
-                                } else {};
+                                }
                                 let matched = context.read_property_at_depth(
                                     result_root.get(),
                                     runtime::Value::Int(0),
@@ -2007,7 +1840,7 @@ fn string_regexp_replace_at_depth(
                                         unicode,
                                         depth,
                                     )?
-                                } else {}
+                                }
                             },
                             _ => return Result::Err(
                                 string_vm_type_error(
@@ -2072,7 +1905,7 @@ fn string_regexp_replace_at_depth(
                                 value => captures.push(
                                     string_value_at_depth_with_root(context, value, depth)?,
                                 ),
-                            };
+                            }
                             capture_index += 1;
                         }
                         let named_captures = context.read_property_at_depth(
@@ -2109,7 +1942,7 @@ fn string_regexp_replace_at_depth(
                                         replacement_text.len(),
                                     )?;
                                     next_source_position.set(position + matched.len())
-                                } else {};
+                                }
                                 Result::Ok(())
                             },
                         )?
@@ -2172,7 +2005,7 @@ fn string_regexp_split_at_depth(
                 |output_roots| {
                     if limit == 0 {
                         return string_array_from_roots(context, output_roots)
-                    } else {};
+                    }
                     let size = input.len();
                     let p = Ref::new(0);
                     let q = Ref::new(0);
@@ -2198,9 +2031,9 @@ fn string_regexp_split_at_depth(
                                     "RegExp exec method must return an object or null",
                                 ),
                             ),
-                        };
+                        }
                         return string_array_from_roots(context, output_roots)
-                    } else {};
+                    }
                     while q.get() < size {
                         string_set_property_at_depth(
                             context,
@@ -2252,7 +2085,7 @@ fn string_regexp_split_at_depth(
                                             );
                                             if output_roots.len() == limit {
                                                 return Result::Ok(true)
-                                            } else {};
+                                            }
                                             p.set(end);
                                             let length_value = context.read_property_at_depth(
                                                 result,
@@ -2278,17 +2111,17 @@ fn string_regexp_split_at_depth(
                                                 );
                                                 if output_roots.len() == limit {
                                                     return Result::Ok(true)
-                                                } else {};
+                                                }
                                                 index += 1;
                                             }
                                             q.set(p.get())
-                                        };
+                                        }
                                         Result::Ok(false)
                                     },
                                 )?;
                                 if reached_limit {
                                     return string_array_from_roots(context, output_roots)
-                                } else {}
+                                }
                             },
                             _ => return Result::Err(
                                 string_vm_type_error(
@@ -2326,7 +2159,7 @@ fn string_split_regexp(
             Ok(value) => Result::Ok(runtime::Value::Object(value)),
             Err(value) => Result::Err(string_vm_native_error(value)),
         }
-    } else {};
+    }
     if input.len() == 0 {
         let found = match match_at(state, input, 0) {
             Ok(value) => value,
@@ -2334,7 +2167,7 @@ fn string_split_regexp(
         };
         if found.is_none() {
             values.push(runtime::Value::String(input))
-        } else {};
+        }
     } else {
         let mut start = 0;
         let mut offset = 0;
@@ -2350,7 +2183,7 @@ fn string_split_regexp(
                     values.push(runtime::Value::String(input.slice(start, found.start)));
                     if values.len() >= limit {
                         break
-                    } else {};
+                    }
                     let mut capture = 1;
                     while capture < found.captures.len() && values.len() < limit {
                         match found.captures[capture] {
@@ -2358,7 +2191,7 @@ fn string_split_regexp(
                                 runtime::Value::String(input.slice(value.start, value.end)),
                             ),
                             None => values.push(runtime::Value::Undefined),
-                        };
+                        }
                         capture += 1;
                     }
                     start = found.end;
@@ -2371,8 +2204,8 @@ fn string_split_regexp(
         }
         if values.len() < limit {
             values.push(runtime::Value::String(input.slice(start, input.len())))
-        } else {}
-    };
+        }
+    }
     match allocate_array(context.heap(), values, values.len()) {
         Ok(value) => Result::Ok(runtime::Value::Object(value)),
         Err(value) => Result::Err(string_vm_native_error(value)),
@@ -2434,7 +2267,7 @@ fn string_symbol_method(
     match value {
         runtime::Value::Object(_) => (),
         _ => return Result::Ok(Option::None),
-    };
+    }
     let symbol = match context.well_known_symbol(kind) {
         Some(value) => value,
         None => return Result::Ok(Option::None),
@@ -2602,7 +2435,7 @@ fn string_regexp_iterator_next(
     let state = string_regexp_iterator_state(iterator_states, this_value)?;
     if state.done.get() {
         return string_iterator_result(context, runtime::Value::Undefined, true)
-    } else {};
+    }
     regexp_with_root(
         context,
         state.matcher,
@@ -2647,10 +2480,10 @@ fn string_regexp_iterator_next(
                                     state.unicode,
                                     depth,
                                 )?
-                            } else {}
+                            }
                         } else {
                             state.done.set(true)
-                        };
+                        }
                         string_iterator_result(context, result, false)
                     },
                     _ => Result::Err(
@@ -2797,103 +2630,6 @@ fn string_regexp_match_all_at_depth(
     )
 }
 
-fn string_match_all_iterator(
-    context: vm::Context,
-    state: RegExpState,
-    input: runtime::JsString,
-    start: isize,
-) -> Result[runtime::Value, vm::VmError] {
-    let completed = Ref::new(false);
-    let index = Ref::new(start);
-    let next = context.new_vm_function(
-        |this_value, arguments, depth| {
-            let _ = this_value;
-            let _ = arguments;
-            let _ = depth;
-            if completed.get() {
-                return string_iterator_result(context, runtime::Value::Undefined, true)
-            } else {};
-            let found = match find_regexp_match(state, input, index.get()) {
-                Ok(value) => value,
-                Err(value) => return Result::Err(string_vm_native_error(value)),
-            };
-            match found {
-                Some(found) => {
-                    if state.global {
-                        let next_index = if found.end == found.start {
-                            string_advance_index(input, found.end, state.unicode)
-                        } else {
-                            found.end
-                        };
-                        index.set(next_index)
-                    } else {
-                        completed.set(true)
-                    };
-                    let value = match regexp_match_array(
-                        context.heap(),
-                        input,
-                        found,
-                        state.has_indices,
-                    ) {
-                        Ok(value) => value,
-                        Err(value) => return Result::Err(string_vm_native_error(value)),
-                    };
-                    string_iterator_result(context, value, false)
-                },
-                None => {
-                    completed.set(true);
-                    string_iterator_result(context, runtime::Value::Undefined, true)
-                },
-            }
-        },
-    )?;
-    let iterator = iterator_allocate_object(context)?;
-    if !runtime::define_own_property(
-        context.heap(),
-        iterator,
-        runtime::string_property_key("next"),
-        runtime::data_descriptor(next, true, false, true),
-    ) {
-        return Result::Err(function_vm_error("cannot define RegExp string iterator next"))
-    } else {};
-    let iterator_symbol = match context.iterator_symbol() {
-        Some(value) => value,
-        None => return Result::Err(function_vm_error("iterator symbol is not installed")),
-    };
-    let identity = context.new_native_function(string_iterator_identity)?;
-    if !runtime::define_own_property(
-        context.heap(),
-        iterator,
-        runtime::PropertyKey::Symbol(iterator_symbol),
-        runtime::data_descriptor(identity, true, false, true),
-    ) {
-        Result::Err(function_vm_error("cannot define RegExp string iterator identity"))
-    } else {
-        Result::Ok(runtime::Value::Object(iterator))
-    }
-}
-
-fn string_regexp_match_all(
-    context: vm::Context,
-    states: HashMap[runtime::ObjectId, RegExpState],
-    this_value: runtime::Value,
-    arguments: Vec[runtime::Value],
-) -> Result[runtime::Value, vm::VmError] {
-    let (object, state) = match regexp_state(states, this_value) {
-        Ok(value) => value,
-        Err(value) => return Result::Err(string_vm_native_error(value)),
-    };
-    let input = match string_receiver(context.heap(), argument(arguments, 0)) {
-        Ok(value) => value,
-        Err(value) => return Result::Err(string_vm_native_error(value)),
-    };
-    let start = match regexp_last_index(context.heap(), object, input.len()) {
-        Ok(value) => value,
-        Err(value) => return Result::Err(string_vm_native_error(value)),
-    };
-    string_match_all_iterator(context, state, input, start)
-}
-
 fn string_match_all_dispatch(
     context: vm::Context,
     states: HashMap[runtime::ObjectId, RegExpState],
@@ -2918,8 +2654,8 @@ fn string_match_all_dispatch(
             return Result::Err(
                 string_vm_type_error("matchAll requires a global regular expression"),
             )
-        } else {}
-    } else {};
+        }
+    }
     match string_symbol_method(context, pattern, vm::WellKnownSymbolKind::MatchAll, depth)? {
         Some(method) => context.invoke_with_this_at_depth(
             method,
@@ -3024,8 +2760,8 @@ fn string_replace_dispatch(
             return Result::Err(
                 string_vm_type_error("replaceAll requires a global regular expression"),
             )
-        } else {}
-    } else {};
+        }
+    }
     match string_symbol_method(context, pattern, vm::WellKnownSymbolKind::Replace, depth)? {
         Some(method) => context.invoke_with_this_at_depth(
             method,
@@ -3292,16 +3028,6 @@ fn string_iterator_result(context: vm::Context, value: runtime::Value, done: boo
     }
 }
 
-fn string_iterator_identity(
-    heap: runtime::Heap,
-    this_value: runtime::Value,
-    arguments: Vec[runtime::Value],
-) -> Result[runtime::Value, vm::NativeError] {
-    let _ = heap;
-    let _ = arguments;
-    Result::Ok(this_value)
-}
-
 fn string_iterator_gc_edges(
     heap: runtime::Heap,
     states: HashMap[runtime::ObjectId, StringIteratorState],
@@ -3310,7 +3036,7 @@ fn string_iterator_gc_edges(
     for (object, _) in states.entries() {
         if !heap.contains(object) {
             stale.push(object)
-        } else {}
+        }
     }
     for object in stale {
         let _ = states.remove(object);
@@ -3464,7 +3190,7 @@ pub fn install_string_prototype(context: vm::Context, constructor: runtime::Valu
         runtime::Value::String(js_string("")),
     ) {
         return Result::Err(BuiltinError { message: "cannot initialize String prototype" })
-    } else {};
+    }
     define_value(
         context.heap(),
         constructor_object,

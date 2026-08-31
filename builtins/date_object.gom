@@ -7,10 +7,6 @@ use std::math;
 use std::num;
 use std::time;
 
-fn date_nan() -> f64 {
-    num::parse_float64_structured("NaN").unwrap_or(0.0)
-}
-
 fn date_number(value: runtime::Value) -> Result[f64, vm::NativeError] {
     match runtime::primitive_to_number(value) {
         Ok(value) => Result::Ok(value),
@@ -23,119 +19,6 @@ fn date_int64(value: runtime::Value) -> Result[i64, vm::NativeError] {
     match date::time_clip(number) {
         Ok(value) => Result::Ok(value),
         Err(value) => Result::Err(native_error(value.to_string())),
-    }
-}
-
-fn date_string(value: runtime::Value) -> Result[string, vm::NativeError] {
-    match value {
-        runtime::Value::String(value) => match value.to_host_string() {
-            Ok(value) => Result::Ok(value),
-            Err(_) => Result::Err(native_error("date string contains an unpaired surrogate")),
-        },
-        _ => Result::Err(native_error("date parser requires a string")),
-    }
-}
-
-fn date_parse(heap: runtime::Heap, this_value: runtime::Value, arguments: Vec[runtime::Value]) -> Result[
-    runtime::Value,
-    vm::NativeError,
-] {
-    let _ = heap;
-    let _ = this_value;
-    let input = if arguments.is_empty() {
-        runtime::Value::Undefined
-    } else {
-        arguments[0]
-    };
-    let source = match date_string(input) {
-        Ok(value) => value,
-        Err(_) => return Result::Ok(runtime::Value::Float(date_nan())),
-    };
-    match date::parse_timestamp(source) {
-        Ok(value) => Result::Ok(
-            runtime::Value::Float(
-                num::parse_float64_structured(value.to_string()).unwrap_or(date_nan()),
-            ),
-        ),
-        Err(_) => Result::Ok(runtime::Value::Float(date_nan())),
-    }
-}
-
-fn component(arguments: Vec[runtime::Value], index: isize, default: i64) -> Result[
-    i64,
-    vm::NativeError,
-] {
-    if index >= arguments.len() {
-        Result::Ok(default)
-    } else {
-        let value = date_number(arguments[index])?;
-        if !math::is_finite(value) {
-            Result::Err(native_error("date component is not finite"))
-        } else {
-            date_int64(runtime::Value::Float(value))
-        }
-    }
-}
-
-fn date_utc(heap: runtime::Heap, this_value: runtime::Value, arguments: Vec[runtime::Value]) -> Result[
-    runtime::Value,
-    vm::NativeError,
-] {
-    let _ = heap;
-    let _ = this_value;
-    if arguments.is_empty() {
-        return Result::Ok(runtime::Value::Float(date_nan()))
-    } else {};
-    let mut year = match component(arguments, 0, 0) {
-        Ok(value) => value,
-        Err(_) => return Result::Ok(runtime::Value::Float(date_nan())),
-    };
-    if year >= 0 && year <= 99 {
-        year += 1900;
-    } else {};
-    let month = match component(arguments, 1, 0) {
-        Ok(value) => value,
-        Err(_) => return Result::Ok(runtime::Value::Float(date_nan())),
-    };
-    let day = match component(arguments, 2, 1) {
-        Ok(value) => value,
-        Err(_) => return Result::Ok(runtime::Value::Float(date_nan())),
-    };
-    let hour = match component(arguments, 3, 0) {
-        Ok(value) => value,
-        Err(_) => return Result::Ok(runtime::Value::Float(date_nan())),
-    };
-    let minute = match component(arguments, 4, 0) {
-        Ok(value) => value,
-        Err(_) => return Result::Ok(runtime::Value::Float(date_nan())),
-    };
-    let second = match component(arguments, 5, 0) {
-        Ok(value) => value,
-        Err(_) => return Result::Ok(runtime::Value::Float(date_nan())),
-    };
-    let millisecond = match component(arguments, 6, 0) {
-        Ok(value) => value,
-        Err(_) => return Result::Ok(runtime::Value::Float(date_nan())),
-    };
-    let timestamp = match date::make_day(year, month, day) {
-        Ok(days) => match date::make_time(hour, minute, second, millisecond) {
-            Ok(time) => date::make_date(days, time),
-            Err(value) => Result::Err(value),
-        },
-        Err(value) => Result::Err(value),
-    };
-    match timestamp {
-        Ok(value) => match date::time_clip(
-            num::parse_float64_structured(value.to_string()).unwrap_or(date_nan()),
-        ) {
-            Ok(value) => Result::Ok(
-                runtime::Value::Float(
-                    num::parse_float64_structured(value.to_string()).unwrap_or(date_nan()),
-                ),
-            ),
-            Err(_) => Result::Ok(runtime::Value::Float(date_nan())),
-        },
-        Err(_) => Result::Ok(runtime::Value::Float(date_nan())),
     }
 }
 
@@ -155,19 +38,6 @@ fn date_to_iso_string(
         Ok(value) => Result::Ok(runtime::Value::String(js_string(value))),
         Err(value) => Result::Err(native_error(value.to_string())),
     }
-}
-
-fn date_now(heap: runtime::Heap, this_value: runtime::Value, arguments: Vec[runtime::Value]) -> Result[
-    runtime::Value,
-    vm::NativeError,
-] {
-    let _ = heap;
-    let _ = this_value;
-    let _ = arguments;
-    let value = time::SystemTime::now().unix_milliseconds();
-    Result::Ok(
-        runtime::Value::Float(num::parse_float64_structured(value.to_string()).unwrap_or(0.0)),
-    )
 }
 
 fn date_fields(heap: runtime::Heap, this_value: runtime::Value, arguments: Vec[runtime::Value]) -> Result[
@@ -213,7 +83,7 @@ fn date_fields(heap: runtime::Heap, this_value: runtime::Value, arguments: Vec[r
             runtime::data_descriptor(field, true, true, true),
         ) {
             return Result::Err(native_error("cannot define date field"))
-        } else {}
+        }
     }
     Result::Ok(runtime::Value::Object(object))
 }
