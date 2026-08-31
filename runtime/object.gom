@@ -415,7 +415,12 @@ fn make_object(kind: ObjectKind, prototype: Option[ObjectId]) -> Object {
     }
 }
 
-fn enqueue_object(heap: Heap, id: ObjectId, marked: collections::BitSet, pending: Vec[ObjectId]) -> () {
+fn enqueue_object(
+    heap: Heap,
+    id: ObjectId,
+    marked: collections::BitSet,
+    pending: collections::Stack[ObjectId],
+) -> () {
     if heap.identity_value == id.heap_identity_value && id.slot_value >= 0
         && id.slot_value < heap.slots_value.len()
         && !marked.contains(id.slot_value) {
@@ -434,7 +439,7 @@ fn enqueue_value(
     value: Value,
     marked: collections::BitSet,
     symbols: collections::HashSet[u64],
-    pending: Vec[ObjectId],
+    pending: collections::Stack[ObjectId],
 ) -> () {
     match value {
         Value::Object(id) => enqueue_object(heap, id, marked, pending),
@@ -450,7 +455,7 @@ fn enqueue_optional_value(
     value: Option[Value],
     marked: collections::BitSet,
     symbols: collections::HashSet[u64],
-    pending: Vec[ObjectId],
+    pending: collections::Stack[ObjectId],
 ) -> () {
     match value {
         Some(value) => enqueue_value(heap, value, marked, symbols, pending),
@@ -463,7 +468,7 @@ fn enqueue_descriptor(
     descriptor: PropertyDescriptor,
     marked: collections::BitSet,
     symbols: collections::HashSet[u64],
-    pending: Vec[ObjectId],
+    pending: collections::Stack[ObjectId],
 ) -> () {
     match descriptor {
         PropertyDescriptor::Data { value, .. } => enqueue_value(
@@ -485,7 +490,7 @@ fn enqueue_private_element(
     element: PrivateElement,
     marked: collections::BitSet,
     symbols: collections::HashSet[u64],
-    pending: Vec[ObjectId],
+    pending: collections::Stack[ObjectId],
 ) -> () {
     match element {
         PrivateElement::Field(value) | PrivateElement::Method(value) => {
@@ -502,7 +507,7 @@ fn drain_pending(
     heap: Heap,
     marked: collections::BitSet,
     symbols: collections::HashSet[u64],
-    pending: Vec[ObjectId],
+    pending: collections::Stack[ObjectId],
 ) -> () {
     while !pending.is_empty() {
         let current = match pending.pop() {
@@ -595,7 +600,7 @@ fn enqueue_conditional_value(
     value: Value,
     marked: collections::BitSet,
     symbols: collections::HashSet[u64],
-    pending: Vec[ObjectId],
+    pending: collections::Stack[ObjectId],
 ) -> bool {
     match value {
         Value::Object(object) => if marked_object(heap, object, marked) {
@@ -613,7 +618,7 @@ fn mark_conditional_edges(
     heap: Heap,
     marked: collections::BitSet,
     symbols: collections::HashSet[u64],
-    pending: Vec[ObjectId],
+    pending: collections::Stack[ObjectId],
     edges: Vec[GcEdge],
 ) -> () {
     let mut changed = true;
@@ -665,7 +670,7 @@ fn mark_reachable(
     symbols: collections::HashSet[u64],
     edges: Vec[GcEdge],
 ) -> isize {
-    let pending: Vec[ObjectId] = Vec::new();
+    let pending: collections::Stack[ObjectId] = collections::Stack::new();
     for root in roots {
         enqueue_value(heap, root, marked, symbols, pending)
     }

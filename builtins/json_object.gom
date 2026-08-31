@@ -4,6 +4,7 @@ use gomlang::quickjs::dtoa;
 use gomlang::quickjs::json;
 use gomlang::quickjs::runtime;
 use gomlang::quickjs::vm;
+use std::collections;
 use std::math;
 use std::num;
 
@@ -388,15 +389,6 @@ fn json_builtin_append_indent(output: Vec[u16], gap: runtime::JsString, nesting:
     }
 }
 
-fn json_builtin_stack_contains(stack: Vec[runtime::ObjectId], object: runtime::ObjectId) -> bool {
-    for value in stack {
-        if value == object {
-            return true
-        }
-    }
-    false
-}
-
 fn json_builtin_raw_character(value: u16) -> bool {
     (value >= 97 && value <= 122) || (value >= 48 && value <= 57) || value == 45 || value == 34
 }
@@ -497,7 +489,7 @@ fn json_builtin_write_array(
     property_list: Option[Vec[runtime::JsString]],
     gap: runtime::JsString,
     nesting: isize,
-    stack: Vec[runtime::ObjectId],
+    stack: collections::HashSet[runtime::ObjectId],
     output: Vec[u16],
     depth: isize,
 ) -> Result[(), vm::VmError] {
@@ -550,7 +542,7 @@ fn json_builtin_write_object(
     property_list: Option[Vec[runtime::JsString]],
     gap: runtime::JsString,
     nesting: isize,
-    stack: Vec[runtime::ObjectId],
+    stack: collections::HashSet[runtime::ObjectId],
     output: Vec[u16],
     depth: isize,
 ) -> Result[(), vm::VmError] {
@@ -606,7 +598,7 @@ fn json_builtin_write_value(
     property_list: Option[Vec[runtime::JsString]],
     gap: runtime::JsString,
     nesting: isize,
-    stack: Vec[runtime::ObjectId],
+    stack: collections::HashSet[runtime::ObjectId],
     output: Vec[u16],
     depth: isize,
 ) -> Result[bool, vm::VmError] {
@@ -660,10 +652,10 @@ fn json_builtin_write_value(
             if object.is_callable() {
                 Result::Ok(false)
             } else {
-                if json_builtin_stack_contains(stack, object) {
+                if stack.contains(object) {
                     return Result::Err(function_vm_error("circular reference"))
                 }
-                stack.push(object);
+                let _ = stack.insert(object);
                 if json_builtin_is_array(context, object)? {
                     json_builtin_write_array(
                         context,
@@ -691,7 +683,7 @@ fn json_builtin_write_value(
                         depth,
                     )?
                 }
-                let _ = stack.pop();
+                let _ = stack.remove(object);
                 Result::Ok(true)
             }
         },
@@ -707,7 +699,7 @@ fn json_builtin_write_property(
     property_list: Option[Vec[runtime::JsString]],
     gap: runtime::JsString,
     nesting: isize,
-    stack: Vec[runtime::ObjectId],
+    stack: collections::HashSet[runtime::ObjectId],
     output: Vec[u16],
     depth: isize,
 ) -> Result[bool, vm::VmError] {
@@ -889,7 +881,7 @@ fn json_builtin_stringify(
     let empty = js_string("");
     json_builtin_define(context.heap(), root, empty, argument(arguments, 0))?;
     let output: Vec[u16] = Vec::new();
-    let stack: Vec[runtime::ObjectId] = Vec::new();
+    let stack: collections::HashSet[runtime::ObjectId] = collections::HashSet::new();
     if json_builtin_write_property(
         context,
         raw_values,

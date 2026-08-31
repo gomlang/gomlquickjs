@@ -3760,15 +3760,21 @@ fn report_forbidden_return(parser: Parser, statement: ast::Stmt, message: string
     }
 }
 
-fn report_duplicate_labels_in_statement(parser: Parser, statement: ast::Stmt, active: Vec[string]) -> () {
+fn report_duplicate_labels_in_statement(
+    parser: Parser,
+    statement: ast::Stmt,
+    active: collections::HashSet[string],
+) -> () {
     match statement {
         ast::Stmt::Labelled { label, body, span } => {
-            if active.contains(label) {
+            let inserted = active.insert(label);
+            if !inserted {
                 report(parser, "duplicate label `" + label + "`", span)
             }
-            active.push(label);
             report_duplicate_labels_in_statement(parser, body.get(), active);
-            let _ = active.pop();
+            if inserted {
+                let _ = active.remove(label);
+            }
         },
         ast::Stmt::Block { body, .. } => for child in body {
             report_duplicate_labels_in_statement(parser, child, active)
@@ -3819,7 +3825,7 @@ fn report_duplicate_labels_in_statement(parser: Parser, statement: ast::Stmt, ac
 }
 
 fn report_duplicate_labels(parser: Parser, body: Vec[ast::Stmt]) -> () {
-    let active: Vec[string] = Vec::new();
+    let active: collections::HashSet[string] = collections::HashSet::new();
     for statement in body {
         report_duplicate_labels_in_statement(parser, statement, active)
     }

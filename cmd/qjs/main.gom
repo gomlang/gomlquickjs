@@ -8,6 +8,7 @@ use gomlang::quickjs::modules;
 use gomlang::quickjs::promise;
 use gomlang::quickjs::runtime;
 use gomlang::quickjs::vm;
+use std::collections;
 use std::env;
 use std::fs;
 use std::io;
@@ -394,21 +395,12 @@ fn rejection_property_key_text(context: vm::Context, key: runtime::PropertyKey) 
                 + rejection_value_text_at_depth(
                     context,
                     runtime::Value::Symbol(value),
-                    Vec::new(),
+                    collections::HashSet::new(),
                     0,
                 )
                 + "]"
         },
     }
-}
-
-fn rejection_seen_object(seen: Vec[runtime::ObjectId], expected: runtime::ObjectId) -> bool {
-    for object in seen {
-        if object == expected {
-            return true
-        }
-    }
-    false
 }
 
 fn rejection_function_text(context: vm::Context, object: runtime::ObjectId) -> string {
@@ -425,7 +417,7 @@ fn rejection_function_text(context: vm::Context, object: runtime::ObjectId) -> s
 fn rejection_descriptor_text(
     context: vm::Context,
     descriptor: runtime::PropertyDescriptor,
-    seen: Vec[runtime::ObjectId],
+    seen: collections::HashSet[runtime::ObjectId],
     depth: isize,
 ) -> string {
     match runtime::descriptor_value(descriptor) {
@@ -449,10 +441,10 @@ fn rejection_descriptor_text(
 fn rejection_object_text(
     context: vm::Context,
     object: runtime::ObjectId,
-    seen: Vec[runtime::ObjectId],
+    seen: collections::HashSet[runtime::ObjectId],
     depth: isize,
 ) -> string {
-    if rejection_seen_object(seen, object) {
+    if seen.contains(object) {
         return "[Circular]"
     } else if depth >= 2 {
         return "[Object]"
@@ -467,7 +459,7 @@ fn rejection_object_text(
         runtime::ObjectKind::Array => true,
         _ => false,
     };
-    seen.push(object);
+    let _ = seen.insert(object);
     let builder = text::StringBuilder::new();
     builder.write_string(
         if array {
@@ -505,7 +497,7 @@ fn rejection_object_text(
             None => (),
         }
     }
-    let _ = seen.pop();
+    let _ = seen.remove(object);
     builder.write_string(
         if array {
             " ]"
@@ -519,7 +511,7 @@ fn rejection_object_text(
 fn rejection_value_text_at_depth(
     context: vm::Context,
     value: runtime::Value,
-    seen: Vec[runtime::ObjectId],
+    seen: collections::HashSet[runtime::ObjectId],
     depth: isize,
 ) -> string {
     match value {
@@ -556,7 +548,7 @@ fn rejection_value_text_at_depth(
 }
 
 fn rejection_value_text(context: vm::Context, value: runtime::Value) -> string {
-    rejection_value_text_at_depth(context, value, Vec::new(), 0)
+    rejection_value_text_at_depth(context, value, collections::HashSet::new(), 0)
 }
 
 fn rejection_failure_text(context: vm::Context, failure: promise::PromiseFailure) -> string {
