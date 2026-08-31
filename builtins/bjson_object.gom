@@ -46,8 +46,7 @@ struct BjsonWriter {
     context: vm::Context,
     buffers: ArrayBufferInstall,
     data: cutils::ByteBuffer,
-    atoms: Vec[runtime::JsString],
-    atom_indices: HashMap[runtime::JsString, u32],
+    atoms: collections::IndexMap[runtime::JsString, u32],
     objects: HashMap[runtime::ObjectId, u32],
     active: collections::HashSet[runtime::ObjectId],
     allow_reference: bool,
@@ -119,12 +118,11 @@ fn bjson_write_string(output: cutils::ByteBuffer, value: runtime::JsString) -> (
 }
 
 fn bjson_writer_atom(writer: BjsonWriter, value: runtime::JsString) -> u32 {
-    match writer.atom_indices.get(value) {
+    match writer.atoms.get(value) {
         Some(index) => index,
         None => {
             let index = (writer.atoms.len() + 1).to_u32();
-            writer.atoms.push(value);
-            writer.atom_indices[value] = index;
+            let _ = writer.atoms.insert(value, index);
             index
         },
     }
@@ -471,7 +469,7 @@ fn bjson_finish_writer(writer: BjsonWriter) -> Result[Vec[byte], vm::VmError] {
     let header = cutils::ByteBuffer::new();
     header.append_byte(BJSON_VERSION);
     bjson_append_leb128(header, writer.atoms.len().to_u32());
-    for atom in writer.atoms {
+    for (atom, _) in writer.atoms {
         bjson_write_string(header, atom)
     }
     let data = writer.data.bytes();
@@ -916,8 +914,7 @@ fn bjson_write_builtin(
         context,
         buffers,
         data: cutils::ByteBuffer::new(),
-        atoms: Vec::new(),
-        atom_indices: HashMap::new(),
+        atoms: collections::IndexMap::new(),
         objects: HashMap::new(),
         active: collections::HashSet::new(),
         allow_reference,
