@@ -536,6 +536,116 @@ fn array_exotic_length_enforces_writability_and_rolls_back_failed_shrinks() -> (
 }
 
 #[test]
+fn array_index_storage_preserves_dense_sparse_boundaries_and_descriptors() -> () {
+    let heap = Heap::new();
+    let array = expect_object(new_array(heap, 0));
+    testing::assert(
+        define_own_property(
+            heap,
+            array,
+            string_property_key("300"),
+            data_descriptor(Value::Int(3), true, true, true),
+        ),
+    );
+    testing::assert(
+        define_own_property(
+            heap,
+            array,
+            string_property_key("256"),
+            data_descriptor(Value::Int(2), true, true, true),
+        ),
+    );
+    testing::assert(
+        define_own_property(
+            heap,
+            array,
+            string_property_key("301"),
+            data_descriptor(Value::Int(4), true, true, true),
+        ),
+    );
+    testing::assert(
+        set_property(heap, array, string_property_key("300"), Value::Int(33)).unwrap_or(false),
+    );
+    match get_property(heap, array, string_property_key("300")) {
+        Ok(Some(Value::Int(value))) => testing::assert_eq(value, 33),
+        _ => testing::fail("expected updated sparse array value"),
+    }
+    let keys = own_property_keys(heap, array);
+    testing::assert_eq(keys.len(), 4);
+    testing::assert(keys[0] == string_property_key("256"));
+    testing::assert(keys[1] == string_property_key("300"));
+    testing::assert(keys[2] == string_property_key("301"));
+    testing::assert(keys[3] == string_property_key("length"));
+    match heap.get(array) {
+        Some(value) => testing::assert_eq(value.own_property_count(), 4),
+        None => testing::fail("expected array"),
+    }
+    testing::assert(delete_property(heap, array, string_property_key("300")));
+    testing::assert(
+        define_own_property(
+            heap,
+            array,
+            string_property_key("300"),
+            data_descriptor(Value::Int(5), true, true, true),
+        ),
+    );
+    testing::assert(seal_object(heap, array, true));
+    testing::assert(object_is_sealed(heap, array, true));
+    match heap.get(array) {
+        Some(value) => match value.own_array_index(300) {
+            Some(descriptor) => {
+                testing::assert(!descriptor_writable(descriptor));
+                testing::assert(!descriptor_configurable(descriptor))
+            },
+            None => testing::fail("expected frozen dense array value"),
+        },
+        None => testing::fail("expected array"),
+    }
+}
+
+#[test]
+fn array_length_shrink_rolls_back_across_sparse_index_storage() -> () {
+    let heap = Heap::new();
+    let array = expect_object(new_array(heap, 0));
+    testing::assert(
+        define_own_property(
+            heap,
+            array,
+            string_property_key("1024"),
+            data_descriptor(Value::Int(1), true, true, false),
+        ),
+    );
+    testing::assert(
+        define_own_property(
+            heap,
+            array,
+            string_property_key("2048"),
+            data_descriptor(Value::Int(2), true, true, true),
+        ),
+    );
+    testing::assert(
+        !define_own_property(
+            heap,
+            array,
+            string_property_key("length"),
+            data_descriptor(Value::Int(0), true, false, false),
+        ),
+    );
+    match get_property(heap, array, string_property_key("length")) {
+        Ok(Some(Value::Int(value))) => testing::assert_eq(value, 1025),
+        _ => testing::fail("expected rolled back sparse array length"),
+    }
+    match get_property(heap, array, string_property_key("1024")) {
+        Ok(Some(Value::Int(value))) => testing::assert_eq(value, 1),
+        _ => testing::fail("expected retained non-configurable sparse value"),
+    }
+    match get_property(heap, array, string_property_key("2048")) {
+        Ok(value) => testing::assert(value.is_none()),
+        Err(value) => testing::fail(value.message),
+    }
+}
+
+#[test]
 fn configured_array_prototype_is_inherited_and_rooted_by_heap() -> () {
     let heap = Heap::new();
     let prototype = expect_object(new_ordinary_object(heap, Option::None));

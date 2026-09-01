@@ -93,6 +93,54 @@ fn gc_traces_prototypes_and_accessor_values() -> () {
 }
 
 #[test]
+fn gc_traces_dense_and_sparse_array_descriptors() -> () {
+    let heap = Heap::new();
+    let array = gc_expect_object(new_array(heap, 0));
+    let dense = gc_expect_object(new_ordinary_object(heap, Option::None));
+    let sparse = gc_expect_object(new_ordinary_object(heap, Option::None));
+    let getter = gc_expect_object(new_object(heap, ObjectKind::Function, Option::None));
+    let setter = gc_expect_object(new_object(heap, ObjectKind::Function, Option::None));
+    testing::assert(
+        define_own_property(
+            heap,
+            array,
+            string_property_key("0"),
+            data_descriptor(Value::Object(dense), true, true, true),
+        ),
+    );
+    testing::assert(
+        define_own_property(
+            heap,
+            array,
+            string_property_key("1024"),
+            data_descriptor(Value::Object(sparse), true, true, true),
+        ),
+    );
+    testing::assert(
+        define_own_property(
+            heap,
+            array,
+            string_property_key("2048"),
+            accessor_descriptor(
+                Option::Some(Value::Object(getter)),
+                Option::Some(Value::Object(setter)),
+                true,
+                true,
+            ),
+        ),
+    );
+    let stats = heap.collect(Vec::from_array([Value::Object(array)]));
+    testing::assert_eq(stats.live_before, 5);
+    testing::assert_eq(stats.reachable, 5);
+    testing::assert_eq(stats.collected, 0);
+    testing::assert(heap.contains(array));
+    testing::assert(heap.contains(dense));
+    testing::assert(heap.contains(sparse));
+    testing::assert(heap.contains(getter));
+    testing::assert(heap.contains(setter))
+}
+
+#[test]
 fn gc_traces_hidden_private_names_and_values() -> () {
     let heap = Heap::new();
     let target = gc_expect_object(new_ordinary_object(heap, Option::None));
