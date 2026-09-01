@@ -3521,8 +3521,8 @@ fn read_array_element(
                     },
                     None => match target.kind() {
                         runtime::ObjectKind::Array => {
-                            match target.own_array_index(index) {
-                                Some(runtime::PropertyDescriptor::Data { value, .. }) => {
+                            match target.own_array_index_value(index) {
+                                Some(value) => {
                                     return Result::Ok(value)
                                 },
                                 _ => (),
@@ -3841,7 +3841,15 @@ fn read_object_property(
         }
     }
     let descriptor = match machine.heap.get(object) {
-        Some(value) => value.own_property(key),
+        Some(value) => {
+            if runtime::is_length_property_key(key) {
+                match value.own_array_length() {
+                    Some(length) => return Result::Ok(length),
+                    None => (),
+                }
+            }
+            value.own_property(key)
+        },
         None => return Result::Err(error(offset, VmErrorKind::TypeError("object is invalid"))),
     };
     match descriptor {
@@ -3879,7 +3887,7 @@ fn read_property(
         runtime::Value::Object(object) => {
             read_object_property(machine, offset, object, receiver, key)
         },
-        runtime::Value::String(value) => if property_name(key, "length") {
+        runtime::Value::String(value) => if runtime::is_length_property_key(key) {
             Result::Ok(runtime::Value::Int(value.len().to_i32()))
         } else {
             match string_property_index(key) {
@@ -5931,34 +5939,28 @@ fn write_array_element_with_strict(
                     },
                     None => match target.kind() {
                         runtime::ObjectKind::Array => {
-                            match target.own_array_index(index) {
-                                Some(runtime::PropertyDescriptor::Data {
-                                    value: _,
-                                    writable,
-                                    enumerable: _,
-                                    configurable: _,
-                                }) => if writable {
-                                    if runtime::set_existing_array_index(
-                                        machine.heap,
-                                        object,
-                                        index,
-                                        value,
-                                    ) {
-                                        return Result::Ok(())
-                                    }
-                                } else {
-                                    return if strict {
-                                        Result::Err(
-                                            error(
-                                                offset,
-                                                VmErrorKind::TypeError("property is not writable"),
-                                            ),
-                                        )
-                                    } else {
-                                        Result::Ok(())
-                                    }
+                            match target.write_array_index(index, value) {
+                                runtime::ArrayIndexWriteResult::Written => {
+                                    return Result::Ok(())
                                 },
-                                _ => (),
+                                runtime::ArrayIndexWriteResult::ReadOnly => return if strict {
+                                    Result::Err(
+                                        error(
+                                            offset,
+                                            VmErrorKind::TypeError("property is not writable"),
+                                        ),
+                                    )
+                                } else {
+                                    Result::Ok(())
+                                },
+                                runtime::ArrayIndexWriteResult::Unhandled => if runtime::try_fast_array_set(
+                                    machine.heap,
+                                    object,
+                                    index,
+                                    value,
+                                ) {
+                                    return Result::Ok(())
+                                },
                             }
                         },
                         _ => (),
@@ -5997,7 +5999,7 @@ fn write_primitive_property(
     strict: bool,
 ) -> Result[(), VmError] {
     let string_virtual = match receiver {
-        runtime::Value::String(source) => if property_name(key, "length") {
+        runtime::Value::String(source) => if runtime::is_length_property_key(key) {
             true
         } else {
             match string_property_index(key) {
@@ -6101,7 +6103,7 @@ fn normalized_array_length_descriptor(
 ) -> Result[runtime::PropertyDescriptor, VmError] {
     let is_array_length = match machine.heap.get(object) {
         Some(value) => match value.kind() {
-            runtime::ObjectKind::Array => key == runtime::string_property_key("length"),
+            runtime::ObjectKind::Array => runtime::is_length_property_key(key),
             _ => false,
         },
         None => false,
@@ -6465,7 +6467,7 @@ fn delete_property(
                 Result::Err(error(offset, VmErrorKind::TypeError("property is not configurable")))
             }
         },
-        runtime::Value::String(value) => if property_name(key, "length") {
+        runtime::Value::String(value) => if runtime::is_length_property_key(key) {
             if machine.function.strict() {
                 Result::Err(error(offset, VmErrorKind::TypeError("property is not configurable")))
             } else {
