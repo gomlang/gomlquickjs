@@ -738,6 +738,140 @@ fn mapped_argument_cells_are_visible_and_traced() -> () {
 }
 
 #[test]
+fn property_access_caches_invalidate_on_descriptor_changes_and_deletion() -> () {
+    let heap = Heap::new();
+    let object = expect_object(new_ordinary_object(heap, Option::None));
+    let key = string_property_key("value");
+    testing::assert(
+        define_own_property(heap, object, key, data_descriptor(Value::Int(1), true, true, true)),
+    );
+    let cache = match property_access_cache(heap, object, key) {
+        Some(value) => value,
+        None => {
+            testing::fail("expected property access cache");
+            loop {}
+        },
+    };
+    match cache.read(heap, object) {
+        Some(Value::Int(value)) => testing::assert_eq(value, 1),
+        _ => testing::fail("expected cached property value"),
+    }
+    testing::assert(cache.write(heap, object, Value::Int(2)));
+    match expect_property(get_property(heap, object, key)) {
+        Value::Int(value) => testing::assert_eq(value, 2),
+        _ => testing::fail("expected updated property value"),
+    }
+    testing::assert(
+        define_own_property(heap, object, key, data_descriptor(Value::Int(3), false, true, false)),
+    );
+    testing::assert(cache.read(heap, object).is_none());
+    testing::assert(!cache.write(heap, object, Value::Int(4)));
+    let removable = expect_object(new_ordinary_object(heap, Option::None));
+    testing::assert(
+        define_own_property(heap, removable, key, data_descriptor(Value::Int(5), true, true, true)),
+    );
+    let removable_cache = match property_access_cache(heap, removable, key) {
+        Some(value) => value,
+        None => {
+            testing::fail("expected removable property cache");
+            loop {}
+        },
+    };
+    testing::assert(delete_property(heap, removable, key));
+    testing::assert(removable_cache.read(heap, removable).is_none())
+}
+
+#[test]
+fn fast_default_property_copy_preserves_values_and_rejects_descriptors() -> () {
+    let heap = Heap::new();
+    let source = expect_object(new_ordinary_object(heap, Option::None));
+    let target = expect_object(new_ordinary_object(heap, Option::None));
+    let first = string_property_key("first");
+    let second = string_property_key("second");
+    testing::assert(
+        define_own_property(heap, source, first, data_descriptor(Value::Int(1), true, true, true)),
+    );
+    testing::assert(
+        define_own_property(heap, source, second, data_descriptor(Value::Int(2), true, true, true)),
+    );
+    testing::assert(property_access_cache(heap, source, first).is_some());
+    testing::assert(try_fast_copy_default_properties(heap, target, source));
+    match expect_property(get_property(heap, target, first)) {
+        Value::Int(value) => testing::assert_eq(value, 1),
+        _ => testing::fail("expected copied first value"),
+    }
+    match expect_property(get_property(heap, target, second)) {
+        Value::Int(value) => testing::assert_eq(value, 2),
+        _ => testing::fail("expected copied second value"),
+    }
+    let described = expect_object(new_ordinary_object(heap, Option::None));
+    let untouched = expect_object(new_ordinary_object(heap, Option::None));
+    testing::assert(
+        define_own_property(
+            heap,
+            described,
+            first,
+            accessor_descriptor(Option::None, Option::None, true, true),
+        ),
+    );
+    testing::assert(!try_fast_copy_default_properties(heap, untouched, described));
+    match heap.get(untouched) {
+        Some(value) => testing::assert_eq(value.own_property_count(), 0),
+        None => testing::fail("expected untouched target"),
+    }
+}
+
+#[test]
+fn fast_property_set_observes_prototype_descriptors_and_extensibility() -> () {
+    let heap = Heap::new();
+    let prototype = expect_object(new_ordinary_object(heap, Option::None));
+    let object = expect_object(new_ordinary_object(heap, Option::Some(prototype)));
+    let read_only = string_property_key("read_only");
+    let accessor = string_property_key("accessor");
+    let direct = string_property_key("direct");
+    testing::assert(
+        define_own_property(
+            heap,
+            prototype,
+            read_only,
+            data_descriptor(Value::Int(1), false, true, true),
+        ),
+    );
+    testing::assert(
+        define_own_property(
+            heap,
+            prototype,
+            accessor,
+            accessor_descriptor(Option::None, Option::None, true, true),
+        ),
+    );
+    match try_fast_property_set(heap, object, read_only, Value::Int(2)) {
+        PropertyWriteResult::ReadOnly => (),
+        _ => testing::fail("expected read-only fast property result"),
+    }
+    match try_fast_property_set(heap, object, accessor, Value::Int(2)) {
+        PropertyWriteResult::Unhandled => (),
+        _ => testing::fail("expected accessor fallback"),
+    }
+    match try_fast_property_set(heap, object, direct, Value::Int(3)) {
+        PropertyWriteResult::Written => (),
+        _ => testing::fail("expected direct fast property write"),
+    }
+    match expect_property(get_property(heap, object, direct)) {
+        Value::Int(value) => testing::assert_eq(value, 3),
+        _ => testing::fail("expected directly written value"),
+    }
+    match heap.get(object) {
+        Some(value) => value.prevent_extensions(),
+        None => testing::fail("expected direct property target"),
+    }
+    match try_fast_property_set(heap, object, string_property_key("missing"), Value::Int(4)) {
+        PropertyWriteResult::ReadOnly => (),
+        _ => testing::fail("expected non-extensible fast property result"),
+    }
+}
+
+#[test]
 fn typed_array_elements_are_synthetic_and_trace_their_buffer_object() -> () {
     let heap = Heap::new();
     let buffer_object = expect_object(new_null_prototype_object(heap));
