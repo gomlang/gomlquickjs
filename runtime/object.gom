@@ -623,9 +623,6 @@ pub fn try_fast_property_set(heap: Heap, object: ObjectId, key: PropertyKey, val
         Some(OrdinaryProperty::Described(_)) => return PropertyWriteResult::Unhandled,
         None => (),
     }
-    if !target.extensible_value.get() {
-        return PropertyWriteResult::ReadOnly
-    }
     let mut cursor = target.prototype_value.get();
     while cursor.is_some() {
         let current = match cursor {
@@ -653,6 +650,9 @@ pub fn try_fast_property_set(heap: Heap, object: ObjectId, key: PropertyKey, val
                 cursor = candidate.prototype_value.get();
             },
         }
+    }
+    if !target.extensible_value.get() {
+        return PropertyWriteResult::ReadOnly
     }
     target.properties_value.insert(key, OrdinaryProperty::Default(value));
     PropertyWriteResult::Written
@@ -2807,7 +2807,9 @@ fn fast_array_prototype_property_absent(heap: Heap, target: Object, key: Propert
     while prototype.is_some() {
         match prototype {
             Some(object) => match heap.get(object) {
-                Some(candidate) => if candidate.is_proxy() || candidate.own_property(key).is_some() {
+                Some(candidate) => if candidate.is_proxy() || candidate.own_property(key).is_some()
+                    || candidate.typed_array_value.get().is_some()
+                        && typed_array_numeric_index(key).is_some() {
                     return false
                 } else {
                     prototype = candidate.prototype_value.get();
