@@ -2000,6 +2000,203 @@ fn array_define_index(
     )
 }
 
+fn fast_array_prototype_property_absent(heap: Heap, target: Object, key: PropertyKey) -> bool {
+    let mut prototype = target.prototype_value.get();
+    while prototype.is_some() {
+        match prototype {
+            Some(object) => match heap.get(object) {
+                Some(candidate) => if candidate.is_proxy() || candidate.own_property(key).is_some() {
+                    return false
+                } else {
+                    prototype = candidate.prototype_value.get();
+                },
+                None => return false,
+            },
+            None => (),
+        }
+    }
+    true
+}
+
+fn fast_array_object(target: Object) -> bool {
+    match target.kind() {
+        ObjectKind::Array => !target.is_proxy(),
+        _ => false,
+    }
+}
+
+pub fn try_fast_array_push(heap: Heap, object: ObjectId, values: Vec[Value]) -> Option[isize] {
+    let target = match heap.get(object) {
+        Some(value) => value,
+        None => return Option::None,
+    };
+    if !fast_array_object(target) {
+        return Option::None
+    }
+    let length_key = string_property_key("length");
+    let (length, length_descriptor) = match target.properties_value.get(length_key) {
+        Some(Data { value, writable: true, enumerable, configurable }) => {
+            let descriptor = Data { value, writable: true, enumerable, configurable };
+            match array_descriptor_length(descriptor) {
+                Some(value) => (value, descriptor),
+                None => return Option::None,
+            }
+        },
+        _ => return Option::None,
+    };
+    if values.len() > 4294967295 - length || values.len() > 0 && !target.extensible() {
+        return Option::None
+    }
+    let mut index = 0;
+    while index < values.len() {
+        let key = string_property_key((length + index).to_string());
+        if target.properties_value.get(key).is_some()
+            || !fast_array_prototype_property_absent(heap, target, key) {
+            return Option::None
+        }
+        index += 1;
+    }
+    index = 0;
+    while index < values.len() {
+        target.properties_value.insert(
+            string_property_key((length + index).to_string()),
+            data_descriptor(values[index], true, true, true),
+        );
+        index += 1;
+    }
+    let next_length = length + values.len();
+    target.properties_value.insert(
+        length_key,
+        match length_descriptor {
+            Data { value: _, writable, enumerable, configurable } => {
+                Data { value: array_length_value(next_length), writable, enumerable, configurable }
+            },
+            _ => length_descriptor,
+        },
+    );
+    Option::Some(next_length)
+}
+
+pub fn try_fast_array_pop(heap: Heap, object: ObjectId) -> Option[Value] {
+    let target = match heap.get(object) {
+        Some(value) => value,
+        None => return Option::None,
+    };
+    if !fast_array_object(target) {
+        return Option::None
+    }
+    let length_key = string_property_key("length");
+    let (length, length_descriptor) = match target.properties_value.get(length_key) {
+        Some(Data { value, writable: true, enumerable, configurable }) => {
+            let descriptor = Data { value, writable: true, enumerable, configurable };
+            match array_descriptor_length(descriptor) {
+                Some(value) => (value, descriptor),
+                None => return Option::None,
+            }
+        },
+        _ => return Option::None,
+    };
+    let value = if length == 0 {
+        Value::Undefined
+    } else {
+        let key = string_property_key((length - 1).to_string());
+        match target.properties_value.get(key) {
+            Some(Data { value, configurable: true, .. }) => {
+                target.properties_value.remove(key);
+                value
+            },
+            Some(_) => return Option::None,
+            None => if fast_array_prototype_property_absent(heap, target, key) {
+                Value::Undefined
+            } else {
+                return Option::None
+            },
+        }
+    };
+    let next_length = if length == 0 {
+        0
+    } else {
+        length - 1
+    };
+    target.properties_value.insert(
+        length_key,
+        match length_descriptor {
+            Data { value: _, writable, enumerable, configurable } => {
+                Data { value: array_length_value(next_length), writable, enumerable, configurable }
+            },
+            _ => length_descriptor,
+        },
+    );
+    Option::Some(value)
+}
+
+pub fn try_fast_array_slice(
+    heap: Heap,
+    source: ObjectId,
+    target: ObjectId,
+    first: isize,
+    final_index: isize,
+) -> bool {
+    let source_object = match heap.get(source) {
+        Some(value) => value,
+        None => return false,
+    };
+    let target_object = match heap.get(target) {
+        Some(value) => value,
+        None => return false,
+    };
+    if !fast_array_object(source_object) || !fast_array_object(target_object)
+        || !target_object.extensible() {
+        return false
+    }
+    let count = final_index - first;
+    let length_key = string_property_key("length");
+    let length_descriptor = match target_object.properties_value.get(length_key) {
+        Some(Data { value, writable: true, enumerable, configurable }) => {
+            let descriptor = Data { value, writable: true, enumerable, configurable };
+            match array_descriptor_length(descriptor) {
+                Some(value) => if value == count {
+                    descriptor
+                } else {
+                    return false
+                },
+                None => return false,
+            }
+        },
+        _ => return false,
+    };
+    let mut index = 0;
+    while index < count {
+        let source_key = string_property_key((first + index).to_string());
+        match source_object.properties_value.get(source_key) {
+            Some(Data { .. }) => (),
+            Some(_) => return false,
+            None => if !fast_array_prototype_property_absent(heap, source_object, source_key) {
+                return false
+            },
+        }
+        if target_object.properties_value.get(string_property_key(index.to_string())).is_some() {
+            return false
+        }
+        index += 1;
+    }
+    index = 0;
+    while index < count {
+        match source_object.properties_value.get(string_property_key((first + index).to_string())) {
+            Some(Data { value, .. }) => {
+                target_object.properties_value.insert(
+                    string_property_key(index.to_string()),
+                    data_descriptor(value, true, true, true),
+                );
+            },
+            _ => (),
+        }
+        index += 1;
+    }
+    target_object.properties_value.insert(length_key, length_descriptor);
+    true
+}
+
 fn typed_array_define_numeric_property(
     state: TypedArrayState,
     key: PropertyKey,
@@ -2298,6 +2495,77 @@ pub fn get_property(heap: Heap, object: ObjectId, key: PropertyKey) -> Result[
         }
     }
     Result::Ok(Option::None)
+}
+
+pub fn try_fast_property_read(heap: Heap, object: ObjectId, key: PropertyKey) -> Option[Value] {
+    if !heap.contains(object) {
+        return Option::None
+    }
+    let mut cursor = Option::Some(object);
+    while cursor.is_some() {
+        match cursor {
+            Some(current) => {
+                let target = match heap.get(current) {
+                    Some(value) => value,
+                    None => return Option::None,
+                };
+                if target.is_proxy() {
+                    return Option::None
+                }
+                match target.own_property(key) {
+                    Some(Data { value, .. }) => return Option::Some(value),
+                    Some(Accessor { get: None, .. }) => return Option::Some(Value::Undefined),
+                    Some(Accessor { get: Some(_), .. }) => return Option::None,
+                    None => match target.typed_array_value.get() {
+                        Some(_) => if typed_array_numeric_index(key).is_some() {
+                            return Option::Some(Value::Undefined)
+                        } else {
+                            cursor = target.prototype_value.get();
+                        },
+                        None => {
+                            cursor = target.prototype_value.get();
+                        },
+                    },
+                }
+            },
+            None => (),
+        }
+    }
+    Option::Some(Value::Undefined)
+}
+
+pub fn try_fast_property_present(heap: Heap, object: ObjectId, key: PropertyKey) -> Option[bool] {
+    if !heap.contains(object) {
+        return Option::None
+    }
+    let mut cursor = Option::Some(object);
+    while cursor.is_some() {
+        match cursor {
+            Some(current) => {
+                let target = match heap.get(current) {
+                    Some(value) => value,
+                    None => return Option::None,
+                };
+                if target.is_proxy() {
+                    return Option::None
+                } else if target.own_property(key).is_some() {
+                    return Option::Some(true)
+                }
+                match target.typed_array_value.get() {
+                    Some(_) => if typed_array_numeric_index(key).is_some() {
+                        return Option::Some(false)
+                    } else {
+                        cursor = target.prototype_value.get();
+                    },
+                    None => {
+                        cursor = target.prototype_value.get();
+                    },
+                }
+            },
+            None => (),
+        }
+    }
+    Option::Some(false)
 }
 
 pub fn get_property_descriptor(heap: Heap, object: ObjectId, key: PropertyKey) -> Result[

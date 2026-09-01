@@ -339,6 +339,12 @@ fn array_species_create(context: vm::Context, original: runtime::Value, length: 
     if array_is_intrinsic_constructor(context, selected) && length > 4294967295 {
         return Result::Err(function_range_error("invalid array length"))
     }
+    match context.intrinsic_array_constructor() {
+        Some(value) => if runtime::same_value(value, selected) {
+            return array_species_default(context, length)
+        },
+        None => (),
+    }
     let result = context.construct_with_new_target_at_depth(
         selected,
         Vec::from_array([array_length_value(length)]),
@@ -939,6 +945,17 @@ fn array_push(
     depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     let object = array_object_value(context, this_value)?;
+    match object {
+        runtime::Value::Object(value) => match runtime::try_fast_array_push(
+            context.heap(),
+            value,
+            arguments,
+        ) {
+            Some(length) => return Result::Ok(array_length_value(length)),
+            None => (),
+        },
+        _ => (),
+    }
     let mut length = array_iterator_length(context, object, depth)?;
     if arguments.len() > ARRAY_MAX_SAFE_INTEGER - length {
         return Result::Err(function_vm_error("Array push exceeds maximum safe length"))
@@ -958,6 +975,13 @@ fn array_pop(
     depth: isize,
 ) -> Result[runtime::Value, vm::VmError] {
     let object = array_object_value(context, this_value)?;
+    match object {
+        runtime::Value::Object(value) => match runtime::try_fast_array_pop(context.heap(), value) {
+            Some(value) => return Result::Ok(value),
+            None => (),
+        },
+        _ => (),
+    }
     let length = array_iterator_length(context, object, depth)?;
     if length == 0 {
         array_set_length(context, object, 0, depth)?;
@@ -1290,6 +1314,14 @@ fn array_slice(
         0
     };
     let target = array_species_create(context, source, count, depth)?;
+    match (source, target) {
+        (runtime::Value::Object(source), runtime::Value::Object(target)) => {
+            if runtime::try_fast_array_slice(context.heap(), source, target, first, final_index) {
+                return Result::Ok(runtime::Value::Object(target))
+            }
+        },
+        _ => (),
+    }
     let mut source_index = first;
     let mut target_index = 0;
     while source_index < final_index {

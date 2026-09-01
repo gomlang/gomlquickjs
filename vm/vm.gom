@@ -559,6 +559,7 @@ pub struct Context {
     well_known_symbols_value: WellKnownSymbols,
     iterator_symbol_value: Ref[Option[runtime::Symbol]],
     intrinsic_eval_value: Ref[Option[runtime::Value]],
+    intrinsic_array_constructor_value: Ref[Option[runtime::Value]],
     object_builtin_tags_value: HashMap[runtime::ObjectId, runtime::JsString],
     global_lexical_bindings_value: HashMap[string, GlobalLexicalBinding],
     dynamic_function_compiler_value: Ref[Option[DynamicFunctionCompiler]],
@@ -752,6 +753,7 @@ impl Context {
             well_known_symbols_value: WellKnownSymbols::new(),
             iterator_symbol_value: Ref::new(Option::None),
             intrinsic_eval_value: Ref::new(Option::None),
+            intrinsic_array_constructor_value: Ref::new(Option::None),
             object_builtin_tags_value: HashMap::new(),
             global_lexical_bindings_value: HashMap::new(),
             dynamic_function_compiler_value: Ref::new(Option::None),
@@ -884,6 +886,7 @@ impl Context {
         push_optional_object_root(roots, self.global_object_value.get());
         push_optional_root(roots, self.regexp_constructor_value.get());
         push_optional_root(roots, self.intrinsic_eval_value.get());
+        push_optional_root(roots, self.intrinsic_array_constructor_value.get());
         push_optional_object_root(roots, self.array_iterator_prototype_value.get());
         push_optional_object_root(roots, self.generators_value.prototype.get());
         push_optional_object_root(roots, self.generators_value.generator_function_prototype.get());
@@ -1491,6 +1494,14 @@ impl Context {
 
     pub fn set_intrinsic_eval(self: Context, value: runtime::Value) -> () {
         self.intrinsic_eval_value.set(Option::Some(value))
+    }
+
+    pub fn intrinsic_array_constructor(self: Context) -> Option[runtime::Value] {
+        self.intrinsic_array_constructor_value.get()
+    }
+
+    pub fn set_intrinsic_array_constructor(self: Context, value: runtime::Value) -> () {
+        self.intrinsic_array_constructor_value.set(Option::Some(value))
     }
 
     pub fn set_dynamic_function_compiler(
@@ -3456,6 +3467,28 @@ fn property_key(machine: Machine, offset: isize, value: runtime::Value) -> Resul
         runtime::Value::Object(_) => Result::Err(
             error(offset, VmErrorKind::TypeError("cannot convert object to property key")),
         ),
+    }
+}
+
+fn direct_property_key(value: runtime::Value) -> Option[runtime::PropertyKey] {
+    match value {
+        runtime::Value::String(value) => {
+            Option::Some(runtime::js_string_property_key(value))
+        },
+        runtime::Value::Symbol(value) => Option::Some(runtime::PropertyKey::Symbol(value)),
+        runtime::Value::Undefined => Option::Some(runtime::string_property_key("undefined")),
+        runtime::Value::Null => Option::Some(runtime::string_property_key("null")),
+        runtime::Value::Bool(value) => {
+            Option::Some(runtime::string_property_key(value.to_string()))
+        },
+        runtime::Value::Int(value) => {
+            Option::Some(runtime::string_property_key(value.to_string()))
+        },
+        runtime::Value::Float(value) => Option::Some(float_property_key(value)),
+        runtime::Value::BigInt(value) => {
+            Option::Some(runtime::string_property_key(value.to_string()))
+        },
+        runtime::Value::Object(_) => Option::None,
     }
 }
 
@@ -10608,6 +10641,17 @@ impl Context {
         key: runtime::Value,
         depth: isize,
     ) -> Result[runtime::Value, VmError] {
+        match (receiver, direct_property_key(key)) {
+            (runtime::Value::Object(object), Some(key)) => match runtime::try_fast_property_read(
+                self.heap_value,
+                object,
+                key,
+            ) {
+                Some(value) => return Result::Ok(value),
+                None => (),
+            },
+            _ => (),
+        }
         let locals: Vec[Ref[runtime::Value]] = Vec::from_array([Ref::new(receiver), Ref::new(key)]);
         execute_initialized(
             bytecode::Function::new(
@@ -10665,6 +10709,17 @@ impl Context {
         key: runtime::Value,
         depth: isize,
     ) -> Result[bool, VmError] {
+        match (target, direct_property_key(key)) {
+            (runtime::Value::Object(object), Some(key)) => match runtime::try_fast_property_present(
+                self.heap_value,
+                object,
+                key,
+            ) {
+                Some(value) => return Result::Ok(value),
+                None => (),
+            },
+            _ => (),
+        }
         match self.instruction_at_depth(
             Vec::from_array([key, target]),
             bytecode::Instruction::In,
