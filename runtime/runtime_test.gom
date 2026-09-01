@@ -462,6 +462,28 @@ fn fast_array_operations_decline_observable_properties() -> () {
 }
 
 #[test]
+fn fast_array_set_declines_typed_array_numeric_prototypes() -> () {
+    let heap = Heap::new();
+    let buffer = expect_object(new_null_prototype_object(heap));
+    let prototype = expect_object(new_null_prototype_object(heap));
+    let view = match arraybuffer::Uint8Array::new(1) {
+        Ok(value) => value,
+        Err(value) => {
+            testing::fail(value.to_string());
+            loop {}
+        },
+    };
+    testing::assert(register_typed_array(heap, prototype, TypedArrayView::Uint8(view), buffer));
+    let array = expect_object(new_array(heap, 0));
+    testing::assert(set_prototype_of(heap, array, Option::Some(prototype)));
+    testing::assert(!try_fast_array_set(heap, array, 1, Value::Int(7)));
+    match heap.get(array) {
+        Some(value) => testing::assert(value.own_property(string_property_key("1")).is_none()),
+        None => testing::fail("expected array target"),
+    }
+}
+
+#[test]
 fn array_exotic_definitions_grow_and_shrink_length() -> () {
     let heap = Heap::new();
     let array = expect_object(new_array(heap, 1));
@@ -868,6 +890,31 @@ fn fast_property_set_observes_prototype_descriptors_and_extensibility() -> () {
     match try_fast_property_set(heap, object, string_property_key("missing"), Value::Int(4)) {
         PropertyWriteResult::ReadOnly => (),
         _ => testing::fail("expected non-extensible fast property result"),
+    }
+}
+
+#[test]
+fn fast_property_set_defers_inherited_accessors_on_non_extensible_targets() -> () {
+    let heap = Heap::new();
+    let prototype = expect_object(new_ordinary_object(heap, Option::None));
+    let setter = expect_object(new_object(heap, ObjectKind::Function, Option::None));
+    let key = string_property_key("value");
+    testing::assert(
+        define_own_property(
+            heap,
+            prototype,
+            key,
+            accessor_descriptor(Option::None, Option::Some(Value::Object(setter)), true, true),
+        ),
+    );
+    let object = expect_object(new_ordinary_object(heap, Option::Some(prototype)));
+    match heap.get(object) {
+        Some(value) => value.prevent_extensions(),
+        None => testing::fail("expected property target"),
+    }
+    match try_fast_property_set(heap, object, key, Value::Int(3)) {
+        PropertyWriteResult::Unhandled => (),
+        _ => testing::fail("expected inherited accessor fallback"),
     }
 }
 
