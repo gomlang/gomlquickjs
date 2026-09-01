@@ -391,6 +391,77 @@ fn creates_arrays_with_non_enumerable_length_and_no_materialized_holes() -> () {
 }
 
 #[test]
+fn fast_array_operations_preserve_dense_values_and_sparse_holes() -> () {
+    let heap = Heap::new();
+    let source = expect_object(new_array(heap, 0));
+    match try_fast_array_push(
+        heap,
+        source,
+        Vec::from_array([Value::Int(3), Value::Int(5), Value::Int(7)]),
+    ) {
+        Some(value) => testing::assert_eq(value, 3),
+        None => testing::fail("expected fast push"),
+    }
+    match try_fast_array_pop(heap, source) {
+        Some(Value::Int(value)) => testing::assert_eq(value, 7),
+        _ => testing::fail("expected fast pop"),
+    }
+    testing::assert(delete_property(heap, source, string_property_key("0")));
+    let target = expect_object(new_array(heap, 2));
+    testing::assert(try_fast_array_slice(heap, source, target, 0, 2));
+    match get_property(heap, target, string_property_key("0")) {
+        Ok(value) => testing::assert(value.is_none()),
+        Err(value) => testing::fail(value.message),
+    }
+    match get_property(heap, target, string_property_key("1")) {
+        Ok(Some(Value::Int(value))) => testing::assert_eq(value, 5),
+        _ => testing::fail("expected copied array value"),
+    }
+}
+
+#[test]
+fn fast_array_operations_decline_observable_properties() -> () {
+    let heap = Heap::new();
+    let prototype = expect_object(new_ordinary_object(heap, Option::None));
+    testing::assert(
+        define_own_property(
+            heap,
+            prototype,
+            string_property_key("0"),
+            data_descriptor(Value::Int(11), true, true, true),
+        ),
+    );
+    let array = expect_object(new_array(heap, 0));
+    testing::assert(set_prototype_of(heap, array, Option::Some(prototype)));
+    testing::assert(try_fast_array_push(heap, array, Vec::from_array([Value::Int(13)])).is_none());
+    let fixed = expect_object(new_array(heap, 1));
+    testing::assert(
+        define_own_property(
+            heap,
+            fixed,
+            string_property_key("0"),
+            data_descriptor(Value::Int(17), true, true, false),
+        ),
+    );
+    testing::assert(try_fast_array_pop(heap, fixed).is_none());
+    let getter = expect_object(new_object(heap, ObjectKind::Function, Option::None));
+    let object = expect_object(new_ordinary_object(heap, Option::None));
+    testing::assert(
+        define_own_property(
+            heap,
+            object,
+            string_property_key("value"),
+            accessor_descriptor(Option::Some(Value::Object(getter)), Option::None, true, true),
+        ),
+    );
+    testing::assert(try_fast_property_read(heap, object, string_property_key("value")).is_none());
+    match try_fast_property_present(heap, object, string_property_key("value")) {
+        Some(value) => testing::assert(value),
+        None => testing::fail("expected fast property presence"),
+    }
+}
+
+#[test]
 fn array_exotic_definitions_grow_and_shrink_length() -> () {
     let heap = Heap::new();
     let array = expect_object(new_array(heap, 1));
