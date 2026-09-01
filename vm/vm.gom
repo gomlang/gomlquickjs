@@ -3104,6 +3104,88 @@ fn field_key(machine: Machine, offset: isize, index: isize) -> Result[runtime::P
     }
 }
 
+fn read_field(machine: Machine, offset: isize, index: isize, receiver: runtime::Value) -> Result[
+    runtime::Value,
+    VmError,
+] {
+    match receiver {
+        runtime::Value::Object(object) => match machine.function.field_cache(offset) {
+            Some(cache) => match cache.read(machine.heap, object) {
+                Some(value) => return Result::Ok(value),
+                None => (),
+            },
+            None => (),
+        },
+        _ => (),
+    }
+    let key = field_key(machine, offset, index)?;
+    match receiver {
+        runtime::Value::Object(object) => match runtime::property_access_cache(
+            machine.heap,
+            object,
+            key,
+        ) {
+            Some(cache) => {
+                machine.function.set_field_cache(offset, cache);
+                match cache.read(machine.heap, object) {
+                    Some(value) => Result::Ok(value),
+                    None => read_property(machine, offset, receiver, key),
+                }
+            },
+            None => read_property(machine, offset, receiver, key),
+        },
+        _ => read_property(machine, offset, receiver, key),
+    }
+}
+
+fn write_field(
+    machine: Machine,
+    offset: isize,
+    index: isize,
+    receiver: runtime::Value,
+    value: runtime::Value,
+    strict: bool,
+) -> Result[(), VmError] {
+    match receiver {
+        runtime::Value::Object(object) => match machine.function.field_cache(offset) {
+            Some(cache) => if cache.write(machine.heap, object, value) {
+                return Result::Ok(())
+            },
+            None => (),
+        },
+        _ => (),
+    }
+    let key = field_key(machine, offset, index)?;
+    match receiver {
+        runtime::Value::Object(object) => match runtime::property_access_cache(
+            machine.heap,
+            object,
+            key,
+        ) {
+            Some(cache) => {
+                machine.function.set_field_cache(offset, cache);
+                if cache.write(machine.heap, object, value) {
+                    Result::Ok(())
+                } else {
+                    write_property_with_strict(machine, offset, receiver, key, value, strict)
+                }
+            },
+            None => match runtime::try_fast_property_set(machine.heap, object, key, value) {
+                runtime::PropertyWriteResult::Written => Result::Ok(()),
+                runtime::PropertyWriteResult::ReadOnly => if strict {
+                    Result::Err(error(offset, VmErrorKind::TypeError("property is not writable")))
+                } else {
+                    Result::Ok(())
+                },
+                runtime::PropertyWriteResult::Unhandled => {
+                    write_property_with_strict(machine, offset, receiver, key, value, strict)
+                },
+            },
+        },
+        _ => write_property_with_strict(machine, offset, receiver, key, value, strict),
+    }
+}
+
 fn global_object(machine: Machine, offset: isize) -> Result[runtime::ObjectId, VmError] {
     match machine.global_object {
         Some(object) => if machine.heap.contains(object) {
@@ -5798,6 +5880,11 @@ fn copy_data_properties_value(
     };
     match source {
         runtime::Value::Object(source_object) => {
+            if excluded.is_empty()
+                && runtime::try_fast_copy_default_properties(machine.heap, target, source_object) {
+                machine.stack.push(target_value);
+                return Result::Ok(())
+            }
             for key in proxy_own_keys(machine, offset, source_object)? {
                 if excluded_property(key, excluded) {} else {
                     match own_property_enumerable(machine, offset, source_object, key)? {
@@ -9181,20 +9268,17 @@ fn step(machine: Machine, offset: isize, instruction: bytecode::Instruction) -> 
         bytecode::Instruction::EnterEvalEnvironment => enter_eval_environment(machine),
         bytecode::Instruction::GetField(index) => {
             let receiver = pop(machine, offset)?;
-            let key = field_key(machine, offset, index)?;
-            machine.stack.push(read_property(machine, offset, receiver, key)?)
+            machine.stack.push(read_field(machine, offset, index, receiver)?)
         },
         bytecode::Instruction::PutField(index) => {
             let value = pop(machine, offset)?;
             let receiver = pop(machine, offset)?;
-            let key = field_key(machine, offset, index)?;
-            write_property(machine, offset, receiver, key, value)?;
+            write_field(machine, offset, index, receiver, value, machine.function.strict())?;
         },
         bytecode::Instruction::PutFieldStrict(index) => {
             let value = pop(machine, offset)?;
             let receiver = pop(machine, offset)?;
-            let key = field_key(machine, offset, index)?;
-            write_property_with_strict(machine, offset, receiver, key, value, true)?;
+            write_field(machine, offset, index, receiver, value, true)?;
         },
         bytecode::Instruction::DefineDataProperty(index) => {
             define_data_property(machine, offset, index)?

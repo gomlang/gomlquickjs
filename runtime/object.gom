@@ -47,6 +47,12 @@ pub enum PropertyDescriptor {
     },
 }
 
+enum OrdinaryProperty {
+    Default(Value),
+    Cached(Ref[Option[Value]]),
+    Described(PropertyDescriptor),
+}
+
 enum ArrayElement {
     Default(Value),
     Described(PropertyDescriptor),
@@ -62,6 +68,17 @@ pub enum ArrayIndexWriteResult {
     Written,
     ReadOnly,
     Unhandled,
+}
+
+pub enum PropertyWriteResult {
+    Written,
+    ReadOnly,
+    Unhandled,
+}
+
+pub struct PropertyAccessCache {
+    object_value: ObjectId,
+    cell_value: Ref[Option[Value]],
 }
 
 pub enum PrivateElement {
@@ -279,7 +296,7 @@ pub struct Object {
     prototype_value: Ref[Option[ObjectId]],
     immutable_prototype_value: Ref[bool],
     extensible_value: Ref[bool],
-    properties_value: collections::IndexMap[PropertyKey, PropertyDescriptor],
+    properties_value: collections::IndexMap[PropertyKey, OrdinaryProperty],
     array_length_value: Ref[Option[ArrayLengthState]],
     array_dense_properties_value: Vec[Option[ArrayElement]],
     array_sparse_properties_value: HashMap[u32, PropertyDescriptor],
@@ -331,7 +348,9 @@ impl Object {
                 },
                 Some(TypedArrayNumericIndex::Invalid) => Option::None,
                 None => match self.properties_value.get(key) {
-                    Some(value) => Option::Some(mapped_descriptor(self, key, value)),
+                    Some(value) => Option::Some(
+                        mapped_descriptor(self, key, ordinary_property_descriptor(value)),
+                    ),
                     None => Option::None,
                 },
             },
@@ -342,13 +361,17 @@ impl Object {
                     } else {
                         match canonical_array_index(value) {
                             Some(index) => array_index_descriptor(self, index),
-                            None => self.properties_value.get(key),
+                            None => self.properties_value.get(key).map(ordinary_property_descriptor),
                         }
                     },
-                    PropertyKey::Symbol(_) => self.properties_value.get(key),
+                    PropertyKey::Symbol(_) => {
+                        self.properties_value.get(key).map(ordinary_property_descriptor)
+                    },
                 },
                 _ => match self.properties_value.get(key) {
-                    Some(value) => Option::Some(mapped_descriptor(self, key, value)),
+                    Some(value) => Option::Some(
+                        mapped_descriptor(self, key, ordinary_property_descriptor(value)),
+                    ),
                     None => Option::None,
                 },
             },
@@ -518,6 +541,166 @@ pub struct GcEdge {
     pub values: Vec[Value],
 }
 
+impl PropertyAccessCache {
+    pub fn read(self: PropertyAccessCache, heap: Heap, object: ObjectId) -> Option[Value] {
+        if object != self.object_value {
+            Option::None
+        } else {
+            match heap.get(object) {
+                Some(target) => if !target.is_proxy() && !target.module_namespace_value.get() {
+                    self.cell_value.get()
+                } else {
+                    Option::None
+                },
+                None => Option::None,
+            }
+        }
+    }
+
+    pub fn write(self: PropertyAccessCache, heap: Heap, object: ObjectId, value: Value) -> bool {
+        match self.read(heap, object) {
+            Some(_) => {
+                self.cell_value.set(Option::Some(value));
+                true
+            },
+            None => false,
+        }
+    }
+}
+
+pub fn property_access_cache(heap: Heap, object: ObjectId, key: PropertyKey) -> Option[
+    PropertyAccessCache,
+] {
+    match heap.get(object) {
+        Some(target) => if target.is_proxy() || target.module_namespace_value.get() {
+            Option::None
+        } else {
+            match argument_index(key) {
+                Some(index) => if target.argument_map_value.get(index).is_some() {
+                    return Option::None
+                },
+                None => (),
+            }
+            match target.properties_value.get(key) {
+                Some(OrdinaryProperty::Default(value)) => {
+                    let cell = Ref::new(Option::Some(value));
+                    target.properties_value.insert(key, OrdinaryProperty::Cached(cell));
+                    Option::Some(PropertyAccessCache { object_value: object, cell_value: cell })
+                },
+                Some(OrdinaryProperty::Cached(cell)) => Option::Some(
+                    PropertyAccessCache { object_value: object, cell_value: cell },
+                ),
+                _ => Option::None,
+            }
+        },
+        None => Option::None,
+    }
+}
+
+pub fn try_fast_property_set(heap: Heap, object: ObjectId, key: PropertyKey, value: Value) -> PropertyWriteResult {
+    let target = match heap.get(object) {
+        Some(value) => value,
+        None => return PropertyWriteResult::Unhandled,
+    };
+    if target.is_proxy() || target.module_namespace_value.get()
+        || target.typed_array_value.get().is_some()
+        || target.argument_map_value.len() > 0 {
+        return PropertyWriteResult::Unhandled
+    }
+    match target.kind() {
+        ObjectKind::Array => return PropertyWriteResult::Unhandled,
+        ObjectKind::Ordinary | ObjectKind::Function => (),
+    }
+    match target.properties_value.get(key) {
+        Some(OrdinaryProperty::Default(_)) => {
+            target.properties_value.insert(key, OrdinaryProperty::Default(value));
+            return PropertyWriteResult::Written
+        },
+        Some(OrdinaryProperty::Cached(cell)) => {
+            cell.set(Option::Some(value));
+            return PropertyWriteResult::Written
+        },
+        Some(OrdinaryProperty::Described(_)) => return PropertyWriteResult::Unhandled,
+        None => (),
+    }
+    if !target.extensible_value.get() {
+        return PropertyWriteResult::ReadOnly
+    }
+    let mut cursor = target.prototype_value.get();
+    while cursor.is_some() {
+        let current = match cursor {
+            Some(value) => value,
+            None => break,
+        };
+        let candidate = match heap.get(current) {
+            Some(value) => value,
+            None => return PropertyWriteResult::Unhandled,
+        };
+        if candidate.is_proxy() {
+            return PropertyWriteResult::Unhandled
+        }
+        match candidate.own_property(key) {
+            Some(PropertyDescriptor::Data { writable: false, .. }) => {
+                return PropertyWriteResult::ReadOnly
+            },
+            Some(PropertyDescriptor::Data { writable: true, .. }) => {
+                cursor = Option::None;
+            },
+            Some(PropertyDescriptor::Accessor { .. }) => {
+                return PropertyWriteResult::Unhandled
+            },
+            None => {
+                cursor = candidate.prototype_value.get();
+            },
+        }
+    }
+    target.properties_value.insert(key, OrdinaryProperty::Default(value));
+    PropertyWriteResult::Written
+}
+
+pub fn try_fast_copy_default_properties(heap: Heap, target: ObjectId, source: ObjectId) -> bool {
+    let target_object = match heap.get(target) {
+        Some(value) => value,
+        None => return false,
+    };
+    let source_object = match heap.get(source) {
+        Some(value) => value,
+        None => return false,
+    };
+    if target_object.is_proxy() || source_object.is_proxy()
+        || target_object.module_namespace_value.get()
+        || source_object.module_namespace_value.get()
+        || target_object.typed_array_value.get().is_some()
+        || source_object.typed_array_value.get().is_some()
+        || target_object.argument_map_value.len() > 0
+        || source_object.argument_map_value.len() > 0
+        || !target_object.extensible_value.get()
+        || !target_object.properties_value.is_empty() {
+        return false
+    }
+    match (target_object.kind(), source_object.kind()) {
+        (ObjectKind::Ordinary, ObjectKind::Ordinary) => (),
+        _ => return false,
+    }
+    let entries = source_object.properties_value.entries();
+    let values: Vec[(PropertyKey, Value)] = Vec::with_capacity(entries.len());
+    for (key, property) in entries {
+        match property {
+            OrdinaryProperty::Default(value) => values.push((key, value)),
+            OrdinaryProperty::Cached(cell) => match cell.get() {
+                Some(value) => values.push((key, value)),
+                None => return false,
+            },
+            OrdinaryProperty::Described(_) => return false,
+        }
+    }
+    target_object.properties_value.reserve(values.len());
+    for (key, value) in values {
+        target_object.properties_value.insert(key, OrdinaryProperty::Default(value));
+    }
+    true
+}
+
 fn object_is_callable(kind: ObjectKind) -> bool {
     match kind {
         ObjectKind::Function => true,
@@ -650,14 +833,24 @@ fn drain_pending(
                     Some(prototype) => enqueue_object(heap, prototype, marked, pending),
                     None => (),
                 }
-                for (key, descriptor) in object.properties_value.entries() {
+                for (key, property) in object.properties_value.entries() {
                     match key {
                         PropertyKey::Symbol(value) => {
                             symbols.insert(value.id());
                         },
                         PropertyKey::String(_) => (),
                     }
-                    enqueue_descriptor(heap, descriptor, marked, symbols, pending)
+                    match property {
+                        OrdinaryProperty::Default(value) => {
+                            enqueue_value(heap, value, marked, symbols, pending)
+                        },
+                        OrdinaryProperty::Cached(cell) => {
+                            enqueue_optional_value(heap, cell.get(), marked, symbols, pending)
+                        },
+                        OrdinaryProperty::Described(descriptor) => {
+                            enqueue_descriptor(heap, descriptor, marked, symbols, pending)
+                        },
+                    }
                 }
                 for descriptor in object.array_dense_properties_value {
                     match descriptor {
@@ -1612,6 +1805,32 @@ pub fn data_descriptor(value: Value, writable: bool, enumerable: bool, configura
     PropertyDescriptor::Data { value, writable, enumerable, configurable }
 }
 
+fn ordinary_property_from_descriptor(descriptor: PropertyDescriptor) -> OrdinaryProperty {
+    match descriptor {
+        PropertyDescriptor::Data { value, writable: true, enumerable: true, configurable: true } => {
+            OrdinaryProperty::Default(value)
+        },
+        _ => OrdinaryProperty::Described(descriptor),
+    }
+}
+
+fn ordinary_property_descriptor(property: OrdinaryProperty) -> PropertyDescriptor {
+    match property {
+        OrdinaryProperty::Default(value) => data_descriptor(value, true, true, true),
+        OrdinaryProperty::Cached(cell) => {
+            data_descriptor(cell.get().unwrap_or(Value::Undefined), true, true, true)
+        },
+        OrdinaryProperty::Described(descriptor) => descriptor,
+    }
+}
+
+fn invalidate_ordinary_property(property: OrdinaryProperty) -> () {
+    match property {
+        OrdinaryProperty::Cached(cell) => cell.set(Option::None),
+        _ => (),
+    }
+}
+
 pub fn accessor_descriptor(
     get: Option[Value],
     set: Option[Value],
@@ -1893,9 +2112,13 @@ pub fn seal_object(heap: Heap, object: ObjectId, frozen: bool) -> bool {
     let keys = target.properties_value.keys();
     for key in keys {
         match target.properties_value.get(key) {
-            Some(descriptor) => {
-                let next = descriptor_sealed(mapped_descriptor(target, key, descriptor), frozen);
-                target.properties_value.insert(key, next);
+            Some(property) => {
+                let next = descriptor_sealed(
+                    mapped_descriptor(target, key, ordinary_property_descriptor(property)),
+                    frozen,
+                );
+                invalidate_ordinary_property(property);
+                target.properties_value.insert(key, OrdinaryProperty::Described(next));
                 update_argument_mapping(target, key, next);
             },
             None => (),
@@ -1941,7 +2164,8 @@ pub fn object_is_sealed(heap: Heap, object: ObjectId, frozen: bool) -> bool {
         },
         None => (),
     }
-    for descriptor in target.properties_value.values() {
+    for property in target.properties_value.values() {
+        let descriptor = ordinary_property_descriptor(property);
         if descriptor_configurable(descriptor)
             || frozen && descriptor_is_data(descriptor) && descriptor_writable(descriptor) {
             return false
@@ -1975,17 +2199,28 @@ fn ordinary_define_own_property(
     match heap.get(object) {
         Some(target) => match target.properties_value.get(key) {
             Some(current) => if compatible_descriptor(
-                mapped_descriptor(target, key, current),
+                mapped_descriptor(target, key, ordinary_property_descriptor(current)),
                 descriptor,
             ) {
-                target.properties_value.insert(key, descriptor);
+                match (current, ordinary_property_from_descriptor(descriptor)) {
+                    (OrdinaryProperty::Default(_), OrdinaryProperty::Default(value)) => {
+                        target.properties_value.insert(key, OrdinaryProperty::Default(value));
+                    },
+                    (OrdinaryProperty::Cached(cell), OrdinaryProperty::Default(value)) => {
+                        cell.set(Option::Some(value));
+                    },
+                    (_, next) => {
+                        invalidate_ordinary_property(current);
+                        target.properties_value.insert(key, next);
+                    },
+                }
                 update_argument_mapping(target, key, descriptor);
                 true
             } else {
                 false
             },
             None => if target.extensible_value.get() {
-                target.properties_value.insert(key, descriptor);
+                target.properties_value.insert(key, ordinary_property_from_descriptor(descriptor));
                 true
             } else {
                 false
@@ -3000,7 +3235,8 @@ pub fn delete_property(heap: Heap, object: ObjectId, key: PropertyKey) -> bool {
 
 fn delete_ordinary_property(target: Object, key: PropertyKey) -> bool {
     match target.properties_value.get(key) {
-        Some(descriptor) => if descriptor_configurable(descriptor) {
+        Some(property) => if descriptor_configurable(ordinary_property_descriptor(property)) {
+            invalidate_ordinary_property(property);
             target.properties_value.remove(key);
             match argument_index(key) {
                 Some(index) => {
@@ -3299,10 +3535,22 @@ pub fn set_existing_array_index(heap: Heap, object: ObjectId, index: isize, valu
 
 fn set_existing_ordinary_data_property(target: Object, key: PropertyKey, value: Value) -> bool {
     match target.properties_value.get(key) {
-        Some(Data { value: _, writable, enumerable, configurable }) => if writable {
+        Some(OrdinaryProperty::Default(_)) => {
+            target.properties_value.insert(key, OrdinaryProperty::Default(value));
+            update_argument_mapping(target, key, data_descriptor(value, true, true, true));
+            true
+        },
+        Some(OrdinaryProperty::Cached(cell)) => {
+            cell.set(Option::Some(value));
+            update_argument_mapping(target, key, data_descriptor(value, true, true, true));
+            true
+        },
+        Some(OrdinaryProperty::Described(Data { value: _, writable, enumerable, configurable })) => if writable {
             target.properties_value.insert(
                 key,
-                PropertyDescriptor::Data { value, writable, enumerable, configurable },
+                ordinary_property_from_descriptor(
+                    PropertyDescriptor::Data { value, writable, enumerable, configurable },
+                ),
             );
             update_argument_mapping(
                 target,
