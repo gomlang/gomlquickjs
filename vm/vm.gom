@@ -3513,7 +3513,7 @@ fn read_array_element(
     property: runtime::Value,
 ) -> Result[runtime::Value, VmError] {
     match (receiver, direct_index_property(property)) {
-        (runtime::Value::Object(object), Some((index, direct_key))) => {
+        (runtime::Value::Object(object), Some((index, _))) => {
             match machine.heap.get(object) {
                 Some(target) => match target.typed_array_view() {
                     Some(view) => {
@@ -3521,11 +3521,7 @@ fn read_array_element(
                     },
                     None => match target.kind() {
                         runtime::ObjectKind::Array => {
-                            let key = match direct_key {
-                                Some(value) => value,
-                                None => runtime::string_property_key(index.to_string()),
-                            };
-                            match target.own_property(key) {
+                            match target.own_array_index(index) {
                                 Some(runtime::PropertyDescriptor::Data { value, .. }) => {
                                     return Result::Ok(value)
                                 },
@@ -5907,7 +5903,7 @@ fn write_array_element_with_strict(
     strict: bool,
 ) -> Result[(), VmError] {
     match (receiver, direct_index_property(property)) {
-        (runtime::Value::Object(object), Some((index, direct_key))) => {
+        (runtime::Value::Object(object), Some((index, _))) => {
             match machine.heap.get(object) {
                 Some(target) => match target.typed_array_view() {
                     Some(view) => {
@@ -5935,21 +5931,17 @@ fn write_array_element_with_strict(
                     },
                     None => match target.kind() {
                         runtime::ObjectKind::Array => {
-                            let key = match direct_key {
-                                Some(value) => value,
-                                None => runtime::string_property_key(index.to_string()),
-                            };
-                            match target.own_property(key) {
+                            match target.own_array_index(index) {
                                 Some(runtime::PropertyDescriptor::Data {
                                     value: _,
                                     writable,
                                     enumerable: _,
                                     configurable: _,
                                 }) => if writable {
-                                    if runtime::set_existing_data_property(
+                                    if runtime::set_existing_array_index(
                                         machine.heap,
                                         object,
-                                        key,
+                                        index,
                                         value,
                                     ) {
                                         return Result::Ok(())

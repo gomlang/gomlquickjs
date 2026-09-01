@@ -245,6 +245,8 @@ pub struct Object {
     immutable_prototype_value: Ref[bool],
     extensible_value: Ref[bool],
     properties_value: collections::IndexMap[PropertyKey, PropertyDescriptor],
+    array_dense_properties_value: Vec[Option[PropertyDescriptor]],
+    array_sparse_properties_value: HashMap[u32, PropertyDescriptor],
     private_elements_value: HashMap[ObjectId, PrivateElement],
     primitive_value_value: Ref[Option[Value]],
     argument_map_value: HashMap[u32, Ref[Value]],
@@ -297,15 +299,41 @@ impl Object {
                     None => Option::None,
                 },
             },
-            None => match self.properties_value.get(key) {
-                Some(value) => Option::Some(mapped_descriptor(self, key, value)),
-                None => Option::None,
+            None => match self.kind() {
+                ObjectKind::Array => match key {
+                    PropertyKey::String(value) => match canonical_array_index(value) {
+                        Some(index) => array_index_descriptor(self, index),
+                        None => self.properties_value.get(key),
+                    },
+                    PropertyKey::Symbol(_) => self.properties_value.get(key),
+                },
+                _ => match self.properties_value.get(key) {
+                    Some(value) => Option::Some(mapped_descriptor(self, key, value)),
+                    None => Option::None,
+                },
             },
         }
     }
 
+    pub fn own_array_index(self: Object, index: isize) -> Option[PropertyDescriptor] {
+        if index < 0 || index > 4294967294 {
+            Option::None
+        } else {
+            match self.kind() {
+                ObjectKind::Array => array_index_descriptor(self, index.to_u32()),
+                _ => Option::None,
+            }
+        }
+    }
+
     pub fn own_property_count(self: Object) -> isize {
-        self.properties_value.len()
+        let mut dense_count = 0;
+        for descriptor in self.array_dense_properties_value {
+            if descriptor.is_some() {
+                dense_count += 1;
+            }
+        }
+        self.properties_value.len() + dense_count + self.array_sparse_properties_value.len()
             + match self.typed_array_value.get() {
                 Some(value) => typed_array_length(value.view),
                 None => 0,
@@ -428,6 +456,8 @@ fn make_object(kind: ObjectKind, prototype: Option[ObjectId]) -> Object {
         immutable_prototype_value: Ref::new(false),
         extensible_value: Ref::new(true),
         properties_value: collections::IndexMap::new(),
+        array_dense_properties_value: Vec::new(),
+        array_sparse_properties_value: HashMap::new(),
         private_elements_value: HashMap::new(),
         primitive_value_value: Ref::new(Option::None),
         argument_map_value: HashMap::new(),
@@ -550,6 +580,15 @@ fn drain_pending(
                         },
                         PropertyKey::String(_) => (),
                     }
+                    enqueue_descriptor(heap, descriptor, marked, symbols, pending)
+                }
+                for descriptor in object.array_dense_properties_value {
+                    match descriptor {
+                        Some(value) => enqueue_descriptor(heap, value, marked, symbols, pending),
+                        None => (),
+                    }
+                }
+                for (_, descriptor) in object.array_sparse_properties_value.entries() {
                     enqueue_descriptor(heap, descriptor, marked, symbols, pending)
                 }
                 for (name, element) in object.private_elements_value.entries() {
@@ -1763,6 +1802,21 @@ pub fn seal_object(heap: Heap, object: ObjectId, frozen: bool) -> bool {
             None => (),
         }
     }
+    let mut dense_index = 0;
+    while dense_index < target.array_dense_properties_value.len() {
+        match target.array_dense_properties_value[dense_index] {
+            Some(descriptor) => {
+                target.array_dense_properties_value[dense_index] = Option::Some(
+                    descriptor_sealed(descriptor, frozen),
+                );
+            },
+            None => (),
+        }
+        dense_index += 1;
+    }
+    for (index, descriptor) in target.array_sparse_properties_value.entries() {
+        target.array_sparse_properties_value[index] = descriptor_sealed(descriptor, frozen);
+    }
     true
 }
 
@@ -1781,6 +1835,21 @@ pub fn object_is_sealed(heap: Heap, object: ObjectId, frozen: bool) -> bool {
         None => (),
     }
     for descriptor in target.properties_value.values() {
+        if descriptor_configurable(descriptor)
+            || frozen && descriptor_is_data(descriptor) && descriptor_writable(descriptor) {
+            return false
+        }
+    }
+    for descriptor in target.array_dense_properties_value {
+        match descriptor {
+            Some(value) => if descriptor_configurable(value)
+                || frozen && descriptor_is_data(value) && descriptor_writable(value) {
+                return false
+            },
+            None => (),
+        }
+    }
+    for (_, descriptor) in target.array_sparse_properties_value.entries() {
         if descriptor_configurable(descriptor)
             || frozen && descriptor_is_data(descriptor) && descriptor_writable(descriptor) {
             return false
@@ -1861,6 +1930,136 @@ fn array_current_length(target: Object) -> Option[(isize, bool)] {
             None => Option::None,
         },
         None => Option::None,
+    }
+}
+
+const ARRAY_DENSE_GAP_LIMIT: isize = 256;
+
+const ARRAY_DENSE_INDEX_LIMIT: isize = 1048576;
+
+fn array_index_descriptor(target: Object, index: u32) -> Option[PropertyDescriptor] {
+    let dense_index = index.to_isize();
+    if dense_index < target.array_dense_properties_value.len() {
+        match target.array_dense_properties_value[dense_index] {
+            Some(value) => Option::Some(value),
+            None => target.array_sparse_properties_value.get(index),
+        }
+    } else {
+        target.array_sparse_properties_value.get(index)
+    }
+}
+
+fn array_insert_index_descriptor(target: Object, index: u32, descriptor: PropertyDescriptor) -> () {
+    let dense_index = index.to_isize();
+    if dense_index < target.array_dense_properties_value.len() {
+        match target.array_dense_properties_value[dense_index] {
+            Some(_) => {
+                target.array_dense_properties_value[dense_index] = Option::Some(descriptor);
+            },
+            None => if target.array_sparse_properties_value.get(index).is_some() {
+                target.array_sparse_properties_value[index] = descriptor;
+            } else {
+                target.array_dense_properties_value[dense_index] = Option::Some(descriptor);
+            },
+        }
+    } else if target.array_sparse_properties_value.get(index).is_some() {
+        target.array_sparse_properties_value[index] = descriptor;
+    } else if dense_index < ARRAY_DENSE_INDEX_LIMIT
+        && dense_index <= target.array_dense_properties_value.len() + ARRAY_DENSE_GAP_LIMIT {
+        while target.array_dense_properties_value.len() < dense_index {
+            target.array_dense_properties_value.push(Option::None)
+        }
+        target.array_dense_properties_value.push(Option::Some(descriptor));
+    } else {
+        target.array_sparse_properties_value[index] = descriptor;
+    }
+}
+
+fn array_insert_new_index_descriptor(target: Object, index: u32, descriptor: PropertyDescriptor) -> () {
+    let dense_index = index.to_isize();
+    if dense_index < target.array_dense_properties_value.len() {
+        target.array_dense_properties_value[dense_index] = Option::Some(descriptor);
+    } else if dense_index < ARRAY_DENSE_INDEX_LIMIT
+        && dense_index <= target.array_dense_properties_value.len() + ARRAY_DENSE_GAP_LIMIT {
+        while target.array_dense_properties_value.len() < dense_index {
+            target.array_dense_properties_value.push(Option::None)
+        }
+        target.array_dense_properties_value.push(Option::Some(descriptor));
+    } else {
+        target.array_sparse_properties_value[index] = descriptor;
+    }
+}
+
+fn array_remove_index_descriptor(target: Object, index: u32) -> bool {
+    let dense_index = index.to_isize();
+    if dense_index < target.array_dense_properties_value.len() {
+        match target.array_dense_properties_value[dense_index] {
+            Some(descriptor) => if descriptor_configurable(descriptor) {
+                target.array_dense_properties_value[dense_index] = Option::None;
+                while !target.array_dense_properties_value.is_empty()
+                    && target.array_dense_properties_value[target.array_dense_properties_value.len()
+                        - 1].is_none() {
+                    target.array_dense_properties_value.truncate(
+                        target.array_dense_properties_value.len() - 1,
+                    );
+                }
+                true
+            } else {
+                false
+            },
+            None => match target.array_sparse_properties_value.get(index) {
+                Some(descriptor) => if descriptor_configurable(descriptor) {
+                    let _ = target.array_sparse_properties_value.remove(index);
+                    true
+                } else {
+                    false
+                },
+                None => true,
+            },
+        }
+    } else {
+        match target.array_sparse_properties_value.get(index) {
+            Some(descriptor) => if descriptor_configurable(descriptor) {
+                let _ = target.array_sparse_properties_value.remove(index);
+                true
+            } else {
+                false
+            },
+            None => true,
+        }
+    }
+}
+
+fn array_define_own_index(target: Object, index: u32, descriptor: PropertyDescriptor) -> bool {
+    match array_index_descriptor(target, index) {
+        Some(current) => if compatible_descriptor(current, descriptor) {
+            array_insert_index_descriptor(target, index, descriptor);
+            true
+        } else {
+            false
+        },
+        None => if target.extensible() {
+            array_insert_new_index_descriptor(target, index, descriptor);
+            true
+        } else {
+            false
+        },
+    }
+}
+
+fn set_existing_array_index_value(target: Object, index: u32, value: Value) -> bool {
+    match array_index_descriptor(target, index) {
+        Some(Data { value: _, writable, enumerable, configurable }) => if writable {
+            array_insert_index_descriptor(
+                target,
+                index,
+                Data { value, writable, enumerable, configurable },
+            );
+            true
+        } else {
+            false
+        },
+        _ => false,
     }
 }
 
@@ -1970,13 +2169,7 @@ fn array_define_length(heap: Heap, object: ObjectId, descriptor: PropertyDescrip
     }
 }
 
-fn array_define_index(
-    heap: Heap,
-    object: ObjectId,
-    key: PropertyKey,
-    index: u32,
-    descriptor: PropertyDescriptor,
-) -> bool {
+fn array_define_index(heap: Heap, object: ObjectId, index: u32, descriptor: PropertyDescriptor) -> bool {
     let target = match heap.get(object) {
         Some(value) => value,
         None => return false,
@@ -1987,7 +2180,7 @@ fn array_define_index(
     };
     if index.to_isize() >= length && !writable {
         return false
-    } else if !ordinary_define_own_property(heap, object, key, descriptor) {
+    } else if !array_define_own_index(target, index, descriptor) {
         return false
     } else if index.to_isize() < length {
         return true
@@ -2049,8 +2242,9 @@ pub fn try_fast_array_push(heap: Heap, object: ObjectId, values: Vec[Value]) -> 
     }
     let mut index = 0;
     while index < values.len() {
-        let key = string_property_key((length + index).to_string());
-        if target.properties_value.get(key).is_some()
+        let array_index = (length + index).to_u32();
+        let key = string_property_key(array_index.to_string());
+        if array_index_descriptor(target, array_index).is_some()
             || !fast_array_prototype_property_absent(heap, target, key) {
             return Option::None
         }
@@ -2058,8 +2252,9 @@ pub fn try_fast_array_push(heap: Heap, object: ObjectId, values: Vec[Value]) -> 
     }
     index = 0;
     while index < values.len() {
-        target.properties_value.insert(
-            string_property_key((length + index).to_string()),
+        array_insert_new_index_descriptor(
+            target,
+            (length + index).to_u32(),
             data_descriptor(values[index], true, true, true),
         );
         index += 1;
@@ -2099,14 +2294,18 @@ pub fn try_fast_array_pop(heap: Heap, object: ObjectId) -> Option[Value] {
     let value = if length == 0 {
         Value::Undefined
     } else {
-        let key = string_property_key((length - 1).to_string());
-        match target.properties_value.get(key) {
+        let index = (length - 1).to_u32();
+        match array_index_descriptor(target, index) {
             Some(Data { value, configurable: true, .. }) => {
-                target.properties_value.remove(key);
+                let _ = array_remove_index_descriptor(target, index);
                 value
             },
             Some(_) => return Option::None,
-            None => if fast_array_prototype_property_absent(heap, target, key) {
+            None => if fast_array_prototype_property_absent(
+                heap,
+                target,
+                string_property_key(index.to_string()),
+            ) {
                 Value::Undefined
             } else {
                 return Option::None
@@ -2167,25 +2366,30 @@ pub fn try_fast_array_slice(
     };
     let mut index = 0;
     while index < count {
-        let source_key = string_property_key((first + index).to_string());
-        match source_object.properties_value.get(source_key) {
+        let source_index = (first + index).to_u32();
+        match array_index_descriptor(source_object, source_index) {
             Some(Data { .. }) => (),
             Some(_) => return false,
-            None => if !fast_array_prototype_property_absent(heap, source_object, source_key) {
+            None => if !fast_array_prototype_property_absent(
+                heap,
+                source_object,
+                string_property_key(source_index.to_string()),
+            ) {
                 return false
             },
         }
-        if target_object.properties_value.get(string_property_key(index.to_string())).is_some() {
+        if array_index_descriptor(target_object, index.to_u32()).is_some() {
             return false
         }
         index += 1;
     }
     index = 0;
     while index < count {
-        match source_object.properties_value.get(string_property_key((first + index).to_string())) {
+        match array_index_descriptor(source_object, (first + index).to_u32()) {
             Some(Data { value, .. }) => {
-                target_object.properties_value.insert(
-                    string_property_key(index.to_string()),
+                array_insert_new_index_descriptor(
+                    target_object,
+                    index.to_u32(),
                     data_descriptor(value, true, true, true),
                 );
             },
@@ -2250,7 +2454,7 @@ pub fn define_own_property(
                 array_define_length(heap, object, descriptor)
             } else {
                 match canonical_array_index(value) {
-                    Some(index) => array_define_index(heap, object, key, index, descriptor),
+                    Some(index) => array_define_index(heap, object, index, descriptor),
                     None => ordinary_define_own_property(heap, object, key, descriptor),
                 }
             },
@@ -2371,7 +2575,16 @@ pub fn delete_property(heap: Heap, object: ObjectId, key: PropertyKey) -> bool {
                 Some(TypedArrayNumericIndex::Invalid) => true,
                 None => delete_ordinary_property(target, key),
             },
-            None => delete_ordinary_property(target, key),
+            None => match target.kind() {
+                ObjectKind::Array => match key {
+                    PropertyKey::String(value) => match canonical_array_index(value) {
+                        Some(index) => array_remove_index_descriptor(target, index),
+                        None => delete_ordinary_property(target, key),
+                    },
+                    PropertyKey::Symbol(_) => delete_ordinary_property(target, key),
+                },
+                _ => delete_ordinary_property(target, key),
+            },
         },
         None => false,
     }
@@ -2621,8 +2834,32 @@ pub fn set_existing_data_property(heap: Heap, object: ObjectId, key: PropertyKey
                     Some(TypedArrayNumericIndex::Invalid) => false,
                     None => set_existing_ordinary_data_property(target, key, value),
                 },
-                None => set_existing_ordinary_data_property(target, key, value),
+                None => match target.kind() {
+                    ObjectKind::Array => match key {
+                        PropertyKey::String(key_value) => match canonical_array_index(key_value) {
+                            Some(index) => set_existing_array_index_value(target, index, value),
+                            None => set_existing_ordinary_data_property(target, key, value),
+                        },
+                        PropertyKey::Symbol(_) => {
+                            set_existing_ordinary_data_property(target, key, value)
+                        },
+                    },
+                    _ => set_existing_ordinary_data_property(target, key, value),
+                },
             }
+        },
+        None => false,
+    }
+}
+
+pub fn set_existing_array_index(heap: Heap, object: ObjectId, index: isize, value: Value) -> bool {
+    if index < 0 || index > 4294967294 {
+        return false
+    }
+    match heap.get(object) {
+        Some(target) => match target.kind() {
+            ObjectKind::Array => set_existing_array_index_value(target, index.to_u32(), value),
+            _ => false,
         },
         None => false,
     }
@@ -2734,18 +2971,9 @@ pub fn set_property(heap: Heap, object: ObjectId, key: PropertyKey, value: Value
             _ => Result::Ok(false),
         }
     }
-    match target.properties_value.get(key) {
-        Some(Data { value: _, writable, enumerable, configurable }) => if writable {
-            target.properties_value.insert(
-                key,
-                PropertyDescriptor::Data { value, writable, enumerable, configurable },
-            );
-            update_argument_mapping(
-                target,
-                key,
-                PropertyDescriptor::Data { value, writable, enumerable, configurable },
-            );
-            Result::Ok(true)
+    match target.own_property(key) {
+        Some(Data { writable, .. }) => if writable {
+            Result::Ok(set_existing_data_property(heap, object, key, value))
         } else {
             Result::Ok(false)
         },
@@ -2810,6 +3038,16 @@ pub fn own_property_keys(heap: Heap, object: ObjectId) -> Vec[PropertyKey] {
     let indexed: Vec[(u32, PropertyKey)] = Vec::new();
     let strings: Vec[PropertyKey] = Vec::new();
     let symbols: Vec[PropertyKey] = Vec::new();
+    let mut dense_index = 0;
+    while dense_index < target.array_dense_properties_value.len() {
+        if target.array_dense_properties_value[dense_index].is_some() {
+            indexed.push((dense_index.to_u32(), string_property_key(dense_index.to_string())));
+        }
+        dense_index += 1;
+    }
+    for (index, _) in target.array_sparse_properties_value.entries() {
+        indexed.push((index, string_property_key(index.to_string())))
+    }
     for key in target.properties_value.keys() {
         match key {
             PropertyKey::String(value) => match canonical_array_index(value) {
