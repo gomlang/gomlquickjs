@@ -1,5 +1,6 @@
 package vm;
 
+use gomlang::quickjs::arraybuffer;
 use gomlang::quickjs::bytecode;
 use gomlang::quickjs::runtime;
 use std::num;
@@ -475,6 +476,140 @@ fn reads_and_writes_array_element_keys() -> () {
     );
     match execute_with_locals(function, heap, Vec::from_array([runtime::Value::Object(object)])) {
         Ok(value) => testing::assert_eq(expect_number(value), 17.0),
+        Err(value) => testing::fail(value.kind.debug()),
+    }
+}
+
+#[test]
+fn preserves_array_element_writability_on_direct_access() -> () {
+    let heap = runtime::Heap::new();
+    let object = expect_object(runtime::new_array(heap, 1));
+    testing::assert(
+        runtime::define_own_property(
+            heap,
+            object,
+            runtime::string_property_key("0"),
+            runtime::data_descriptor(runtime::Value::Int(1), false, true, true),
+        ),
+    );
+    let non_strict = bytecode::Function::new(
+        Vec::new(),
+        Vec::from_array(
+            [
+                bytecode::Instruction::GetLoc(0),
+                bytecode::Instruction::PushI32(0),
+                bytecode::Instruction::PushI32(2),
+                bytecode::Instruction::PutArrayEl,
+                bytecode::Instruction::GetLoc(0),
+                bytecode::Instruction::PushI32(0),
+                bytecode::Instruction::GetArrayEl,
+                bytecode::Instruction::Return,
+            ],
+        ),
+        1,
+    );
+    match execute_with_locals(non_strict, heap, Vec::from_array([runtime::Value::Object(object)])) {
+        Ok(value) => testing::assert_eq(expect_number(value), 1.0),
+        Err(value) => testing::fail(value.kind.debug()),
+    }
+    let strict = bytecode::Function::new(
+        Vec::new(),
+        Vec::from_array(
+            [
+                bytecode::Instruction::GetLoc(0),
+                bytecode::Instruction::PushI32(0),
+                bytecode::Instruction::PushI32(3),
+                bytecode::Instruction::PutArrayElStrict,
+                bytecode::Instruction::ReturnUndef,
+            ],
+        ),
+        1,
+    );
+    match execute_with_locals(strict, heap, Vec::from_array([runtime::Value::Object(object)])) {
+        Err(VmError { kind: VmErrorKind::TypeError(_), .. }) => (),
+        _ => testing::fail("expected strict non-writable array element error"),
+    }
+}
+
+#[test]
+fn reads_and_writes_typed_array_integer_indices() -> () {
+    let heap = runtime::Heap::new();
+    let buffer_object = expect_object(runtime::new_null_prototype_object(heap));
+    let object = expect_object(runtime::new_null_prototype_object(heap));
+    let view = match arraybuffer::Uint8Array::new(2) {
+        Ok(value) => value,
+        Err(value) => {
+            testing::fail(value.to_string());
+            loop {}
+        },
+    };
+    testing::assert(
+        runtime::register_typed_array(
+            heap,
+            object,
+            runtime::TypedArrayView::Uint8(view),
+            buffer_object,
+        ),
+    );
+    let valid = bytecode::Function::new(
+        Vec::new(),
+        Vec::from_array(
+            [
+                bytecode::Instruction::GetLoc(0),
+                bytecode::Instruction::PushI32(0),
+                bytecode::Instruction::PushI32(257),
+                bytecode::Instruction::PutArrayEl,
+                bytecode::Instruction::GetLoc(0),
+                bytecode::Instruction::PushI32(0),
+                bytecode::Instruction::GetArrayEl,
+                bytecode::Instruction::Return,
+            ],
+        ),
+        1,
+    );
+    match execute_with_locals(valid, heap, Vec::from_array([runtime::Value::Object(object)])) {
+        Ok(value) => testing::assert_eq(expect_number(value), 1.0),
+        Err(value) => testing::fail(value.kind.debug()),
+    }
+    let string_index = bytecode::Function::new(
+        Vec::from_array([bytecode::Constant::String(test_js_string("1"))]),
+        Vec::from_array(
+            [
+                bytecode::Instruction::GetLoc(0),
+                bytecode::Instruction::PushConst(0),
+                bytecode::Instruction::PushI32(258),
+                bytecode::Instruction::PutArrayEl,
+                bytecode::Instruction::GetLoc(0),
+                bytecode::Instruction::PushConst(0),
+                bytecode::Instruction::GetArrayEl,
+                bytecode::Instruction::Return,
+            ],
+        ),
+        1,
+    );
+    match execute_with_locals(string_index, heap, Vec::from_array([runtime::Value::Object(object)])) {
+        Ok(value) => testing::assert_eq(expect_number(value), 2.0),
+        Err(value) => testing::fail(value.kind.debug()),
+    }
+    let invalid = bytecode::Function::new(
+        Vec::new(),
+        Vec::from_array(
+            [
+                bytecode::Instruction::GetLoc(0),
+                bytecode::Instruction::PushI32(-1),
+                bytecode::Instruction::PushI32(7),
+                bytecode::Instruction::PutArrayElStrict,
+                bytecode::Instruction::GetLoc(0),
+                bytecode::Instruction::PushI32(-1),
+                bytecode::Instruction::GetArrayEl,
+                bytecode::Instruction::Return,
+            ],
+        ),
+        1,
+    );
+    match execute_with_locals(invalid, heap, Vec::from_array([runtime::Value::Object(object)])) {
+        Ok(runtime::Value::Undefined) => (),
+        Ok(_) => testing::fail("expected undefined typed array element"),
         Err(value) => testing::fail(value.kind.debug()),
     }
 }
