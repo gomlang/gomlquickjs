@@ -129,6 +129,94 @@ fn executes_arithmetic_and_comparison() -> () {
     }
 }
 
+fn execute_numeric_binary(
+    left: runtime::Value,
+    right: runtime::Value,
+    instruction: bytecode::Instruction,
+) -> runtime::Value {
+    match execute_with_locals(
+        bytecode::Function::new(
+            Vec::new(),
+            Vec::from_array(
+                [
+                    bytecode::Instruction::GetLoc(0),
+                    bytecode::Instruction::GetLoc(1),
+                    instruction,
+                    bytecode::Instruction::Return,
+                ],
+            ),
+            2,
+        ),
+        runtime::Heap::new(),
+        Vec::from_array([left, right]),
+    ) {
+        Ok(value) => value,
+        Err(value) => {
+            testing::fail(value.kind.debug());
+            runtime::Value::Undefined
+        },
+    }
+}
+
+fn expect_bool(value: runtime::Value) -> bool {
+    match value {
+        runtime::Value::Bool(value) => value,
+        _ => {
+            testing::fail("expected boolean");
+            false
+        },
+    }
+}
+
+#[test]
+fn numeric_fast_paths_preserve_overflow_negative_zero_and_mixed_comparisons() -> () {
+    match execute_numeric_binary(
+        runtime::Value::Int(2147483647),
+        runtime::Value::Int(1),
+        bytecode::Instruction::Add,
+    ) {
+        runtime::Value::Float(value) => testing::assert_eq(value, 2147483648.0),
+        _ => testing::fail("expected floating point overflow result"),
+    }
+    match execute_numeric_binary(
+        runtime::Value::Int(0),
+        runtime::Value::Int(-1),
+        bytecode::Instruction::Mul,
+    ) {
+        runtime::Value::Float(value) => testing::assert(
+            runtime::same_value(runtime::Value::Float(value), runtime::Value::Float(-0.0)),
+        ),
+        _ => testing::fail("expected negative zero"),
+    }
+    testing::assert(
+        expect_bool(
+            execute_numeric_binary(
+                runtime::Value::Int(1),
+                runtime::Value::Float(1.0),
+                bytecode::Instruction::Eq,
+            ),
+        ),
+    );
+    testing::assert(
+        expect_bool(
+            execute_numeric_binary(
+                runtime::Value::Int(2147483647),
+                runtime::Value::Float(2147483647.5),
+                bytecode::Instruction::Lt,
+            ),
+        ),
+    );
+    testing::assert(
+        !expect_bool(
+            execute_numeric_binary(
+                runtime::Value::Float(0.0 / 0.0),
+                runtime::Value::Int(0),
+                bytecode::Instruction::Gte,
+            ),
+        ),
+    )
+}
+
 fn big(value: string) -> runtime::Value {
     runtime::Value::BigInt(
         runtime::BigInt::parse_radix(value, 10).unwrap_or(runtime::BigInt::from_int64(0)),
