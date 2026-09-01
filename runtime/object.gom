@@ -142,6 +142,22 @@ fn typed_array_set_value(view: TypedArrayView, index: isize, value: Value) -> Re
     }
 }
 
+pub fn read_typed_array_index(view: TypedArrayView, index: isize) -> Value {
+    match typed_array_element(view, index) {
+        Some(value) => value,
+        None => Value::Undefined,
+    }
+}
+
+pub fn write_typed_array_index(view: TypedArrayView, index: isize, value: Value) -> Result[
+    bool,
+    TypeError,
+] {
+    let valid = index >= 0 && index < typed_array_length(view);
+    let written = typed_array_set_value(view, index, value)?;
+    Result::Ok(written || !valid)
+}
+
 fn typed_array_numeric_index(key: PropertyKey) -> Option[TypedArrayNumericIndex] {
     let value = match key {
         PropertyKey::String(value) => value,
@@ -246,6 +262,13 @@ struct ProxyData {
 impl Object {
     pub fn kind(self: Object) -> ObjectKind {
         self.kind_value
+    }
+
+    pub fn typed_array_view(self: Object) -> Option[TypedArrayView] {
+        match self.typed_array_value.get() {
+            Some(value) => Option::Some(value.view),
+            None => Option::None,
+        }
     }
 
     pub fn prototype(self: Object) -> Option[ObjectId] {
@@ -1256,10 +1279,7 @@ pub fn typed_array_element_length(heap: Heap, object: ObjectId) -> Option[isize]
 
 pub fn typed_array_view(heap: Heap, object: ObjectId) -> Option[TypedArrayView] {
     match heap.get(object) {
-        Some(value) => match value.typed_array_value.get() {
-            Some(value) => Option::Some(value.view),
-            None => Option::None,
-        },
+        Some(value) => value.typed_array_view(),
         None => Option::None,
     }
 }

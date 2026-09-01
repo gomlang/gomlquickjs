@@ -3473,6 +3473,44 @@ fn property_reference_key(
     }
 }
 
+fn read_array_element(
+    machine: Machine,
+    offset: isize,
+    receiver: runtime::Value,
+    property: runtime::Value,
+) -> Result[runtime::Value, VmError] {
+    match (receiver, direct_index_property(property)) {
+        (runtime::Value::Object(object), Some((index, direct_key))) => {
+            match machine.heap.get(object) {
+                Some(target) => match target.typed_array_view() {
+                    Some(view) => {
+                        return Result::Ok(runtime::read_typed_array_index(view, index))
+                    },
+                    None => match target.kind() {
+                        runtime::ObjectKind::Array => {
+                            let key = match direct_key {
+                                Some(value) => value,
+                                None => runtime::string_property_key(index.to_string()),
+                            };
+                            match target.own_property(key) {
+                                Some(runtime::PropertyDescriptor::Data { value, .. }) => {
+                                    return Result::Ok(value)
+                                },
+                                _ => (),
+                            }
+                        },
+                        _ => (),
+                    },
+                },
+                None => (),
+            }
+        },
+        _ => (),
+    }
+    let key = property_reference_key(machine, offset, receiver, property)?;
+    read_property(machine, offset, receiver, key)
+}
+
 fn property_key_value(machine: Machine, offset: isize, value: runtime::Value) -> Result[
     runtime::Value,
     VmError,
@@ -3514,6 +3552,20 @@ fn string_property_index(key: runtime::PropertyKey) -> Option[isize] {
         offset += 1;
     }
     Option::Some(result)
+}
+
+fn direct_index_property(value: runtime::Value) -> Option[(isize, Option[runtime::PropertyKey])] {
+    match value {
+        runtime::Value::Int(index) => Option::Some((index.to_isize(), Option::None)),
+        runtime::Value::String(value) => {
+            let key = runtime::js_string_property_key(value);
+            match string_property_index(key) {
+                Some(index) => Option::Some((index, Option::Some(key))),
+                None => Option::None,
+            }
+        },
+        _ => Option::None,
+    }
 }
 
 fn read_prototype_property(
@@ -5811,6 +5863,89 @@ fn write_property_with_strict(
         ),
         _ => write_primitive_property(machine, offset, receiver, key, value, strict),
     }
+}
+
+fn write_array_element_with_strict(
+    machine: Machine,
+    offset: isize,
+    receiver: runtime::Value,
+    property: runtime::Value,
+    value: runtime::Value,
+    strict: bool,
+) -> Result[(), VmError] {
+    match (receiver, direct_index_property(property)) {
+        (runtime::Value::Object(object), Some((index, direct_key))) => {
+            match machine.heap.get(object) {
+                Some(target) => match target.typed_array_view() {
+                    Some(view) => {
+                        let converted = match view {
+                            runtime::TypedArrayView::BigInt(_) => {
+                                runtime::Value::BigInt(bigint_value(machine, offset, value)?)
+                            },
+                            _ => runtime::Value::Float(number(machine, offset, value)?),
+                        };
+                        let written = match runtime::write_typed_array_index(view, index, converted) {
+                            Ok(value) => value,
+                            Err(value) => {
+                                return Result::Err(
+                                    error(offset, VmErrorKind::TypeError(value.message)),
+                                )
+                            },
+                        };
+                        return if written || !strict {
+                            Result::Ok(())
+                        } else {
+                            Result::Err(
+                                error(offset, VmErrorKind::TypeError("property is not writable")),
+                            )
+                        }
+                    },
+                    None => match target.kind() {
+                        runtime::ObjectKind::Array => {
+                            let key = match direct_key {
+                                Some(value) => value,
+                                None => runtime::string_property_key(index.to_string()),
+                            };
+                            match target.own_property(key) {
+                                Some(runtime::PropertyDescriptor::Data {
+                                    value: _,
+                                    writable,
+                                    enumerable: _,
+                                    configurable: _,
+                                }) => if writable {
+                                    if runtime::set_existing_data_property(
+                                        machine.heap,
+                                        object,
+                                        key,
+                                        value,
+                                    ) {
+                                        return Result::Ok(())
+                                    }
+                                } else {
+                                    return if strict {
+                                        Result::Err(
+                                            error(
+                                                offset,
+                                                VmErrorKind::TypeError("property is not writable"),
+                                            ),
+                                        )
+                                    } else {
+                                        Result::Ok(())
+                                    }
+                                },
+                                _ => (),
+                            }
+                        },
+                        _ => (),
+                    },
+                },
+                None => (),
+            }
+        },
+        _ => (),
+    }
+    let key = property_reference_key(machine, offset, receiver, property)?;
+    write_property_with_strict(machine, offset, receiver, key, value, strict)
 }
 
 fn primitive_property_prototype(machine: Machine, receiver: runtime::Value) -> Option[
@@ -9146,24 +9281,28 @@ fn step(machine: Machine, offset: isize, instruction: bytecode::Instruction) -> 
             write_super_reference(machine, offset, base, receiver, key, value, strict)?
         },
         bytecode::Instruction::GetArrayEl => {
-            let value = pop(machine, offset)?;
+            let property = pop(machine, offset)?;
             let receiver = pop(machine, offset)?;
-            let key = property_reference_key(machine, offset, receiver, value)?;
-            machine.stack.push(read_property(machine, offset, receiver, key)?)
+            machine.stack.push(read_array_element(machine, offset, receiver, property)?)
         },
         bytecode::Instruction::PutArrayEl => {
             let value = pop(machine, offset)?;
             let property = pop(machine, offset)?;
             let receiver = pop(machine, offset)?;
-            let key = property_reference_key(machine, offset, receiver, property)?;
-            write_property(machine, offset, receiver, key, value)?;
+            write_array_element_with_strict(
+                machine,
+                offset,
+                receiver,
+                property,
+                value,
+                machine.function.strict(),
+            )?;
         },
         bytecode::Instruction::PutArrayElStrict => {
             let value = pop(machine, offset)?;
             let property = pop(machine, offset)?;
             let receiver = pop(machine, offset)?;
-            let key = property_reference_key(machine, offset, receiver, property)?;
-            write_property_with_strict(machine, offset, receiver, key, value, true)?;
+            write_array_element_with_strict(machine, offset, receiver, property, value, true)?;
         },
         bytecode::Instruction::ReflectGet => push_reflect_get(machine, offset)?,
         bytecode::Instruction::ReflectSet => push_reflect_set(machine, offset)?,
