@@ -8215,29 +8215,27 @@ fn call_value_with_mode(
     new_target: Option[runtime::Value],
 ) -> Result[runtime::Value, VmError] {
     update_active_frame_offset(machine, offset);
-    let roots: Vec[runtime::Value] = Vec::with_capacity(arguments.len() + 3);
-    roots.push(callee);
-    roots.push(this_value);
+    let stack_start = machine.stack.len();
+    machine.stack.push(callee);
+    machine.stack.push(this_value);
     for value in arguments {
-        roots.push(value)
+        machine.stack.push(value)
     }
     match new_target {
-        Some(value) => roots.push(value),
+        Some(value) => machine.stack.push(value),
         None => (),
     }
-    with_machine_roots(
+    let result = call_value_with_mode_rooted(
         machine,
-        roots,
-        || call_value_with_mode_rooted(
-            machine,
-            offset,
-            callee,
-            arguments,
-            this_value,
-            constructing,
-            new_target,
-        ),
-    )
+        offset,
+        callee,
+        arguments,
+        this_value,
+        constructing,
+        new_target,
+    );
+    machine.stack.truncate(stack_start);
+    result
 }
 
 fn call_value_with_mode_rooted(
@@ -8325,16 +8323,21 @@ fn call_value_with_mode_rooted(
                             },
                         )
                     };
-                    let eval_environment = Ref::new(
-                        Option::Some(
-                            Ref::new(
-                                EvalEnvironment {
-                                    values: HashMap::new(),
-                                    parent: closure.eval_environment,
-                                },
+                    let eval_environment = if function.eval_site_count() > 0
+                        || !function.eval_declarations().is_empty() {
+                        Ref::new(
+                            Option::Some(
+                                Ref::new(
+                                    EvalEnvironment {
+                                        values: HashMap::new(),
+                                        parent: closure.eval_environment,
+                                    },
+                                ),
                             ),
-                        ),
-                    );
+                        )
+                    } else {
+                        Ref::new(closure.eval_environment)
+                    };
                     if function.generator() || function.asynchronous() {
                         if constructing {
                             return Result::Err(
@@ -8841,16 +8844,51 @@ fn push_call(machine: Machine, offset: isize, argument_count: isize, method: boo
     (),
     VmError,
 ] {
-    let arguments = pop_arguments(machine, offset, argument_count)?;
-    let callee = pop(machine, offset)?;
+    let prefix = if method {
+        2
+    } else {
+        1
+    };
+    if argument_count < 0 || machine.stack.len() < argument_count + prefix {
+        return Result::Err(error(offset, VmErrorKind::StackUnderflow))
+    }
+    let stack_start = machine.stack.len() - argument_count - prefix;
+    let callee_index = if method {
+        stack_start + 1
+    } else {
+        stack_start
+    };
+    let argument_start = callee_index + 1;
+    let arguments: Vec[runtime::Value] = Vec::with_capacity(argument_count);
+    let mut index = 0;
+    while index < argument_count {
+        arguments.push(machine.stack[argument_start + index]);
+        index += 1;
+    }
+    let callee = machine.stack[callee_index];
     let this_value = if method {
-        pop(machine, offset)?
+        machine.stack[stack_start]
     } else {
         runtime::Value::Undefined
     };
-    let result = call_value(machine, offset, callee, arguments, this_value)?;
-    machine.stack.push(result);
-    Result::Ok(())
+    update_active_frame_offset(machine, offset);
+    let result = call_value_with_mode_rooted(
+        machine,
+        offset,
+        callee,
+        arguments,
+        this_value,
+        false,
+        Option::None,
+    );
+    machine.stack.truncate(stack_start);
+    match result {
+        Ok(value) => {
+            machine.stack.push(value);
+            Result::Ok(())
+        },
+        Err(value) => Result::Err(value),
+    }
 }
 
 fn push_construct(machine: Machine, offset: isize, argument_count: isize) -> Result[(), VmError] {
@@ -9784,6 +9822,343 @@ fn execute_machine(machine: Machine) -> Result[runtime::Value, VmError] {
     }
 }
 
+fn compare_int_float(left: i32, right: f64, instruction: bytecode::Instruction) -> bool {
+    if math::is_nan(right) {
+        return false
+    }
+    if right < -2147483648.0 {
+        return match instruction {
+            bytecode::Instruction::Lt | bytecode::Instruction::Lte => false,
+            bytecode::Instruction::Gt | bytecode::Instruction::Gte => true,
+            _ => false,
+        }
+    }
+    if right > 2147483647.0 {
+        return match instruction {
+            bytecode::Instruction::Lt | bytecode::Instruction::Lte => true,
+            bytecode::Instruction::Gt | bytecode::Instruction::Gte => false,
+            _ => false,
+        }
+    }
+    let truncated = math::trunc(right);
+    let integer = to_i32(truncated);
+    match instruction {
+        bytecode::Instruction::Lt => left < integer || left == integer && right > truncated,
+        bytecode::Instruction::Lte => left < integer || left == integer && right >= truncated,
+        bytecode::Instruction::Gt => left > integer || left == integer && right < truncated,
+        bytecode::Instruction::Gte => left > integer || left == integer && right <= truncated,
+        _ => false,
+    }
+}
+
+fn equal_int_float(left: i32, right: f64) -> bool {
+    math::is_finite(right) && right >= -2147483648.0 && right <= 2147483647.0
+        && math::trunc(right) == right
+        && left == to_i32(right)
+}
+
+fn fast_numeric_step(machine: Machine, instruction: bytecode::Instruction) -> bool {
+    let right = pop_verified(machine);
+    let left = pop_verified(machine);
+    match instruction {
+        bytecode::Instruction::StrictEq | bytecode::Instruction::StrictNeq => {
+            let equal = runtime::strict_equal(left, right);
+            machine.stack.push(
+                runtime::Value::Bool(
+                    if instruction == bytecode::Instruction::StrictEq {
+                        equal
+                    } else {
+                        !equal
+                    },
+                ),
+            );
+            true
+        },
+        bytecode::Instruction::Add => match (left, right) {
+            (runtime::Value::Int(left), runtime::Value::Int(right)) => {
+                let result = left.to_i64() + right.to_i64();
+                if result >= -2147483648 && result <= 2147483647 {
+                    machine.stack.push(runtime::Value::Int(result.to_i32()));
+                    true
+                } else {
+                    machine.stack.push(runtime::Value::Int(left));
+                    machine.stack.push(runtime::Value::Int(right));
+                    false
+                }
+            },
+            (runtime::Value::Float(left), runtime::Value::Float(right)) => {
+                machine.stack.push(runtime::Value::Float(left + right));
+                true
+            },
+            _ => {
+                machine.stack.push(left);
+                machine.stack.push(right);
+                false
+            },
+        },
+        bytecode::Instruction::Sub => match (left, right) {
+            (runtime::Value::Int(left), runtime::Value::Int(right)) => {
+                let result = left.to_i64() - right.to_i64();
+                if result >= -2147483648 && result <= 2147483647 {
+                    machine.stack.push(runtime::Value::Int(result.to_i32()));
+                    true
+                } else {
+                    machine.stack.push(runtime::Value::Int(left));
+                    machine.stack.push(runtime::Value::Int(right));
+                    false
+                }
+            },
+            (runtime::Value::Float(left), runtime::Value::Float(right)) => {
+                machine.stack.push(runtime::Value::Float(left - right));
+                true
+            },
+            _ => {
+                machine.stack.push(left);
+                machine.stack.push(right);
+                false
+            },
+        },
+        bytecode::Instruction::Mul => match (left, right) {
+            (runtime::Value::Int(left), runtime::Value::Int(right)) => {
+                let result = left.to_i64() * right.to_i64();
+                if result >= -2147483648 && result <= 2147483647
+                    && (result != 0 || left >= 0 && right >= 0) {
+                    machine.stack.push(runtime::Value::Int(result.to_i32()));
+                    true
+                } else {
+                    machine.stack.push(runtime::Value::Int(left));
+                    machine.stack.push(runtime::Value::Int(right));
+                    false
+                }
+            },
+            (runtime::Value::Float(left), runtime::Value::Float(right)) => {
+                machine.stack.push(runtime::Value::Float(left * right));
+                true
+            },
+            _ => {
+                machine.stack.push(left);
+                machine.stack.push(right);
+                false
+            },
+        },
+        bytecode::Instruction::Div | bytecode::Instruction::Mod => match (left, right) {
+            (runtime::Value::Float(left), runtime::Value::Float(right)) => {
+                machine.stack.push(
+                    runtime::Value::Float(
+                        if instruction == bytecode::Instruction::Div {
+                            left / right
+                        } else {
+                            remainder(left, right)
+                        },
+                    ),
+                );
+                true
+            },
+            _ => {
+                machine.stack.push(left);
+                machine.stack.push(right);
+                false
+            },
+        },
+        bytecode::Instruction::Lt | bytecode::Instruction::Lte | bytecode::Instruction::Gt | bytecode::Instruction::Gte => match (
+            left,
+            right,
+        ) {
+            (runtime::Value::Int(left), runtime::Value::Int(right)) => {
+                machine.stack.push(
+                    runtime::Value::Bool(
+                        match instruction {
+                            bytecode::Instruction::Lt => left < right,
+                            bytecode::Instruction::Lte => left <= right,
+                            bytecode::Instruction::Gt => left > right,
+                            bytecode::Instruction::Gte => left >= right,
+                            _ => false,
+                        },
+                    ),
+                );
+                true
+            },
+            (runtime::Value::Int(left), runtime::Value::Float(right)) => {
+                machine.stack.push(
+                    runtime::Value::Bool(compare_int_float(left, right, instruction)),
+                );
+                true
+            },
+            (runtime::Value::Float(left), runtime::Value::Int(right)) => {
+                let reversed = match instruction {
+                    bytecode::Instruction::Lt => bytecode::Instruction::Gt,
+                    bytecode::Instruction::Lte => bytecode::Instruction::Gte,
+                    bytecode::Instruction::Gt => bytecode::Instruction::Lt,
+                    bytecode::Instruction::Gte => bytecode::Instruction::Lte,
+                    _ => instruction,
+                };
+                machine.stack.push(runtime::Value::Bool(compare_int_float(right, left, reversed)));
+                true
+            },
+            (runtime::Value::Float(left), runtime::Value::Float(right)) => {
+                machine.stack.push(
+                    runtime::Value::Bool(
+                        match instruction {
+                            bytecode::Instruction::Lt => left < right,
+                            bytecode::Instruction::Lte => left <= right,
+                            bytecode::Instruction::Gt => left > right,
+                            bytecode::Instruction::Gte => left >= right,
+                            _ => false,
+                        },
+                    ),
+                );
+                true
+            },
+            _ => {
+                machine.stack.push(left);
+                machine.stack.push(right);
+                false
+            },
+        },
+        bytecode::Instruction::Eq | bytecode::Instruction::Neq => match (left, right) {
+            (runtime::Value::Int(left), runtime::Value::Int(right)) => {
+                machine.stack.push(
+                    runtime::Value::Bool(
+                        if instruction == bytecode::Instruction::Eq {
+                            left == right
+                        } else {
+                            left != right
+                        },
+                    ),
+                );
+                true
+            },
+            (runtime::Value::Int(left), runtime::Value::Float(right)) => {
+                let equal = equal_int_float(left, right);
+                machine.stack.push(
+                    runtime::Value::Bool(
+                        if instruction == bytecode::Instruction::Eq {
+                            equal
+                        } else {
+                            !equal
+                        },
+                    ),
+                );
+                true
+            },
+            (runtime::Value::Float(left), runtime::Value::Int(right)) => {
+                let equal = equal_int_float(right, left);
+                machine.stack.push(
+                    runtime::Value::Bool(
+                        if instruction == bytecode::Instruction::Eq {
+                            equal
+                        } else {
+                            !equal
+                        },
+                    ),
+                );
+                true
+            },
+            (runtime::Value::Float(left), runtime::Value::Float(right)) => {
+                machine.stack.push(
+                    runtime::Value::Bool(
+                        if instruction == bytecode::Instruction::Eq {
+                            left == right
+                        } else {
+                            left != right
+                        },
+                    ),
+                );
+                true
+            },
+            _ => {
+                machine.stack.push(left);
+                machine.stack.push(right);
+                false
+            },
+        },
+        _ => {
+            machine.stack.push(left);
+            machine.stack.push(right);
+            false
+        },
+    }
+}
+
+fn fast_global_step(machine: Machine, offset: isize, instruction: bytecode::Instruction) -> bool {
+    let (index, write) = match instruction {
+        bytecode::Instruction::GetGlobal(index) => (index, false),
+        bytecode::Instruction::SetGlobal(index) => (index, true),
+        _ => return false,
+    };
+    let object = match machine.global_object {
+        Some(value) => value,
+        None => return false,
+    };
+    let key = match machine.function.constant(index) {
+        Some(bytecode::Constant::String(value)) => runtime::js_string_property_key(value),
+        _ => return false,
+    };
+    let cache = match machine.function.field_cache(offset) {
+        Some(value) => value,
+        None => match runtime::property_access_cache(machine.heap, object, key) {
+            Some(value) => {
+                machine.function.set_field_cache(offset, value);
+                value
+            },
+            None => return false,
+        },
+    };
+    if write {
+        let value = pop_verified(machine);
+        if cache.write(machine.heap, object, value) {
+            machine.stack.push(value);
+            true
+        } else {
+            machine.stack.push(value);
+            false
+        }
+    } else {
+        match cache.read(machine.heap, object) {
+            Some(value) => {
+                machine.stack.push(value);
+                true
+            },
+            None => false,
+        }
+    }
+}
+
+fn recover_execution_error(machine: Machine, offset: isize, value: VmError) -> Result[
+    isize,
+    VmError,
+] {
+    if !catchable(value.kind) {
+        return Result::Err(value)
+    }
+    match handler_target(machine.function, offset) {
+        Some(target) => {
+            machine.stack.clear();
+            machine.stack.push(error_value_at(machine, value.kind, value.offset));
+            Result::Ok(target)
+        },
+        None => if machine.depth <= 0 {
+            Result::Err(value)
+        } else {
+            match value.kind {
+                VmErrorKind::CallDepthExceeded => Result::Err(value),
+                VmErrorKind::Thrown(thrown) => Result::Err(
+                    error(
+                        value.offset,
+                        VmErrorKind::Thrown(ensure_error_stack(machine, thrown, value.offset)),
+                    ),
+                ),
+                kind => Result::Err(
+                    error(
+                        value.offset,
+                        VmErrorKind::Thrown(error_value_at(machine, kind, value.offset)),
+                    ),
+                ),
+            }
+        },
+    }
+}
+
 fn execute_machine_from(machine: Machine, start: isize) -> Result[ExecutionResult, VmError] {
     let mut offset = start;
     while offset >= 0 && offset < machine.function.code_len() {
@@ -9849,6 +10224,60 @@ fn execute_machine_from(machine: Machine, start: isize) -> Result[ExecutionResul
             bytecode::Instruction::Goto(target) => {
                 offset = target;
             },
+            bytecode::Instruction::Mul | bytecode::Instruction::Div | bytecode::Instruction::Mod | bytecode::Instruction::Add | bytecode::Instruction::Sub | bytecode::Instruction::Lt | bytecode::Instruction::Lte | bytecode::Instruction::Gt | bytecode::Instruction::Gte | bytecode::Instruction::Eq | bytecode::Instruction::Neq | bytecode::Instruction::StrictEq | bytecode::Instruction::StrictNeq | bytecode::Instruction::GetGlobal(_) | bytecode::Instruction::SetGlobal(_) => if match instruction {
+                bytecode::Instruction::GetGlobal(_) | bytecode::Instruction::SetGlobal(_) => {
+                    fast_global_step(machine, offset, instruction)
+                },
+                _ => fast_numeric_step(machine, instruction),
+            } {
+                offset += 1;
+            } else {
+                match step(machine, offset, instruction) {
+                    Ok(next) => if next < 0 {
+                        return Result::Err(error(offset, VmErrorKind::InvalidJump(next)))
+                    } else {
+                        offset = next;
+                    },
+                    Err(value) => match recover_execution_error(machine, offset, value) {
+                        Ok(target) => {
+                            offset = target;
+                        },
+                        Err(value) => return Result::Err(value),
+                    },
+                }
+            },
+            bytecode::Instruction::Call(arguments) => match push_call(
+                machine,
+                offset,
+                arguments,
+                false,
+            ) {
+                Ok(_) => {
+                    offset += 1;
+                },
+                Err(value) => match recover_execution_error(machine, offset, value) {
+                    Ok(target) => {
+                        offset = target;
+                    },
+                    Err(value) => return Result::Err(value),
+                },
+            },
+            bytecode::Instruction::CallMethod(arguments) => match push_call(
+                machine,
+                offset,
+                arguments,
+                true,
+            ) {
+                Ok(_) => {
+                    offset += 1;
+                },
+                Err(value) => match recover_execution_error(machine, offset, value) {
+                    Ok(target) => {
+                        offset = target;
+                    },
+                    Err(value) => return Result::Err(value),
+                },
+            },
             bytecode::Instruction::TypeOf => {
                 machine.stack.push(
                     runtime::Value::String(js_string(runtime::type_of(pop_verified(machine)))),
@@ -9886,39 +10315,11 @@ fn execute_machine_from(machine: Machine, start: isize) -> Result[ExecutionResul
                 } else {
                     offset = next;
                 },
-                Err(value) => if catchable(value.kind) {
-                    match handler_target(machine.function, offset) {
-                        Some(target) => {
-                            machine.stack.clear();
-                            machine.stack.push(error_value_at(machine, value.kind, value.offset));
-                            offset = target;
-                        },
-                        None => if machine.depth <= 0 {
-                            return Result::Err(value)
-                        } else {
-                            return match value.kind {
-                                VmErrorKind::CallDepthExceeded => Result::Err(value),
-                                VmErrorKind::Thrown(thrown) => Result::Err(
-                                    error(
-                                        value.offset,
-                                        VmErrorKind::Thrown(
-                                            ensure_error_stack(machine, thrown, value.offset),
-                                        ),
-                                    ),
-                                ),
-                                kind => Result::Err(
-                                    error(
-                                        value.offset,
-                                        VmErrorKind::Thrown(
-                                            error_value_at(machine, kind, value.offset),
-                                        ),
-                                    ),
-                                ),
-                            }
-                        },
-                    }
-                } else {
-                    return Result::Err(value)
+                Err(value) => match recover_execution_error(machine, offset, value) {
+                    Ok(target) => {
+                        offset = target;
+                    },
+                    Err(value) => return Result::Err(value),
                 },
             },
         }
