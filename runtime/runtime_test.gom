@@ -812,6 +812,67 @@ fn property_access_caches_invalidate_on_descriptor_changes_and_deletion() -> () 
 }
 
 #[test]
+fn inherited_property_access_caches_preserve_descriptor_semantics() -> () {
+    let heap = Heap::new();
+    let prototype = expect_object(new_ordinary_object(heap, Option::None));
+    let first = expect_object(new_ordinary_object(heap, Option::Some(prototype)));
+    let second = expect_object(new_ordinary_object(heap, Option::Some(prototype)));
+    let key = string_property_key("value");
+    testing::assert(
+        define_own_property(heap, prototype, key, data_descriptor(Value::Int(1), true, false, true)),
+    );
+    let cache = match inherited_property_access_cache(heap, first, key) {
+        Some(value) => value,
+        None => {
+            testing::fail("expected inherited property access cache");
+            loop {}
+        },
+    };
+    match cache.read(heap, first) {
+        Some(Value::Int(value)) => testing::assert_eq(value, 1),
+        _ => testing::fail("expected first inherited value"),
+    }
+    match cache.read(heap, second) {
+        Some(Value::Int(value)) => testing::assert_eq(value, 1),
+        _ => testing::fail("expected second inherited value"),
+    }
+    testing::assert(!cache.write(heap, first, Value::Int(9)));
+    testing::assert(set_existing_data_property(heap, prototype, key, Value::Int(2)));
+    match cache.read(heap, first) {
+        Some(Value::Int(value)) => testing::assert_eq(value, 2),
+        _ => testing::fail("expected updated inherited value"),
+    }
+    testing::assert(
+        define_own_property(heap, first, key, data_descriptor(Value::Int(3), true, true, true)),
+    );
+    testing::assert(cache.read(heap, first).is_none());
+    testing::assert(delete_property(heap, first, key));
+    match cache.read(heap, first) {
+        Some(Value::Int(value)) => testing::assert_eq(value, 2),
+        _ => testing::fail("expected restored inherited value"),
+    }
+    testing::assert(
+        define_own_property(
+            heap,
+            prototype,
+            key,
+            data_descriptor(Value::Int(4), false, false, true),
+        ),
+    );
+    testing::assert(cache.read(heap, first).is_none());
+    let readonly = match property_access_cache(heap, prototype, key) {
+        Some(value) => value,
+        None => {
+            testing::fail("expected described property access cache");
+            loop {}
+        },
+    };
+    testing::assert(!readonly.write(heap, prototype, Value::Int(5)));
+    testing::assert(set_prototype_of(heap, first, Option::None));
+    testing::assert(readonly.read(heap, first).is_none())
+}
+
+#[test]
 fn fast_default_property_copy_preserves_values_and_rejects_descriptors() -> () {
     let heap = Heap::new();
     let source = expect_object(new_ordinary_object(heap, Option::None));
