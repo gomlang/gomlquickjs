@@ -8878,6 +8878,75 @@ fn construct_value(
     construct_value_with_new_target(machine, offset, callee, arguments, callee)
 }
 
+fn construct_regexp_literal(
+    machine: Machine,
+    offset: isize,
+    constructor: runtime::Value,
+    pattern: runtime::Value,
+    flags: runtime::Value,
+) -> Result[runtime::Value, VmError] {
+    let object = match constructor {
+        runtime::Value::Object(value) => value,
+        _ => return construct_value(machine, offset, constructor, Vec::from_array([pattern, flags])),
+    };
+    let callbacks = match machine.vm_constructor_functions.get(object) {
+        Some(value) => value,
+        None => return construct_value(
+            machine,
+            offset,
+            constructor,
+            Vec::from_array([pattern, flags]),
+        ),
+    };
+    let callback = match callbacks.callback {
+        Some(value) => value,
+        None => return construct_value(
+            machine,
+            offset,
+            constructor,
+            Vec::from_array([pattern, flags]),
+        ),
+    };
+    let prototype = match machine.heap.get(object) {
+        Some(value) => match value.own_property(runtime::string_property_key("prototype")) {
+            Some(descriptor) => match runtime::descriptor_value(descriptor) {
+                Some(runtime::Value::Object(value)) => value,
+                _ => return construct_value(
+                    machine,
+                    offset,
+                    constructor,
+                    Vec::from_array([pattern, flags]),
+                ),
+            },
+            None => return construct_value(
+                machine,
+                offset,
+                constructor,
+                Vec::from_array([pattern, flags]),
+            ),
+        },
+        None => return construct_value(
+            machine,
+            offset,
+            constructor,
+            Vec::from_array([pattern, flags]),
+        ),
+    };
+    update_active_frame_offset(machine, offset);
+    let receiver = match runtime::new_ordinary_object(machine.heap, Option::Some(prototype)) {
+        Ok(value) => value,
+        Err(value) => return Result::Err(error(offset, VmErrorKind::TypeError(value.message))),
+    };
+    let arguments = Vec::from_array([pattern, flags]);
+    match callback(receiver, arguments, Option::Some(prototype), constructor, machine.depth) {
+        Ok(runtime::Value::Object(value)) => {
+            Result::Ok(ensure_error_stack(machine, runtime::Value::Object(value), offset))
+        },
+        Ok(_) => Result::Ok(runtime::Value::Object(receiver)),
+        Err(value) => Result::Err(value),
+    }
+}
+
 fn call_super_constructor(
     machine: Machine,
     offset: isize,
@@ -9144,12 +9213,7 @@ fn step(machine: Machine, offset: isize, instruction: bytecode::Instruction) -> 
             };
             let pattern = constant_value(machine, offset, pattern)?;
             let flags = constant_value(machine, offset, flags)?;
-            let value = construct_value(
-                machine,
-                offset,
-                constructor,
-                Vec::from_array([pattern, flags]),
-            )?;
+            let value = construct_regexp_literal(machine, offset, constructor, pattern, flags)?;
             machine.stack.push(value);
         },
         bytecode::Instruction::ArrayAppend => append_array_literal(machine, offset)?,

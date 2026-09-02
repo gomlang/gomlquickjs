@@ -790,6 +790,37 @@ pub fn try_fast_property_set(heap: Heap, object: ObjectId, key: PropertyKey, val
     PropertyWriteResult::Written
 }
 
+pub fn try_define_new_default_data_property(
+    heap: Heap,
+    object: ObjectId,
+    key: PropertyKey,
+    value: Value,
+) -> bool {
+    let target = match heap.get(object) {
+        Some(value) => value,
+        None => return false,
+    };
+    if target.is_proxy() || target.state_value.get().module_namespace_value.get()
+        || target.state_value.get().typed_array_value.get().is_some()
+        || target.state_value.get().argument_map_value.len() > 0
+        || !target.extensible()
+        || target.own_property(key).is_some() {
+        return false
+    }
+    match target.kind() {
+        ObjectKind::Array => match key {
+            PropertyKey::String(value) => if is_length_property_key(key)
+                || canonical_array_index(value).is_some() {
+                return false
+            },
+            PropertyKey::Symbol(_) => (),
+        },
+        ObjectKind::Ordinary | ObjectKind::Function => (),
+    }
+    target.state_value.get().properties_value.insert(key, OrdinaryProperty::Default(value));
+    true
+}
+
 pub fn try_fast_copy_default_properties(heap: Heap, target: ObjectId, source: ObjectId) -> bool {
     let target_object = match heap.get(target) {
         Some(value) => value,
@@ -1886,6 +1917,46 @@ pub fn new_array(heap: Heap, length: isize) -> Result[ObjectId, TypeError] {
         let _ = heap.free(object);
         Result::Err(TypeError { message: "cannot define array length" })
     }
+}
+
+pub fn new_array_with_values(heap: Heap, values: Vec[Value], length: isize) -> Result[
+    ObjectId,
+    TypeError,
+] {
+    let object = new_array(heap, length)?;
+    let target = match heap.get(object) {
+        Some(value) => value,
+        None => return Result::Err(TypeError { message: "cannot initialize array" }),
+    };
+    if values.len() > length {
+        if values.len() > 4294967295 {
+            let _ = heap.free(object);
+            return Result::Err(TypeError { message: "invalid array length" })
+        }
+        match target.state_value.get().array_length_value.get() {
+            Some(state) => target.state_value.get().array_length_value.set(
+                Option::Some(
+                    ArrayLengthState {
+                        value: values.len(),
+                        writable: state.writable,
+                        enumerable: state.enumerable,
+                        configurable: state.configurable,
+                    },
+                ),
+            ),
+            None => {
+                let _ = heap.free(object);
+                return Result::Err(TypeError { message: "cannot initialize array" })
+            },
+        }
+    }
+    target.state_value.get().array_dense_properties_value.reserve(values.len());
+    for value in values {
+        target.state_value.get().array_dense_properties_value.push(
+            Option::Some(ArrayElement::Default(value)),
+        )
+    }
+    Result::Ok(object)
 }
 
 pub fn primitive_value(heap: Heap, object: ObjectId) -> Option[Value] {

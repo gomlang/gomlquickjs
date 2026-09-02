@@ -463,21 +463,17 @@ fn string_append_capture(
 }
 
 fn string_has_named_captures(found: LocatedMatch) -> bool {
-    let mut index = 1;
-    while index < found.capture_names.len() {
-        if found.capture_names[index].is_some() {
-            return true
-        }
-        index += 1;
+    match found.regex {
+        Some(regex) => regex.has_named_captures(),
+        None => false,
     }
-    false
 }
 
 fn string_named_capture_index(found: LocatedMatch, name: runtime::JsString) -> isize {
     let mut index = 1;
     let mut first = 0 - 1;
-    while index < found.capture_names.len() {
-        match found.capture_names[index] {
+    while index < found.captures.len() {
+        match located_match_capture_name(found, index) {
             Some(value) => if value == name {
                 if first < 0 {
                     first = index;
@@ -1593,7 +1589,7 @@ fn string_literal_matches(input: runtime::JsString, search: runtime::JsString, a
                 start,
                 end,
                 captures: Vec::from_array([Option::Some(regexp::RegexCapture { start, end })]),
-                capture_names: Vec::from_array([Option::None]),
+                regex: Option::None,
             },
         );
         if !all {
@@ -1678,6 +1674,114 @@ fn string_has_default_regexp_exec(
     }
 }
 
+fn string_plain_replacement(value: runtime::JsString) -> bool {
+    let mut index = 0;
+    while index < value.len() {
+        if value.get(index) == 36 {
+            return false
+        }
+        index += 1;
+    }
+    true
+}
+
+fn string_regexp_plain_replace_at_depth(
+    context: vm::Context,
+    states: HashMap[runtime::ObjectId, RegExpState],
+    receiver: runtime::Value,
+    input: runtime::JsString,
+    replacement: runtime::JsString,
+    global: bool,
+    unicode: bool,
+    depth: isize,
+) -> Result[runtime::Value, vm::VmError] {
+    let output: Vec[u16] = Vec::with_capacity(input.len());
+    let mut next_source_position = 0;
+    let mut matched = false;
+    loop {
+        let (_, _, found) = regexp_match_at_depth(
+            context,
+            states,
+            receiver,
+            runtime::Value::String(input),
+            depth,
+        )?;
+        match found {
+            Some(value) => {
+                let empty = value.start == value.end;
+                if value.start >= next_source_position {
+                    string_append_slice(output, input, next_source_position, value.start)?;
+                    string_append_slice(output, replacement, 0, replacement.len())?;
+                    next_source_position = value.end;
+                    matched = true;
+                }
+                if !global {
+                    break
+                } else if empty {
+                    string_advance_regexp_last_index(context, receiver, input, unicode, depth)?
+                }
+            },
+            None => break,
+        }
+    }
+    if !matched {
+        return Result::Ok(runtime::Value::String(input))
+    }
+    string_append_slice(output, input, next_source_position, input.len())?;
+    Result::Ok(runtime::Value::String(runtime::JsString::from_code_units(output)))
+}
+
+fn string_regexp_plain_global_replace(
+    context: vm::Context,
+    state: RegExpState,
+    object: runtime::ObjectId,
+    input: runtime::JsString,
+    replacement: runtime::JsString,
+    unicode: bool,
+) -> Result[runtime::Value, vm::VmError] {
+    let output: Vec[u16] = Vec::with_capacity(input.len());
+    let mut next_source_position = 0;
+    let mut last_index = 0;
+    let mut matched = false;
+    loop {
+        let found = match find_regexp_match(state, input, last_index) {
+            Ok(value) => value,
+            Err(value) => return Result::Err(string_vm_native_error(value)),
+        };
+        match found {
+            Some(value) => {
+                let empty = value.start == value.end;
+                if value.start >= next_source_position {
+                    string_append_slice(output, input, next_source_position, value.start)?;
+                    string_append_slice(output, replacement, 0, replacement.len())?;
+                    next_source_position = value.end;
+                    matched = true;
+                }
+                last_index = value.end;
+                if empty {
+                    last_index = string_advance_index(input, last_index, unicode);
+                }
+                match set_regexp_last_index(context.heap(), object, last_index) {
+                    Ok(()) => (),
+                    Err(value) => return Result::Err(string_vm_native_error(value)),
+                }
+            },
+            None => {
+                match set_regexp_last_index(context.heap(), object, 0) {
+                    Ok(()) => (),
+                    Err(value) => return Result::Err(string_vm_native_error(value)),
+                }
+                break
+            },
+        }
+    }
+    if !matched {
+        return Result::Ok(runtime::Value::String(input))
+    }
+    string_append_slice(output, input, next_source_position, input.len())?;
+    Result::Ok(runtime::Value::String(runtime::JsString::from_code_units(output)))
+}
+
 fn string_regexp_builtin_replace_at_depth(
     context: vm::Context,
     states: HashMap[runtime::ObjectId, RegExpState],
@@ -1691,6 +1795,39 @@ fn string_regexp_builtin_replace_at_depth(
 ) -> Result[runtime::Value, vm::VmError] {
     if global {
         string_set_property_at_depth(context, receiver, "lastIndex", runtime::Value::Int(0), depth)?
+    }
+    if !functional {
+        match replacement {
+            runtime::Value::String(value) => if string_plain_replacement(value) {
+                if global {
+                    match regexp_state(states, receiver) {
+                        Ok((object, state)) => if state.global
+                            && (state.unicode || state.unicode_sets) == unicode {
+                            return string_regexp_plain_global_replace(
+                                context,
+                                state,
+                                object,
+                                input,
+                                value,
+                                unicode,
+                            )
+                        },
+                        Err(_) => (),
+                    }
+                }
+                return string_regexp_plain_replace_at_depth(
+                    context,
+                    states,
+                    receiver,
+                    input,
+                    value,
+                    global,
+                    unicode,
+                    depth,
+                )
+            },
+            _ => (),
+        }
     }
     let matches: Vec[LocatedMatch] = Vec::new();
     loop {

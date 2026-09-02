@@ -1337,6 +1337,10 @@ fn define_data(
     enumerable: bool,
     configurable: bool,
 ) -> Result[(), vm::NativeError] {
+    if writable && enumerable && configurable
+        && runtime::try_define_new_default_data_property(heap, object, key, value) {
+        return Result::Ok(())
+    }
     if runtime::define_own_property(
         heap,
         object,
@@ -1361,24 +1365,10 @@ fn allocate_array(heap: runtime::Heap, values: Vec[runtime::Value], length: isiz
     runtime::ObjectId,
     vm::NativeError,
 ] {
-    let object = match runtime::new_array(heap, length) {
-        Ok(value) => value,
-        Err(value) => return Result::Err(native_error(value.message)),
-    };
-    let mut index = 0;
-    while index < values.len() {
-        define_data(
-            heap,
-            object,
-            runtime::string_property_key(index.to_string()),
-            values[index],
-            true,
-            true,
-            true,
-        )?;
-        index += 1;
+    match runtime::new_array_with_values(heap, values, length) {
+        Ok(value) => Result::Ok(value),
+        Err(value) => Result::Err(native_error(value.message)),
     }
-    Result::Ok(object)
 }
 
 fn object_constructor(

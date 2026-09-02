@@ -88,6 +88,7 @@ pub struct Regex {
     canonicalizer: unicode::CaseCanonicalizer,
     capture_count: isize,
     capture_names: Vec[Option[runtime::JsString]],
+    literal: Option[Vec[u32]],
 }
 
 struct Parser {
@@ -1871,6 +1872,35 @@ fn parse_alternation(parser: Parser) -> Result[isize, RegexError] {
     }
 }
 
+fn append_literal_pattern(nodes: Vec[Node], node: isize, output: Vec[u32]) -> bool {
+    match nodes[node] {
+        Node::Empty => true,
+        Node::Literal(value) => {
+            output.push(value);
+            true
+        },
+        Node::Sequence(children) => {
+            for child in children {
+                if !append_literal_pattern(nodes, child, output) {
+                    return false
+                }
+            }
+            true
+        },
+        Node::Group(child) => append_literal_pattern(nodes, child, output),
+        _ => false,
+    }
+}
+
+fn literal_pattern(nodes: Vec[Node], root: isize) -> Option[Vec[u32]] {
+    let output: Vec[u32] = Vec::new();
+    if append_literal_pattern(nodes, root, output) {
+        Option::Some(output)
+    } else {
+        Option::None
+    }
+}
+
 fn compile_parsed(pattern: runtime::JsString, flags: RegexFlags) -> Result[Regex, RegexError] {
     let metadata = capture_metadata(pattern)?;
     let parser = parser_new(pattern, flags, metadata);
@@ -1878,6 +1908,7 @@ fn compile_parsed(pattern: runtime::JsString, flags: RegexFlags) -> Result[Regex
     if !parser_at_end(parser) {
         Result::Err(regex_error("unmatched closing parenthesis", parser.index.get()))
     } else {
+        let literal = literal_pattern(parser.nodes, root);
         Result::Ok(
             Regex {
                 nodes: parser.nodes,
@@ -1886,6 +1917,7 @@ fn compile_parsed(pattern: runtime::JsString, flags: RegexFlags) -> Result[Regex
                 canonicalizer: parser.canonicalizer,
                 capture_count: parser.total_captures,
                 capture_names: parser.capture_names,
+                literal,
             },
         )
     }
@@ -3093,6 +3125,10 @@ pub fn match_at(regex: Regex, input: runtime::JsString, start: isize) -> Option[
     if start < 0 || start > input.len() {
         return Option::None
     }
+    match regex.literal {
+        Some(literal) => return match_literal_at(regex, literal, input, start),
+        None => (),
+    }
     let initial = MatchState { position: start, captures: empty_captures(regex.capture_count) };
     match match_root_first_with_flags(regex, regex.flags, regex.root, input, initial) {
         Some(outcome) => {
@@ -3102,6 +3138,29 @@ pub fn match_at(regex: Regex, input: runtime::JsString, start: isize) -> Option[
         },
         None => Option::None,
     }
+}
+
+fn match_literal_at(regex: Regex, literal: Vec[u32], input: runtime::JsString, start: isize) -> Option[
+    RegexMatch,
+] {
+    let mut position = start;
+    for expected in literal {
+        if position >= input.len() {
+            return Option::None
+        }
+        let (actual, width) = input_forward_code_point(input, position, unicode_mode(regex.flags));
+        if !literal_matches(regex, regex.flags, expected, actual) {
+            return Option::None
+        }
+        position += width;
+    }
+    Option::Some(
+        RegexMatch {
+            start,
+            end: position,
+            captures: Vec::from_array([Option::Some(RegexCapture { start, end: position })]),
+        },
+    )
 }
 
 pub fn search(regex: Regex, input: runtime::JsString) -> Option[RegexMatch] {

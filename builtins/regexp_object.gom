@@ -32,7 +32,7 @@ struct LocatedMatch {
     start: isize,
     end: isize,
     captures: Vec[Option[regexp::RegexCapture]],
-    capture_names: Vec[Option[runtime::JsString]],
+    regex: Option[regexp::Regex],
 }
 
 struct RegExpInstall {
@@ -721,19 +721,14 @@ fn set_regexp_last_index(heap: runtime::Heap, object: runtime::ObjectId, value: 
 }
 
 fn located_match(regex: regexp::Regex, value: regexp::RegexMatch, start: isize) -> LocatedMatch {
-    let captures: Vec[Option[regexp::RegexCapture]] = Vec::with_capacity(value.capture_count() + 1);
-    let capture_names: Vec[Option[runtime::JsString]] = Vec::with_capacity(
-        value.capture_count() + 1,
-    );
-    captures.push(Option::Some(regexp::RegexCapture { start, end: value.end }));
-    capture_names.push(Option::None);
-    let mut index = 1;
-    while index <= value.capture_count() {
-        captures.push(value.capture(index));
-        capture_names.push(regex.capture_name(index));
-        index += 1;
+    LocatedMatch { start, end: value.end, captures: value.captures, regex: Option::Some(regex) }
+}
+
+fn located_match_capture_name(found: LocatedMatch, index: isize) -> Option[runtime::JsString] {
+    match found.regex {
+        Some(regex) => regex.capture_name(index),
+        None => Option::None,
     }
-    LocatedMatch { start, end: value.end, captures, capture_names }
 }
 
 fn match_at(state: RegExpState, input: runtime::JsString, offset: isize) -> Result[
@@ -793,22 +788,14 @@ fn regexp_groups_value(heap: runtime::Heap, input: runtime::JsString, found: Loc
     runtime::Value,
     vm::NativeError,
 ] {
-    let mut has_named_captures = false;
-    let mut name_index = 1;
-    while name_index < found.capture_names.len() {
-        if found.capture_names[name_index].is_some() {
-            has_named_captures = true;
-        }
-        name_index += 1;
-    }
-    if has_named_captures {
+    if string_has_named_captures(found) {
         let groups = match runtime::new_null_prototype_object(heap) {
             Ok(value) => value,
             Err(value) => return Result::Err(native_error(value.message)),
         };
         let mut index = 1;
-        while index < found.capture_names.len() {
-            match found.capture_names[index] {
+        while index < found.captures.len() {
+            match located_match_capture_name(found, index) {
                 Some(name) => {
                     let value = match found.captures[index] {
                         Some(capture) => {
@@ -865,8 +852,8 @@ fn regexp_index_groups_value(heap: runtime::Heap, found: LocatedMatch, values: V
         Err(value) => return Result::Err(native_error(value.message)),
     };
     let mut index = 1;
-    while index < found.capture_names.len() {
-        match found.capture_names[index] {
+    while index < found.captures.len() {
+        match located_match_capture_name(found, index) {
             Some(name) => {
                 let key = runtime::js_string_property_key(name);
                 let should_define = match values[index] {
