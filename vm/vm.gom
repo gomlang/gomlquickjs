@@ -2584,17 +2584,16 @@ fn materialize_template(machine: Machine, offset: isize, template: Ref[bytecode:
 }
 
 fn constant_value(machine: Machine, offset: isize, index: isize) -> Result[runtime::Value, VmError] {
-    match machine.function.constant(index) {
-        Some(bytecode::Constant::Float(value)) => Result::Ok(runtime::Value::Float(value)),
-        Some(bytecode::Constant::String(value)) => Result::Ok(runtime::Value::String(value)),
-        Some(bytecode::Constant::BigInt(value)) => Result::Ok(runtime::Value::BigInt(value)),
-        Some(bytecode::Constant::Function(function)) => {
+    match machine.function.constant_unchecked(index) {
+        bytecode::Constant::Float(value) => Result::Ok(runtime::Value::Float(value)),
+        bytecode::Constant::String(value) => Result::Ok(runtime::Value::String(value)),
+        bytecode::Constant::BigInt(value) => Result::Ok(runtime::Value::BigInt(value)),
+        bytecode::Constant::Function(function) => {
             materialize_function(machine, offset, Option::None, function)
         },
-        Some(bytecode::Constant::Template(template)) => {
+        bytecode::Constant::Template(template) => {
             materialize_template(machine, offset, template)
         },
-        None => Result::Err(error(offset, VmErrorKind::InvalidConstant(index))),
     }
 }
 
@@ -10090,8 +10089,8 @@ fn fast_global_step(machine: Machine, offset: isize, instruction: bytecode::Inst
         Some(value) => value,
         None => return false,
     };
-    let key = match machine.function.constant(index) {
-        Some(bytecode::Constant::String(value)) => runtime::js_string_property_key(value),
+    let key = match machine.function.constant_unchecked(index) {
+        bytecode::Constant::String(value) => runtime::js_string_property_key(value),
         _ => return false,
     };
     let cache = match machine.function.field_cache(offset) {
@@ -10167,6 +10166,37 @@ fn execute_machine_from(machine: Machine, start: isize) -> Result[ExecutionResul
             bytecode::Instruction::PushI32(value) => {
                 machine.stack.push(runtime::Value::Int(value));
                 offset += 1;
+            },
+            bytecode::Instruction::PushConst(index) => match machine.function.constant_unchecked(
+                index,
+            ) {
+                bytecode::Constant::Float(value) => {
+                    machine.stack.push(runtime::Value::Float(value));
+                    offset += 1;
+                },
+                bytecode::Constant::String(value) => {
+                    machine.stack.push(runtime::Value::String(value));
+                    offset += 1;
+                },
+                bytecode::Constant::BigInt(value) => {
+                    machine.stack.push(runtime::Value::BigInt(value));
+                    offset += 1;
+                },
+                bytecode::Constant::Function(_) | bytecode::Constant::Template(_) => match step(
+                    machine,
+                    offset,
+                    instruction,
+                ) {
+                    Ok(next) => {
+                        offset = next;
+                    },
+                    Err(value) => match recover_execution_error(machine, offset, value) {
+                        Ok(target) => {
+                            offset = target;
+                        },
+                        Err(value) => return Result::Err(value),
+                    },
+                },
             },
             bytecode::Instruction::Undefined => {
                 machine.stack.push(runtime::Value::Undefined);
