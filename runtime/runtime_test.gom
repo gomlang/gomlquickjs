@@ -399,6 +399,91 @@ fn creates_arrays_with_non_enumerable_length_and_no_materialized_holes() -> () {
 }
 
 #[test]
+fn creates_dense_arrays_with_values_and_preserves_requested_length() -> () {
+    let heap = Heap::new();
+    let array = expect_object(
+        new_array_with_values(heap, Vec::from_array([Value::Int(3), Value::Int(5)]), 4),
+    );
+    match expect_property(get_property(heap, array, string_property_key("length"))) {
+        Value::Int(value) => testing::assert_eq(value, 4),
+        _ => testing::fail("expected initialized array length"),
+    }
+    match expect_property(get_property(heap, array, string_property_key("1"))) {
+        Value::Int(value) => testing::assert_eq(value, 5),
+        _ => testing::fail("expected initialized array element"),
+    }
+    match heap.get(array) {
+        Some(value) => match value.own_property(string_property_key("0")) {
+            Some(descriptor) => {
+                testing::assert(descriptor_writable(descriptor));
+                testing::assert(descriptor_enumerable(descriptor));
+                testing::assert(descriptor_configurable(descriptor))
+            },
+            None => testing::fail("expected initialized array descriptor"),
+        },
+        None => testing::fail("expected initialized array"),
+    }
+    let extended = expect_object(
+        new_array_with_values(
+            heap,
+            Vec::from_array([Value::Int(7), Value::Int(11), Value::Int(13)]),
+            1,
+        ),
+    );
+    match expect_property(get_property(heap, extended, string_property_key("length"))) {
+        Value::Int(value) => testing::assert_eq(value, 3),
+        _ => testing::fail("expected extended array length"),
+    }
+    testing::assert(new_array_with_values(heap, Vec::new(), -1).is_err())
+}
+
+#[test]
+fn direct_default_property_definition_rejects_observable_cases() -> () {
+    let heap = Heap::new();
+    let object = expect_object(new_ordinary_object(heap, Option::None));
+    let key = string_property_key("value");
+    testing::assert(try_define_new_default_data_property(heap, object, key, Value::Int(3)));
+    testing::assert(!try_define_new_default_data_property(heap, object, key, Value::Int(5)));
+    match expect_property(get_property(heap, object, key)) {
+        Value::Int(value) => testing::assert_eq(value, 3),
+        _ => testing::fail("expected direct default property"),
+    }
+    match heap.get(object) {
+        Some(value) => match value.own_property(key) {
+            Some(descriptor) => {
+                testing::assert(descriptor_writable(descriptor));
+                testing::assert(descriptor_enumerable(descriptor));
+                testing::assert(descriptor_configurable(descriptor))
+            },
+            None => testing::fail("expected direct property descriptor"),
+        },
+        None => testing::fail("expected direct property target"),
+    }
+    let fixed = expect_object(new_ordinary_object(heap, Option::None));
+    testing::assert(prevent_extensions(heap, fixed));
+    testing::assert(
+        !try_define_new_default_data_property(
+            heap,
+            fixed,
+            string_property_key("blocked"),
+            Value::Int(1),
+        ),
+    );
+    let array = expect_object(new_array(heap, 0));
+    testing::assert(
+        !try_define_new_default_data_property(heap, array, string_property_key("0"), Value::Int(1)),
+    );
+    testing::assert(
+        try_define_new_default_data_property(
+            heap,
+            array,
+            string_property_key("named"),
+            Value::Int(2),
+        ),
+    )
+}
+
+#[test]
 fn fast_array_operations_preserve_dense_values_and_sparse_holes() -> () {
     let heap = Heap::new();
     let source = expect_object(new_array(heap, 0));

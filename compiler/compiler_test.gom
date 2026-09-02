@@ -2580,6 +2580,16 @@ fn regexp_replace_fast_path_preserves_exec_overrides() -> () {
 }
 
 #[test]
+fn regexp_plain_replace_fast_path_preserves_empty_sticky_and_substitution_semantics() -> () {
+    match execute_source_with_builtins(
+        "let empty = /(?:)/gu; empty.lastIndex = 9; let emptyResult = '😀'.replace(empty, 'x'); let sticky = /a/gy; sticky.lastIndex = 7; let stickyResult = 'aba'.replace(sticky, 'x'); let missing = /z/g; missing.lastIndex = 3; let missingResult = 'aba'.replace(missing, 'x'); let substitution = 'aba'.replace(/a/g, '$&$&'); let make = () => /a/g; let first = make(); let second = make(); return emptyResult === 'x😀x' && empty.lastIndex === 0 && stickyResult === 'xba' && sticky.lastIndex === 0 && missingResult === 'aba' && missing.lastIndex === 0 && substitution === 'aabaa' && first !== second && Object.getPrototypeOf(first) === RegExp.prototype;",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected regexp plain replace fast path result"),
+    }
+}
+
+#[test]
 fn iterates_match_all_with_cloned_regexp_state_and_symbol_dispatch() -> () {
     match execute_source_with_builtins(
         "let regexp = new RegExp('a(.)', 'g'); regexp.lastIndex = 2; let iterator = 'a1a2'.matchAll(regexp); let first = iterator.next(); let second = iterator.next(); let third = iterator.next(); let empty = '😀'.matchAll(new RegExp('(?:)', 'gu')); let emptyFirst = empty.next(); let emptySecond = empty.next(); let emptyDone = empty.next(); let custom = {[Symbol.matchAll](value) { return value + '!'; }}; let rejected = false; try { 'aa'.matchAll(new RegExp('a')); } catch (error) { rejected = error instanceof TypeError; } return first.value[0] === 'a2' && first.value[1] === '2' && first.value.index === 2 && second.done && third.done && regexp.lastIndex === 2 && iterator[Symbol.iterator]() === iterator && emptyFirst.value.index === 0 && emptySecond.value.index === 2 && emptyDone.done && 'x'.matchAll(custom) === 'x!' && rejected;",
