@@ -50,6 +50,12 @@ pub enum PropertyDescriptor {
 enum OrdinaryProperty {
     Default(Value),
     Cached(Ref[Option[Value]]),
+    CachedDescribed {
+        cell: Ref[Option[Value]],
+        writable: bool,
+        enumerable: bool,
+        configurable: bool,
+    },
     Described(PropertyDescriptor),
 }
 
@@ -78,7 +84,10 @@ pub enum PropertyWriteResult {
 
 pub struct PropertyAccessCache {
     object_value: ObjectId,
+    receiver_prototype_value: Option[ObjectId],
+    key_value: PropertyKey,
     cell_value: Ref[Option[Value]],
+    writable_value: bool,
 }
 
 pub enum PrivateElement {
@@ -563,21 +572,36 @@ pub struct GcEdge {
 impl PropertyAccessCache {
     pub fn read(self: PropertyAccessCache, heap: Heap, object: ObjectId) -> Option[Value] {
         if object != self.object_value {
-            Option::None
-        } else {
-            match heap.get(object) {
-                Some(target) => if !target.is_proxy()
-                    && !target.state_value.get().module_namespace_value.get() {
-                    self.cell_value.get()
-                } else {
-                    Option::None
-                },
-                None => Option::None,
+            let prototype = match self.receiver_prototype_value {
+                Some(value) => value,
+                None => return Option::None,
+            };
+            let receiver = match heap.get(object) {
+                Some(value) => value,
+                None => return Option::None,
+            };
+            if receiver.is_proxy() || receiver.state_value.get().module_namespace_value.get()
+                || receiver.prototype() != Option::Some(prototype)
+                || receiver.own_property(self.key_value).is_some() {
+                return Option::None
             }
+        }
+        match heap.get(self.object_value) {
+            Some(target) => if !target.is_proxy()
+                && !target.state_value.get().module_namespace_value.get() {
+                self.cell_value.get()
+            } else {
+                Option::None
+            },
+            None => Option::None,
         }
     }
 
     pub fn write(self: PropertyAccessCache, heap: Heap, object: ObjectId, value: Value) -> bool {
+        if !self.writable_value
+            || object != self.object_value && self.receiver_prototype_value.is_some() {
+            return false
+        }
         match self.read(heap, object) {
             Some(_) => {
                 self.cell_value.set(Option::Some(value));
@@ -609,14 +633,92 @@ pub fn property_access_cache(heap: Heap, object: ObjectId, key: PropertyKey) -> 
                         key,
                         OrdinaryProperty::Cached(cell),
                     );
-                    Option::Some(PropertyAccessCache { object_value: object, cell_value: cell })
+                    Option::Some(
+                        PropertyAccessCache {
+                            object_value: object,
+                            receiver_prototype_value: Option::None,
+                            key_value: key,
+                            cell_value: cell,
+                            writable_value: true,
+                        },
+                    )
                 },
                 Some(OrdinaryProperty::Cached(cell)) => Option::Some(
-                    PropertyAccessCache { object_value: object, cell_value: cell },
+                    PropertyAccessCache {
+                        object_value: object,
+                        receiver_prototype_value: Option::None,
+                        key_value: key,
+                        cell_value: cell,
+                        writable_value: true,
+                    },
                 ),
+                Some(OrdinaryProperty::CachedDescribed { cell, writable, .. }) => Option::Some(
+                    PropertyAccessCache {
+                        object_value: object,
+                        receiver_prototype_value: Option::None,
+                        key_value: key,
+                        cell_value: cell,
+                        writable_value: writable,
+                    },
+                ),
+                Some(OrdinaryProperty::Described(PropertyDescriptor::Data {
+                    value,
+                    writable,
+                    enumerable,
+                    configurable,
+                })) => {
+                    let cell = Ref::new(Option::Some(value));
+                    target.state_value.get().properties_value.insert(
+                        key,
+                        OrdinaryProperty::CachedDescribed {
+                            cell,
+                            writable,
+                            enumerable,
+                            configurable,
+                        },
+                    );
+                    Option::Some(
+                        PropertyAccessCache {
+                            object_value: object,
+                            receiver_prototype_value: Option::None,
+                            key_value: key,
+                            cell_value: cell,
+                            writable_value: writable,
+                        },
+                    )
+                },
                 _ => Option::None,
             }
         },
+        None => Option::None,
+    }
+}
+
+pub fn inherited_property_access_cache(heap: Heap, object: ObjectId, key: PropertyKey) -> Option[
+    PropertyAccessCache,
+] {
+    let receiver = match heap.get(object) {
+        Some(value) => value,
+        None => return Option::None,
+    };
+    if receiver.is_proxy() || receiver.state_value.get().module_namespace_value.get()
+        || receiver.own_property(key).is_some() {
+        return Option::None
+    }
+    let prototype = match receiver.prototype() {
+        Some(value) => value,
+        None => return Option::None,
+    };
+    match property_access_cache(heap, prototype, key) {
+        Some(cache) => Option::Some(
+            PropertyAccessCache {
+                object_value: prototype,
+                receiver_prototype_value: Option::Some(prototype),
+                key_value: key,
+                cell_value: cache.cell_value,
+                writable_value: cache.writable_value,
+            },
+        ),
         None => Option::None,
     }
 }
@@ -643,6 +745,12 @@ pub fn try_fast_property_set(heap: Heap, object: ObjectId, key: PropertyKey, val
         Some(OrdinaryProperty::Cached(cell)) => {
             cell.set(Option::Some(value));
             return PropertyWriteResult::Written
+        },
+        Some(OrdinaryProperty::CachedDescribed { cell, writable, .. }) => if writable {
+            cell.set(Option::Some(value));
+            return PropertyWriteResult::Written
+        } else {
+            return PropertyWriteResult::ReadOnly
         },
         Some(OrdinaryProperty::Described(_)) => return PropertyWriteResult::Unhandled,
         None => (),
@@ -715,6 +823,7 @@ pub fn try_fast_copy_default_properties(heap: Heap, target: ObjectId, source: Ob
                 Some(value) => values.push((key, value)),
                 None => return false,
             },
+            OrdinaryProperty::CachedDescribed { .. } => return false,
             OrdinaryProperty::Described(_) => return false,
         }
     }
@@ -876,6 +985,9 @@ fn drain_pending(
                             enqueue_value(heap, value, marked, symbols, pending)
                         },
                         OrdinaryProperty::Cached(cell) => {
+                            enqueue_optional_value(heap, cell.get(), marked, symbols, pending)
+                        },
+                        OrdinaryProperty::CachedDescribed { cell, .. } => {
                             enqueue_optional_value(heap, cell.get(), marked, symbols, pending)
                         },
                         OrdinaryProperty::Described(descriptor) => {
@@ -1841,13 +1953,23 @@ fn ordinary_property_descriptor(property: OrdinaryProperty) -> PropertyDescripto
         OrdinaryProperty::Cached(cell) => {
             data_descriptor(cell.get().unwrap_or(Value::Undefined), true, true, true)
         },
+        OrdinaryProperty::CachedDescribed { cell, writable, enumerable, configurable } => {
+            data_descriptor(
+                cell.get().unwrap_or(Value::Undefined),
+                writable,
+                enumerable,
+                configurable,
+            )
+        },
         OrdinaryProperty::Described(descriptor) => descriptor,
     }
 }
 
 fn invalidate_ordinary_property(property: OrdinaryProperty) -> () {
     match property {
-        OrdinaryProperty::Cached(cell) => cell.set(Option::None),
+        OrdinaryProperty::Cached(cell) | OrdinaryProperty::CachedDescribed { cell, .. } => {
+            cell.set(Option::None)
+        },
         _ => (),
     }
 }
@@ -3597,6 +3719,17 @@ fn set_existing_ordinary_data_property(target: Object, key: PropertyKey, value: 
             cell.set(Option::Some(value));
             update_argument_mapping(target, key, data_descriptor(value, true, true, true));
             true
+        },
+        Some(OrdinaryProperty::CachedDescribed { cell, writable, enumerable, configurable }) => if writable {
+            cell.set(Option::Some(value));
+            update_argument_mapping(
+                target,
+                key,
+                PropertyDescriptor::Data { value, writable, enumerable, configurable },
+            );
+            true
+        } else {
+            false
         },
         Some(OrdinaryProperty::Described(Data { value: _, writable, enumerable, configurable })) => if writable {
             target.state_value.get().properties_value.insert(

@@ -3131,7 +3131,16 @@ fn read_field(machine: Machine, offset: isize, index: isize, receiver: runtime::
                     None => read_property(machine, offset, receiver, key),
                 }
             },
-            None => read_property(machine, offset, receiver, key),
+            None => match runtime::inherited_property_access_cache(machine.heap, object, key) {
+                Some(cache) => {
+                    machine.function.set_field_cache(offset, cache);
+                    match cache.read(machine.heap, object) {
+                        Some(value) => Result::Ok(value),
+                        None => read_property(machine, offset, receiver, key),
+                    }
+                },
+                None => read_property(machine, offset, receiver, key),
+            },
         },
         _ => read_property(machine, offset, receiver, key),
     }
