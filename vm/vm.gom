@@ -8470,12 +8470,13 @@ fn call_value_with_mode_rooted(
                     }
                 },
                 None => match machine.native_functions.get(object) {
-                    Some(callback) => match callback(machine.heap, this_value, arguments) {
-                        Ok(value) => Result::Ok(ensure_error_stack(machine, value, offset)),
-                        Err(value) => {
-                            Result::Err(error(offset, native_error_kind(value.message)))
-                        },
-                    },
+                    Some(callback) => invoke_native_callable(
+                        machine,
+                        offset,
+                        callback,
+                        this_value,
+                        arguments,
+                    ),
                     None => match machine.vm_functions.get(object) {
                         Some(callback) => match callback(this_value, arguments, machine.depth) {
                             Ok(value) => Result::Ok(ensure_error_stack(machine, value, offset)),
@@ -8493,6 +8494,44 @@ fn call_value_with_mode_rooted(
             }
         },
         _ => Result::Err(error(offset, VmErrorKind::TypeError("value is not callable"))),
+    }
+}
+
+fn invoke_native_callable(
+    machine: Machine,
+    offset: isize,
+    callback: NativeCallable,
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+) -> Result[runtime::Value, VmError] {
+    match callback(machine.heap, this_value, arguments) {
+        Ok(value) => Result::Ok(ensure_error_stack(machine, value, offset)),
+        Err(value) => Result::Err(error(offset, native_error_kind(value.message))),
+    }
+}
+
+fn cached_native_callable(machine: Machine, offset: isize, callee: runtime::Value) -> Option[
+    NativeCallable,
+] {
+    let object = match callee {
+        runtime::Value::Object(value) => value,
+        _ => return Option::None,
+    };
+    if !machine.heap.contains(object) {
+        return Option::None
+    }
+    match machine.function.native_call_cache(offset) {
+        Some(cached) => if cached == object {
+            return machine.native_functions.get(object)
+        },
+        None => (),
+    }
+    match machine.native_functions.get(object) {
+        Some(callback) => {
+            machine.function.set_native_call_cache(offset, object);
+            Option::Some(callback)
+        },
+        None => Option::None,
     }
 }
 
@@ -8880,15 +8919,18 @@ fn push_call(machine: Machine, offset: isize, argument_count: isize, method: boo
         runtime::Value::Undefined
     };
     update_active_frame_offset(machine, offset);
-    let result = call_value_with_mode_rooted(
-        machine,
-        offset,
-        callee,
-        arguments,
-        this_value,
-        false,
-        Option::None,
-    );
+    let result = match cached_native_callable(machine, offset, callee) {
+        Some(callback) => invoke_native_callable(machine, offset, callback, this_value, arguments),
+        None => call_value_with_mode_rooted(
+            machine,
+            offset,
+            callee,
+            arguments,
+            this_value,
+            false,
+            Option::None,
+        ),
+    };
     machine.stack.truncate(stack_start);
     match result {
         Ok(value) => {
