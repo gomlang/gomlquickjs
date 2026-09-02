@@ -10123,6 +10123,55 @@ fn fast_global_step(machine: Machine, offset: isize, instruction: bytecode::Inst
     }
 }
 
+fn fast_put_array_element(machine: Machine) -> bool {
+    let value = pop_verified(machine);
+    let property = pop_verified(machine);
+    let receiver = pop_verified(machine);
+    match (receiver, property) {
+        (runtime::Value::Object(object), runtime::Value::Int(index)) => if index >= 0 {
+            match machine.heap.get(object) {
+                Some(target) => match target.kind() {
+                    runtime::ObjectKind::Array => match target.write_array_index(
+                        index.to_isize(),
+                        value,
+                    ) {
+                        runtime::ArrayIndexWriteResult::Written => true,
+                        _ => {
+                            machine.stack.push(receiver);
+                            machine.stack.push(property);
+                            machine.stack.push(value);
+                            false
+                        },
+                    },
+                    _ => {
+                        machine.stack.push(receiver);
+                        machine.stack.push(property);
+                        machine.stack.push(value);
+                        false
+                    },
+                },
+                None => {
+                    machine.stack.push(receiver);
+                    machine.stack.push(property);
+                    machine.stack.push(value);
+                    false
+                },
+            }
+        } else {
+            machine.stack.push(receiver);
+            machine.stack.push(property);
+            machine.stack.push(value);
+            false
+        },
+        _ => {
+            machine.stack.push(receiver);
+            machine.stack.push(property);
+            machine.stack.push(value);
+            false
+        },
+    }
+}
+
 fn recover_execution_error(machine: Machine, offset: isize, value: VmError) -> Result[
     isize,
     VmError,
@@ -10251,9 +10300,12 @@ fn execute_machine_from(machine: Machine, start: isize) -> Result[ExecutionResul
             bytecode::Instruction::Goto(target) => {
                 offset = target;
             },
-            bytecode::Instruction::Mul | bytecode::Instruction::Div | bytecode::Instruction::Mod | bytecode::Instruction::Add | bytecode::Instruction::Sub | bytecode::Instruction::Lt | bytecode::Instruction::Lte | bytecode::Instruction::Gt | bytecode::Instruction::Gte | bytecode::Instruction::Eq | bytecode::Instruction::Neq | bytecode::Instruction::StrictEq | bytecode::Instruction::StrictNeq | bytecode::Instruction::GetGlobal(_) | bytecode::Instruction::SetGlobal(_) => if match instruction {
+            bytecode::Instruction::Mul | bytecode::Instruction::Div | bytecode::Instruction::Mod | bytecode::Instruction::Add | bytecode::Instruction::Sub | bytecode::Instruction::Lt | bytecode::Instruction::Lte | bytecode::Instruction::Gt | bytecode::Instruction::Gte | bytecode::Instruction::Eq | bytecode::Instruction::Neq | bytecode::Instruction::StrictEq | bytecode::Instruction::StrictNeq | bytecode::Instruction::GetGlobal(_) | bytecode::Instruction::SetGlobal(_) | bytecode::Instruction::PutArrayEl | bytecode::Instruction::PutArrayElStrict => if match instruction {
                 bytecode::Instruction::GetGlobal(_) | bytecode::Instruction::SetGlobal(_) => {
                     fast_global_step(machine, offset, instruction)
+                },
+                bytecode::Instruction::PutArrayEl | bytecode::Instruction::PutArrayElStrict => {
+                    fast_put_array_element(machine)
                 },
                 _ => fast_numeric_step(machine, instruction),
             } {
