@@ -4624,16 +4624,7 @@ fn compile_update(
     span: ast::Span,
 ) -> () {
     let target = prepare_assignment_target(compiler, argument, span, true);
-    let previous = new_local(compiler);
     load_assignment_target(compiler, target);
-    let _ = emit(compiler, bytecode::Instruction::PutLoc(previous));
-    let _ = emit(compiler, bytecode::Instruction::GetLoc(previous));
-    let _ = emit(compiler, bytecode::Instruction::TypeOf);
-    let bigint_name = string_constant(compiler, "bigint");
-    let _ = emit(compiler, bytecode::Instruction::PushConst(bigint_name));
-    let _ = emit(compiler, bytecode::Instruction::StrictEq);
-    let bigint_branch = emit(compiler, bytecode::Instruction::IfTrue(-1));
-    let _ = emit(compiler, bytecode::Instruction::GetLoc(previous));
     set_source_offset(
         compiler,
         if prefix {
@@ -4642,35 +4633,23 @@ fn compile_update(
             first_source_byte_between(compiler, ast::expr_span(argument).end, span.end)
         },
     );
-    let _ = emit(compiler, bytecode::Instruction::Plus);
-    let _ = emit(compiler, bytecode::Instruction::SetLoc(previous));
-    let _ = emit(compiler, bytecode::Instruction::PushI32(1));
     let _ = emit(
         compiler,
-        if operator == ast::UpdateOperator::Increment {
-            bytecode::Instruction::Add
+        if prefix {
+            if operator == ast::UpdateOperator::Increment {
+                bytecode::Instruction::PreIncrement
+            } else {
+                bytecode::Instruction::PreDecrement
+            }
+        } else if operator == ast::UpdateOperator::Increment {
+            bytecode::Instruction::PostIncrement
         } else {
-            bytecode::Instruction::Sub
+            bytecode::Instruction::PostDecrement
         },
     );
-    let end_number = emit(compiler, bytecode::Instruction::Goto(-1));
-    let _ = patch_jump(compiler, bigint_branch, current_offset(compiler));
-    let _ = emit(compiler, bytecode::Instruction::GetLoc(previous));
-    let one = add_constant(compiler, bytecode::Constant::BigInt(runtime::BigInt::from_int64(1)));
-    let _ = emit(compiler, bytecode::Instruction::PushConst(one));
-    let _ = emit(
-        compiler,
-        if operator == ast::UpdateOperator::Increment {
-            bytecode::Instruction::Add
-        } else {
-            bytecode::Instruction::Sub
-        },
-    );
-    let _ = patch_jump(compiler, end_number, current_offset(compiler));
     store_assignment_target(compiler, target);
-    if prefix {} else {
+    if !prefix {
         let _ = emit(compiler, bytecode::Instruction::Drop);
-        let _ = emit(compiler, bytecode::Instruction::GetLoc(previous));
     }
 }
 

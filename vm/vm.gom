@@ -9598,6 +9598,9 @@ fn step(machine: Machine, offset: isize, instruction: bytecode::Instruction) -> 
                 _ => machine.stack.push(runtime::Value::Float(number(machine, offset, value)?)),
             }
         },
+        bytecode::Instruction::PreIncrement | bytecode::Instruction::PostIncrement | bytecode::Instruction::PreDecrement | bytecode::Instruction::PostDecrement => {
+            push_update(machine, offset, instruction)?
+        },
         bytecode::Instruction::LNot => {
             let value = pop(machine, offset)?;
             machine.stack.push(runtime::Value::Bool(!runtime::to_boolean(value)))
@@ -9854,6 +9857,149 @@ fn equal_int_float(left: i32, right: f64) -> bool {
     math::is_finite(right) && right >= -2147483648.0 && right <= 2147483647.0
         && math::trunc(right) == right
         && left == to_i32(right)
+}
+
+fn push_update(machine: Machine, offset: isize, instruction: bytecode::Instruction) -> Result[
+    (),
+    VmError,
+] {
+    let (increment, postfix) = match instruction {
+        bytecode::Instruction::PreIncrement => (true, false),
+        bytecode::Instruction::PostIncrement => (true, true),
+        bytecode::Instruction::PreDecrement => (false, false),
+        bytecode::Instruction::PostDecrement => (false, true),
+        _ => return Result::Err(error(offset, VmErrorKind::UnsupportedInstruction)),
+    };
+    let primitive = to_primitive(machine, offset, pop(machine, offset)?, PrimitiveHint::Number)?;
+    let (previous, updated) = match primitive {
+        runtime::Value::Int(value) => {
+            let result = if increment {
+                value.to_i64() + 1
+            } else {
+                value.to_i64() - 1
+            };
+            (
+                runtime::Value::Int(value),
+                if result >= -2147483648 && result <= 2147483647 {
+                    runtime::Value::Int(result.to_i32())
+                } else {
+                    runtime::Value::Float(
+                        number(machine, offset, runtime::Value::Int(value))?
+                            + if increment {
+                                1.0
+                            } else {
+                                -1.0
+                            },
+                    )
+                },
+            )
+        },
+        runtime::Value::Float(value) => (
+            runtime::Value::Float(value),
+            runtime::Value::Float(
+                value
+                    + if increment {
+                        1.0
+                    } else {
+                        -1.0
+                    },
+            ),
+        ),
+        runtime::Value::BigInt(value) => (
+            runtime::Value::BigInt(value),
+            runtime::Value::BigInt(
+                if increment {
+                    value.add(runtime::BigInt::from_int64(1))
+                } else {
+                    value.subtract(runtime::BigInt::from_int64(1))
+                },
+            ),
+        ),
+        _ => {
+            let value = number(machine, offset, primitive)?;
+            (
+                runtime::Value::Float(value),
+                runtime::Value::Float(
+                    value
+                        + if increment {
+                            1.0
+                        } else {
+                            -1.0
+                        },
+                ),
+            )
+        },
+    };
+    if postfix {
+        machine.stack.push(previous)
+    }
+    machine.stack.push(updated);
+    Result::Ok(())
+}
+
+fn fast_update_step(machine: Machine, instruction: bytecode::Instruction) -> bool {
+    let (increment, postfix) = match instruction {
+        bytecode::Instruction::PreIncrement => (true, false),
+        bytecode::Instruction::PostIncrement => (true, true),
+        bytecode::Instruction::PreDecrement => (false, false),
+        bytecode::Instruction::PostDecrement => (false, true),
+        _ => return false,
+    };
+    let source = pop_verified(machine);
+    match source {
+        runtime::Value::Int(value) => {
+            let result = if increment {
+                value.to_i64() + 1
+            } else {
+                value.to_i64() - 1
+            };
+            if result < -2147483648 || result > 2147483647 {
+                machine.stack.push(source);
+                false
+            } else {
+                if postfix {
+                    machine.stack.push(source)
+                }
+                machine.stack.push(runtime::Value::Int(result.to_i32()));
+                true
+            }
+        },
+        runtime::Value::Float(value) => {
+            if postfix {
+                machine.stack.push(source)
+            }
+            machine.stack.push(
+                runtime::Value::Float(
+                    value
+                        + if increment {
+                            1.0
+                        } else {
+                            -1.0
+                        },
+                ),
+            );
+            true
+        },
+        runtime::Value::BigInt(value) => {
+            if postfix {
+                machine.stack.push(source)
+            }
+            machine.stack.push(
+                runtime::Value::BigInt(
+                    if increment {
+                        value.add(runtime::BigInt::from_int64(1))
+                    } else {
+                        value.subtract(runtime::BigInt::from_int64(1))
+                    },
+                ),
+            );
+            true
+        },
+        _ => {
+            machine.stack.push(source);
+            false
+        },
+    }
 }
 
 fn fast_numeric_step(machine: Machine, instruction: bytecode::Instruction) -> bool {
@@ -10300,12 +10446,15 @@ fn execute_machine_from(machine: Machine, start: isize) -> Result[ExecutionResul
             bytecode::Instruction::Goto(target) => {
                 offset = target;
             },
-            bytecode::Instruction::Mul | bytecode::Instruction::Div | bytecode::Instruction::Mod | bytecode::Instruction::Add | bytecode::Instruction::Sub | bytecode::Instruction::Lt | bytecode::Instruction::Lte | bytecode::Instruction::Gt | bytecode::Instruction::Gte | bytecode::Instruction::Eq | bytecode::Instruction::Neq | bytecode::Instruction::StrictEq | bytecode::Instruction::StrictNeq | bytecode::Instruction::GetGlobal(_) | bytecode::Instruction::SetGlobal(_) | bytecode::Instruction::PutArrayEl | bytecode::Instruction::PutArrayElStrict => if match instruction {
+            bytecode::Instruction::Mul | bytecode::Instruction::Div | bytecode::Instruction::Mod | bytecode::Instruction::Add | bytecode::Instruction::Sub | bytecode::Instruction::Lt | bytecode::Instruction::Lte | bytecode::Instruction::Gt | bytecode::Instruction::Gte | bytecode::Instruction::Eq | bytecode::Instruction::Neq | bytecode::Instruction::StrictEq | bytecode::Instruction::StrictNeq | bytecode::Instruction::PreIncrement | bytecode::Instruction::PostIncrement | bytecode::Instruction::PreDecrement | bytecode::Instruction::PostDecrement | bytecode::Instruction::GetGlobal(_) | bytecode::Instruction::SetGlobal(_) | bytecode::Instruction::PutArrayEl | bytecode::Instruction::PutArrayElStrict => if match instruction {
                 bytecode::Instruction::GetGlobal(_) | bytecode::Instruction::SetGlobal(_) => {
                     fast_global_step(machine, offset, instruction)
                 },
                 bytecode::Instruction::PutArrayEl | bytecode::Instruction::PutArrayElStrict => {
                     fast_put_array_element(machine)
+                },
+                bytecode::Instruction::PreIncrement | bytecode::Instruction::PostIncrement | bytecode::Instruction::PreDecrement | bytecode::Instruction::PostDecrement => {
+                    fast_update_step(machine, instruction)
                 },
                 _ => fast_numeric_step(machine, instruction),
             } {
