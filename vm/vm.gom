@@ -79,6 +79,11 @@ type NativeCallable = (runtime::Heap, runtime::Value, Vec[runtime::Value]) -> Re
     NativeError,
 ];
 
+struct NativeFunction {
+    callback: NativeCallable,
+    reusable_arguments: bool,
+}
+
 type NativeConstructorCallable = (
     runtime::Heap,
     runtime::ObjectId,
@@ -506,12 +511,13 @@ struct Machine {
     bound_functions: HashMap[runtime::ObjectId, BoundFunction],
     function_objects: HashMap[u64, runtime::ObjectId],
     template_objects: HashMap[u64, runtime::ObjectId],
-    native_functions: HashMap[runtime::ObjectId, NativeCallable],
+    native_functions: HashMap[runtime::ObjectId, NativeFunction],
     native_constructor_functions: HashMap[runtime::ObjectId, NativeConstructorCallable],
     vm_functions: HashMap[runtime::ObjectId, VmCallable],
     vm_constructor_functions: HashMap[runtime::ObjectId, VmConstructorCallbacks],
     native_constructors: collections::HashSet[runtime::ObjectId],
     stack: Vec[runtime::Value],
+    native_argument_buffer: Vec[runtime::Value],
     locals: Vec[Ref[runtime::Value]],
     upvalues: Vec[UpvalueCell],
     global_object: Option[runtime::ObjectId],
@@ -547,7 +553,7 @@ pub struct Context {
     bound_functions_value: HashMap[runtime::ObjectId, BoundFunction],
     function_objects_value: HashMap[u64, runtime::ObjectId],
     template_objects_value: HashMap[u64, runtime::ObjectId],
-    native_functions_value: HashMap[runtime::ObjectId, NativeCallable],
+    native_functions_value: HashMap[runtime::ObjectId, NativeFunction],
     native_constructor_functions_value: HashMap[runtime::ObjectId, NativeConstructorCallable],
     vm_functions_value: HashMap[runtime::ObjectId, VmCallable],
     vm_constructor_functions_value: HashMap[runtime::ObjectId, VmConstructorCallbacks],
@@ -1416,6 +1422,7 @@ impl Context {
             vm_constructor_functions: self.vm_constructor_functions_value,
             native_constructors: self.native_constructors_value,
             stack: frame.stack,
+            native_argument_buffer: Vec::new(),
             locals: frame.locals,
             upvalues: frame.upvalues,
             global_object: self.global_object_value.get(),
@@ -1861,6 +1868,27 @@ impl Context {
             NativeError,
         ],
     ) -> Result[runtime::Value, VmError] {
+        self.new_native_function_with_arguments(callback, false)
+    }
+
+    pub fn new_builtin_function(
+        self: Context,
+        callback: (runtime::Heap, runtime::Value, Vec[runtime::Value]) -> Result[
+            runtime::Value,
+            NativeError,
+        ],
+    ) -> Result[runtime::Value, VmError] {
+        self.new_native_function_with_arguments(callback, true)
+    }
+
+    fn new_native_function_with_arguments(
+        self: Context,
+        callback: (runtime::Heap, runtime::Value, Vec[runtime::Value]) -> Result[
+            runtime::Value,
+            NativeError,
+        ],
+        reusable_arguments: bool,
+    ) -> Result[runtime::Value, VmError] {
         match runtime::new_object(
             self.heap_value,
             runtime::ObjectKind::Function,
@@ -1870,7 +1898,10 @@ impl Context {
             },
         ) {
             Ok(object) => {
-                self.native_functions_value[object] = callback;
+                self.native_functions_value[object] = NativeFunction {
+                    callback,
+                    reusable_arguments,
+                };
                 Result::Ok(runtime::Value::Object(object))
             },
             Err(value) => Result::Err(error(-1, VmErrorKind::TypeError(value.message))),
@@ -2647,7 +2678,10 @@ fn arguments_thrower(machine: Machine, offset: isize) -> Result[runtime::Value, 
         Ok(value) => value,
         Err(value) => return Result::Err(error(offset, VmErrorKind::TypeError(value.message))),
     };
-    machine.native_functions[object] = throw_restricted_arguments_property;
+    machine.native_functions[object] = NativeFunction {
+        callback: throw_restricted_arguments_property,
+        reusable_arguments: true,
+    };
     if !runtime::define_own_property(
         machine.heap,
         object,
@@ -8105,6 +8139,7 @@ fn prime_generator(machine: Machine, generator: runtime::ObjectId, offset: isize
         vm_constructor_functions: machine.vm_constructor_functions,
         native_constructors: machine.native_constructors,
         stack: frame.stack,
+        native_argument_buffer: Vec::new(),
         locals: frame.locals,
         upvalues: frame.upvalues,
         global_object: machine.global_object,
@@ -8470,10 +8505,10 @@ fn call_value_with_mode_rooted(
                     }
                 },
                 None => match machine.native_functions.get(object) {
-                    Some(callback) => invoke_native_callable(
+                    Some(function) => invoke_native_callable(
                         machine,
                         offset,
-                        callback,
+                        function.callback,
                         this_value,
                         arguments,
                     ),
@@ -8510,8 +8545,8 @@ fn invoke_native_callable(
     }
 }
 
-fn cached_native_callable(machine: Machine, offset: isize, callee: runtime::Value) -> Option[
-    NativeCallable,
+fn cached_native_function(machine: Machine, offset: isize, callee: runtime::Value) -> Option[
+    NativeFunction,
 ] {
     let object = match callee {
         runtime::Value::Object(value) => value,
@@ -8527,9 +8562,9 @@ fn cached_native_callable(machine: Machine, offset: isize, callee: runtime::Valu
         None => (),
     }
     match machine.native_functions.get(object) {
-        Some(callback) => {
+        Some(function) => {
             machine.function.set_native_call_cache(offset, object);
-            Option::Some(callback)
+            Option::Some(function)
         },
         None => Option::None,
     }
@@ -8906,21 +8941,33 @@ fn push_call(machine: Machine, offset: isize, argument_count: isize, method: boo
         stack_start
     };
     let argument_start = callee_index + 1;
-    let arguments: Vec[runtime::Value] = Vec::with_capacity(argument_count);
+    let callee = machine.stack[callee_index];
+    let native_function = cached_native_function(machine, offset, callee);
+    let reusable_arguments = match native_function {
+        Some(function) => function.reusable_arguments,
+        None => false,
+    };
+    let arguments: Vec[runtime::Value] = if reusable_arguments {
+        machine.native_argument_buffer.truncate(0);
+        machine.native_argument_buffer
+    } else {
+        Vec::with_capacity(argument_count)
+    };
     let mut index = 0;
     while index < argument_count {
         arguments.push(machine.stack[argument_start + index]);
         index += 1;
     }
-    let callee = machine.stack[callee_index];
     let this_value = if method {
         machine.stack[stack_start]
     } else {
         runtime::Value::Undefined
     };
     update_active_frame_offset(machine, offset);
-    let result = match cached_native_callable(machine, offset, callee) {
-        Some(callback) => invoke_native_callable(machine, offset, callback, this_value, arguments),
+    let result = match native_function {
+        Some(function) => {
+            invoke_native_callable(machine, offset, function.callback, this_value, arguments)
+        },
         None => call_value_with_mode_rooted(
             machine,
             offset,
@@ -8931,6 +8978,9 @@ fn push_call(machine: Machine, offset: isize, argument_count: isize, method: boo
             Option::None,
         ),
     };
+    if reusable_arguments {
+        machine.native_argument_buffer.truncate(0)
+    }
     machine.stack.truncate(stack_start);
     match result {
         Ok(value) => {
@@ -9765,7 +9815,7 @@ fn execute_initialized(
     bound_functions: HashMap[runtime::ObjectId, BoundFunction],
     function_objects: HashMap[u64, runtime::ObjectId],
     template_objects: HashMap[u64, runtime::ObjectId],
-    native_functions: HashMap[runtime::ObjectId, NativeCallable],
+    native_functions: HashMap[runtime::ObjectId, NativeFunction],
     native_constructor_functions: HashMap[runtime::ObjectId, NativeConstructorCallable],
     vm_functions: HashMap[runtime::ObjectId, VmCallable],
     vm_constructor_functions: HashMap[runtime::ObjectId, VmConstructorCallbacks],
@@ -9836,6 +9886,7 @@ fn execute_initialized(
         vm_constructor_functions,
         native_constructors,
         stack,
+        native_argument_buffer: Vec::new(),
         locals,
         upvalues,
         global_object,
