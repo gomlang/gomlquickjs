@@ -70,6 +70,31 @@ fn js_string_slice_and_concat_operate_on_code_units() -> () {
 }
 
 #[test]
+fn js_string_long_concat_preserves_aliases_order_and_hash() -> () {
+    let base = JsString::from_code_units(Vec::from_array([0x0041]));
+    let chunk = JsString::from_code_units(Vec::from_array([0x0062, 0x0063]));
+    let alias = base;
+    let mut appended = base;
+    let mut prepended = base;
+    let mut index = 0;
+    while index < 512 {
+        appended = appended.concat(chunk);
+        prepended = chunk.concat(prepended);
+        index += 1;
+    }
+    testing::assert(alias.code_units() == Vec::from_array([0x0041]));
+    testing::assert_eq(appended.len(), 1025);
+    testing::assert_eq(prepended.len(), 1025);
+    testing::assert_eq(appended.get(0), 0x0041.to_u16());
+    testing::assert_eq(appended.get(1024), 0x0063.to_u16());
+    testing::assert_eq(prepended.get(0), 0x0062.to_u16());
+    testing::assert_eq(prepended.get(1024), 0x0041.to_u16());
+    let flat = JsString::from_code_units(appended.code_units());
+    testing::assert(appended == flat);
+    testing::assert_eq(Hash::hash(appended), Hash::hash(flat))
+}
+
+#[test]
 fn js_string_code_unit_vectors_do_not_mutate_the_string() -> () {
     let source: Vec[u16] = Vec::from_array([0xd800]);
     let value = from_code_units(source);
