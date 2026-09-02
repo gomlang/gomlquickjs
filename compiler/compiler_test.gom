@@ -204,6 +204,31 @@ fn compiles_numeric_and_bitwise_compound_assignments() -> () {
 }
 
 #[test]
+fn compiles_local_addition_assignment_to_specialized_instruction() -> () {
+    let function = expect_function(compile("let value = 1; value += 2; return value;"));
+    let mut found = false;
+    for instruction in function.code() {
+        match instruction {
+            bytecode::Instruction::AddLoc(_) => {
+                found = true;
+            },
+            _ => (),
+        }
+    }
+    testing::assert(found)
+}
+
+#[test]
+fn specialized_local_addition_preserves_general_addition() -> () {
+    match execute_source(
+        "let text = 'a'; text += 'b'; let object = {valueOf() { return 4; }}; object += 3; let high = 2147483647; high += 1; return text === 'ab' && object === 7 && high === 2147483648;",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected specialized local addition result"),
+    }
+}
+
+#[test]
 fn numeric_literals_use_ecmascript_binary64_rounding() -> () {
     match execute_source(
         "return 1.797693134862315708145274237317e+308 < 1.797693134862315808e+308 && 1.797693134862315808e+308 === 1e309 && 4.9406564584124654417656879286822e-324 !== 0 && 2e-324 === 0;",
