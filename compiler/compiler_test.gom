@@ -244,6 +244,50 @@ fn prefix_and_postfix_updates_convert_numbers_and_preserve_bigints() -> () {
 }
 
 #[test]
+fn compiles_updates_to_specialized_instructions() -> () {
+    let function = expect_function(
+        compile(
+            "let a = 0; let b = 0; let c = 0; let d = 0; ++a; b++; --c; d--; return a + b + c + d;",
+        ),
+    );
+    let mut pre_increment = false;
+    let mut post_increment = false;
+    let mut pre_decrement = false;
+    let mut post_decrement = false;
+    for instruction in function.code() {
+        match instruction {
+            bytecode::Instruction::PreIncrement => {
+                pre_increment = true;
+            },
+            bytecode::Instruction::PostIncrement => {
+                post_increment = true;
+            },
+            bytecode::Instruction::PreDecrement => {
+                pre_decrement = true;
+            },
+            bytecode::Instruction::PostDecrement => {
+                post_decrement = true;
+            },
+            _ => (),
+        }
+    }
+    testing::assert(pre_increment);
+    testing::assert(post_increment);
+    testing::assert(pre_decrement);
+    testing::assert(post_decrement)
+}
+
+#[test]
+fn specialized_updates_preserve_integer_boundaries() -> () {
+    match execute_source_with_builtins(
+        "let high = 2147483647; let old_high = high++; let low = -2147483648; let old_low = low--; let zero = -1; let old_zero = zero++; return old_high === 2147483647 && high === 2147483648 && old_low === -2147483648 && low === -2147483649 && old_zero === -1 && zero === 0 && 1 / zero === Infinity;",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected bounded update result"),
+    }
+}
+
+#[test]
 fn member_assignments_evaluate_receiver_and_key_once() -> () {
     expect_int(
         execute_source(
