@@ -9120,6 +9120,15 @@ fn step(machine: Machine, offset: isize, instruction: bytecode::Instruction) -> 
             machine.stack.push(value);
             local_put(machine, offset, index, value)?;
         },
+        bytecode::Instruction::AddLoc(index) => {
+            let right = pop(machine, offset)?;
+            machine.stack.push(local_get(machine, offset, index)?);
+            machine.stack.push(right);
+            push_add(machine, offset)?;
+            let value = pop(machine, offset)?;
+            local_put(machine, offset, index, value)?;
+            machine.stack.push(value);
+        },
         bytecode::Instruction::SetTdzLoc(index, writable) => {
             let value = pop(machine, offset)?;
             let current = local_get(machine, offset, index)?;
@@ -10002,6 +10011,31 @@ fn fast_update_step(machine: Machine, instruction: bytecode::Instruction) -> boo
     }
 }
 
+fn fast_add_local(machine: Machine, index: isize) -> bool {
+    let right = pop_verified(machine);
+    let left = machine.locals[index].get();
+    let value = match (left, right) {
+        (runtime::Value::Int(left), runtime::Value::Int(right)) => {
+            let result = left.to_i64() + right.to_i64();
+            if result < -2147483648 || result > 2147483647 {
+                machine.stack.push(runtime::Value::Int(right));
+                return false
+            }
+            runtime::Value::Int(result.to_i32())
+        },
+        (runtime::Value::Float(left), runtime::Value::Float(right)) => {
+            runtime::Value::Float(left + right)
+        },
+        _ => {
+            machine.stack.push(right);
+            return false
+        },
+    };
+    machine.locals[index].set(value);
+    machine.stack.push(value);
+    true
+}
+
 fn fast_numeric_step(machine: Machine, instruction: bytecode::Instruction) -> bool {
     let right = pop_verified(machine);
     let left = pop_verified(machine);
@@ -10432,6 +10466,21 @@ fn execute_machine_from(machine: Machine, start: isize) -> Result[ExecutionResul
                 machine.stack.push(value);
                 machine.locals[index].set(value);
                 offset += 1;
+            },
+            bytecode::Instruction::AddLoc(index) => if fast_add_local(machine, index) {
+                offset += 1;
+            } else {
+                match step(machine, offset, instruction) {
+                    Ok(next) => {
+                        offset = next;
+                    },
+                    Err(value) => match recover_execution_error(machine, offset, value) {
+                        Ok(target) => {
+                            offset = target;
+                        },
+                        Err(value) => return Result::Err(value),
+                    },
+                }
             },
             bytecode::Instruction::IfFalse(target) => if runtime::to_boolean(pop_verified(machine)) {
                 offset += 1;

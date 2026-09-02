@@ -4593,26 +4593,55 @@ fn compile_assignment(
         || operator == ast::AssignmentOperator::NullishCoalescing {
         compile_logical_assignment(compiler, operator, target, right, inferred_name)
     } else {
-        load_assignment_target(compiler, target);
-        compile_expression(compiler, right);
-        set_source_offset(
-            compiler,
-            first_source_byte_between(
-                compiler,
-                ast::expr_span(left).end,
-                ast::expr_span(right).start,
-            ),
-        );
-        match assignment_binary_operator(operator) {
-            Some(binary) => match binary_instruction(binary) {
-                Some(instruction) => {
-                    let _ = emit(compiler, instruction);
-                },
-                None => compile_error(compiler, "compound assignment is not supported", span),
+        let add_local = match target.storage {
+            AssignmentStorage::Local(index) => if target.writable && !target.throws_on_write
+                && operator == ast::AssignmentOperator::Add {
+                Option::Some(index)
+            } else {
+                Option::None
             },
-            None => compile_error(compiler, "compound assignment is not supported", span),
+            _ => Option::None,
+        };
+        match add_local {
+            Some(index) => {
+                compile_expression(compiler, right);
+                set_source_offset(
+                    compiler,
+                    first_source_byte_between(
+                        compiler,
+                        ast::expr_span(left).end,
+                        ast::expr_span(right).start,
+                    ),
+                );
+                let _ = emit(compiler, bytecode::Instruction::AddLoc(index));
+            },
+            None => {
+                load_assignment_target(compiler, target);
+                compile_expression(compiler, right);
+                set_source_offset(
+                    compiler,
+                    first_source_byte_between(
+                        compiler,
+                        ast::expr_span(left).end,
+                        ast::expr_span(right).start,
+                    ),
+                );
+                match assignment_binary_operator(operator) {
+                    Some(binary) => match binary_instruction(binary) {
+                        Some(instruction) => {
+                            let _ = emit(compiler, instruction);
+                        },
+                        None => {
+                            compile_error(compiler, "compound assignment is not supported", span)
+                        },
+                    },
+                    None => {
+                        compile_error(compiler, "compound assignment is not supported", span)
+                    },
+                }
+                store_assignment_target(compiler, target)
+            },
         }
-        store_assignment_target(compiler, target)
     }
 }
 
