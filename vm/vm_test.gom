@@ -1047,6 +1047,81 @@ fn calls_registered_native_functions_with_ordered_arguments() -> () {
 }
 
 #[test]
+fn builtin_calls_reuse_cleared_argument_storage() -> () {
+    let context = Context::new(runtime::Heap::new());
+    let callable = expect_native(context.new_builtin_function(native_sum));
+    let caller = bytecode::Function::new(
+        Vec::new(),
+        Vec::from_array(
+            [
+                bytecode::Instruction::GetLoc(0),
+                bytecode::Instruction::PushI32(10),
+                bytecode::Instruction::Call(1),
+                bytecode::Instruction::GetLoc(0),
+                bytecode::Instruction::PushI32(20),
+                bytecode::Instruction::PushI32(22),
+                bytecode::Instruction::Call(2),
+                bytecode::Instruction::Add,
+                bytecode::Instruction::Return,
+            ],
+        ),
+        1,
+    );
+    match context.execute_with_locals(caller, Vec::from_array([callable])) {
+        Ok(value) => testing::assert_eq(expect_number(value), 52.0),
+        Err(value) => testing::fail(value.kind.debug()),
+    }
+}
+
+#[test]
+fn host_native_calls_keep_independent_argument_storage() -> () {
+    let context = Context::new(runtime::Heap::new());
+    let calls = Ref::new(0);
+    let saved: Ref[Option[Vec[runtime::Value]]] = Ref::new(Option::None);
+    let callable = expect_native(
+        context.new_native_function(
+            |heap, this_value, arguments| {
+                let _ = heap;
+                let _ = this_value;
+                if calls.get() == 0 {
+                    saved.set(Option::Some(arguments))
+                }
+                calls.set(calls.get() + 1);
+                Result::Ok(runtime::Value::Undefined)
+            },
+        ),
+    );
+    let caller = bytecode::Function::new(
+        Vec::new(),
+        Vec::from_array(
+            [
+                bytecode::Instruction::GetLoc(0),
+                bytecode::Instruction::PushI32(10),
+                bytecode::Instruction::Call(1),
+                bytecode::Instruction::Drop,
+                bytecode::Instruction::GetLoc(0),
+                bytecode::Instruction::PushI32(20),
+                bytecode::Instruction::PushI32(22),
+                bytecode::Instruction::Call(2),
+                bytecode::Instruction::Return,
+            ],
+        ),
+        1,
+    );
+    match context.execute_with_locals(caller, Vec::from_array([callable])) {
+        Ok(runtime::Value::Undefined) => (),
+        _ => testing::fail("expected native call result"),
+    }
+    match saved.get() {
+        Some(arguments) => {
+            testing::assert_eq(arguments.len(), 1);
+            testing::assert_eq(expect_number(arguments[0]), 10.0);
+        },
+        None => testing::fail("expected retained native arguments"),
+    }
+}
+
+#[test]
 fn native_methods_receive_the_heap_and_this_value() -> () {
     let heap = runtime::Heap::new();
     let receiver = expect_object(runtime::new_ordinary_object(heap, Option::None));
