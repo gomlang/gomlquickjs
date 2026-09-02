@@ -292,6 +292,10 @@ impl Debug for ObjectId {
 }
 
 pub struct Object {
+    state_value: Ref[ObjectState],
+}
+
+struct ObjectState {
     kind_value: ObjectKind,
     prototype_value: Ref[Option[ObjectId]],
     immutable_prototype_value: Ref[bool],
@@ -316,30 +320,30 @@ struct ProxyData {
 
 impl Object {
     pub fn kind(self: Object) -> ObjectKind {
-        self.kind_value
+        self.state_value.get().kind_value
     }
 
     pub fn typed_array_view(self: Object) -> Option[TypedArrayView] {
-        match self.typed_array_value.get() {
+        match self.state_value.get().typed_array_value.get() {
             Some(value) => Option::Some(value.view),
             None => Option::None,
         }
     }
 
     pub fn prototype(self: Object) -> Option[ObjectId] {
-        self.prototype_value.get()
+        self.state_value.get().prototype_value.get()
     }
 
     pub fn extensible(self: Object) -> bool {
-        self.extensible_value.get()
+        self.state_value.get().extensible_value.get()
     }
 
     pub fn prevent_extensions(self: Object) -> () {
-        self.extensible_value.set(false)
+        self.state_value.get().extensible_value.set(false)
     }
 
     pub fn own_property(self: Object, key: PropertyKey) -> Option[PropertyDescriptor] {
-        match self.typed_array_value.get() {
+        match self.state_value.get().typed_array_value.get() {
             Some(state) => match typed_array_numeric_index(key) {
                 Some(TypedArrayNumericIndex::Index(index)) => {
                     typed_array_element(state.view, index).map(
@@ -347,7 +351,7 @@ impl Object {
                     )
                 },
                 Some(TypedArrayNumericIndex::Invalid) => Option::None,
-                None => match self.properties_value.get(key) {
+                None => match self.state_value.get().properties_value.get(key) {
                     Some(value) => Option::Some(
                         mapped_descriptor(self, key, ordinary_property_descriptor(value)),
                     ),
@@ -357,18 +361,22 @@ impl Object {
             None => match self.kind() {
                 ObjectKind::Array => match key {
                     PropertyKey::String(value) => if is_length_property_key(key) {
-                        self.array_length_value.get().map(array_length_descriptor)
+                        self.state_value.get().array_length_value.get().map(array_length_descriptor)
                     } else {
                         match canonical_array_index(value) {
                             Some(index) => array_index_descriptor(self, index),
-                            None => self.properties_value.get(key).map(ordinary_property_descriptor),
+                            None => self.state_value.get().properties_value.get(key).map(
+                                ordinary_property_descriptor,
+                            ),
                         }
                     },
                     PropertyKey::Symbol(_) => {
-                        self.properties_value.get(key).map(ordinary_property_descriptor)
+                        self.state_value.get().properties_value.get(key).map(
+                            ordinary_property_descriptor,
+                        )
                     },
                 },
-                _ => match self.properties_value.get(key) {
+                _ => match self.state_value.get().properties_value.get(key) {
                     Some(value) => Option::Some(
                         mapped_descriptor(self, key, ordinary_property_descriptor(value)),
                     ),
@@ -413,7 +421,7 @@ impl Object {
 
     pub fn own_array_length(self: Object) -> Option[Value] {
         match self.kind() {
-            ObjectKind::Array => self.array_length_value.get().map(
+            ObjectKind::Array => self.state_value.get().array_length_value.get().map(
                 |state| array_length_value(state.value),
             ),
             _ => Option::None,
@@ -422,55 +430,56 @@ impl Object {
 
     pub fn own_property_count(self: Object) -> isize {
         let mut dense_count = 0;
-        for descriptor in self.array_dense_properties_value {
+        for descriptor in self.state_value.get().array_dense_properties_value {
             if descriptor.is_some() {
                 dense_count += 1;
             }
         }
-        self.properties_value.len() + dense_count + self.array_sparse_properties_value.len()
-            + if self.array_length_value.get().is_some() {
+        self.state_value.get().properties_value.len() + dense_count
+            + self.state_value.get().array_sparse_properties_value.len()
+            + if self.state_value.get().array_length_value.get().is_some() {
                 1
             } else {
                 0
             }
-            + match self.typed_array_value.get() {
+            + match self.state_value.get().typed_array_value.get() {
                 Some(value) => typed_array_length(value.view),
                 None => 0,
             }
     }
 
     pub fn private_element(self: Object, name: ObjectId) -> Option[PrivateElement] {
-        self.private_elements_value.get(name)
+        self.state_value.get().private_elements_value.get(name)
     }
 
     pub fn primitive_value(self: Object) -> Option[Value] {
-        self.primitive_value_value.get()
+        self.state_value.get().primitive_value_value.get()
     }
 
     pub fn set_primitive_value(self: Object, value: Value) -> () {
-        self.primitive_value_value.set(Option::Some(value))
+        self.state_value.get().primitive_value_value.set(Option::Some(value))
     }
 
     pub fn is_proxy(self: Object) -> bool {
-        self.proxy_value.get().is_some()
+        self.state_value.get().proxy_value.get().is_some()
     }
 
     pub fn proxy_target(self: Object) -> Option[ObjectId] {
-        match self.proxy_value.get() {
+        match self.state_value.get().proxy_value.get() {
             Some(value) => value.target_value.get(),
             None => Option::None,
         }
     }
 
     pub fn proxy_handler(self: Object) -> Option[ObjectId] {
-        match self.proxy_value.get() {
+        match self.state_value.get().proxy_value.get() {
             Some(value) => value.handler_value.get(),
             None => Option::None,
         }
     }
 
     pub fn revoke_proxy(self: Object) -> bool {
-        match self.proxy_value.get() {
+        match self.state_value.get().proxy_value.get() {
             Some(value) => {
                 value.target_value.set(Option::None);
                 value.handler_value.set(Option::None);
@@ -557,7 +566,8 @@ impl PropertyAccessCache {
             Option::None
         } else {
             match heap.get(object) {
-                Some(target) => if !target.is_proxy() && !target.module_namespace_value.get() {
+                Some(target) => if !target.is_proxy()
+                    && !target.state_value.get().module_namespace_value.get() {
                     self.cell_value.get()
                 } else {
                     Option::None
@@ -582,19 +592,23 @@ pub fn property_access_cache(heap: Heap, object: ObjectId, key: PropertyKey) -> 
     PropertyAccessCache,
 ] {
     match heap.get(object) {
-        Some(target) => if target.is_proxy() || target.module_namespace_value.get() {
+        Some(target) => if target.is_proxy()
+            || target.state_value.get().module_namespace_value.get() {
             Option::None
         } else {
             match argument_index(key) {
-                Some(index) => if target.argument_map_value.get(index).is_some() {
+                Some(index) => if target.state_value.get().argument_map_value.get(index).is_some() {
                     return Option::None
                 },
                 None => (),
             }
-            match target.properties_value.get(key) {
+            match target.state_value.get().properties_value.get(key) {
                 Some(OrdinaryProperty::Default(value)) => {
                     let cell = Ref::new(Option::Some(value));
-                    target.properties_value.insert(key, OrdinaryProperty::Cached(cell));
+                    target.state_value.get().properties_value.insert(
+                        key,
+                        OrdinaryProperty::Cached(cell),
+                    );
                     Option::Some(PropertyAccessCache { object_value: object, cell_value: cell })
                 },
                 Some(OrdinaryProperty::Cached(cell)) => Option::Some(
@@ -612,18 +626,18 @@ pub fn try_fast_property_set(heap: Heap, object: ObjectId, key: PropertyKey, val
         Some(value) => value,
         None => return PropertyWriteResult::Unhandled,
     };
-    if target.is_proxy() || target.module_namespace_value.get()
-        || target.typed_array_value.get().is_some()
-        || target.argument_map_value.len() > 0 {
+    if target.is_proxy() || target.state_value.get().module_namespace_value.get()
+        || target.state_value.get().typed_array_value.get().is_some()
+        || target.state_value.get().argument_map_value.len() > 0 {
         return PropertyWriteResult::Unhandled
     }
     match target.kind() {
         ObjectKind::Array => return PropertyWriteResult::Unhandled,
         ObjectKind::Ordinary | ObjectKind::Function => (),
     }
-    match target.properties_value.get(key) {
+    match target.state_value.get().properties_value.get(key) {
         Some(OrdinaryProperty::Default(_)) => {
-            target.properties_value.insert(key, OrdinaryProperty::Default(value));
+            target.state_value.get().properties_value.insert(key, OrdinaryProperty::Default(value));
             return PropertyWriteResult::Written
         },
         Some(OrdinaryProperty::Cached(cell)) => {
@@ -633,7 +647,7 @@ pub fn try_fast_property_set(heap: Heap, object: ObjectId, key: PropertyKey, val
         Some(OrdinaryProperty::Described(_)) => return PropertyWriteResult::Unhandled,
         None => (),
     }
-    let mut cursor = target.prototype_value.get();
+    let mut cursor = target.state_value.get().prototype_value.get();
     while cursor.is_some() {
         let current = match cursor {
             Some(value) => value,
@@ -657,14 +671,14 @@ pub fn try_fast_property_set(heap: Heap, object: ObjectId, key: PropertyKey, val
                 return PropertyWriteResult::Unhandled
             },
             None => {
-                cursor = candidate.prototype_value.get();
+                cursor = candidate.state_value.get().prototype_value.get();
             },
         }
     }
-    if !target.extensible_value.get() {
+    if !target.state_value.get().extensible_value.get() {
         return PropertyWriteResult::ReadOnly
     }
-    target.properties_value.insert(key, OrdinaryProperty::Default(value));
+    target.state_value.get().properties_value.insert(key, OrdinaryProperty::Default(value));
     PropertyWriteResult::Written
 }
 
@@ -678,21 +692,21 @@ pub fn try_fast_copy_default_properties(heap: Heap, target: ObjectId, source: Ob
         None => return false,
     };
     if target_object.is_proxy() || source_object.is_proxy()
-        || target_object.module_namespace_value.get()
-        || source_object.module_namespace_value.get()
-        || target_object.typed_array_value.get().is_some()
-        || source_object.typed_array_value.get().is_some()
-        || target_object.argument_map_value.len() > 0
-        || source_object.argument_map_value.len() > 0
-        || !target_object.extensible_value.get()
-        || !target_object.properties_value.is_empty() {
+        || target_object.state_value.get().module_namespace_value.get()
+        || source_object.state_value.get().module_namespace_value.get()
+        || target_object.state_value.get().typed_array_value.get().is_some()
+        || source_object.state_value.get().typed_array_value.get().is_some()
+        || target_object.state_value.get().argument_map_value.len() > 0
+        || source_object.state_value.get().argument_map_value.len() > 0
+        || !target_object.state_value.get().extensible_value.get()
+        || !target_object.state_value.get().properties_value.is_empty() {
         return false
     }
     match (target_object.kind(), source_object.kind()) {
         (ObjectKind::Ordinary, ObjectKind::Ordinary) => (),
         _ => return false,
     }
-    let entries = source_object.properties_value.entries();
+    let entries = source_object.state_value.get().properties_value.entries();
     let values: Vec[(PropertyKey, Value)] = Vec::with_capacity(entries.len());
     for (key, property) in entries {
         match property {
@@ -704,9 +718,12 @@ pub fn try_fast_copy_default_properties(heap: Heap, target: ObjectId, source: Ob
             OrdinaryProperty::Described(_) => return false,
         }
     }
-    target_object.properties_value.reserve(values.len());
+    target_object.state_value.get().properties_value.reserve(values.len());
     for (key, value) in values {
-        target_object.properties_value.insert(key, OrdinaryProperty::Default(value));
+        target_object.state_value.get().properties_value.insert(
+            key,
+            OrdinaryProperty::Default(value),
+        );
     }
     true
 }
@@ -720,21 +737,25 @@ fn object_is_callable(kind: ObjectKind) -> bool {
 
 fn make_object(kind: ObjectKind, prototype: Option[ObjectId]) -> Object {
     Object {
-        kind_value: kind,
-        prototype_value: Ref::new(prototype),
-        immutable_prototype_value: Ref::new(false),
-        extensible_value: Ref::new(true),
-        properties_value: collections::IndexMap::new(),
-        array_length_value: Ref::new(Option::None),
-        array_dense_properties_value: Vec::new(),
-        array_sparse_properties_value: HashMap::new(),
-        private_elements_value: HashMap::new(),
-        primitive_value_value: Ref::new(Option::None),
-        argument_map_value: HashMap::new(),
-        module_namespace_bindings_value: HashMap::new(),
-        module_namespace_value: Ref::new(false),
-        typed_array_value: Ref::new(Option::None),
-        proxy_value: Ref::new(Option::None),
+        state_value: Ref::new(
+            ObjectState {
+                kind_value: kind,
+                prototype_value: Ref::new(prototype),
+                immutable_prototype_value: Ref::new(false),
+                extensible_value: Ref::new(true),
+                properties_value: collections::IndexMap::new(),
+                array_length_value: Ref::new(Option::None),
+                array_dense_properties_value: Vec::new(),
+                array_sparse_properties_value: HashMap::new(),
+                private_elements_value: HashMap::new(),
+                primitive_value_value: Ref::new(Option::None),
+                argument_map_value: HashMap::new(),
+                module_namespace_bindings_value: HashMap::new(),
+                module_namespace_value: Ref::new(false),
+                typed_array_value: Ref::new(Option::None),
+                proxy_value: Ref::new(Option::None),
+            },
+        ),
     }
 }
 
@@ -839,11 +860,11 @@ fn drain_pending(
         };
         match heap.get(current) {
             Some(object) => {
-                match object.prototype_value.get() {
+                match object.state_value.get().prototype_value.get() {
                     Some(prototype) => enqueue_object(heap, prototype, marked, pending),
                     None => (),
                 }
-                for (key, property) in object.properties_value.entries() {
+                for (key, property) in object.state_value.get().properties_value.entries() {
                     match key {
                         PropertyKey::Symbol(value) => {
                             symbols.insert(value.id());
@@ -862,7 +883,7 @@ fn drain_pending(
                         },
                     }
                 }
-                for descriptor in object.array_dense_properties_value {
+                for descriptor in object.state_value.get().array_dense_properties_value {
                     match descriptor {
                         Some(ArrayElement::Default(value)) => {
                             enqueue_value(heap, value, marked, symbols, pending)
@@ -873,31 +894,31 @@ fn drain_pending(
                         None => (),
                     }
                 }
-                for (_, descriptor) in object.array_sparse_properties_value.entries() {
+                for (_, descriptor) in object.state_value.get().array_sparse_properties_value.entries() {
                     enqueue_descriptor(heap, descriptor, marked, symbols, pending)
                 }
-                for (name, element) in object.private_elements_value.entries() {
+                for (name, element) in object.state_value.get().private_elements_value.entries() {
                     enqueue_object(heap, name, marked, pending);
                     enqueue_private_element(heap, element, marked, symbols, pending)
                 }
                 enqueue_optional_value(
                     heap,
-                    object.primitive_value_value.get(),
+                    object.state_value.get().primitive_value_value.get(),
                     marked,
                     symbols,
                     pending,
                 );
-                for (_, cell) in object.argument_map_value.entries() {
+                for (_, cell) in object.state_value.get().argument_map_value.entries() {
                     enqueue_value(heap, cell.get(), marked, symbols, pending)
                 }
-                for (_, cell) in object.module_namespace_bindings_value.entries() {
+                for (_, cell) in object.state_value.get().module_namespace_bindings_value.entries() {
                     enqueue_value(heap, cell.get(), marked, symbols, pending)
                 }
-                match object.typed_array_value.get() {
+                match object.state_value.get().typed_array_value.get() {
                     Some(value) => enqueue_object(heap, value.buffer_object, marked, pending),
                     None => (),
                 }
-                match object.proxy_value.get() {
+                match object.state_value.get().proxy_value.get() {
                     Some(value) => {
                         match value.target_value.get() {
                             Some(target) => enqueue_object(heap, target, marked, pending),
@@ -1532,7 +1553,7 @@ pub fn new_proxy(heap: Heap, target: ObjectId, handler: ObjectId) -> Result[Obje
     let proxy = new_object(heap, kind, prototype)?;
     match heap.get(proxy) {
         Some(value) => {
-            value.proxy_value.set(
+            value.state_value.get().proxy_value.set(
                 Option::Some(
                     ProxyData {
                         target_value: Ref::new(Option::Some(target)),
@@ -1564,7 +1585,9 @@ pub fn register_typed_array(
     } else {
         match heap.get(object) {
             Some(target) => {
-                target.typed_array_value.set(Option::Some(TypedArrayState { view, buffer_object }));
+                target.state_value.get().typed_array_value.set(
+                    Option::Some(TypedArrayState { view, buffer_object }),
+                );
                 true
             },
             None => false,
@@ -1574,14 +1597,14 @@ pub fn register_typed_array(
 
 pub fn is_typed_array(heap: Heap, object: ObjectId) -> bool {
     match heap.get(object) {
-        Some(value) => value.typed_array_value.get().is_some(),
+        Some(value) => value.state_value.get().typed_array_value.get().is_some(),
         None => false,
     }
 }
 
 pub fn typed_array_element_length(heap: Heap, object: ObjectId) -> Option[isize] {
     match heap.get(object) {
-        Some(value) => match value.typed_array_value.get() {
+        Some(value) => match value.state_value.get().typed_array_value.get() {
             Some(value) => Option::Some(typed_array_length(value.view)),
             None => Option::None,
         },
@@ -1598,7 +1621,7 @@ pub fn typed_array_view(heap: Heap, object: ObjectId) -> Option[TypedArrayView] 
 
 pub fn typed_array_buffer_object(heap: Heap, object: ObjectId) -> Option[ObjectId] {
     match heap.get(object) {
-        Some(value) => match value.typed_array_value.get() {
+        Some(value) => match value.state_value.get().typed_array_value.get() {
             Some(value) => Option::Some(value.buffer_object),
             None => Option::None,
         },
@@ -1640,7 +1663,7 @@ pub fn is_typed_array_backed_by_variable_length_buffer(heap: Heap, object: Objec
 
 pub fn is_typed_array_detached(heap: Heap, object: ObjectId) -> bool {
     match heap.get(object) {
-        Some(target) => match target.typed_array_value.get() {
+        Some(target) => match target.state_value.get().typed_array_value.get() {
             Some(value) => match value.view {
                 TypedArrayView::Uint8(view) => view.buffer().is_detached(),
                 TypedArrayView::Int32(view) => view.buffer().is_detached(),
@@ -1678,7 +1701,7 @@ pub fn is_typed_array_length_tracking(heap: Heap, object: ObjectId) -> bool {
 
 pub fn is_typed_array_numeric_property(heap: Heap, object: ObjectId, key: PropertyKey) -> bool {
     match heap.get(object) {
-        Some(value) => value.typed_array_value.get().is_some()
+        Some(value) => value.state_value.get().typed_array_value.get().is_some()
             && typed_array_numeric_index(key).is_some(),
         None => false,
     }
@@ -1686,7 +1709,7 @@ pub fn is_typed_array_numeric_property(heap: Heap, object: ObjectId, key: Proper
 
 pub fn is_bigint_typed_array(heap: Heap, object: ObjectId) -> bool {
     match heap.get(object) {
-        Some(target) => match target.typed_array_value.get() {
+        Some(target) => match target.state_value.get().typed_array_value.get() {
             Some(value) => match value.view {
                 TypedArrayView::BigInt(_) => true,
                 _ => false,
@@ -1699,7 +1722,7 @@ pub fn is_bigint_typed_array(heap: Heap, object: ObjectId) -> bool {
 
 pub fn is_typed_array_valid_numeric_property(heap: Heap, object: ObjectId, key: PropertyKey) -> bool {
     match heap.get(object) {
-        Some(target) => match target.typed_array_value.get() {
+        Some(target) => match target.state_value.get().typed_array_value.get() {
             Some(value) => match typed_array_numeric_index(key) {
                 Some(TypedArrayNumericIndex::Index(index)) => {
                     typed_array_element(value.view, index).is_some()
@@ -1792,7 +1815,7 @@ pub fn is_tdz_value(heap: Heap, value: Value) -> bool {
 pub fn map_argument_index(heap: Heap, object: ObjectId, index: u32, cell: Ref[Value]) -> bool {
     match heap.get(object) {
         Some(target) => {
-            target.argument_map_value[index] = cell;
+            target.state_value.get().argument_map_value[index] = cell;
             true
         },
         None => false,
@@ -1957,7 +1980,7 @@ fn argument_index(key: PropertyKey) -> Option[u32] {
 }
 
 fn mapped_descriptor(target: Object, key: PropertyKey, descriptor: PropertyDescriptor) -> PropertyDescriptor {
-    match target.module_namespace_bindings_value.get(key) {
+    match target.state_value.get().module_namespace_bindings_value.get(key) {
         Some(cell) => return match descriptor {
             PropertyDescriptor::Data { value: _, writable, enumerable, configurable } => {
                 PropertyDescriptor::Data { value: cell.get(), writable, enumerable, configurable }
@@ -1967,7 +1990,7 @@ fn mapped_descriptor(target: Object, key: PropertyKey, descriptor: PropertyDescr
         None => (),
     }
     match (argument_index(key), descriptor) {
-        (Some(index), PropertyDescriptor::Data { value: _, writable, enumerable, configurable }) => match target.argument_map_value.get(
+        (Some(index), PropertyDescriptor::Data { value: _, writable, enumerable, configurable }) => match target.state_value.get().argument_map_value.get(
             index,
         ) {
             Some(cell) => PropertyDescriptor::Data {
@@ -1984,16 +2007,16 @@ fn mapped_descriptor(target: Object, key: PropertyKey, descriptor: PropertyDescr
 
 fn update_argument_mapping(target: Object, key: PropertyKey, descriptor: PropertyDescriptor) -> () {
     match argument_index(key) {
-        Some(index) => match target.argument_map_value.get(index) {
+        Some(index) => match target.state_value.get().argument_map_value.get(index) {
             Some(cell) => match descriptor {
                 PropertyDescriptor::Data { value, writable, .. } => {
                     cell.set(value);
                     if !writable {
-                        let _ = target.argument_map_value.remove(index);
+                        let _ = target.state_value.get().argument_map_value.remove(index);
                     }
                 },
                 PropertyDescriptor::Accessor { .. } => {
-                    let _ = target.argument_map_value.remove(index);
+                    let _ = target.state_value.get().argument_map_value.remove(index);
                 },
             },
             None => (),
@@ -2041,7 +2064,7 @@ pub fn define_module_namespace_export(
         Some(value) => value,
         None => return false,
     };
-    if target.module_namespace_bindings_value.get(key).is_some()
+    if target.state_value.get().module_namespace_bindings_value.get(key).is_some()
         || !ordinary_define_own_property(
             heap,
             object,
@@ -2050,7 +2073,7 @@ pub fn define_module_namespace_export(
         ) {
         false
     } else {
-        target.module_namespace_bindings_value[key] = cell;
+        target.state_value.get().module_namespace_bindings_value[key] = cell;
         true
     }
 }
@@ -2058,7 +2081,7 @@ pub fn define_module_namespace_export(
 pub fn mark_module_namespace(heap: Heap, object: ObjectId) -> bool {
     match heap.get(object) {
         Some(target) => {
-            target.module_namespace_value.set(true);
+            target.state_value.get().module_namespace_value.set(true);
             true
         },
         None => false,
@@ -2067,7 +2090,7 @@ pub fn mark_module_namespace(heap: Heap, object: ObjectId) -> bool {
 
 pub fn is_module_namespace(heap: Heap, object: ObjectId) -> bool {
     match heap.get(object) {
-        Some(target) => target.module_namespace_value.get(),
+        Some(target) => target.state_value.get().module_namespace_value.get(),
         None => false,
     }
 }
@@ -2081,17 +2104,17 @@ pub fn seal_object(heap: Heap, object: ObjectId, frozen: bool) -> bool {
         None => return false,
     };
     target.prevent_extensions();
-    if frozen && target.module_namespace_bindings_value.len() > 0 {
+    if frozen && target.state_value.get().module_namespace_bindings_value.len() > 0 {
         return false
     }
-    match target.typed_array_value.get() {
+    match target.state_value.get().typed_array_value.get() {
         Some(value) => if typed_array_length(value.view) > 0 {
             return false
         },
         None => (),
     }
-    match target.array_length_value.get() {
-        Some(state) => target.array_length_value.set(
+    match target.state_value.get().array_length_value.get() {
+        Some(state) => target.state_value.get().array_length_value.set(
             Option::Some(
                 ArrayLengthState {
                     value: state.value,
@@ -2107,26 +2130,29 @@ pub fn seal_object(heap: Heap, object: ObjectId, frozen: bool) -> bool {
         ),
         None => (),
     }
-    let keys = target.properties_value.keys();
+    let keys = target.state_value.get().properties_value.keys();
     for key in keys {
-        match target.properties_value.get(key) {
+        match target.state_value.get().properties_value.get(key) {
             Some(property) => {
                 let next = descriptor_sealed(
                     mapped_descriptor(target, key, ordinary_property_descriptor(property)),
                     frozen,
                 );
                 invalidate_ordinary_property(property);
-                target.properties_value.insert(key, OrdinaryProperty::Described(next));
+                target.state_value.get().properties_value.insert(
+                    key,
+                    OrdinaryProperty::Described(next),
+                );
                 update_argument_mapping(target, key, next);
             },
             None => (),
         }
     }
     let mut dense_index = 0;
-    while dense_index < target.array_dense_properties_value.len() {
-        match target.array_dense_properties_value[dense_index] {
+    while dense_index < target.state_value.get().array_dense_properties_value.len() {
+        match target.state_value.get().array_dense_properties_value[dense_index] {
             Some(element) => {
-                target.array_dense_properties_value[dense_index] = Option::Some(
+                target.state_value.get().array_dense_properties_value[dense_index] = Option::Some(
                     ArrayElement::Described(
                         descriptor_sealed(array_element_descriptor(element), frozen),
                     ),
@@ -2136,8 +2162,11 @@ pub fn seal_object(heap: Heap, object: ObjectId, frozen: bool) -> bool {
         }
         dense_index += 1;
     }
-    for (index, descriptor) in target.array_sparse_properties_value.entries() {
-        target.array_sparse_properties_value[index] = descriptor_sealed(descriptor, frozen);
+    for (index, descriptor) in target.state_value.get().array_sparse_properties_value.entries() {
+        target.state_value.get().array_sparse_properties_value[index] = descriptor_sealed(
+            descriptor,
+            frozen,
+        );
     }
     true
 }
@@ -2150,26 +2179,26 @@ pub fn object_is_sealed(heap: Heap, object: ObjectId, frozen: bool) -> bool {
     if target.extensible() {
         return false
     }
-    match target.typed_array_value.get() {
+    match target.state_value.get().typed_array_value.get() {
         Some(value) => if typed_array_length(value.view) > 0 {
             return false
         },
         None => (),
     }
-    match target.array_length_value.get() {
+    match target.state_value.get().array_length_value.get() {
         Some(state) => if state.configurable || frozen && state.writable {
             return false
         },
         None => (),
     }
-    for property in target.properties_value.values() {
+    for property in target.state_value.get().properties_value.values() {
         let descriptor = ordinary_property_descriptor(property);
         if descriptor_configurable(descriptor)
             || frozen && descriptor_is_data(descriptor) && descriptor_writable(descriptor) {
             return false
         }
     }
-    for descriptor in target.array_dense_properties_value {
+    for descriptor in target.state_value.get().array_dense_properties_value {
         match descriptor {
             Some(value) => if descriptor_configurable(array_element_descriptor(value))
                 || frozen && descriptor_is_data(array_element_descriptor(value))
@@ -2179,7 +2208,7 @@ pub fn object_is_sealed(heap: Heap, object: ObjectId, frozen: bool) -> bool {
             None => (),
         }
     }
-    for (_, descriptor) in target.array_sparse_properties_value.entries() {
+    for (_, descriptor) in target.state_value.get().array_sparse_properties_value.entries() {
         if descriptor_configurable(descriptor)
             || frozen && descriptor_is_data(descriptor) && descriptor_writable(descriptor) {
             return false
@@ -2195,21 +2224,24 @@ fn ordinary_define_own_property(
     descriptor: PropertyDescriptor,
 ) -> bool {
     match heap.get(object) {
-        Some(target) => match target.properties_value.get(key) {
+        Some(target) => match target.state_value.get().properties_value.get(key) {
             Some(current) => if compatible_descriptor(
                 mapped_descriptor(target, key, ordinary_property_descriptor(current)),
                 descriptor,
             ) {
                 match (current, ordinary_property_from_descriptor(descriptor)) {
                     (OrdinaryProperty::Default(_), OrdinaryProperty::Default(value)) => {
-                        target.properties_value.insert(key, OrdinaryProperty::Default(value));
+                        target.state_value.get().properties_value.insert(
+                            key,
+                            OrdinaryProperty::Default(value),
+                        );
                     },
                     (OrdinaryProperty::Cached(cell), OrdinaryProperty::Default(value)) => {
                         cell.set(Option::Some(value));
                     },
                     (_, next) => {
                         invalidate_ordinary_property(current);
-                        target.properties_value.insert(key, next);
+                        target.state_value.get().properties_value.insert(key, next);
                     },
                 }
                 update_argument_mapping(target, key, descriptor);
@@ -2217,8 +2249,11 @@ fn ordinary_define_own_property(
             } else {
                 false
             },
-            None => if target.extensible_value.get() {
-                target.properties_value.insert(key, ordinary_property_from_descriptor(descriptor));
+            None => if target.state_value.get().extensible_value.get() {
+                target.state_value.get().properties_value.insert(
+                    key,
+                    ordinary_property_from_descriptor(descriptor),
+                );
                 true
             } else {
                 false
@@ -2233,7 +2268,7 @@ fn module_namespace_define_own_property(
     key: PropertyKey,
     descriptor: PropertyDescriptor,
 ) -> bool {
-    match (target.module_namespace_bindings_value.get(key), descriptor) {
+    match (target.state_value.get().module_namespace_bindings_value.get(key), descriptor) {
         (Some(cell), PropertyDescriptor::Data { value, writable, enumerable, configurable }) => writable
             && enumerable
             && !configurable
@@ -2287,15 +2322,15 @@ fn array_store_length_descriptor(target: Object, descriptor: PropertyDescriptor)
         Some(value) => value,
         None => return false,
     };
-    match target.array_length_value.get() {
+    match target.state_value.get().array_length_value.get() {
         Some(current) => if compatible_descriptor(array_length_descriptor(current), descriptor) {
-            target.array_length_value.set(Option::Some(next));
+            target.state_value.get().array_length_value.set(Option::Some(next));
             true
         } else {
             false
         },
         None => if target.extensible() {
-            target.array_length_value.set(Option::Some(next));
+            target.state_value.get().array_length_value.set(Option::Some(next));
             true
         } else {
             false
@@ -2304,7 +2339,7 @@ fn array_store_length_descriptor(target: Object, descriptor: PropertyDescriptor)
 }
 
 fn array_current_length(target: Object) -> Option[(isize, bool)] {
-    match target.array_length_value.get() {
+    match target.state_value.get().array_length_value.get() {
         Some(state) => Option::Some((state.value, state.writable)),
         None => Option::None,
     }
@@ -2340,28 +2375,28 @@ fn array_element_value(element: ArrayElement) -> Option[Value] {
 
 fn array_index_descriptor(target: Object, index: u32) -> Option[PropertyDescriptor] {
     let dense_index = index.to_isize();
-    if dense_index < target.array_dense_properties_value.len() {
-        match target.array_dense_properties_value[dense_index] {
+    if dense_index < target.state_value.get().array_dense_properties_value.len() {
+        match target.state_value.get().array_dense_properties_value[dense_index] {
             Some(value) => Option::Some(array_element_descriptor(value)),
-            None => target.array_sparse_properties_value.get(index),
+            None => target.state_value.get().array_sparse_properties_value.get(index),
         }
     } else {
-        target.array_sparse_properties_value.get(index)
+        target.state_value.get().array_sparse_properties_value.get(index)
     }
 }
 
 fn array_index_value(target: Object, index: u32) -> Option[Value] {
     let dense_index = index.to_isize();
-    if dense_index < target.array_dense_properties_value.len() {
-        match target.array_dense_properties_value[dense_index] {
+    if dense_index < target.state_value.get().array_dense_properties_value.len() {
+        match target.state_value.get().array_dense_properties_value[dense_index] {
             Some(element) => array_element_value(element),
-            None => match target.array_sparse_properties_value.get(index) {
+            None => match target.state_value.get().array_sparse_properties_value.get(index) {
                 Some(PropertyDescriptor::Data { value, .. }) => Option::Some(value),
                 _ => Option::None,
             },
         }
     } else {
-        match target.array_sparse_properties_value.get(index) {
+        match target.state_value.get().array_sparse_properties_value.get(index) {
             Some(PropertyDescriptor::Data { value, .. }) => Option::Some(value),
             _ => Option::None,
         }
@@ -2370,8 +2405,8 @@ fn array_index_value(target: Object, index: u32) -> Option[Value] {
 
 fn fast_array_slot(target: Object, index: u32) -> FastArraySlot {
     let dense_index = index.to_isize();
-    if dense_index < target.array_dense_properties_value.len() {
-        match target.array_dense_properties_value[dense_index] {
+    if dense_index < target.state_value.get().array_dense_properties_value.len() {
+        match target.state_value.get().array_dense_properties_value[dense_index] {
             Some(ArrayElement::Default(value)) => return FastArraySlot::Data(value),
             Some(ArrayElement::Described(Data { value, .. })) => {
                 return FastArraySlot::Data(value)
@@ -2382,7 +2417,7 @@ fn fast_array_slot(target: Object, index: u32) -> FastArraySlot {
             None => (),
         }
     }
-    match target.array_sparse_properties_value.get(index) {
+    match target.state_value.get().array_sparse_properties_value.get(index) {
         Some(Data { value, .. }) => FastArraySlot::Data(value),
         Some(Accessor { .. }) => FastArraySlot::Observable,
         None => FastArraySlot::Hole,
@@ -2391,15 +2426,15 @@ fn fast_array_slot(target: Object, index: u32) -> FastArraySlot {
 
 fn take_fast_array_slot(target: Object, index: u32) -> FastArraySlot {
     let dense_index = index.to_isize();
-    if dense_index < target.array_dense_properties_value.len() {
-        match target.array_dense_properties_value[dense_index] {
+    if dense_index < target.state_value.get().array_dense_properties_value.len() {
+        match target.state_value.get().array_dense_properties_value[dense_index] {
             Some(ArrayElement::Default(value)) => {
-                target.array_dense_properties_value[dense_index] = Option::None;
+                target.state_value.get().array_dense_properties_value[dense_index] = Option::None;
                 trim_array_dense_properties(target);
                 return FastArraySlot::Data(value)
             },
             Some(ArrayElement::Described(Data { value, configurable: true, .. })) => {
-                target.array_dense_properties_value[dense_index] = Option::None;
+                target.state_value.get().array_dense_properties_value[dense_index] = Option::None;
                 trim_array_dense_properties(target);
                 return FastArraySlot::Data(value)
             },
@@ -2407,9 +2442,9 @@ fn take_fast_array_slot(target: Object, index: u32) -> FastArraySlot {
             None => (),
         }
     }
-    match target.array_sparse_properties_value.get(index) {
+    match target.state_value.get().array_sparse_properties_value.get(index) {
         Some(Data { value, configurable: true, .. }) => {
-            let _ = target.array_sparse_properties_value.remove(index);
+            let _ = target.state_value.get().array_sparse_properties_value.remove(index);
             FastArraySlot::Data(value)
         },
         Some(_) => FastArraySlot::Observable,
@@ -2419,92 +2454,102 @@ fn take_fast_array_slot(target: Object, index: u32) -> FastArraySlot {
 
 fn array_insert_new_default_element(target: Object, index: u32, value: Value) -> () {
     let dense_index = index.to_isize();
-    if dense_index < target.array_dense_properties_value.len() {
-        target.array_dense_properties_value[dense_index] = Option::Some(
+    if dense_index < target.state_value.get().array_dense_properties_value.len() {
+        target.state_value.get().array_dense_properties_value[dense_index] = Option::Some(
             ArrayElement::Default(value),
         );
     } else if dense_index < ARRAY_DENSE_INDEX_LIMIT
-        && dense_index <= target.array_dense_properties_value.len() + ARRAY_DENSE_GAP_LIMIT {
-        while target.array_dense_properties_value.len() < dense_index {
-            target.array_dense_properties_value.push(Option::None)
+        && dense_index
+            <= target.state_value.get().array_dense_properties_value.len() + ARRAY_DENSE_GAP_LIMIT {
+        while target.state_value.get().array_dense_properties_value.len() < dense_index {
+            target.state_value.get().array_dense_properties_value.push(Option::None)
         }
-        target.array_dense_properties_value.push(Option::Some(ArrayElement::Default(value)));
+        target.state_value.get().array_dense_properties_value.push(
+            Option::Some(ArrayElement::Default(value)),
+        );
     } else {
-        target.array_sparse_properties_value[index] = data_descriptor(value, true, true, true);
+        target.state_value.get().array_sparse_properties_value[index] = data_descriptor(
+            value,
+            true,
+            true,
+            true,
+        );
     }
 }
 
 fn array_insert_index_descriptor(target: Object, index: u32, descriptor: PropertyDescriptor) -> () {
     let dense_index = index.to_isize();
-    if dense_index < target.array_dense_properties_value.len() {
-        match target.array_dense_properties_value[dense_index] {
+    if dense_index < target.state_value.get().array_dense_properties_value.len() {
+        match target.state_value.get().array_dense_properties_value[dense_index] {
             Some(_) => {
-                target.array_dense_properties_value[dense_index] = Option::Some(
+                target.state_value.get().array_dense_properties_value[dense_index] = Option::Some(
                     array_element_from_descriptor(descriptor),
                 );
             },
-            None => if target.array_sparse_properties_value.get(index).is_some() {
-                target.array_sparse_properties_value[index] = descriptor;
+            None => if target.state_value.get().array_sparse_properties_value.get(index).is_some() {
+                target.state_value.get().array_sparse_properties_value[index] = descriptor;
             } else {
-                target.array_dense_properties_value[dense_index] = Option::Some(
+                target.state_value.get().array_dense_properties_value[dense_index] = Option::Some(
                     array_element_from_descriptor(descriptor),
                 );
             },
         }
-    } else if target.array_sparse_properties_value.get(index).is_some() {
-        target.array_sparse_properties_value[index] = descriptor;
+    } else if target.state_value.get().array_sparse_properties_value.get(index).is_some() {
+        target.state_value.get().array_sparse_properties_value[index] = descriptor;
     } else if dense_index < ARRAY_DENSE_INDEX_LIMIT
-        && dense_index <= target.array_dense_properties_value.len() + ARRAY_DENSE_GAP_LIMIT {
-        while target.array_dense_properties_value.len() < dense_index {
-            target.array_dense_properties_value.push(Option::None)
+        && dense_index
+            <= target.state_value.get().array_dense_properties_value.len() + ARRAY_DENSE_GAP_LIMIT {
+        while target.state_value.get().array_dense_properties_value.len() < dense_index {
+            target.state_value.get().array_dense_properties_value.push(Option::None)
         }
-        target.array_dense_properties_value.push(
+        target.state_value.get().array_dense_properties_value.push(
             Option::Some(array_element_from_descriptor(descriptor)),
         );
     } else {
-        target.array_sparse_properties_value[index] = descriptor;
+        target.state_value.get().array_sparse_properties_value[index] = descriptor;
     }
 }
 
 fn array_insert_new_index_descriptor(target: Object, index: u32, descriptor: PropertyDescriptor) -> () {
     let dense_index = index.to_isize();
-    if dense_index < target.array_dense_properties_value.len() {
-        target.array_dense_properties_value[dense_index] = Option::Some(
+    if dense_index < target.state_value.get().array_dense_properties_value.len() {
+        target.state_value.get().array_dense_properties_value[dense_index] = Option::Some(
             array_element_from_descriptor(descriptor),
         );
     } else if dense_index < ARRAY_DENSE_INDEX_LIMIT
-        && dense_index <= target.array_dense_properties_value.len() + ARRAY_DENSE_GAP_LIMIT {
-        while target.array_dense_properties_value.len() < dense_index {
-            target.array_dense_properties_value.push(Option::None)
+        && dense_index
+            <= target.state_value.get().array_dense_properties_value.len() + ARRAY_DENSE_GAP_LIMIT {
+        while target.state_value.get().array_dense_properties_value.len() < dense_index {
+            target.state_value.get().array_dense_properties_value.push(Option::None)
         }
-        target.array_dense_properties_value.push(
+        target.state_value.get().array_dense_properties_value.push(
             Option::Some(array_element_from_descriptor(descriptor)),
         );
     } else {
-        target.array_sparse_properties_value[index] = descriptor;
+        target.state_value.get().array_sparse_properties_value[index] = descriptor;
     }
 }
 
 fn array_remove_index_descriptor(target: Object, index: u32) -> bool {
     let dense_index = index.to_isize();
-    if dense_index < target.array_dense_properties_value.len() {
-        match target.array_dense_properties_value[dense_index] {
+    if dense_index < target.state_value.get().array_dense_properties_value.len() {
+        match target.state_value.get().array_dense_properties_value[dense_index] {
             Some(element) => if descriptor_configurable(array_element_descriptor(element)) {
-                target.array_dense_properties_value[dense_index] = Option::None;
-                while !target.array_dense_properties_value.is_empty()
-                    && target.array_dense_properties_value[target.array_dense_properties_value.len()
+                target.state_value.get().array_dense_properties_value[dense_index] = Option::None;
+                while !target.state_value.get().array_dense_properties_value.is_empty()
+                    && target.state_value.get().array_dense_properties_value[target.state_value.get().array_dense_properties_value.len()
                         - 1].is_none() {
-                    target.array_dense_properties_value.truncate(
-                        target.array_dense_properties_value.len() - 1,
+                    target.state_value.get().array_dense_properties_value.truncate(
+                        target.state_value.get().array_dense_properties_value.len() - 1,
                     );
                 }
                 true
             } else {
                 false
             },
-            None => match target.array_sparse_properties_value.get(index) {
+            None => match target.state_value.get().array_sparse_properties_value.get(index) {
                 Some(descriptor) => if descriptor_configurable(descriptor) {
-                    let _ = target.array_sparse_properties_value.remove(index);
+                    let _ = target.state_value.get().array_sparse_properties_value.remove(index);
                     true
                 } else {
                     false
@@ -2513,9 +2558,9 @@ fn array_remove_index_descriptor(target: Object, index: u32) -> bool {
             },
         }
     } else {
-        match target.array_sparse_properties_value.get(index) {
+        match target.state_value.get().array_sparse_properties_value.get(index) {
             Some(descriptor) => if descriptor_configurable(descriptor) {
-                let _ = target.array_sparse_properties_value.remove(index);
+                let _ = target.state_value.get().array_sparse_properties_value.remove(index);
                 true
             } else {
                 false
@@ -2544,16 +2589,16 @@ fn array_define_own_index(target: Object, index: u32, descriptor: PropertyDescri
 
 fn write_existing_array_index_value(target: Object, index: u32, value: Value) -> ArrayIndexWriteResult {
     let dense_index = index.to_isize();
-    if dense_index < target.array_dense_properties_value.len() {
-        match target.array_dense_properties_value[dense_index] {
+    if dense_index < target.state_value.get().array_dense_properties_value.len() {
+        match target.state_value.get().array_dense_properties_value[dense_index] {
             Some(ArrayElement::Default(_)) => {
-                target.array_dense_properties_value[dense_index] = Option::Some(
+                target.state_value.get().array_dense_properties_value[dense_index] = Option::Some(
                     ArrayElement::Default(value),
                 );
                 return ArrayIndexWriteResult::Written
             },
             Some(ArrayElement::Described(Data { value: _, writable, enumerable, configurable })) => return if writable {
-                target.array_dense_properties_value[dense_index] = Option::Some(
+                target.state_value.get().array_dense_properties_value[dense_index] = Option::Some(
                     ArrayElement::Described(
                         PropertyDescriptor::Data { value, writable, enumerable, configurable },
                     ),
@@ -2568,9 +2613,9 @@ fn write_existing_array_index_value(target: Object, index: u32, value: Value) ->
             None => (),
         }
     }
-    match target.array_sparse_properties_value.get(index) {
+    match target.state_value.get().array_sparse_properties_value.get(index) {
         Some(Data { value: _, writable, enumerable, configurable }) => if writable {
-            target.array_sparse_properties_value[index] = PropertyDescriptor::Data {
+            target.state_value.get().array_sparse_properties_value[index] = PropertyDescriptor::Data {
                 value,
                 writable,
                 enumerable,
@@ -2620,31 +2665,31 @@ fn compare_array_index(left: u32, right: u32) -> isize {
 }
 
 fn trim_array_dense_properties(target: Object) -> () {
-    let mut length = target.array_dense_properties_value.len();
-    while length > 0 && target.array_dense_properties_value[length - 1].is_none() {
+    let mut length = target.state_value.get().array_dense_properties_value.len();
+    while length > 0 && target.state_value.get().array_dense_properties_value[length - 1].is_none() {
         length -= 1;
     }
-    if length < target.array_dense_properties_value.len() {
-        target.array_dense_properties_value.truncate(length)
+    if length < target.state_value.get().array_dense_properties_value.len() {
+        target.state_value.get().array_dense_properties_value.truncate(length)
     }
 }
 
 fn array_delete_indices_from(target: Object, minimum: isize) -> Option[u32] {
     let sparse_indices: Vec[u32] = Vec::new();
-    for (index, _) in target.array_sparse_properties_value.entries() {
+    for (index, _) in target.state_value.get().array_sparse_properties_value.entries() {
         if index.to_isize() >= minimum {
             sparse_indices.push(index)
         }
     }
     collections::sort_by(sparse_indices, compare_array_index);
     let mut sparse_cursor = sparse_indices.len();
-    let mut dense_cursor = target.array_dense_properties_value.len();
+    let mut dense_cursor = target.state_value.get().array_dense_properties_value.len();
     let mut dense_index: Option[u32] = Option::None;
     loop {
         if dense_index.is_none() {
             while dense_cursor > minimum {
                 dense_cursor -= 1;
-                if target.array_dense_properties_value[dense_cursor].is_some() {
+                if target.state_value.get().array_dense_properties_value[dense_cursor].is_some() {
                     dense_index = Option::Some(dense_cursor.to_u32());
                     break
                 }
@@ -2666,9 +2711,9 @@ fn array_delete_indices_from(target: Object, minimum: isize) -> Option[u32] {
         };
         if delete_dense {
             match dense_index {
-                Some(index) => match target.array_dense_properties_value[index.to_isize()] {
+                Some(index) => match target.state_value.get().array_dense_properties_value[index.to_isize()] {
                     Some(element) => if descriptor_configurable(array_element_descriptor(element)) {
-                        target.array_dense_properties_value[index.to_isize()] = Option::None;
+                        target.state_value.get().array_dense_properties_value[index.to_isize()] = Option::None;
                         dense_index = Option::None;
                     } else {
                         trim_array_dense_properties(target);
@@ -2682,9 +2727,11 @@ fn array_delete_indices_from(target: Object, minimum: isize) -> Option[u32] {
             }
         } else {
             match sparse_index {
-                Some(index) => match target.array_sparse_properties_value.get(index) {
+                Some(index) => match target.state_value.get().array_sparse_properties_value.get(
+                    index,
+                ) {
                     Some(descriptor) => if descriptor_configurable(descriptor) {
-                        let _ = target.array_sparse_properties_value.remove(index);
+                        let _ = target.state_value.get().array_sparse_properties_value.remove(index);
                         sparse_cursor -= 1;
                     } else {
                         trim_array_dense_properties(target);
@@ -2782,9 +2829,9 @@ fn array_define_index(heap: Heap, object: ObjectId, index: u32, descriptor: Prop
     } else if index.to_isize() < length {
         return true
     }
-    match target.array_length_value.get() {
+    match target.state_value.get().array_length_value.get() {
         Some(state) => {
-            target.array_length_value.set(
+            target.state_value.get().array_length_value.set(
                 Option::Some(
                     ArrayLengthState {
                         value: index.to_isize() + 1,
@@ -2801,16 +2848,16 @@ fn array_define_index(heap: Heap, object: ObjectId, index: u32, descriptor: Prop
 }
 
 fn fast_array_prototype_property_absent(heap: Heap, target: Object, key: PropertyKey) -> bool {
-    let mut prototype = target.prototype_value.get();
+    let mut prototype = target.state_value.get().prototype_value.get();
     while prototype.is_some() {
         match prototype {
             Some(object) => match heap.get(object) {
                 Some(candidate) => if candidate.is_proxy() || candidate.own_property(key).is_some()
-                    || candidate.typed_array_value.get().is_some()
+                    || candidate.state_value.get().typed_array_value.get().is_some()
                         && typed_array_numeric_index(key).is_some() {
                     return false
                 } else {
-                    prototype = candidate.prototype_value.get();
+                    prototype = candidate.state_value.get().prototype_value.get();
                 },
                 None => return false,
             },
@@ -2838,7 +2885,7 @@ pub fn try_fast_array_set(heap: Heap, object: ObjectId, index: isize, value: Val
     if !fast_array_object(target) || !target.extensible() {
         return false
     }
-    let length_state = match target.array_length_value.get() {
+    let length_state = match target.state_value.get().array_length_value.get() {
         Some(state) => state,
         None => return false,
     };
@@ -2853,7 +2900,7 @@ pub fn try_fast_array_set(heap: Heap, object: ObjectId, index: isize, value: Val
     }
     array_insert_new_default_element(target, index.to_u32(), value);
     if index >= length_state.value {
-        target.array_length_value.set(
+        target.state_value.get().array_length_value.set(
             Option::Some(
                 ArrayLengthState {
                     value: index + 1,
@@ -2875,7 +2922,7 @@ pub fn try_fast_array_push(heap: Heap, object: ObjectId, values: Vec[Value]) -> 
     if !fast_array_object(target) {
         return Option::None
     }
-    let length_state = match target.array_length_value.get() {
+    let length_state = match target.state_value.get().array_length_value.get() {
         Some(state) => if state.writable {
             state
         } else {
@@ -2903,7 +2950,7 @@ pub fn try_fast_array_push(heap: Heap, object: ObjectId, values: Vec[Value]) -> 
         index += 1;
     }
     let next_length = length + values.len();
-    target.array_length_value.set(
+    target.state_value.get().array_length_value.set(
         Option::Some(
             ArrayLengthState {
                 value: next_length,
@@ -2924,7 +2971,7 @@ pub fn try_fast_array_pop(heap: Heap, object: ObjectId) -> Option[Value] {
     if !fast_array_object(target) {
         return Option::None
     }
-    let length_state = match target.array_length_value.get() {
+    let length_state = match target.state_value.get().array_length_value.get() {
         Some(state) => if state.writable {
             state
         } else {
@@ -2956,7 +3003,7 @@ pub fn try_fast_array_pop(heap: Heap, object: ObjectId) -> Option[Value] {
     } else {
         length - 1
     };
-    target.array_length_value.set(
+    target.state_value.get().array_length_value.set(
         Option::Some(
             ArrayLengthState {
                 value: next_length,
@@ -2986,15 +3033,15 @@ pub fn try_fast_array_slice(
     };
     if !fast_array_object(source_object) || !fast_array_object(target_object)
         || !target_object.extensible()
-        || !target_object.array_dense_properties_value.is_empty()
-        || target_object.array_sparse_properties_value.len() > 0 {
+        || !target_object.state_value.get().array_dense_properties_value.is_empty()
+        || target_object.state_value.get().array_sparse_properties_value.len() > 0 {
         return false
     }
     let count = final_index - first;
     if count < 0 || count >= ARRAY_DENSE_INDEX_LIMIT {
         return false
     }
-    let length_state = match target_object.array_length_value.get() {
+    let length_state = match target_object.state_value.get().array_length_value.get() {
         Some(state) => if state.writable && state.value == count {
             state
         } else {
@@ -3021,15 +3068,17 @@ pub fn try_fast_array_slice(
     index = 0;
     while index < count {
         match fast_array_slot(source_object, (first + index).to_u32()) {
-            FastArraySlot::Data(value) => target_object.array_dense_properties_value.push(
+            FastArraySlot::Data(value) => target_object.state_value.get().array_dense_properties_value.push(
                 Option::Some(ArrayElement::Default(value)),
             ),
-            FastArraySlot::Hole => target_object.array_dense_properties_value.push(Option::None),
+            FastArraySlot::Hole => target_object.state_value.get().array_dense_properties_value.push(
+                Option::None,
+            ),
             FastArraySlot::Observable => return false,
         }
         index += 1;
     }
-    target_object.array_length_value.set(Option::Some(length_state));
+    target_object.state_value.get().array_length_value.set(Option::Some(length_state));
     true
 }
 
@@ -3070,10 +3119,10 @@ pub fn define_own_property(
         Some(value) => value,
         None => return false,
     };
-    if target.module_namespace_bindings_value.get(key).is_some() {
+    if target.state_value.get().module_namespace_bindings_value.get(key).is_some() {
         return module_namespace_define_own_property(target, key, descriptor)
     }
-    match target.typed_array_value.get() {
+    match target.state_value.get().typed_array_value.get() {
         Some(value) => if typed_array_numeric_index(key).is_some() {
             return typed_array_define_numeric_property(value, key, descriptor)
         },
@@ -3100,10 +3149,10 @@ pub fn define_private_field(heap: Heap, object: ObjectId, name: ObjectId, value:
         return false
     }
     match heap.get(object) {
-        Some(target) => if target.private_elements_value.get(name).is_some() {
+        Some(target) => if target.state_value.get().private_elements_value.get(name).is_some() {
             false
         } else {
-            target.private_elements_value.set(name, PrivateElement::Field(value));
+            target.state_value.get().private_elements_value.set(name, PrivateElement::Field(value));
             true
         },
         None => false,
@@ -3115,10 +3164,10 @@ pub fn define_private_method(heap: Heap, object: ObjectId, name: ObjectId, value
         return false
     }
     match heap.get(object) {
-        Some(target) => if target.private_elements_value.get(name).is_some() {
+        Some(target) => if target.state_value.get().private_elements_value.get(name).is_some() {
             false
         } else {
-            target.private_elements_value.set(name, PrivateElement::Method(value));
+            target.state_value.get().private_elements_value.set(name, PrivateElement::Method(value));
             true
         },
         None => false,
@@ -3136,9 +3185,9 @@ pub fn define_private_accessor(
         return false
     }
     match heap.get(object) {
-        Some(target) => match target.private_elements_value.get(name) {
+        Some(target) => match target.state_value.get().private_elements_value.get(name) {
             None => {
-                target.private_elements_value.set(
+                target.state_value.get().private_elements_value.set(
                     name,
                     if getter {
                         PrivateElement::Accessor { get: Option::Some(value), set: Option::None }
@@ -3149,13 +3198,13 @@ pub fn define_private_accessor(
                 true
             },
             Some(PrivateElement::Accessor { get, set }) => if getter && get.is_none() {
-                target.private_elements_value.set(
+                target.state_value.get().private_elements_value.set(
                     name,
                     PrivateElement::Accessor { get: Option::Some(value), set },
                 );
                 true
             } else if !getter && set.is_none() {
-                target.private_elements_value.set(
+                target.state_value.get().private_elements_value.set(
                     name,
                     PrivateElement::Accessor { get, set: Option::Some(value) },
                 );
@@ -3171,23 +3220,26 @@ pub fn define_private_accessor(
 
 pub fn private_element(heap: Heap, object: ObjectId, name: ObjectId) -> Option[PrivateElement] {
     match heap.get(object) {
-        Some(target) => target.private_elements_value.get(name),
+        Some(target) => target.state_value.get().private_elements_value.get(name),
         None => Option::None,
     }
 }
 
 pub fn has_private_element(heap: Heap, object: ObjectId, name: ObjectId) -> bool {
     match heap.get(object) {
-        Some(target) => target.private_elements_value.get(name).is_some(),
+        Some(target) => target.state_value.get().private_elements_value.get(name).is_some(),
         None => false,
     }
 }
 
 pub fn set_private_field(heap: Heap, object: ObjectId, name: ObjectId, value: Value) -> bool {
     match heap.get(object) {
-        Some(target) => match target.private_elements_value.get(name) {
+        Some(target) => match target.state_value.get().private_elements_value.get(name) {
             Some(PrivateElement::Field(_)) => {
-                target.private_elements_value.set(name, PrivateElement::Field(value));
+                target.state_value.get().private_elements_value.set(
+                    name,
+                    PrivateElement::Field(value),
+                );
                 true
             },
             _ => false,
@@ -3198,7 +3250,7 @@ pub fn set_private_field(heap: Heap, object: ObjectId, name: ObjectId, value: Va
 
 pub fn delete_property(heap: Heap, object: ObjectId, key: PropertyKey) -> bool {
     match heap.get(object) {
-        Some(target) => match target.typed_array_value.get() {
+        Some(target) => match target.state_value.get().typed_array_value.get() {
             Some(value) => match typed_array_numeric_index(key) {
                 Some(TypedArrayNumericIndex::Index(index)) => {
                     typed_array_element(value.view, index).is_none()
@@ -3209,9 +3261,9 @@ pub fn delete_property(heap: Heap, object: ObjectId, key: PropertyKey) -> bool {
             None => match target.kind() {
                 ObjectKind::Array => match key {
                     PropertyKey::String(value) => if is_length_property_key(key) {
-                        match target.array_length_value.get() {
+                        match target.state_value.get().array_length_value.get() {
                             Some(state) => if state.configurable {
-                                target.array_length_value.set(Option::None);
+                                target.state_value.get().array_length_value.set(Option::None);
                                 true
                             } else {
                                 false
@@ -3234,13 +3286,13 @@ pub fn delete_property(heap: Heap, object: ObjectId, key: PropertyKey) -> bool {
 }
 
 fn delete_ordinary_property(target: Object, key: PropertyKey) -> bool {
-    match target.properties_value.get(key) {
+    match target.state_value.get().properties_value.get(key) {
         Some(property) => if descriptor_configurable(ordinary_property_descriptor(property)) {
             invalidate_ordinary_property(property);
-            target.properties_value.remove(key);
+            target.state_value.get().properties_value.remove(key);
             match argument_index(key) {
                 Some(index) => {
-                    let _ = target.argument_map_value.remove(index);
+                    let _ = target.state_value.get().argument_map_value.remove(index);
                 },
                 None => (),
             }
@@ -3263,11 +3315,11 @@ pub fn set_prototype_of(heap: Heap, object: ObjectId, prototype: Option[ObjectId
         },
         None => (),
     }
-    if target.prototype_value.get() == prototype {
+    if target.state_value.get().prototype_value.get() == prototype {
         true
-    } else if target.immutable_prototype_value.get() {
+    } else if target.state_value.get().immutable_prototype_value.get() {
         false
-    } else if !target.extensible_value.get() {
+    } else if !target.state_value.get().extensible_value.get() {
         false
     } else {
         let mut cursor = prototype;
@@ -3280,7 +3332,7 @@ pub fn set_prototype_of(heap: Heap, object: ObjectId, prototype: Option[ObjectId
                         Some(candidate) => if candidate.is_proxy() {
                             cursor = Option::None;
                         } else {
-                            cursor = candidate.prototype_value.get();
+                            cursor = candidate.state_value.get().prototype_value.get();
                         },
                         None => return false,
                     }
@@ -3288,7 +3340,7 @@ pub fn set_prototype_of(heap: Heap, object: ObjectId, prototype: Option[ObjectId
                 None => (),
             }
         }
-        target.prototype_value.set(prototype);
+        target.state_value.get().prototype_value.set(prototype);
         true
     }
 }
@@ -3296,7 +3348,7 @@ pub fn set_prototype_of(heap: Heap, object: ObjectId, prototype: Option[ObjectId
 pub fn set_immutable_prototype(heap: Heap, object: ObjectId) -> bool {
     match heap.get(object) {
         Some(target) => {
-            target.immutable_prototype_value.set(true);
+            target.state_value.get().immutable_prototype_value.set(true);
             true
         },
         None => false,
@@ -3336,14 +3388,14 @@ pub fn get_property(heap: Heap, object: ObjectId, key: PropertyKey) -> Result[
                             )
                         },
                     },
-                    None => match target.typed_array_value.get() {
+                    None => match target.state_value.get().typed_array_value.get() {
                         Some(_) => if typed_array_numeric_index(key).is_some() {
                             return Result::Ok(Option::None)
                         } else {
-                            cursor = target.prototype_value.get();
+                            cursor = target.state_value.get().prototype_value.get();
                         },
                         None => {
-                            cursor = target.prototype_value.get();
+                            cursor = target.state_value.get().prototype_value.get();
                         },
                     },
                 }
@@ -3373,14 +3425,14 @@ pub fn try_fast_property_read(heap: Heap, object: ObjectId, key: PropertyKey) ->
                     Some(Data { value, .. }) => return Option::Some(value),
                     Some(Accessor { get: None, .. }) => return Option::Some(Value::Undefined),
                     Some(Accessor { get: Some(_), .. }) => return Option::None,
-                    None => match target.typed_array_value.get() {
+                    None => match target.state_value.get().typed_array_value.get() {
                         Some(_) => if typed_array_numeric_index(key).is_some() {
                             return Option::Some(Value::Undefined)
                         } else {
-                            cursor = target.prototype_value.get();
+                            cursor = target.state_value.get().prototype_value.get();
                         },
                         None => {
-                            cursor = target.prototype_value.get();
+                            cursor = target.state_value.get().prototype_value.get();
                         },
                     },
                 }
@@ -3408,14 +3460,14 @@ pub fn try_fast_property_present(heap: Heap, object: ObjectId, key: PropertyKey)
                 } else if target.own_property(key).is_some() {
                     return Option::Some(true)
                 }
-                match target.typed_array_value.get() {
+                match target.state_value.get().typed_array_value.get() {
                     Some(_) => if typed_array_numeric_index(key).is_some() {
                         return Option::Some(false)
                     } else {
-                        cursor = target.prototype_value.get();
+                        cursor = target.state_value.get().prototype_value.get();
                     },
                     None => {
-                        cursor = target.prototype_value.get();
+                        cursor = target.state_value.get().prototype_value.get();
                     },
                 }
             },
@@ -3442,14 +3494,14 @@ pub fn get_property_descriptor(heap: Heap, object: ObjectId, key: PropertyKey) -
                 };
                 match target.own_property(key) {
                     Some(value) => return Result::Ok(Option::Some(value)),
-                    None => match target.typed_array_value.get() {
+                    None => match target.state_value.get().typed_array_value.get() {
                         Some(_) => if typed_array_numeric_index(key).is_some() {
                             return Result::Ok(Option::None)
                         } else {
-                            cursor = target.prototype_value.get();
+                            cursor = target.state_value.get().prototype_value.get();
                         },
                         None => {
-                            cursor = target.prototype_value.get();
+                            cursor = target.state_value.get().prototype_value.get();
                         },
                     },
                 }
@@ -3462,10 +3514,10 @@ pub fn get_property_descriptor(heap: Heap, object: ObjectId, key: PropertyKey) -
 
 pub fn set_existing_data_property(heap: Heap, object: ObjectId, key: PropertyKey, value: Value) -> bool {
     match heap.get(object) {
-        Some(target) => if target.module_namespace_value.get() {
+        Some(target) => if target.state_value.get().module_namespace_value.get() {
             false
         } else {
-            match target.typed_array_value.get() {
+            match target.state_value.get().typed_array_value.get() {
                 Some(state) => match typed_array_numeric_index(key) {
                     Some(TypedArrayNumericIndex::Index(index)) => match typed_array_set_value(
                         state.view,
@@ -3482,11 +3534,11 @@ pub fn set_existing_data_property(heap: Heap, object: ObjectId, key: PropertyKey
                     ObjectKind::Array => match key {
                         PropertyKey::String(key_value) => if is_length_property_key(key) {
                             match (
-                                target.array_length_value.get(),
+                                target.state_value.get().array_length_value.get(),
                                 array_descriptor_length(data_descriptor(value, true, false, false)),
                             ) {
                                 (Some(state), Some(length)) => if state.writable {
-                                    target.array_length_value.set(
+                                    target.state_value.get().array_length_value.set(
                                         Option::Some(
                                             ArrayLengthState {
                                                 value: length,
@@ -3534,9 +3586,9 @@ pub fn set_existing_array_index(heap: Heap, object: ObjectId, index: isize, valu
 }
 
 fn set_existing_ordinary_data_property(target: Object, key: PropertyKey, value: Value) -> bool {
-    match target.properties_value.get(key) {
+    match target.state_value.get().properties_value.get(key) {
         Some(OrdinaryProperty::Default(_)) => {
-            target.properties_value.insert(key, OrdinaryProperty::Default(value));
+            target.state_value.get().properties_value.insert(key, OrdinaryProperty::Default(value));
             update_argument_mapping(target, key, data_descriptor(value, true, true, true));
             true
         },
@@ -3546,7 +3598,7 @@ fn set_existing_ordinary_data_property(target: Object, key: PropertyKey, value: 
             true
         },
         Some(OrdinaryProperty::Described(Data { value: _, writable, enumerable, configurable })) => if writable {
-            target.properties_value.insert(
+            target.state_value.get().properties_value.insert(
                 key,
                 ordinary_property_from_descriptor(
                     PropertyDescriptor::Data { value, writable, enumerable, configurable },
@@ -3573,7 +3625,7 @@ fn inherited_descriptor(heap: Heap, object: ObjectId, key: PropertyKey) -> Resul
         Some(value) => value,
         None => return Result::Err(invalid_object_error()),
     };
-    let mut cursor = target.prototype_value.get();
+    let mut cursor = target.state_value.get().prototype_value.get();
     while cursor.is_some() {
         match cursor {
             Some(current) => {
@@ -3583,14 +3635,14 @@ fn inherited_descriptor(heap: Heap, object: ObjectId, key: PropertyKey) -> Resul
                 };
                 match candidate.own_property(key) {
                     Some(descriptor) => return Result::Ok(Option::Some(descriptor)),
-                    None => match candidate.typed_array_value.get() {
+                    None => match candidate.state_value.get().typed_array_value.get() {
                         Some(_) => if typed_array_numeric_index(key).is_some() {
                             return Result::Ok(Option::None)
                         } else {
-                            cursor = candidate.prototype_value.get();
+                            cursor = candidate.state_value.get().prototype_value.get();
                         },
                         None => {
-                            cursor = candidate.prototype_value.get();
+                            cursor = candidate.state_value.get().prototype_value.get();
                         },
                     },
                 }
@@ -3609,10 +3661,10 @@ pub fn set_property(heap: Heap, object: ObjectId, key: PropertyKey, value: Value
         Some(value) => value,
         None => return Result::Err(invalid_object_error()),
     };
-    if target.module_namespace_value.get() {
+    if target.state_value.get().module_namespace_value.get() {
         return Result::Ok(false)
     }
-    match target.typed_array_value.get() {
+    match target.state_value.get().typed_array_value.get() {
         Some(state) => match typed_array_numeric_index(key) {
             Some(TypedArrayNumericIndex::Index(index)) => {
                 let written = typed_array_set_value(state.view, index, value)?;
@@ -3635,7 +3687,7 @@ pub fn set_property(heap: Heap, object: ObjectId, key: PropertyKey, value: Value
         _ => false,
     };
     if array_length {
-        return match target.array_length_value.get() {
+        return match target.state_value.get().array_length_value.get() {
             Some(state) => if state.writable {
                 Result::Ok(
                     define_own_property(
@@ -3724,19 +3776,19 @@ pub fn own_property_keys(heap: Heap, object: ObjectId) -> Vec[PropertyKey] {
     let strings: Vec[PropertyKey] = Vec::new();
     let symbols: Vec[PropertyKey] = Vec::new();
     let mut dense_index = 0;
-    while dense_index < target.array_dense_properties_value.len() {
-        if target.array_dense_properties_value[dense_index].is_some() {
+    while dense_index < target.state_value.get().array_dense_properties_value.len() {
+        if target.state_value.get().array_dense_properties_value[dense_index].is_some() {
             indexed.push((dense_index.to_u32(), string_property_key(dense_index.to_string())));
         }
         dense_index += 1;
     }
-    for (index, _) in target.array_sparse_properties_value.entries() {
+    for (index, _) in target.state_value.get().array_sparse_properties_value.entries() {
         indexed.push((index, string_property_key(index.to_string())))
     }
-    if target.array_length_value.get().is_some() {
+    if target.state_value.get().array_length_value.get().is_some() {
         strings.push(string_property_key("length"))
     }
-    for key in target.properties_value.keys() {
+    for key in target.state_value.get().properties_value.keys() {
         match key {
             PropertyKey::String(value) => match canonical_array_index(value) {
                 Some(index) => indexed.push((index, key)),
@@ -3746,7 +3798,7 @@ pub fn own_property_keys(heap: Heap, object: ObjectId) -> Vec[PropertyKey] {
         }
     }
     collections::sort_by(indexed, compare_indexed_key);
-    let typed_length = match target.typed_array_value.get() {
+    let typed_length = match target.state_value.get().typed_array_value.get() {
         Some(value) => typed_array_length(value.view),
         None => 0,
     };
