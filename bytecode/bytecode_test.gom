@@ -746,3 +746,23 @@ fn invalidates_cached_verification_after_semantic_updates() -> () {
     testing::assert_eq(invalidated.errors.len(), 1);
     testing::assert(invalidated.errors[0] == VerifyError::MappedArgumentsInStrictFunction)
 }
+
+#[test]
+fn reuses_cleared_operand_stacks_without_aliasing_active_stacks() -> () {
+    let function = Function::new(Vec::new(), Vec::from_array([Instruction::ReturnUndef]), 0);
+    let first = function.take_stack(2);
+    first.push(runtime::Value::Int(1));
+    let concurrent = function.take_stack(1);
+    concurrent.push(runtime::Value::Int(2));
+    testing::assert_eq(first.len(), 1);
+    testing::assert_eq(concurrent.len(), 1);
+    match first[0] {
+        runtime::Value::Int(value) => testing::assert_eq(value, 1),
+        _ => testing::fail("expected first active stack value"),
+    }
+    function.return_stack(first);
+    function.return_stack(concurrent);
+    let reused = function.take_stack(2);
+    testing::assert(reused.is_empty());
+    testing::assert(reused.capacity() >= 2)
+}
