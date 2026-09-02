@@ -492,9 +492,19 @@ enum HeapSlot {
     },
 }
 
-struct WeakEntry {
+#[derive(Hash, PartialEq, Eq)]
+enum WeakTarget {
+    Object(ObjectId),
+    Symbol(Symbol),
+}
+
+#[derive(Hash, PartialEq, Eq)]
+struct WeakEntryKey {
     owner: ObjectId,
-    key: Value,
+    target: WeakTarget,
+}
+
+struct WeakEntry {
     value: Value,
 }
 
@@ -524,7 +534,7 @@ pub struct Heap {
     string_prototype_value: Ref[Option[ObjectId]],
     bigint_prototype_value: Ref[Option[ObjectId]],
     symbol_prototype_value: Ref[Option[ObjectId]],
-    weak_entries_value: Vec[Option[WeakEntry]],
+    weak_entries_value: HashMap[WeakEntryKey, WeakEntry],
     finalization_cells_value: Vec[Option[FinalizationCell]],
     finalization_jobs_value: collections::Deque[FinalizationJob],
 }
@@ -969,14 +979,11 @@ fn mark_conditional_edges(
                 }
             }
         }
-        for candidate in heap.weak_entries_value {
-            match candidate {
-                Some(entry) => if marked_object(heap, entry.owner, marked)
-                    && marked_weak_key(heap, entry.key, marked, symbols) {
-                    changed = enqueue_conditional_value(heap, entry.value, marked, symbols, pending)
-                        || changed;
-                },
-                None => (),
+        for (key, entry) in heap.weak_entries_value.entries() {
+            if marked_object(heap, key.owner, marked)
+                && marked_weak_key(heap, weak_target_value(key.target), marked, symbols) {
+                changed = enqueue_conditional_value(heap, entry.value, marked, symbols, pending)
+                    || changed;
             }
         }
         for candidate in heap.finalization_cells_value {
@@ -1031,7 +1038,7 @@ impl Heap {
             string_prototype_value: Ref::new(Option::None),
             bigint_prototype_value: Ref::new(Option::None),
             symbol_prototype_value: Ref::new(Option::None),
-            weak_entries_value: Vec::new(),
+            weak_entries_value: HashMap::new(),
             finalization_cells_value: Vec::new(),
             finalization_jobs_value: collections::Deque::new(),
         }
@@ -1323,96 +1330,89 @@ impl Heap {
             slot += 1;
         }
         self.live_count_value.set(reachable);
-        let mut weak_index = 0;
-        while weak_index < self.weak_entries_value.len() {
-            match self.weak_entries_value[weak_index] {
-                Some(entry) => if !self.contains(entry.owner)
-                    || !marked_weak_key(self, entry.key, marked, marked_symbols) {
-                    self.weak_entries_value[weak_index] = Option::None;
-                },
-                None => (),
+        for (key, _) in self.weak_entries_value.entries() {
+            if !self.contains(key.owner)
+                || !marked_weak_key(self, weak_target_value(key.target), marked, marked_symbols) {
+                self.weak_entries_value.remove(key);
             }
-            weak_index += 1;
         }
         GcStats { live_before, reachable, collected, live_after: reachable }
     }
 }
 
-fn weak_key_live(heap: Heap, value: Value) -> bool {
+fn weak_target(heap: Heap, value: Value) -> Option[WeakTarget] {
     match value {
-        Value::Object(object) => heap.contains(object),
-        Value::Symbol(symbol) => !symbol.is_registered(),
-        _ => false,
+        Value::Object(object) => if heap.contains(object) {
+            Option::Some(WeakTarget::Object(object))
+        } else {
+            Option::None
+        },
+        Value::Symbol(symbol) => if !symbol.is_registered() {
+            Option::Some(WeakTarget::Symbol(symbol))
+        } else {
+            Option::None
+        },
+        _ => Option::None,
     }
+}
+
+fn weak_target_value(target: WeakTarget) -> Value {
+    match target {
+        WeakTarget::Object(object) => Value::Object(object),
+        WeakTarget::Symbol(symbol) => Value::Symbol(symbol),
+    }
+}
+
+fn weak_key_live(heap: Heap, value: Value) -> bool {
+    weak_target(heap, value).is_some()
 }
 
 pub fn is_weak_target(heap: Heap, value: Value) -> bool {
     weak_key_live(heap, value)
 }
 
-fn weak_entry_index(heap: Heap, owner: ObjectId, key: Value) -> Option[isize] {
-    let mut index = 0;
-    while index < heap.weak_entries_value.len() {
-        match heap.weak_entries_value[index] {
-            Some(entry) => if !heap.contains(entry.owner) || !weak_key_live(heap, entry.key) {
-                heap.weak_entries_value[index] = Option::None;
-            } else if entry.owner == owner && same_value_zero(entry.key, key) {
-                return Option::Some(index)
-            },
-            None => (),
-        }
-        index += 1;
-    }
-    Option::None
-}
-
-pub fn weak_map_set(heap: Heap, owner: ObjectId, key: Value, value: Value) -> bool {
-    if !heap.contains(owner) || !weak_key_live(heap, key) {
-        false
-    } else {
-        match weak_entry_index(heap, owner, key) {
-            Some(index) => {
-                heap.weak_entries_value[index] = Option::Some(WeakEntry { owner, key, value });
-            },
-            None => heap.weak_entries_value.push(Option::Some(WeakEntry { owner, key, value })),
-        }
-        true
-    }
-}
-
-pub fn weak_map_get(heap: Heap, owner: ObjectId, key: Value) -> Option[Value] {
-    if !heap.contains(owner) || !weak_key_live(heap, key) {
+fn weak_entry_key(heap: Heap, owner: ObjectId, value: Value) -> Option[WeakEntryKey] {
+    if !heap.contains(owner) {
         Option::None
     } else {
-        match weak_entry_index(heap, owner, key) {
-            Some(index) => match heap.weak_entries_value[index] {
-                Some(entry) => Option::Some(entry.value),
-                None => Option::None,
-            },
+        match weak_target(heap, value) {
+            Some(target) => Option::Some(WeakEntryKey { owner, target }),
             None => Option::None,
         }
     }
 }
 
+pub fn weak_map_set(heap: Heap, owner: ObjectId, key: Value, value: Value) -> bool {
+    match weak_entry_key(heap, owner, key) {
+        Some(entry_key) => {
+            heap.weak_entries_value.set(entry_key, WeakEntry { value });
+            true
+        },
+        None => false,
+    }
+}
+
+pub fn weak_map_get(heap: Heap, owner: ObjectId, key: Value) -> Option[Value] {
+    match weak_entry_key(heap, owner, key) {
+        Some(entry_key) => match heap.weak_entries_value.get(entry_key) {
+            Some(entry) => Option::Some(entry.value),
+            None => Option::None,
+        },
+        None => Option::None,
+    }
+}
+
 pub fn weak_map_has(heap: Heap, owner: ObjectId, key: Value) -> bool {
-    if !heap.contains(owner) || !weak_key_live(heap, key) {
-        false
-    } else {
-        weak_entry_index(heap, owner, key).is_some()
+    match weak_entry_key(heap, owner, key) {
+        Some(entry_key) => heap.weak_entries_value.contains(entry_key),
+        None => false,
     }
 }
 
 pub fn weak_map_delete(heap: Heap, owner: ObjectId, key: Value) -> bool {
-    if !heap.contains(owner) || !weak_key_live(heap, key) {
-        false
-    } else {
-        match weak_entry_index(heap, owner, key) {
-            Some(index) => {
-                heap.weak_entries_value[index] = Option::None;
-                true
-            },
-            None => false,
-        }
+    match weak_entry_key(heap, owner, key) {
+        Some(entry_key) => heap.weak_entries_value.remove_value(entry_key).is_some(),
+        None => false,
     }
 }
 
@@ -1436,15 +1436,13 @@ pub fn weak_ref_deref(heap: Heap, owner: ObjectId) -> Option[Value] {
     if !heap.contains(owner) {
         Option::None
     } else {
-        let mut index = 0;
-        while index < heap.weak_entries_value.len() {
-            match heap.weak_entries_value[index] {
-                Some(entry) => if entry.owner == owner && weak_key_live(heap, entry.key) {
-                    return Option::Some(entry.key)
-                },
-                None => (),
+        for (key, _) in heap.weak_entries_value.entries() {
+            if key.owner == owner {
+                let target = weak_target_value(key.target);
+                if weak_target(heap, target).is_some() {
+                    return Option::Some(target)
+                }
             }
-            index += 1;
         }
         Option::None
     }
