@@ -1793,6 +1793,32 @@ fn string_regexp_plain_global_replace(
     let mut next_source_position = 0;
     let mut last_index = 0;
     let mut matched = false;
+    if state.compiled.is_literal() {
+        loop {
+            match state.compiled.literal_search_from(input, last_index) {
+                Some((start, end)) => {
+                    string_append_slice(output, input, next_source_position, start)?;
+                    string_append_slice(output, replacement, 0, replacement.len())?;
+                    next_source_position = end;
+                    matched = true;
+                    last_index = end;
+                    if start == end {
+                        last_index = string_advance_index(input, last_index, unicode);
+                    }
+                },
+                None => break,
+            }
+        }
+        match set_regexp_last_index(context.heap(), object, 0) {
+            Ok(()) => (),
+            Err(value) => return Result::Err(string_vm_native_error(value)),
+        }
+        if !matched {
+            return Result::Ok(runtime::Value::String(input))
+        }
+        string_append_slice(output, input, next_source_position, input.len())?;
+        return Result::Ok(runtime::Value::String(runtime::JsString::from_code_units(output)))
+    }
     loop {
         let found = match find_regexp_match(state, input, last_index) {
             Ok(value) => value,
@@ -1810,10 +1836,6 @@ fn string_regexp_plain_global_replace(
                 last_index = value.end;
                 if empty {
                     last_index = string_advance_index(input, last_index, unicode);
-                }
-                match set_regexp_last_index(context.heap(), object, last_index) {
-                    Ok(()) => (),
-                    Err(value) => return Result::Err(string_vm_native_error(value)),
                 }
             },
             None => {
@@ -2958,6 +2980,11 @@ fn string_search_dispatch(
 fn string_replace_dispatch(
     context: vm::Context,
     states: HashMap[runtime::ObjectId, RegExpState],
+    regexp_prototype: runtime::ObjectId,
+    builtin_exec: runtime::Value,
+    flags_getter: runtime::Value,
+    flag_getters: Vec[(runtime::JsString, runtime::Value)],
+    builtin_replace: Ref[Option[runtime::Value]],
     replace_all: bool,
     this_value: runtime::Value,
     arguments: Vec[runtime::Value],
@@ -2982,12 +3009,34 @@ fn string_replace_dispatch(
         }
     }
     match string_symbol_method(context, pattern, vm::WellKnownSymbolKind::Replace, depth)? {
-        Some(method) => context.invoke_with_this_at_depth(
-            method,
-            Vec::from_array([receiver, argument(arguments, 1)]),
-            pattern,
-            depth,
-        ),
+        Some(method) => match builtin_replace.get() {
+            Some(expected) => if runtime::same_value(method, expected) {
+                string_regexp_replace_at_depth(
+                    context,
+                    states,
+                    regexp_prototype,
+                    builtin_exec,
+                    flags_getter,
+                    flag_getters,
+                    pattern,
+                    Vec::from_array([receiver, argument(arguments, 1)]),
+                    depth,
+                )
+            } else {
+                context.invoke_with_this_at_depth(
+                    method,
+                    Vec::from_array([receiver, argument(arguments, 1)]),
+                    pattern,
+                    depth,
+                )
+            },
+            None => context.invoke_with_this_at_depth(
+                method,
+                Vec::from_array([receiver, argument(arguments, 1)]),
+                pattern,
+                depth,
+            ),
+        },
         None => string_replace_internal(
             context,
             replace_all,
@@ -3098,18 +3147,43 @@ fn install_regexp_string_methods(
             )
         },
     )?;
+    let regexp_replace_slot = Ref::new(Option::None);
     let replace_method = allocate_vm_function(
         context,
         "String.prototype.replace",
         |this_value, arguments, depth| {
-            string_replace_dispatch(context, states, false, this_value, arguments, depth)
+            string_replace_dispatch(
+                context,
+                states,
+                regexp_prototype,
+                builtin_exec,
+                flags_getter,
+                flag_getters,
+                regexp_replace_slot,
+                false,
+                this_value,
+                arguments,
+                depth,
+            )
         },
     )?;
     let replace_all_method = allocate_vm_function(
         context,
         "String.prototype.replaceAll",
         |this_value, arguments, depth| {
-            string_replace_dispatch(context, states, true, this_value, arguments, depth)
+            string_replace_dispatch(
+                context,
+                states,
+                regexp_prototype,
+                builtin_exec,
+                flags_getter,
+                flag_getters,
+                regexp_replace_slot,
+                true,
+                this_value,
+                arguments,
+                depth,
+            )
         },
     )?;
     let split_method = allocate_vm_function(
@@ -3178,6 +3252,7 @@ fn install_regexp_string_methods(
             )
         },
     )?;
+    regexp_replace_slot.set(Option::Some(regexp_replace));
     let regexp_split = allocate_vm_function(
         context,
         "RegExp.prototype[Symbol.split]",

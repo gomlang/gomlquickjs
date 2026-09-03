@@ -28,6 +28,11 @@ struct RegExpCacheKey {
     flags: runtime::JsString,
 }
 
+struct RegExpCache {
+    values: HashMap[RegExpCacheKey, RegExpState],
+    hot: Ref[Option[(RegExpCacheKey, RegExpState)]],
+}
+
 struct LocatedMatch {
     start: isize,
     end: isize,
@@ -200,52 +205,63 @@ fn flags_text(value: runtime::JsString) -> Result[string, vm::NativeError] {
 }
 
 fn new_regexp_state_with_cache(
-    cache: Option[HashMap[RegExpCacheKey, regexp::Regex]],
+    cache: Option[RegExpCache],
     pattern: runtime::JsString,
     requested_flags: runtime::JsString,
 ) -> Result[RegExpState, vm::NativeError] {
+    let key = RegExpCacheKey { pattern, flags: requested_flags };
+    match cache {
+        Some(cache) => {
+            match cache.hot.get() {
+                Some((cached_key, value)) => if cached_key == key {
+                    return Result::Ok(value)
+                },
+                None => (),
+            }
+            match cache.values.get(key) {
+                Some(value) => {
+                    cache.hot.set(Option::Some((key, value)));
+                    return Result::Ok(value)
+                },
+                None => (),
+            }
+        },
+        None => (),
+    }
     let requested = flags_text(requested_flags)?;
     let parsed = match regexp::parse_flags(requested) {
         Ok(value) => value,
         Err(value) => return Result::Err(regexp_compile_error(value)),
     };
-    let key = RegExpCacheKey { pattern, flags: requested_flags };
-    let cached = match cache {
-        Some(cache) => cache.get(key),
-        None => Option::None,
-    };
-    let compiled = match cached {
-        Some(value) => value,
-        None => match regexp::compile_with_flags(pattern, requested) {
-            Ok(value) => {
-                match cache {
-                    Some(cache) => if cache.len() < 256 {
-                        cache[key] = value;
-                    },
-                    None => (),
-                }
-                value
-            },
-            Err(value) => return Result::Err(regexp_compile_error(value)),
-        },
+    let compiled = match regexp::compile_with_flags(pattern, requested) {
+        Ok(value) => value,
+        Err(value) => return Result::Err(regexp_compile_error(value)),
     };
     let flags_host = canonical_flags(parsed);
-    Result::Ok(
-        RegExpState {
-            pattern,
-            source: regexp_source(pattern),
-            flags: js_string(flags_host),
-            compiled,
-            has_indices: parsed.has_indices,
-            global: parsed.global,
-            ignore_case: parsed.ignore_case,
-            multiline: parsed.multiline,
-            dot_all: parsed.dot_all,
-            unicode: parsed.unicode,
-            unicode_sets: parsed.unicode_sets,
-            sticky: parsed.sticky,
+    let state = RegExpState {
+        pattern,
+        source: regexp_source(pattern),
+        flags: js_string(flags_host),
+        compiled,
+        has_indices: parsed.has_indices,
+        global: parsed.global,
+        ignore_case: parsed.ignore_case,
+        multiline: parsed.multiline,
+        dot_all: parsed.dot_all,
+        unicode: parsed.unicode,
+        unicode_sets: parsed.unicode_sets,
+        sticky: parsed.sticky,
+    };
+    match cache {
+        Some(cache) => {
+            cache.hot.set(Option::Some((key, state)));
+            if cache.values.len() < 256 {
+                cache.values[key] = state;
+            }
         },
-    )
+        None => (),
+    }
+    Result::Ok(state)
 }
 
 fn define_regexp_instance(heap: runtime::Heap, object: runtime::ObjectId, state: RegExpState) -> Result[
@@ -380,7 +396,7 @@ fn regexp_flags_at_constructor_depth(context: vm::Context, value: runtime::Value
 
 fn regexp_prepared_state_at_depth(
     context: vm::Context,
-    cache: HashMap[RegExpCacheKey, regexp::Regex],
+    cache: RegExpCache,
     arguments: Vec[runtime::Value],
     depth: isize,
 ) -> Result[RegExpState, vm::VmError] {
@@ -398,7 +414,7 @@ fn regexp_prepared_state_at_depth(
 fn regexp_initialize_instance_at_depth(
     context: vm::Context,
     states: HashMap[runtime::ObjectId, RegExpState],
-    cache: HashMap[RegExpCacheKey, regexp::Regex],
+    cache: RegExpCache,
     object: runtime::ObjectId,
     arguments: Vec[runtime::Value],
     depth: isize,
@@ -422,7 +438,7 @@ fn regexp_initialize_instance_at_depth(
 fn regexp_initialize_rooted_instance_at_depth(
     context: vm::Context,
     states: HashMap[runtime::ObjectId, RegExpState],
-    cache: HashMap[RegExpCacheKey, regexp::Regex],
+    cache: RegExpCache,
     object: runtime::ObjectId,
     arguments: Vec[runtime::Value],
     depth: isize,
@@ -443,7 +459,7 @@ fn regexp_initialize_rooted_instance_at_depth(
 fn regexp_allocate_instance_at_depth(
     context: vm::Context,
     states: HashMap[runtime::ObjectId, RegExpState],
-    cache: HashMap[RegExpCacheKey, regexp::Regex],
+    cache: RegExpCache,
     prototype: runtime::ObjectId,
     arguments: Vec[runtime::Value],
     depth: isize,
@@ -458,7 +474,7 @@ fn regexp_allocate_instance_at_depth(
 fn regexp_constructor_call_at_depth(
     context: vm::Context,
     states: HashMap[runtime::ObjectId, RegExpState],
-    cache: HashMap[RegExpCacheKey, regexp::Regex],
+    cache: RegExpCache,
     prototype: runtime::ObjectId,
     constructor: runtime::Value,
     arguments: Vec[runtime::Value],
@@ -494,7 +510,7 @@ fn regexp_constructor_call_at_depth(
 fn regexp_compile_instance_at_depth(
     context: vm::Context,
     states: HashMap[runtime::ObjectId, RegExpState],
-    cache: HashMap[RegExpCacheKey, regexp::Regex],
+    cache: RegExpCache,
     this_value: runtime::Value,
     arguments: Vec[runtime::Value],
     depth: isize,
@@ -1300,7 +1316,7 @@ fn install_regexp_runtime(context: vm::Context) -> Result[RegExpInstall, Builtin
     };
     let states: HashMap[runtime::ObjectId, RegExpState] = HashMap::new();
     let last_match = Ref::new(js_string(""));
-    let cache: HashMap[RegExpCacheKey, regexp::Regex] = HashMap::new();
+    let cache = RegExpCache { values: HashMap::new(), hot: Ref::new(Option::None) };
     context.add_external_edge_provider(|| regexp_gc_edges(context.heap(), states));
     let flags_getter = allocate_vm_function(
         context,
@@ -1397,7 +1413,14 @@ fn install_regexp_runtime(context: vm::Context) -> Result[RegExpInstall, Builtin
         |receiver, arguments, selected_prototype, new_target, depth| {
             let _ = new_target;
             constructor_receiver_prototype(context.heap(), receiver, selected_prototype, prototype)?;
-            regexp_initialize_instance_at_depth(context, states, cache, receiver, arguments, depth)
+            regexp_initialize_rooted_instance_at_depth(
+                context,
+                states,
+                cache,
+                receiver,
+                arguments,
+                depth,
+            )
         },
     ) {
         Ok(()) => (),

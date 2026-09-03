@@ -671,6 +671,19 @@ fn decimal_order(parts: BinaryParts) -> isize {
     order
 }
 
+fn fast_decimal_order(value: f64) -> Option[isize] {
+    if value < 1.0 || value >= 1000000000000000.0 {
+        return Option::None
+    }
+    let mut order = 0;
+    let mut threshold = 10.0;
+    while value >= threshold {
+        threshold *= 10.0;
+        order += 1;
+    }
+    Option::Some(order)
+}
+
 fn exact_binary_ratio(parts: BinaryParts) -> (bigint::BigInteger, bigint::BigInteger) {
     let numerator = bigint::BigInteger::from_uint64(parts.mantissa);
     if parts.exponent >= 0 {
@@ -784,7 +797,10 @@ fn rounded_scaled_integer(parts: BinaryParts, decimal_scale: isize) -> bigint::B
 
 fn exact_precision_parts(value: f64, negative: bool, precision: isize) -> DecimalParts {
     let parts = binary_parts(value);
-    let mut order = decimal_order(parts);
+    let mut order = match fast_decimal_order(value) {
+        Some(value) => value,
+        None => decimal_order(parts),
+    };
     let mut digits = if precision <= 19 {
         let scale = order - precision + 1;
         decimal_u64(
@@ -1022,6 +1038,20 @@ fn format_decimal_parts(parts: DecimalParts) -> string {
     builder.finish()
 }
 
+fn fast_single_decimal(value: f64) -> Option[string] {
+    if value < 0.1 || value >= 1000000000000.0 {
+        return Option::None
+    }
+    let integer = math::floor(value);
+    if value != integer + 0.1 {
+        return Option::None
+    }
+    let builder = text::StringBuilder::with_capacity(24);
+    builder.write_string(decimal_u64(positive_integral_float_to_u64(integer)));
+    builder.write_string(".1");
+    Option::Some(builder.finish())
+}
+
 pub fn number_to_string(value: f64) -> string {
     if value != value {
         "NaN"
@@ -1032,7 +1062,10 @@ pub fn number_to_string(value: f64) -> string {
     } else if value == 0.0 {
         "0"
     } else if value >= 0.000001 && value < 1.0e21 || value <= -0.000001 && value > -1.0e21 {
-        value.to_string()
+        match fast_single_decimal(value) {
+            Some(value) => value,
+            None => value.to_string(),
+        }
     } else if value < 0.0 {
         format_decimal_parts(shortest_decimal_parts(-value, true))
     } else {
@@ -1093,7 +1126,10 @@ pub fn number_to_fixed(value: f64, fractional_digits: isize) -> string {
         return scaled_digits_text("0", fractional_digits, negative)
     }
     let parts = binary_parts(magnitude);
-    let order = decimal_order(parts);
+    let order = match fast_decimal_order(magnitude) {
+        Some(value) => value,
+        None => decimal_order(parts),
+    };
     if order + fractional_digits <= 18 {
         let scale = -fractional_digits;
         scaled_digits_text(

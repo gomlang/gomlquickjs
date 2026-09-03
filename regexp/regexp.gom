@@ -3143,6 +3143,22 @@ pub fn match_at(regex: Regex, input: runtime::JsString, start: isize) -> Option[
 fn match_literal_at(regex: Regex, literal: Vec[u32], input: runtime::JsString, start: isize) -> Option[
     RegexMatch,
 ] {
+    let position = match literal_end_at(regex, literal, input, start) {
+        Some(value) => value,
+        None => return Option::None,
+    };
+    Option::Some(
+        RegexMatch {
+            start,
+            end: position,
+            captures: Vec::from_array([Option::Some(RegexCapture { start, end: position })]),
+        },
+    )
+}
+
+fn literal_end_at(regex: Regex, literal: Vec[u32], input: runtime::JsString, start: isize) -> Option[
+    isize,
+] {
     let mut position = start;
     for expected in literal {
         if position >= input.len() {
@@ -3154,13 +3170,7 @@ fn match_literal_at(regex: Regex, literal: Vec[u32], input: runtime::JsString, s
         }
         position += width;
     }
-    Option::Some(
-        RegexMatch {
-            start,
-            end: position,
-            captures: Vec::from_array([Option::Some(RegexCapture { start, end: position })]),
-        },
-    )
+    Option::Some(position)
 }
 
 pub fn search(regex: Regex, input: runtime::JsString) -> Option[RegexMatch] {
@@ -3202,6 +3212,36 @@ impl Regex {
 
     pub fn has_named_captures(self: Regex) -> bool {
         has_capture_names(self.capture_names)
+    }
+
+    pub fn is_literal(self: Regex) -> bool {
+        self.literal.is_some()
+    }
+
+    pub fn literal_search_from(self: Regex, input: runtime::JsString, first: isize) -> Option[
+        (isize, isize),
+    ] {
+        let literal = match self.literal {
+            Some(value) => value,
+            None => return Option::None,
+        };
+        let mut start = first;
+        while start <= input.len() {
+            match literal_end_at(self, literal, input, start) {
+                Some(end) => return Option::Some((start, end)),
+                None => (),
+            }
+            if self.flags.sticky {
+                return Option::None
+            }
+            if unicode_mode(self.flags) && start < input.len() {
+                let (_, width) = input_forward_code_point(input, start, true);
+                start += width;
+            } else {
+                start += 1;
+            }
+        }
+        Option::None
     }
 
     pub fn search(self: Regex, input: runtime::JsString) -> Option[RegexMatch] {

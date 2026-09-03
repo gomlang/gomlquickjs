@@ -3177,6 +3177,19 @@ fn field_key(machine: Machine, offset: isize, index: isize) -> Result[runtime::P
     }
 }
 
+fn cached_primitive_property_prototype(machine: Machine, receiver: runtime::Value) -> Option[
+    runtime::ObjectId,
+] {
+    match receiver {
+        runtime::Value::Bool(_) => machine.primitive_prototypes.boolean_value.get(),
+        runtime::Value::Int(_) | runtime::Value::Float(_) => {
+            machine.primitive_prototypes.number_value.get()
+        },
+        runtime::Value::BigInt(_) => machine.primitive_prototypes.bigint_value.get(),
+        _ => Option::None,
+    }
+}
+
 fn read_field(machine: Machine, offset: isize, index: isize, receiver: runtime::Value) -> Result[
     runtime::Value,
     VmError,
@@ -3189,7 +3202,16 @@ fn read_field(machine: Machine, offset: isize, index: isize, receiver: runtime::
             },
             None => (),
         },
-        _ => (),
+        _ => match cached_primitive_property_prototype(machine, receiver) {
+            Some(prototype) => match machine.function.field_cache(offset) {
+                Some(cache) => match cache.get().read_own(prototype) {
+                    Some(value) => return Result::Ok(value),
+                    None => (),
+                },
+                None => (),
+            },
+            None => (),
+        },
     }
     let key = field_key(machine, offset, index)?;
     match receiver {
@@ -3218,7 +3240,20 @@ fn read_field(machine: Machine, offset: isize, index: isize, receiver: runtime::
                 None => read_property(machine, offset, receiver, key),
             },
         },
-        _ => read_property(machine, offset, receiver, key),
+        _ => match cached_primitive_property_prototype(machine, receiver) {
+            Some(prototype) => match runtime::property_access_cache(machine.heap, prototype, key) {
+                Some(cache) => {
+                    let cache_ref = Ref::new(cache);
+                    machine.function.set_field_cache(offset, cache_ref);
+                    match cache_ref.get().read_own(prototype) {
+                        Some(value) => Result::Ok(value),
+                        None => read_property(machine, offset, receiver, key),
+                    }
+                },
+                None => read_property(machine, offset, receiver, key),
+            },
+            None => read_property(machine, offset, receiver, key),
+        },
     }
 }
 
@@ -5069,6 +5104,21 @@ fn push_enumerable_property(machine: Machine, offset: isize) -> Result[(), VmErr
             return Result::Ok(())
         },
     };
+    match string_property_index(key) {
+        Some(index) => match machine.heap.get(object) {
+            Some(target) => match target.own_array_index(index) {
+                Some(descriptor) => {
+                    machine.stack.push(
+                        runtime::Value::Bool(runtime::descriptor_enumerable(descriptor)),
+                    );
+                    return Result::Ok(())
+                },
+                None => (),
+            },
+            None => (),
+        },
+        None => (),
+    }
     machine.stack.push(runtime::Value::Bool(enumerable_property(machine, offset, object, key)?));
     Result::Ok(())
 }
@@ -5250,21 +5300,56 @@ fn advance_iterator_direct(machine: Machine, offset: isize) -> Result[(), VmErro
             runtime::Value::Object(iterator_object),
             runtime::Value::Object(next_object),
             Some(fast_next_object),
-        ) => if next_object == fast_next_object
-            && machine.iterators.array_states.get(iterator_object).is_some() {
-            match machine.iterators.array_fast_next.get() {
-                Some(callback) => {
-                    match callback(iterator, machine.depth + 1)? {
-                        IteratorStep::Value(value) => {
-                            machine.stack.push(value);
-                            machine.stack.push(runtime::Value::Bool(false));
-                        },
-                        IteratorStep::Done => {
-                            machine.stack.push(runtime::Value::Undefined);
-                            machine.stack.push(runtime::Value::Bool(true));
-                        },
+        ) => if next_object == fast_next_object {
+            match machine.iterators.array_states.get(iterator_object) {
+                Some(state) => {
+                    if state.kind == 1 && !state.done.get() {
+                        match state.iterable {
+                            runtime::Value::Object(array_object) => match machine.heap.get(
+                                array_object,
+                            ) {
+                                Some(array) => match array.array_length_state() {
+                                    Some((length, _)) => {
+                                        let current = state.index.get();
+                                        if current >= length {
+                                            state.done.set(true);
+                                            machine.stack.push(runtime::Value::Undefined);
+                                            machine.stack.push(runtime::Value::Bool(true));
+                                            return Result::Ok(())
+                                        }
+                                        match array.own_array_index_value(current) {
+                                            Some(value) => {
+                                                state.index.set(current + 1);
+                                                machine.stack.push(value);
+                                                machine.stack.push(runtime::Value::Bool(false));
+                                                return Result::Ok(())
+                                            },
+                                            None => (),
+                                        }
+                                    },
+                                    None => (),
+                                },
+                                None => (),
+                            },
+                            _ => (),
+                        }
                     }
-                    return Result::Ok(())
+                    match machine.iterators.array_fast_next.get() {
+                        Some(callback) => {
+                            match callback(iterator, machine.depth + 1)? {
+                                IteratorStep::Value(value) => {
+                                    machine.stack.push(value);
+                                    machine.stack.push(runtime::Value::Bool(false));
+                                },
+                                IteratorStep::Done => {
+                                    machine.stack.push(runtime::Value::Undefined);
+                                    machine.stack.push(runtime::Value::Bool(true));
+                                },
+                            }
+                            return Result::Ok(())
+                        },
+                        None => (),
+                    }
                 },
                 None => (),
             }
@@ -8805,6 +8890,26 @@ fn invoke_native_callable(
     }
 }
 
+fn invoke_vm_callable(
+    machine: Machine,
+    offset: isize,
+    callback: VmCallable,
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+) -> Result[runtime::Value, VmError] {
+    if machine.depth >= MAX_CALL_DEPTH {
+        return Result::Err(error(offset, VmErrorKind::CallDepthExceeded))
+    }
+    match callback(this_value, arguments, machine.depth) {
+        Ok(value) => Result::Ok(ensure_error_stack(machine, value, offset)),
+        Err(VmError { offset: inner_offset, kind }) => if inner_offset < 0 {
+            Result::Err(error(offset, kind))
+        } else {
+            Result::Err(VmError { offset: inner_offset, kind })
+        },
+    }
+}
+
 fn cached_native_function(machine: Machine, offset: isize, callee: runtime::Value) -> Option[
     NativeFunction,
 ] {
@@ -8822,6 +8927,29 @@ fn cached_native_function(machine: Machine, offset: isize, callee: runtime::Valu
         None => (),
     }
     match machine.native_functions.get(object) {
+        Some(function) => {
+            machine.function.set_native_call_cache(offset, object);
+            Option::Some(function)
+        },
+        None => Option::None,
+    }
+}
+
+fn cached_vm_function(machine: Machine, offset: isize, callee: runtime::Value) -> Option[VmCallable] {
+    let object = match callee {
+        runtime::Value::Object(value) => value,
+        _ => return Option::None,
+    };
+    if !machine.heap.contains(object) {
+        return Option::None
+    }
+    match machine.function.native_call_cache(offset) {
+        Some(cached) => if cached == object {
+            return machine.vm_functions.get(object)
+        },
+        None => (),
+    }
+    match machine.vm_functions.get(object) {
         Some(function) => {
             machine.function.set_native_call_cache(offset, object);
             Option::Some(function)
@@ -9198,7 +9326,12 @@ fn construct_regexp_literal(
         Err(value) => return Result::Err(error(offset, VmErrorKind::TypeError(value.message))),
     };
     let arguments = Vec::from_array([pattern, flags]);
-    match callback(receiver, arguments, Option::Some(prototype), constructor, machine.depth) {
+    let result = with_machine_roots(
+        machine,
+        Vec::from_array([runtime::Value::Object(receiver)]),
+        || callback(receiver, arguments, Option::Some(prototype), constructor, machine.depth),
+    );
+    match result {
         Ok(runtime::Value::Object(value)) => {
             Result::Ok(ensure_error_stack(machine, runtime::Value::Object(value), offset))
         },
@@ -9272,6 +9405,11 @@ fn push_call(machine: Machine, offset: isize, argument_count: isize, method: boo
     let argument_start = callee_index + 1;
     let callee = machine.stack[callee_index];
     let native_function = cached_native_function(machine, offset, callee);
+    let vm_function = if native_function.is_some() {
+        Option::None
+    } else {
+        cached_vm_function(machine, offset, callee)
+    };
     let reusable_arguments = match native_function {
         Some(function) => function.reusable_arguments,
         None => false,
@@ -9297,15 +9435,18 @@ fn push_call(machine: Machine, offset: isize, argument_count: isize, method: boo
         Some(function) => {
             invoke_native_callable(machine, offset, function.callback, this_value, arguments)
         },
-        None => call_value_with_mode_rooted(
-            machine,
-            offset,
-            callee,
-            arguments,
-            this_value,
-            false,
-            Option::None,
-        ),
+        None => match vm_function {
+            Some(callback) => invoke_vm_callable(machine, offset, callback, this_value, arguments),
+            None => call_value_with_mode_rooted(
+                machine,
+                offset,
+                callee,
+                arguments,
+                this_value,
+                false,
+                Option::None,
+            ),
+        },
     };
     if reusable_arguments {
         machine.native_argument_buffer.truncate(0)
@@ -10490,7 +10631,20 @@ fn fast_add_local(machine: Machine, index: isize) -> bool {
     true
 }
 
-fn fast_numeric_step(machine: Machine, instruction: bytecode::Instruction) -> bool {
+fn cached_string_number(machine: Machine, offset: isize, value: runtime::JsString) -> f64 {
+    match machine.function.numeric_string_cache(offset, value) {
+        Some(number) => number,
+        None => {
+            let number = runtime::primitive_to_number(runtime::Value::String(value)).unwrap_or(
+                runtime::primitive_to_number(runtime::Value::Undefined).unwrap_or(0.0),
+            );
+            machine.function.set_numeric_string_cache(offset, value, number);
+            number
+        },
+    }
+}
+
+fn fast_numeric_step(machine: Machine, offset: isize, instruction: bytecode::Instruction) -> bool {
     let right = pop_verified(machine);
     let left = pop_verified(machine);
     match instruction {
@@ -10559,6 +10713,34 @@ fn fast_numeric_step(machine: Machine, instruction: bytecode::Instruction) -> bo
             },
             (runtime::Value::Float(left), runtime::Value::Int(right)) => {
                 machine.stack.push(runtime::Value::Float(left - runtime::int_to_number(right)));
+                true
+            },
+            (runtime::Value::Int(left), runtime::Value::String(right)) => {
+                machine.stack.push(
+                    runtime::Value::Float(
+                        runtime::int_to_number(left) - cached_string_number(machine, offset, right),
+                    ),
+                );
+                true
+            },
+            (runtime::Value::Float(left), runtime::Value::String(right)) => {
+                machine.stack.push(
+                    runtime::Value::Float(left - cached_string_number(machine, offset, right)),
+                );
+                true
+            },
+            (runtime::Value::String(left), runtime::Value::Int(right)) => {
+                machine.stack.push(
+                    runtime::Value::Float(
+                        cached_string_number(machine, offset, left) - runtime::int_to_number(right),
+                    ),
+                );
+                true
+            },
+            (runtime::Value::String(left), runtime::Value::Float(right)) => {
+                machine.stack.push(
+                    runtime::Value::Float(cached_string_number(machine, offset, left) - right),
+                );
                 true
             },
             _ => {
@@ -10777,6 +10959,12 @@ fn fast_numeric_step(machine: Machine, instruction: bytecode::Instruction) -> bo
                 ) | (runtime::Value::Float(_), runtime::Value::Int(_)) | (
                     runtime::Value::Float(_),
                     runtime::Value::Float(_),
+                ) | (runtime::Value::String(_), runtime::Value::Int(_)) | (
+                    runtime::Value::String(_),
+                    runtime::Value::Float(_),
+                ) | (runtime::Value::Int(_), runtime::Value::String(_)) | (
+                    runtime::Value::Float(_),
+                    runtime::Value::String(_),
                 ) => true,
                 _ => false,
             };
@@ -10785,8 +10973,18 @@ fn fast_numeric_step(machine: Machine, instruction: bytecode::Instruction) -> bo
                 machine.stack.push(right);
                 return false
             }
-            let left_i32 = fast_to_i32(left);
-            let right_i32 = fast_to_i32(right);
+            let left_i32 = match left {
+                runtime::Value::String(value) => to_i32(
+                    cached_string_number(machine, offset, value),
+                ),
+                _ => fast_to_i32(left),
+            };
+            let right_i32 = match right {
+                runtime::Value::String(value) => to_i32(
+                    cached_string_number(machine, offset, value),
+                ),
+                _ => fast_to_i32(right),
+            };
             let result = match instruction {
                 bytecode::Instruction::BitAnd => left_i32 & right_i32,
                 bytecode::Instruction::BitXor => left_i32 ^ right_i32,
@@ -10883,7 +11081,7 @@ fn fast_global_step(machine: Machine, offset: isize, instruction: bytecode::Inst
     };
     if write {
         let value = pop_verified(machine);
-        if cache.get().write(machine.heap, object, value) {
+        if cache.get().write_own(object, value) {
             machine.stack.push(value);
             true
         } else {
@@ -10891,13 +11089,50 @@ fn fast_global_step(machine: Machine, offset: isize, instruction: bytecode::Inst
             false
         }
     } else {
-        match cache.get().read(machine.heap, object) {
+        match cache.get().read_own(object) {
             Some(value) => {
                 machine.stack.push(value);
                 true
             },
             None => false,
         }
+    }
+}
+
+fn fast_argument_element(machine: Machine, offset: isize, name_index: isize, depth: isize) -> Option[
+    runtime::Value,
+] {
+    if machine.arguments_binding_initialized.get() || machine.arguments_object.get().is_some()
+        || offset + 2 >= machine.function.code_len() {
+        return Option::None
+    }
+    let argument_index = match machine.function.instruction_unchecked(offset + 1) {
+        bytecode::Instruction::PushI32(value) => value.to_isize(),
+        _ => return Option::None,
+    };
+    if argument_index < 0
+        || machine.function.instruction_unchecked(offset + 2) != bytecode::Instruction::GetArrayEl {
+        return Option::None
+    }
+    if depth > 0 {
+        let name = match eval_name(machine, offset, name_index) {
+            Ok(value) => value,
+            Err(_) => return Option::None,
+        };
+        if eval_environment_cell_with_depth(machine.eval_environment.get(), name, depth).is_some() {
+            return Option::None
+        }
+    }
+    if argument_index >= machine.arguments.len() {
+        return Option::Some(runtime::Value::Undefined)
+    }
+    match machine.function.argument_local(argument_index) {
+        Some(local) => if local >= 0 && local < machine.locals.len() {
+            Option::Some(machine.locals[local].get())
+        } else {
+            Option::None
+        },
+        None => Option::Some(machine.arguments[argument_index]),
     }
 }
 
@@ -11164,7 +11399,7 @@ fn execute_machine_from(machine: Machine, start: isize) -> Result[ExecutionResul
                     offset,
                     index,
                 ) {
-                    Some((object, cache)) => match cache.get().read(machine.heap, object) {
+                    Some((object, cache)) => match cache.get().read_own(object) {
                         Some(value) => {
                             machine.stack.push(value);
                             offset += 1;
@@ -11241,8 +11476,33 @@ fn execute_machine_from(machine: Machine, start: isize) -> Result[ExecutionResul
                         },
                     }
                 },
-                Some(ResolvedEvalBinding::GlobalObject) | None => {
-                    match step(machine, offset, instruction) {
+                Some(ResolvedEvalBinding::GlobalObject) => match global_field_cache(
+                    machine,
+                    function,
+                    offset,
+                    index,
+                ) {
+                    Some((object, cache)) => {
+                        let value = pop_verified(machine);
+                        if cache.get().write_own(object, value) {
+                            machine.stack.push(value);
+                            offset += 1;
+                        } else {
+                            machine.stack.push(value);
+                            match step(machine, offset, instruction) {
+                                Ok(next) => {
+                                    offset = next;
+                                },
+                                Err(value) => match recover_execution_error(machine, offset, value) {
+                                    Ok(target) => {
+                                        offset = target;
+                                    },
+                                    Err(value) => return Result::Err(value),
+                                },
+                            }
+                        }
+                    },
+                    None => match step(machine, offset, instruction) {
                         Ok(next) => {
                             offset = next;
                         },
@@ -11252,7 +11512,40 @@ fn execute_machine_from(machine: Machine, start: isize) -> Result[ExecutionResul
                             },
                             Err(value) => return Result::Err(value),
                         },
-                    }
+                    },
+                },
+                None => match step(machine, offset, instruction) {
+                    Ok(next) => {
+                        offset = next;
+                    },
+                    Err(value) => match recover_execution_error(machine, offset, value) {
+                        Ok(target) => {
+                            offset = target;
+                        },
+                        Err(value) => return Result::Err(value),
+                    },
+                },
+            },
+            bytecode::Instruction::GetEvalOrArguments(index, depth) => match fast_argument_element(
+                machine,
+                offset,
+                index,
+                depth,
+            ) {
+                Some(value) => {
+                    machine.stack.push(value);
+                    offset += 3;
+                },
+                None => match step(machine, offset, instruction) {
+                    Ok(next) => {
+                        offset = next;
+                    },
+                    Err(value) => match recover_execution_error(machine, offset, value) {
+                        Ok(target) => {
+                            offset = target;
+                        },
+                        Err(value) => return Result::Err(value),
+                    },
                 },
             },
             bytecode::Instruction::Mul | bytecode::Instruction::Div | bytecode::Instruction::Mod | bytecode::Instruction::Add | bytecode::Instruction::Sub | bytecode::Instruction::Lt | bytecode::Instruction::Lte | bytecode::Instruction::Gt | bytecode::Instruction::Gte | bytecode::Instruction::Eq | bytecode::Instruction::Neq | bytecode::Instruction::StrictEq | bytecode::Instruction::StrictNeq | bytecode::Instruction::BitAnd | bytecode::Instruction::BitXor | bytecode::Instruction::BitOr | bytecode::Instruction::Shl | bytecode::Instruction::Sar | bytecode::Instruction::Shr | bytecode::Instruction::PreIncrement | bytecode::Instruction::PostIncrement | bytecode::Instruction::PreDecrement | bytecode::Instruction::PostDecrement | bytecode::Instruction::GetGlobal(_) | bytecode::Instruction::SetGlobal(_) | bytecode::Instruction::PutArrayEl | bytecode::Instruction::PutArrayElStrict => if match instruction {
@@ -11265,7 +11558,7 @@ fn execute_machine_from(machine: Machine, start: isize) -> Result[ExecutionResul
                 bytecode::Instruction::PreIncrement | bytecode::Instruction::PostIncrement | bytecode::Instruction::PreDecrement | bytecode::Instruction::PostDecrement => {
                     fast_update_step(machine, instruction)
                 },
-                _ => fast_numeric_step(machine, instruction),
+                _ => fast_numeric_step(machine, offset, instruction),
             } {
                 offset += 1;
             } else {
