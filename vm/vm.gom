@@ -509,7 +509,7 @@ pub enum GeneratorCompletion {
 struct Machine {
     function: bytecode::Function,
     heap: runtime::Heap,
-    functions: HashMap[runtime::ObjectId, Closure],
+    functions: HashMap[runtime::ObjectId, Ref[Closure]],
     bound_functions: HashMap[runtime::ObjectId, BoundFunction],
     function_objects: HashMap[u64, runtime::ObjectId],
     template_objects: HashMap[u64, runtime::ObjectId],
@@ -551,7 +551,7 @@ struct Machine {
 
 pub struct Context {
     heap_value: runtime::Heap,
-    functions_value: HashMap[runtime::ObjectId, Closure],
+    functions_value: HashMap[runtime::ObjectId, Ref[Closure]],
     bound_functions_value: HashMap[runtime::ObjectId, BoundFunction],
     function_objects_value: HashMap[u64, runtime::ObjectId],
     template_objects_value: HashMap[u64, runtime::ObjectId],
@@ -959,7 +959,8 @@ impl Context {
         for generator in self.generators_value.async_roots.to_vec() {
             roots.push(runtime::Value::Object(generator))
         }
-        for (owner, closure) in self.functions_value.entries() {
+        for (owner, closure_ref) in self.functions_value.entries() {
+            let closure = closure_ref.get();
             let values: Vec[runtime::Value] = Vec::new();
             push_upvalue_roots(values, closure.upvalues);
             push_optional_object_root(values, closure.home_object.get());
@@ -2848,7 +2849,7 @@ pub fn is_constructor(self: Context, value: runtime::Value) -> bool {
         }
     }
     match self.functions_value.get(object) {
-        Some(value) => value.function.get().constructable(),
+        Some(value) => value.get().function.get().constructable(),
         None => self.native_constructors_value.contains(object),
     }
 }
@@ -2856,7 +2857,7 @@ pub fn is_constructor(self: Context, value: runtime::Value) -> bool {
 pub fn function_source(self: Context, value: runtime::Value) -> Option[runtime::JsString] {
     match value {
         runtime::Value::Object(object) => match self.functions_value.get(object) {
-            Some(closure) => closure.function.get().source_text(),
+            Some(closure) => closure.get().function.get().source_text(),
             None => Option::None,
         },
         _ => Option::None,
@@ -2893,7 +2894,7 @@ pub fn native_function_name(self: Context, value: runtime::Value) -> Option[runt
 pub fn function_source_name(self: Context, value: runtime::Value) -> Option[runtime::JsString] {
     match value {
         runtime::Value::Object(object) => match self.functions_value.get(object) {
-            Some(closure) => closure.function.get().source_name(),
+            Some(closure) => closure.get().function.get().source_name(),
             None => Option::None,
         },
         _ => Option::None,
@@ -2905,7 +2906,7 @@ pub fn function_definition_location(self: Context, value: runtime::Value) -> Opt
 ] {
     match value {
         runtime::Value::Object(object) => match self.functions_value.get(object) {
-            Some(closure) => closure.function.get().definition_location(),
+            Some(closure) => closure.get().function.get().definition_location(),
             None => Option::None,
         },
         _ => Option::None,
@@ -3018,26 +3019,29 @@ fn materialize_function(
                 upvalues.push(cell);
                 index += 1;
             }
-            machine.functions[object] = Closure {
-                function,
-                upvalues,
-                home_object: Ref::new(
-                    if function.get().inherit_home_object() {
-                        machine.home_object
+            machine.functions[object] = Ref::new(
+                Closure {
+                    function,
+                    upvalues,
+                    home_object: Ref::new(
+                        if function.get().inherit_home_object() {
+                            machine.home_object
+                        } else {
+                            Option::None
+                        },
+                    ),
+                    constructor_home: function.get().class_constructor()
+                        || (function.get().inherit_home_object()
+                            && current_constructor_home(machine)),
+                    new_target: if function.get().lexical_this() {
+                        machine.new_target
                     } else {
                         Option::None
                     },
-                ),
-                constructor_home: function.get().class_constructor()
-                    || (function.get().inherit_home_object() && current_constructor_home(machine)),
-                new_target: if function.get().lexical_this() {
-                    machine.new_target
-                } else {
-                    Option::None
+                    instance_initializer: Ref::new(Option::None),
+                    eval_environment: machine.eval_environment.get(),
                 },
-                instance_initializer: Ref::new(Option::None),
-                eval_environment: machine.eval_environment.get(),
-            };
+            );
             if !runtime::define_own_property(
                 machine.heap,
                 object,
@@ -4034,7 +4038,7 @@ fn restricted_legacy_caller(machine: Machine, value: runtime::Value) -> bool {
     };
     match machine.functions.get(object) {
         Some(closure) => {
-            let function = closure.function.get();
+            let function = closure.get().function.get();
             function.strict() || function.generator() || function.asynchronous()
         },
         None => false,
@@ -4089,7 +4093,7 @@ fn read_object_property(
     if legacy_function_property {
         match (machine.heap.get(object), machine.functions.get(object)) {
             (Some(value), Some(closure)) => {
-                let function = closure.function.get();
+                let function = closure.get().function.get();
                 if value.own_property(key).is_none()
                     && value.prototype() == machine.heap.function_prototype()
                     && function.constructable()
@@ -5473,7 +5477,7 @@ fn define_accessor_property_with_key(
     if !enumerable {
         match accessor {
             runtime::Value::Object(value) => match machine.functions.get(value) {
-                Some(closure) => closure.home_object.set(Option::Some(target)),
+                Some(closure) => closure.get().home_object.set(Option::Some(target)),
                 None => (),
             },
             _ => (),
@@ -5610,7 +5614,7 @@ fn define_class_element_with_key(
         }
         match method {
             runtime::Value::Object(value) => match machine.functions.get(value) {
-                Some(closure) => closure.home_object.set(Option::Some(target)),
+                Some(closure) => closure.get().home_object.set(Option::Some(target)),
                 None => (),
             },
             _ => (),
@@ -5706,7 +5710,7 @@ fn callable_constructor(machine: Machine, object: runtime::ObjectId) -> bool {
         false
     } else {
         match machine.functions.get(object) {
-            Some(closure) => closure.function.get().constructable(),
+            Some(closure) => closure.get().function.get().constructable(),
             None => if machine.native_constructors.contains(object) {
                 true
             } else {
@@ -5742,7 +5746,7 @@ fn set_class_heritage(machine: Machine, offset: isize, derived: bool) -> Result[
         ),
     };
     match machine.functions.get(class) {
-        Some(closure) => closure.home_object.set(Option::Some(class)),
+        Some(closure) => closure.get().home_object.set(Option::Some(class)),
         None => {
             return Result::Err(
                 error(offset, VmErrorKind::TypeError("class constructor is not a source function")),
@@ -5825,7 +5829,7 @@ fn source_function_closure(machine: Machine, offset: isize, value: runtime::Valu
 ] {
     match value {
         runtime::Value::Object(object) => match machine.functions.get(object) {
-            Some(closure) => Result::Ok(closure),
+            Some(closure) => Result::Ok(closure.get()),
             None => Result::Err(
                 error(offset, VmErrorKind::TypeError("value is not a source function")),
             ),
@@ -5872,7 +5876,7 @@ fn set_class_instance_initializer(machine: Machine, offset: isize) -> Result[(),
     initializer_closure.home_object.set(Option::Some(home));
     match machine.functions.get(class) {
         Some(closure) => {
-            closure.instance_initializer.set(Option::Some(initializer_object));
+            closure.get().instance_initializer.set(Option::Some(initializer_object));
             Result::Ok(())
         },
         None => Result::Err(
@@ -7818,7 +7822,7 @@ fn current_constructor_home(machine: Machine) -> bool {
     } else {
         match machine.callee {
             Some(runtime::Value::Object(object)) => match machine.functions.get(object) {
-                Some(closure) => closure.constructor_home,
+                Some(closure) => closure.get().constructor_home,
                 None => false,
             },
             _ => false,
@@ -8497,6 +8501,7 @@ fn call_value_with_mode_rooted(
             }
             match machine.functions.get(object) {
                 Some(closure) => {
+                    let closure = closure.get();
                     let function = closure.function.get();
                     if function.class_constructor() && !constructing {
                         return Result::Err(
@@ -8874,7 +8879,7 @@ fn construct_prepared_value_with_new_target(
         },
     };
     let derived = match machine.functions.get(object) {
-        Some(closure) => closure.function.get().derived_constructor(),
+        Some(closure) => closure.get().function.get().derived_constructor(),
         None => false,
     };
     let receiver = if derived {
@@ -8989,13 +8994,13 @@ fn construct_value_with_new_target_rooted(
     }
     let source_function = machine.functions.get(object);
     let source_constructable = match source_function {
-        Some(closure) => closure.function.get().constructable(),
+        Some(closure) => closure.get().function.get().constructable(),
         None => false,
     };
     if !machine.heap.contains(object) || !object.is_callable()
         || !source_constructable && !machine.native_constructors.contains(object) {
         let message = match source_function {
-            Some(closure) => match closure.function.get().name() {
+            Some(closure) => match closure.get().function.get().name() {
                 Some(name) => host_string(name) + " is not a constructor",
                 None => "value is not a constructor",
             },
@@ -10034,10 +10039,34 @@ fn step(machine: Machine, offset: isize, instruction: bytecode::Instruction) -> 
     Result::Ok(next)
 }
 
+const MAX_POOLED_STACKS: isize = 64;
+
+fn take_stack_pooled(heap: runtime::Heap, capacity: isize) -> Vec[runtime::Value] {
+    let pool = heap.stack_pool();
+    if pool.get().len() > 0 {
+        let stack = match pool.get().pop() {
+            Some(value) => value,
+            None => return Vec::with_capacity(capacity),
+        };
+        if stack.capacity() >= capacity {
+            return stack
+        }
+    }
+    Vec::with_capacity(capacity)
+}
+
+fn return_stack_pooled(heap: runtime::Heap, stack: Vec[runtime::Value]) -> () {
+    stack.truncate(0);
+    let pool = heap.stack_pool();
+    if pool.get().len() < MAX_POOLED_STACKS {
+        pool.get().push(stack)
+    }
+}
+
 fn execute_initialized(
     function: bytecode::Function,
     heap: runtime::Heap,
-    functions: HashMap[runtime::ObjectId, Closure],
+    functions: HashMap[runtime::ObjectId, Ref[Closure]],
     bound_functions: HashMap[runtime::ObjectId, BoundFunction],
     function_objects: HashMap[u64, runtime::ObjectId],
     template_objects: HashMap[u64, runtime::ObjectId],
@@ -10075,7 +10104,7 @@ fn execute_initialized(
     if !verification.errors.is_empty() {
         return Result::Err(error(-1, VmErrorKind::VerificationFailed(verification.errors)))
     }
-    let stack = function.take_stack(verification.max_stack);
+    let stack = take_stack_pooled(heap, verification.max_stack);
     let arguments_object = Ref::new(Option::None);
     let arguments_binding = Ref::new(runtime::Value::Undefined);
     let arguments_binding_initialized = Ref::new(false);
@@ -10143,7 +10172,7 @@ fn execute_initialized(
     };
     let result = execute_machine(machine);
     let _ = active_frames.pop();
-    function.return_stack(stack);
+    return_stack_pooled(heap, stack);
     result
 }
 
