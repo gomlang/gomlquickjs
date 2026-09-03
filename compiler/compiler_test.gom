@@ -788,6 +788,16 @@ fn builtin_array_and_string_iterators_return_protocol_objects() -> () {
 }
 
 #[test]
+fn for_of_builtin_array_fast_path_preserves_live_and_overridden_next_semantics() -> () {
+    match execute_source_with_builtins(
+        "let values = [1, , 3]; let seen = []; for (let value of values) { seen.push(value); if (seen.length === 1) values.push(4); } let iterator = [5, 6][Symbol.iterator](); let builtinNext = iterator.next; let calls = 0; iterator.next = function() { calls += 1; return builtinNext.call(this); }; iterator[Symbol.iterator] = function() { return this; }; let wrapped = []; for (let value of iterator) wrapped.push(value); return seen.length === 4 && seen[0] === 1 && seen[1] === undefined && seen[2] === 3 && seen[3] === 4 && wrapped.join(',') === '5,6' && calls === 3;",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected builtin array for-of semantics"),
+    }
+}
+
+#[test]
 fn array_keys_and_entries_iterators_follow_live_index_semantics() -> () {
     match execute_source_with_builtins(
         "let array = [10, , 30]; let keys = array.keys(); let firstKey = keys.next(); array.push(40); let restKeys = []; for (let key of keys) restKeys.push(key); let entries = []; for (let entry of array.entries()) entries.push(entry[0] + ':' + entry[1]); let hole = array.entries(); hole.next(); let second = hole.next(); return firstKey.value === 0 && !firstKey.done && restKeys.join(',') === '1,2,3' && entries.join('|') === '0:10|1:undefined|2:30|3:40' && second.value[0] === 1 && second.value[1] === undefined && keys[Symbol.iterator]() === keys;",
