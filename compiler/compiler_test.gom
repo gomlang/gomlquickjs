@@ -2590,6 +2590,16 @@ fn regexp_replace_fast_path_preserves_exec_overrides() -> () {
 }
 
 #[test]
+fn regexp_replace_fast_path_preserves_flag_getter_overrides() -> () {
+    match execute_source_with_builtins(
+        "let own = /a/g; let ownCalls = 0; Object.defineProperty(own, 'global', {configurable: true, get() { ownCalls += 1; return true; }}); let ownResult = 'aba'.replace(own, 'x'); let globalDescriptor = Object.getOwnPropertyDescriptor(RegExp.prototype, 'global'); let prototypeCalls = 0; Object.defineProperty(RegExp.prototype, 'global', {configurable: true, get() { prototypeCalls += 1; return globalDescriptor.get.call(this); }}); let prototypeResult = 'aba'.replace(/a/g, 'y'); Object.defineProperty(RegExp.prototype, 'global', globalDescriptor); let flagsDescriptor = Object.getOwnPropertyDescriptor(RegExp.prototype, 'flags'); let flagsCalls = 0; Object.defineProperty(RegExp.prototype, 'flags', {configurable: true, get() { flagsCalls += 1; return flagsDescriptor.get.call(this); }}); let flagsResult = 'aba'.replace(/a/g, 'z'); Object.defineProperty(RegExp.prototype, 'flags', flagsDescriptor); return ownResult === 'xbx' && ownCalls === 1 && prototypeResult === 'yby' && prototypeCalls === 1 && flagsResult === 'zbz' && flagsCalls === 1;",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected regexp flag getter overrides"),
+    }
+}
+
+#[test]
 fn regexp_plain_replace_fast_path_preserves_empty_sticky_and_substitution_semantics() -> () {
     match execute_source_with_builtins(
         "let empty = /(?:)/gu; empty.lastIndex = 9; let emptyResult = '😀'.replace(empty, 'x'); let sticky = /a/gy; sticky.lastIndex = 7; let stickyResult = 'aba'.replace(sticky, 'x'); let missing = /z/g; missing.lastIndex = 3; let missingResult = 'aba'.replace(missing, 'x'); let substitution = 'aba'.replace(/a/g, '$&$&'); let make = () => /a/g; let first = make(); let second = make(); return emptyResult === 'x😀x' && empty.lastIndex === 0 && stickyResult === 'xba' && sticky.lastIndex === 0 && missingResult === 'aba' && missing.lastIndex === 0 && substitution === 'aabaa' && first !== second && Object.getPrototypeOf(first) === RegExp.prototype;",
