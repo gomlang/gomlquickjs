@@ -317,9 +317,10 @@ pub struct Function {
     source_name_value: Ref[Option[runtime::JsString]],
     source_text_value: Ref[Option[runtime::JsString]],
     verification_max_stack_value: Ref[Option[isize]],
-    field_caches_value: Ref[Vec[Option[runtime::PropertyAccessCache]]],
+    field_caches_value: Ref[Vec[Option[Ref[runtime::PropertyAccessCache]]]],
     native_call_caches_value: Ref[Vec[Option[runtime::ObjectId]]],
     stack_cache_value: Ref[Option[Vec[runtime::Value]]],
+    eval_binding_cache_value: Ref[runtime::EvalBindingCache],
 }
 
 impl Function {
@@ -463,7 +464,9 @@ impl Function {
         inherit_home_object: bool,
         lexical_this: bool,
     ) -> Function {
-        let field_caches: Vec[Option[runtime::PropertyAccessCache]] = Vec::with_capacity(code.len());
+        let field_caches: Vec[Option[Ref[runtime::PropertyAccessCache]]] = Vec::with_capacity(
+            code.len(),
+        );
         let native_call_caches: Vec[Option[runtime::ObjectId]] = Vec::with_capacity(code.len());
         for _ in 0..code.len() {
             field_caches.push(Option::None);
@@ -500,10 +503,11 @@ impl Function {
             field_caches_value: Ref::new(field_caches),
             native_call_caches_value: Ref::new(native_call_caches),
             stack_cache_value: Ref::new(Option::None),
+            eval_binding_cache_value: Ref::new(runtime::EvalBindingCache::new()),
         }
     }
 
-    pub fn field_cache(self: Function, offset: isize) -> Option[runtime::PropertyAccessCache] {
+    pub fn field_cache(self: Function, offset: isize) -> Option[Ref[runtime::PropertyAccessCache]] {
         if offset < 0 || offset >= self.field_caches_value.get().len() {
             Option::None
         } else {
@@ -511,7 +515,7 @@ impl Function {
         }
     }
 
-    pub fn set_field_cache(self: Function, offset: isize, cache: runtime::PropertyAccessCache) -> () {
+    pub fn set_field_cache(self: Function, offset: isize, cache: Ref[runtime::PropertyAccessCache]) -> () {
         if offset >= 0 && offset < self.field_caches_value.get().len() {
             self.field_caches_value.get()[offset] = Option::Some(cache);
         }
@@ -550,6 +554,10 @@ impl Function {
         if self.stack_cache_value.get().is_none() {
             self.stack_cache_value.set(Option::Some(stack))
         }
+    }
+
+    pub fn eval_binding_cache(self: Function) -> Ref[runtime::EvalBindingCache] {
+        self.eval_binding_cache_value
     }
 
     pub fn set_name(self: Function, name: runtime::JsString) -> () {

@@ -98,6 +98,16 @@ fn length_descriptor(heap: runtime::Heap, array: runtime::ObjectId) -> Result[
 }
 
 pub fn length(heap: runtime::Heap, array: runtime::ObjectId) -> Result[isize, ArrayError] {
+    match heap.get(array) {
+        Some(object) => match object.array_length_state() {
+            Some((value, _)) => Result::Ok(value),
+            None => length_slow(heap, array),
+        },
+        None => length_slow(heap, array),
+    }
+}
+
+fn length_slow(heap: runtime::Heap, array: runtime::ObjectId) -> Result[isize, ArrayError] {
     match runtime::descriptor_value(length_descriptor(heap, array)?) {
         Some(runtime::Value::Int(value)) => if value >= 0 {
             Result::Ok(value.to_isize())
@@ -116,10 +126,28 @@ pub fn length(heap: runtime::Heap, array: runtime::ObjectId) -> Result[isize, Ar
 }
 
 fn require_writable_length(heap: runtime::Heap, array: runtime::ObjectId) -> Result[(), ArrayError] {
-    if runtime::descriptor_writable(length_descriptor(heap, array)?) {
-        Result::Ok(())
-    } else {
-        Result::Err(ArrayError::LengthNotWritable)
+    match heap.get(array) {
+        Some(object) => match object.array_length_state() {
+            Some((_, writable)) => if writable {
+                Result::Ok(())
+            } else {
+                Result::Err(ArrayError::LengthNotWritable)
+            },
+            None => {
+                if runtime::descriptor_writable(length_descriptor(heap, array)?) {
+                    Result::Ok(())
+                } else {
+                    Result::Err(ArrayError::LengthNotWritable)
+                }
+            },
+        },
+        None => {
+            if runtime::descriptor_writable(length_descriptor(heap, array)?) {
+                Result::Ok(())
+            } else {
+                Result::Err(ArrayError::LengthNotWritable)
+            }
+        },
     }
 }
 
@@ -171,6 +199,15 @@ fn read_index(heap: runtime::Heap, array: runtime::ObjectId, index: isize) -> Re
     ArraySlot,
     ArrayError,
 ] {
+    if index >= 0 && index <= 4294967294 {
+        match heap.get(array) {
+            Some(object) => match object.own_array_index_value(index) {
+                Some(value) => return Result::Ok(ArraySlot::Value(value)),
+                None => (),
+            },
+            None => return Result::Err(ArrayError::InvalidObject),
+        }
+    }
     match runtime::get_property(heap, array, index_key(index)) {
         Ok(Some(value)) => Result::Ok(ArraySlot::Value(value)),
         Ok(None) => Result::Ok(ArraySlot::Hole),
@@ -182,6 +219,18 @@ fn write_index(heap: runtime::Heap, array: runtime::ObjectId, index: isize, valu
     (),
     ArrayError,
 ] {
+    if index >= 0 && index <= 4294967294 {
+        match heap.get(array) {
+            Some(object) => match object.write_array_index(index, value) {
+                runtime::ArrayIndexWriteResult::Written => return Result::Ok(()),
+                runtime::ArrayIndexWriteResult::ReadOnly => {
+                    return Result::Err(ArrayError::CannotWrite(index))
+                },
+                runtime::ArrayIndexWriteResult::Unhandled => (),
+            },
+            None => return Result::Err(ArrayError::InvalidObject),
+        }
+    }
     let object = checked_array(heap, array)?;
     let key = index_key(index);
     let descriptor = match object.own_property(key) {
@@ -509,11 +558,29 @@ pub fn push(heap: runtime::Heap, array: runtime::ObjectId, values: Vec[runtime::
     }
     require_writable_length(heap, array)?;
     let final_length = checked_total(size, values.len())?;
+    let mut fast = true;
     for value in values {
-        write_index(heap, array, size, value)?;
-        size += 1;
-        set_length(heap, array, size)?
+        if fast {
+            match heap.get(array) {
+                Some(object) => match object.array_append_dense(value) {
+                    runtime::ArrayIndexWriteResult::Written => {
+                        size += 1;
+                        let _ = object.set_array_length_state(size);
+                    },
+                    _ => {
+                        fast = false;
+                        write_index(heap, array, size, value)?;
+                        size += 1;
+                    },
+                },
+                None => return Result::Err(ArrayError::InvalidObject),
+            }
+        } else {
+            write_index(heap, array, size, value)?;
+            size += 1;
+        }
     }
+    set_length(heap, array, final_length)?;
     Result::Ok(final_length)
 }
 
@@ -524,11 +591,29 @@ pub fn pop(heap: runtime::Heap, array: runtime::ObjectId) -> Result[ArraySlot, A
         set_length(heap, array, 0)?;
         Result::Ok(ArraySlot::Hole)
     } else {
-        let index = size - 1;
-        let value = read_index(heap, array, index)?;
-        delete_index(heap, array, index)?;
-        set_length(heap, array, index)?;
-        Result::Ok(value)
+        match heap.get(array) {
+            Some(object) => match object.array_pop_fast(size) {
+                runtime::ArrayPopResult::Empty => Result::Ok(ArraySlot::Hole),
+                runtime::ArrayPopResult::Value(value) => {
+                    let _ = object.set_array_length_state(size - 1);
+                    Result::Ok(ArraySlot::Value(value))
+                },
+                runtime::ArrayPopResult::Slow => {
+                    let index = size - 1;
+                    let value = read_index(heap, array, index)?;
+                    delete_index(heap, array, index)?;
+                    set_length(heap, array, index)?;
+                    Result::Ok(value)
+                },
+            },
+            None => {
+                let index = size - 1;
+                let value = read_index(heap, array, index)?;
+                delete_index(heap, array, index)?;
+                set_length(heap, array, index)?;
+                Result::Ok(value)
+            },
+        }
     }
 }
 
@@ -539,6 +624,26 @@ pub fn shift(heap: runtime::Heap, array: runtime::ObjectId) -> Result[ArraySlot,
         set_length(heap, array, 0)?;
         return Result::Ok(ArraySlot::Hole)
     }
+    match heap.get(array) {
+        Some(object) => match object.array_shift_fast(size) {
+            runtime::ArrayShiftResult::Empty => {
+                set_length(heap, array, 0)?;
+                Result::Ok(ArraySlot::Hole)
+            },
+            runtime::ArrayShiftResult::Value(value) => {
+                let _ = object.set_array_length_state(size - 1);
+                Result::Ok(ArraySlot::Value(value))
+            },
+            runtime::ArrayShiftResult::Slow => shift_slow(heap, array, size),
+        },
+        None => shift_slow(heap, array, size),
+    }
+}
+
+fn shift_slow(heap: runtime::Heap, array: runtime::ObjectId, size: isize) -> Result[
+    ArraySlot,
+    ArrayError,
+] {
     let first = read_index(heap, array, 0)?;
     let mut index = 1;
     while index < size {

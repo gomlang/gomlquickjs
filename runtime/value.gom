@@ -379,20 +379,33 @@ pub fn int_to_number(value: i32) -> f64 {
     } else {
         value.to_u64()
     };
-    let mut highest_bit: u64 = 0;
-    let mut remaining = magnitude;
-    while remaining > 1 {
-        remaining >>= 1;
-        highest_bit += 1;
-    }
-    let sign = if negative {
-        1.to_u64() << 63
+    if negative {
+        -uint64_to_number(magnitude)
     } else {
-        0.to_u64()
-    };
+        uint64_to_number(magnitude)
+    }
+}
+
+pub fn uint64_to_number(magnitude: u64) -> f64 {
+    if magnitude == 0 {
+        return 0.0
+    }
+    let mut highest_bit: u64 = 0;
+    let mut remaining: u64 = 64;
+    while remaining > 1 {
+        let half = remaining >> 1;
+        if magnitude >> (highest_bit + half) != 0 {
+            highest_bit += half;
+        }
+        remaining -= half;
+    }
     let exponent = (highest_bit + 1023) << 52;
-    let fraction = (magnitude - (1.to_u64() << highest_bit)) << (52 - highest_bit);
-    float64_from_bits(sign | exponent | fraction)
+    let mantissa_field = if highest_bit > 52 {
+        (magnitude >> (highest_bit - 52)) & 0xfffffffffffff
+    } else {
+        (magnitude - (1.to_u64() << highest_bit)) << (52 - highest_bit)
+    };
+    float64_from_bits(exponent | mantissa_field)
 }
 
 fn not_a_number() -> f64 {

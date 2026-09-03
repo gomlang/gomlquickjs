@@ -342,6 +342,8 @@ impl PrimitivePrototypes {
 struct EvalEnvironment {
     values: HashMap[string, Ref[runtime::Value]],
     parent: Option[Ref[EvalEnvironment]],
+    identity_value: u64,
+    epoch_value: Ref[u64],
 }
 
 struct GlobalLexicalBinding {
@@ -3143,7 +3145,7 @@ fn read_field(machine: Machine, offset: isize, index: isize, receiver: runtime::
 ] {
     match receiver {
         runtime::Value::Object(object) => match machine.function.field_cache(offset) {
-            Some(cache) => match cache.read(machine.heap, object) {
+            Some(cache) => match cache.get().read(machine.heap, object) {
                 Some(value) => return Result::Ok(value),
                 None => (),
             },
@@ -3159,16 +3161,18 @@ fn read_field(machine: Machine, offset: isize, index: isize, receiver: runtime::
             key,
         ) {
             Some(cache) => {
-                machine.function.set_field_cache(offset, cache);
-                match cache.read(machine.heap, object) {
+                let cache_ref = Ref::new(cache);
+                machine.function.set_field_cache(offset, cache_ref);
+                match cache_ref.get().read(machine.heap, object) {
                     Some(value) => Result::Ok(value),
                     None => read_property(machine, offset, receiver, key),
                 }
             },
             None => match runtime::inherited_property_access_cache(machine.heap, object, key) {
                 Some(cache) => {
-                    machine.function.set_field_cache(offset, cache);
-                    match cache.read(machine.heap, object) {
+                    let cache_ref = Ref::new(cache);
+                    machine.function.set_field_cache(offset, cache_ref);
+                    match cache_ref.get().read(machine.heap, object) {
                         Some(value) => Result::Ok(value),
                         None => read_property(machine, offset, receiver, key),
                     }
@@ -3190,7 +3194,7 @@ fn write_field(
 ) -> Result[(), VmError] {
     match receiver {
         runtime::Value::Object(object) => match machine.function.field_cache(offset) {
-            Some(cache) => if cache.write(machine.heap, object, value) {
+            Some(cache) => if cache.get().write(machine.heap, object, value) {
                 return Result::Ok(())
             },
             None => (),
@@ -3205,8 +3209,9 @@ fn write_field(
             key,
         ) {
             Some(cache) => {
-                machine.function.set_field_cache(offset, cache);
-                if cache.write(machine.heap, object, value) {
+                let cache_ref = Ref::new(cache);
+                machine.function.set_field_cache(offset, cache_ref);
+                if cache_ref.get().write(machine.heap, object, value) {
                     Result::Ok(())
                 } else {
                     write_property_with_strict(machine, offset, receiver, key, value, strict)
@@ -3264,6 +3269,115 @@ fn eval_environment_cell(environment: Option[Ref[EvalEnvironment]], name: string
             },
             None => return Option::None,
         }
+    }
+}
+
+enum ResolvedEvalBinding {
+    Cell {
+        cell: Ref[runtime::Value],
+        epoch: Ref[u64],
+    },
+    GlobalLexical {
+        value: Ref[runtime::Value],
+        initialized: Ref[bool],
+        mutable: bool,
+    },
+    GlobalObject,
+}
+
+fn eval_environment_cell_annotated(environment: Option[Ref[EvalEnvironment]], name: string) -> Option[
+    (Ref[runtime::Value], Ref[u64]),
+] {
+    let mut current = environment;
+    loop {
+        match current {
+            Some(value) => match value.get().values.get(name) {
+                Some(cell) => return Option::Some((cell, value.get().epoch_value)),
+                None => {
+                    current = value.get().parent;
+                },
+            },
+            None => return Option::None,
+        }
+    }
+}
+
+fn eval_environment_root_key(machine: Machine) -> (u64, u64) {
+    match machine.eval_environment.get() {
+        Some(environment) => (environment.get().identity_value, environment.get().epoch_value.get()),
+        None => (0, 0),
+    }
+}
+
+fn resolve_eval_binding(machine: Machine, name: string) -> ResolvedEvalBinding {
+    match eval_environment_cell_annotated(machine.eval_environment.get(), name) {
+        Some((cell, epoch)) => ResolvedEvalBinding::Cell { cell, epoch },
+        None => match machine.global_lexical_bindings.get(name) {
+            Some(binding) => ResolvedEvalBinding::GlobalLexical {
+                value: binding.value,
+                initialized: binding.initialized,
+                mutable: binding.mutable,
+            },
+            None => ResolvedEvalBinding::GlobalObject,
+        },
+    }
+}
+
+fn store_eval_binding_cache(machine: Machine, index: isize, resolution: ResolvedEvalBinding) -> () {
+    let (root_identity, root_epoch) = eval_environment_root_key(machine);
+    let kind = match resolution {
+        ResolvedEvalBinding::Cell { cell, epoch } => runtime::EvalBindingCacheKind::Cell {
+            cell,
+            environment_epoch: epoch,
+            captured_epoch: epoch.get(),
+        },
+        ResolvedEvalBinding::GlobalLexical { value, initialized, mutable } => {
+            runtime::EvalBindingCacheKind::GlobalLexical { value, initialized, mutable }
+        },
+        ResolvedEvalBinding::GlobalObject => runtime::EvalBindingCacheKind::GlobalObject,
+    };
+    let cache = machine.function.eval_binding_cache().get();
+    machine.function.eval_binding_cache().set(
+        cache.set_entry(
+            index,
+            Option::Some(runtime::EvalBindingCacheEntry { root_identity, root_epoch, kind }),
+        ),
+    )
+}
+
+fn eval_binding_cache_hit(
+    cache: Ref[runtime::EvalBindingCache],
+    eval_environment: Ref[Option[Ref[EvalEnvironment]]],
+    index: isize,
+) -> Option[ResolvedEvalBinding] {
+    match cache.get().get_entry(index) {
+        Some(entry) => {
+            let (root_identity, root_epoch) = match eval_environment.get() {
+                Some(environment) => (
+                    environment.get().identity_value,
+                    environment.get().epoch_value.get(),
+                ),
+                None => (0, 0),
+            };
+            if entry.root_identity != root_identity || entry.root_epoch != root_epoch {
+                return Option::None
+            }
+            match entry.kind {
+                runtime::EvalBindingCacheKind::Cell { cell, environment_epoch, captured_epoch } => if environment_epoch.get()
+                    != captured_epoch {
+                    Option::None
+                } else {
+                    Option::Some(ResolvedEvalBinding::Cell { cell, epoch: environment_epoch })
+                },
+                runtime::EvalBindingCacheKind::GlobalLexical { value, initialized, mutable } => {
+                    Option::Some(ResolvedEvalBinding::GlobalLexical { value, initialized, mutable })
+                },
+                runtime::EvalBindingCacheKind::GlobalObject => {
+                    Option::Some(ResolvedEvalBinding::GlobalObject)
+                },
+            }
+        },
+        None => Option::None,
     }
 }
 
@@ -3359,6 +3473,7 @@ fn delete_eval_binding_with_depth(machine: Machine, offset: isize, index: isize,
                 let value = environment.get();
                 if value.values.get(name).is_some() {
                     value.values.remove(name);
+                    bump_environment_epoch(environment);
                     return Result::Ok(true)
                 } else {
                     current = value.parent;
@@ -3375,41 +3490,53 @@ fn read_eval_binding(machine: Machine, offset: isize, index: isize, missing_is_u
     runtime::Value,
     VmError,
 ] {
-    let name = eval_name(machine, offset, index)?;
-    match eval_environment_cell(machine.eval_environment.get(), name) {
-        Some(cell) => initialized_tdz_value(machine, offset, cell.get()),
-        None => match machine.global_lexical_bindings.get(name) {
-            Some(binding) => if binding.initialized.get() {
-                Result::Ok(binding.value.get())
-            } else {
-                Result::Err(
-                    error(
-                        offset,
-                        VmErrorKind::ReferenceError(
-                            "cannot access '" + name + "' before initialization",
-                        ),
+    let resolution = match eval_binding_cache_hit(
+        machine.function.eval_binding_cache(),
+        machine.eval_environment,
+        index,
+    ) {
+        Some(resolution) => resolution,
+        None => {
+            let name = eval_name(machine, offset, index)?;
+            let resolution = resolve_eval_binding(machine, name);
+            store_eval_binding_cache(machine, index, resolution);
+            resolution
+        },
+    };
+    match resolution {
+        ResolvedEvalBinding::Cell { cell, .. } => initialized_tdz_value(machine, offset, cell.get()),
+        ResolvedEvalBinding::GlobalLexical { value, initialized, .. } => if initialized.get() {
+            Result::Ok(value.get())
+        } else {
+            let name = eval_name(machine, offset, index)?;
+            Result::Err(
+                error(
+                    offset,
+                    VmErrorKind::ReferenceError(
+                        "cannot access '" + name + "' before initialization",
                     ),
-                )
-            },
-            None => {
-                let object = global_object(machine, offset)?;
-                let key = field_key(machine, offset, index)?;
-                if missing_is_undefined {
-                    if has_property(machine, offset, object, key)? {
-                        read_object_property(
-                            machine,
-                            offset,
-                            object,
-                            runtime::Value::Object(object),
-                            key,
-                        )
-                    } else {
-                        Result::Ok(runtime::Value::Undefined)
-                    }
+                ),
+            )
+        },
+        ResolvedEvalBinding::GlobalObject => {
+            let name = eval_name(machine, offset, index)?;
+            let object = global_object(machine, offset)?;
+            let key = field_key(machine, offset, index)?;
+            if missing_is_undefined {
+                if has_property(machine, offset, object, key)? {
+                    read_object_property(
+                        machine,
+                        offset,
+                        object,
+                        runtime::Value::Object(object),
+                        key,
+                    )
                 } else {
-                    read_global_property(machine, offset, object, key)
+                    Result::Ok(runtime::Value::Undefined)
                 }
-            },
+            } else {
+                read_global_property(machine, offset, object, key)
+            }
         },
     }
 }
@@ -3429,14 +3556,27 @@ fn write_eval_binding(machine: Machine, offset: isize, index: isize, value: runt
     (),
     VmError,
 ] {
-    let name = eval_name(machine, offset, index)?;
-    match eval_environment_cell(machine.eval_environment.get(), name) {
-        Some(cell) => {
+    let resolution = match eval_binding_cache_hit(
+        machine.function.eval_binding_cache(),
+        machine.eval_environment,
+        index,
+    ) {
+        Some(resolution) => resolution,
+        None => {
+            let name = eval_name(machine, offset, index)?;
+            let resolution = resolve_eval_binding(machine, name);
+            store_eval_binding_cache(machine, index, resolution);
+            resolution
+        },
+    };
+    match resolution {
+        ResolvedEvalBinding::Cell { cell, .. } => {
             cell.set(value);
             Result::Ok(())
         },
-        None => match machine.global_lexical_bindings.get(name) {
-            Some(binding) => if !binding.initialized.get() {
+        ResolvedEvalBinding::GlobalLexical { value: binding_value, initialized, mutable } => {
+            if !initialized.get() {
+                let name = eval_name(machine, offset, index)?;
                 Result::Err(
                     error(
                         offset,
@@ -3445,24 +3585,24 @@ fn write_eval_binding(machine: Machine, offset: isize, index: isize, value: runt
                         ),
                     ),
                 )
-            } else if !binding.mutable {
+            } else if !mutable {
                 Result::Err(
                     error(offset, VmErrorKind::TypeError("assignment to constant variable")),
                 )
             } else {
-                binding.value.set(value);
+                binding_value.set(value);
                 Result::Ok(())
-            },
-            None => {
-                let object = global_object(machine, offset)?;
-                write_property(
-                    machine,
-                    offset,
-                    runtime::Value::Object(object),
-                    field_key(machine, offset, index)?,
-                    value,
-                )
-            },
+            }
+        },
+        ResolvedEvalBinding::GlobalObject => {
+            let object = global_object(machine, offset)?;
+            write_property(
+                machine,
+                offset,
+                runtime::Value::Object(object),
+                field_key(machine, offset, index)?,
+                value,
+            )
         },
     }
 }
@@ -3489,6 +3629,10 @@ fn initialize_global_lexical_binding(machine: Machine, offset: isize, index: isi
     }
 }
 
+fn bump_environment_epoch(environment: Ref[EvalEnvironment]) -> () {
+    environment.get().epoch_value.set(environment.get().epoch_value.get() + 1)
+}
+
 fn initialize_eval_binding(machine: Machine, offset: isize, index: isize) -> Result[(), VmError] {
     let name = eval_name(machine, offset, index)?;
     match machine.eval_environment.get() {
@@ -3496,6 +3640,7 @@ fn initialize_eval_binding(machine: Machine, offset: isize, index: isize) -> Res
             let values = environment.get().values;
             if values.get(name).is_none() {
                 values[name] = Ref::new(runtime::Value::Undefined);
+                bump_environment_epoch(environment);
             }
             Result::Ok(())
         },
@@ -3535,6 +3680,7 @@ fn delete_eval_binding(machine: Machine, offset: isize, index: isize) -> Result[
                 let value = environment.get();
                 if value.values.get(name).is_some() {
                     value.values.remove(name);
+                    bump_environment_epoch(environment);
                     return Result::Ok(true)
                 } else {
                     current = value.parent;
@@ -3558,8 +3704,14 @@ fn delete_eval_binding(machine: Machine, offset: isize, index: isize) -> Result[
 }
 
 fn enter_eval_environment(machine: Machine) -> () {
+    let identity = machine.heap.next_environment_identity();
     let environment = Ref::new(
-        EvalEnvironment { values: HashMap::new(), parent: machine.eval_environment.get() },
+        EvalEnvironment {
+            values: HashMap::new(),
+            parent: machine.eval_environment.get(),
+            identity_value: identity,
+            epoch_value: Ref::new(0),
+        },
     );
     machine.eval_environment.set(Option::Some(environment))
 }
@@ -6686,20 +6838,27 @@ fn to_u32(value: f64) -> u32 {
     if !math::is_finite(value) || value == 0.0 {
         0
     } else {
-        let integer = math::trunc(value);
-        let mut remaining = integer - math::floor(integer / 4294967296.0) * 4294967296.0;
-        let mut place = 2147483648.0;
-        let mut mask: u32 = 0x80000000;
-        let mut result: u32 = 0;
-        while mask != 0 {
-            if remaining >= place {
-                result = result | mask;
-                remaining -= place;
+        let bits = float64_to_bits(value);
+        let exponent = (bits >> 52) & 0x7ff;
+        let mantissa = bits & 0xfffffffffffff;
+        let magnitude = mantissa | 0x10000000000000;
+        let low: u64 = if exponent < 1023 {
+            0
+        } else if exponent >= 1023 + 64 {
+            0
+        } else {
+            let shift = exponent - 1023;
+            if shift >= 52 {
+                (magnitude << (shift - 52)) & 0xffffffff
+            } else {
+                (magnitude >> (52 - shift)) & 0xffffffff
             }
-            place /= 2.0;
-            mask >>= 1;
+        };
+        if bits >> 63 != 0 {
+            ((0x100000000 - low) & 0xffffffff).to_u32()
+        } else {
+            low.to_u32()
         }
-        result
     }
 }
 
@@ -6708,7 +6867,7 @@ fn to_i32(value: f64) -> i32 {
 }
 
 fn uint32_number(value: u32) -> f64 {
-    num::parse_float64_structured(value.to_string()).unwrap_or(0.0)
+    runtime::uint64_to_number(value.to_u64())
 }
 
 fn remainder(left: f64, right: f64) -> f64 {
@@ -8368,12 +8527,15 @@ fn call_value_with_mode_rooted(
                     };
                     let eval_environment = if function.eval_site_count() > 0
                         || !function.eval_declarations().is_empty() {
+                        let identity = machine.heap.next_environment_identity();
                         Ref::new(
                             Option::Some(
                                 Ref::new(
                                     EvalEnvironment {
                                         values: HashMap::new(),
                                         parent: closure.eval_environment,
+                                        identity_value: identity,
+                                        epoch_value: Ref::new(0),
                                     },
                                 ),
                             ),
@@ -10236,6 +10398,14 @@ fn fast_numeric_step(machine: Machine, instruction: bytecode::Instruction) -> bo
                 machine.stack.push(runtime::Value::Float(left + right));
                 true
             },
+            (runtime::Value::Int(left), runtime::Value::Float(right)) => {
+                machine.stack.push(runtime::Value::Float(runtime::int_to_number(left) + right));
+                true
+            },
+            (runtime::Value::Float(left), runtime::Value::Int(right)) => {
+                machine.stack.push(runtime::Value::Float(left + runtime::int_to_number(right)));
+                true
+            },
             _ => {
                 machine.stack.push(left);
                 machine.stack.push(right);
@@ -10256,6 +10426,14 @@ fn fast_numeric_step(machine: Machine, instruction: bytecode::Instruction) -> bo
             },
             (runtime::Value::Float(left), runtime::Value::Float(right)) => {
                 machine.stack.push(runtime::Value::Float(left - right));
+                true
+            },
+            (runtime::Value::Int(left), runtime::Value::Float(right)) => {
+                machine.stack.push(runtime::Value::Float(runtime::int_to_number(left) - right));
+                true
+            },
+            (runtime::Value::Float(left), runtime::Value::Int(right)) => {
+                machine.stack.push(runtime::Value::Float(left - runtime::int_to_number(right)));
                 true
             },
             _ => {
@@ -10281,6 +10459,14 @@ fn fast_numeric_step(machine: Machine, instruction: bytecode::Instruction) -> bo
                 machine.stack.push(runtime::Value::Float(left * right));
                 true
             },
+            (runtime::Value::Int(left), runtime::Value::Float(right)) => {
+                machine.stack.push(runtime::Value::Float(runtime::int_to_number(left) * right));
+                true
+            },
+            (runtime::Value::Float(left), runtime::Value::Int(right)) => {
+                machine.stack.push(runtime::Value::Float(left * runtime::int_to_number(right)));
+                true
+            },
             _ => {
                 machine.stack.push(left);
                 machine.stack.push(right);
@@ -10295,6 +10481,46 @@ fn fast_numeric_step(machine: Machine, instruction: bytecode::Instruction) -> bo
                             left / right
                         } else {
                             remainder(left, right)
+                        },
+                    ),
+                );
+                true
+            },
+            (runtime::Value::Int(left), runtime::Value::Int(right)) => {
+                let left_number = runtime::int_to_number(left);
+                let right_number = runtime::int_to_number(right);
+                machine.stack.push(
+                    runtime::Value::Float(
+                        if instruction == bytecode::Instruction::Div {
+                            left_number / right_number
+                        } else {
+                            remainder(left_number, right_number)
+                        },
+                    ),
+                );
+                true
+            },
+            (runtime::Value::Int(left), runtime::Value::Float(right)) => {
+                let left_number = runtime::int_to_number(left);
+                machine.stack.push(
+                    runtime::Value::Float(
+                        if instruction == bytecode::Instruction::Div {
+                            left_number / right
+                        } else {
+                            remainder(left_number, right)
+                        },
+                    ),
+                );
+                true
+            },
+            (runtime::Value::Float(left), runtime::Value::Int(right)) => {
+                let right_number = runtime::int_to_number(right);
+                machine.stack.push(
+                    runtime::Value::Float(
+                        if instruction == bytecode::Instruction::Div {
+                            left / right_number
+                        } else {
+                            remainder(left, right_number)
                         },
                     ),
                 );
@@ -10418,11 +10644,90 @@ fn fast_numeric_step(machine: Machine, instruction: bytecode::Instruction) -> bo
                 false
             },
         },
+        bytecode::Instruction::BitAnd | bytecode::Instruction::BitXor | bytecode::Instruction::BitOr => {
+            let numeric = match (left, right) {
+                (runtime::Value::Int(_), runtime::Value::Int(_)) | (
+                    runtime::Value::Int(_),
+                    runtime::Value::Float(_),
+                ) | (runtime::Value::Float(_), runtime::Value::Int(_)) | (
+                    runtime::Value::Float(_),
+                    runtime::Value::Float(_),
+                ) => true,
+                _ => false,
+            };
+            if !numeric {
+                machine.stack.push(left);
+                machine.stack.push(right);
+                return false
+            }
+            let left_i32 = fast_to_i32(left);
+            let right_i32 = fast_to_i32(right);
+            let result = match instruction {
+                bytecode::Instruction::BitAnd => left_i32 & right_i32,
+                bytecode::Instruction::BitXor => left_i32 ^ right_i32,
+                _ => left_i32 | right_i32,
+            };
+            machine.stack.push(runtime::Value::Int(result));
+            true
+        },
+        bytecode::Instruction::Shl | bytecode::Instruction::Sar | bytecode::Instruction::Shr => {
+            let numeric = match (left, right) {
+                (runtime::Value::Int(_), runtime::Value::Int(_)) | (
+                    runtime::Value::Int(_),
+                    runtime::Value::Float(_),
+                ) | (runtime::Value::Float(_), runtime::Value::Int(_)) | (
+                    runtime::Value::Float(_),
+                    runtime::Value::Float(_),
+                ) => true,
+                _ => false,
+            };
+            if !numeric {
+                machine.stack.push(left);
+                machine.stack.push(right);
+                return false
+            }
+            let left_i32 = fast_to_i32(left);
+            let count = fast_to_u32(right) & 31;
+            if instruction == bytecode::Instruction::Shr {
+                let shifted = left_i32.to_u32() >> count;
+                if shifted <= 0x7fffffff {
+                    machine.stack.push(runtime::Value::Int(shifted.to_i32()));
+                } else {
+                    machine.stack.push(
+                        runtime::Value::Float(runtime::uint64_to_number(shifted.to_u64())),
+                    );
+                }
+                return true
+            }
+            let result = if instruction == bytecode::Instruction::Shl {
+                left_i32 << count
+            } else {
+                left_i32 >> count
+            };
+            machine.stack.push(runtime::Value::Int(result));
+            true
+        },
         _ => {
             machine.stack.push(left);
             machine.stack.push(right);
             false
         },
+    }
+}
+
+fn fast_to_i32(value: runtime::Value) -> i32 {
+    match value {
+        runtime::Value::Int(value) => value,
+        runtime::Value::Float(value) => to_i32(value),
+        _ => 0,
+    }
+}
+
+fn fast_to_u32(value: runtime::Value) -> u32 {
+    match value {
+        runtime::Value::Int(value) => value.to_u32(),
+        runtime::Value::Float(value) => to_u32(value),
+        _ => 0,
     }
 }
 
@@ -10444,15 +10749,16 @@ fn fast_global_step(machine: Machine, offset: isize, instruction: bytecode::Inst
         Some(value) => value,
         None => match runtime::property_access_cache(machine.heap, object, key) {
             Some(value) => {
-                machine.function.set_field_cache(offset, value);
-                value
+                let cache_ref = Ref::new(value);
+                machine.function.set_field_cache(offset, cache_ref);
+                cache_ref
             },
             None => return false,
         },
     };
     if write {
         let value = pop_verified(machine);
-        if cache.write(machine.heap, object, value) {
+        if cache.get().write(machine.heap, object, value) {
             machine.stack.push(value);
             true
         } else {
@@ -10460,13 +10766,39 @@ fn fast_global_step(machine: Machine, offset: isize, instruction: bytecode::Inst
             false
         }
     } else {
-        match cache.read(machine.heap, object) {
+        match cache.get().read(machine.heap, object) {
             Some(value) => {
                 machine.stack.push(value);
                 true
             },
             None => false,
         }
+    }
+}
+
+fn global_field_cache(machine: Machine, function: bytecode::Function, offset: isize, index: isize) -> Option[
+    (runtime::ObjectId, Ref[runtime::PropertyAccessCache]),
+] {
+    let object = match machine.global_object {
+        Some(value) => value,
+        None => return Option::None,
+    };
+    match function.field_cache(offset) {
+        Some(value) => Option::Some((object, value)),
+        None => {
+            let key = match function.constant_unchecked(index) {
+                bytecode::Constant::String(value) => runtime::js_string_property_key(value),
+                _ => return Option::None,
+            };
+            match runtime::property_access_cache(machine.heap, object, key) {
+                Some(value) => {
+                    let cache_ref = Ref::new(value);
+                    function.set_field_cache(offset, cache_ref);
+                    Option::Some((object, cache_ref))
+                },
+                None => Option::None,
+            }
+        },
     }
 }
 
@@ -10555,17 +10887,16 @@ fn recover_execution_error(machine: Machine, offset: isize, value: VmError) -> R
 }
 
 fn execute_machine_from(machine: Machine, start: isize) -> Result[ExecutionResult, VmError] {
+    let function = machine.function;
     let mut offset = start;
-    while offset >= 0 && offset < machine.function.code_len() {
-        let instruction = machine.function.instruction_unchecked(offset);
+    while offset >= 0 && offset < function.code_len() {
+        let instruction = function.instruction_unchecked(offset);
         match instruction {
             bytecode::Instruction::PushI32(value) => {
                 machine.stack.push(runtime::Value::Int(value));
                 offset += 1;
             },
-            bytecode::Instruction::PushConst(index) => match machine.function.constant_unchecked(
-                index,
-            ) {
+            bytecode::Instruction::PushConst(index) => match function.constant_unchecked(index) {
                 bytecode::Constant::Float(value) => {
                     machine.stack.push(runtime::Value::Float(value));
                     offset += 1;
@@ -10662,7 +10993,144 @@ fn execute_machine_from(machine: Machine, start: isize) -> Result[ExecutionResul
             bytecode::Instruction::Goto(target) => {
                 offset = target;
             },
-            bytecode::Instruction::Mul | bytecode::Instruction::Div | bytecode::Instruction::Mod | bytecode::Instruction::Add | bytecode::Instruction::Sub | bytecode::Instruction::Lt | bytecode::Instruction::Lte | bytecode::Instruction::Gt | bytecode::Instruction::Gte | bytecode::Instruction::Eq | bytecode::Instruction::Neq | bytecode::Instruction::StrictEq | bytecode::Instruction::StrictNeq | bytecode::Instruction::PreIncrement | bytecode::Instruction::PostIncrement | bytecode::Instruction::PreDecrement | bytecode::Instruction::PostDecrement | bytecode::Instruction::GetGlobal(_) | bytecode::Instruction::SetGlobal(_) | bytecode::Instruction::PutArrayEl | bytecode::Instruction::PutArrayElStrict => if match instruction {
+            bytecode::Instruction::GetEval(index) => match eval_binding_cache_hit(
+                function.eval_binding_cache(),
+                machine.eval_environment,
+                index,
+            ) {
+                Some(ResolvedEvalBinding::Cell { cell, .. }) => {
+                    let value = cell.get();
+                    if runtime::is_tdz_value(machine.heap, value) {
+                        match step(machine, offset, instruction) {
+                            Ok(next) => {
+                                offset = next;
+                            },
+                            Err(value) => match recover_execution_error(machine, offset, value) {
+                                Ok(target) => {
+                                    offset = target;
+                                },
+                                Err(value) => return Result::Err(value),
+                            },
+                        }
+                    } else {
+                        machine.stack.push(value);
+                        offset += 1;
+                    }
+                },
+                Some(ResolvedEvalBinding::GlobalLexical { value, initialized, .. }) => if initialized.get() {
+                    machine.stack.push(value.get());
+                    offset += 1;
+                } else {
+                    match step(machine, offset, instruction) {
+                        Ok(next) => {
+                            offset = next;
+                        },
+                        Err(value) => match recover_execution_error(machine, offset, value) {
+                            Ok(target) => {
+                                offset = target;
+                            },
+                            Err(value) => return Result::Err(value),
+                        },
+                    }
+                },
+                Some(ResolvedEvalBinding::GlobalObject) => match global_field_cache(
+                    machine,
+                    function,
+                    offset,
+                    index,
+                ) {
+                    Some((object, cache)) => match cache.get().read(machine.heap, object) {
+                        Some(value) => {
+                            machine.stack.push(value);
+                            offset += 1;
+                        },
+                        None => {
+                            match step(machine, offset, instruction) {
+                                Ok(next) => {
+                                    offset = next;
+                                },
+                                Err(value) => match recover_execution_error(machine, offset, value) {
+                                    Ok(target) => {
+                                        offset = target;
+                                    },
+                                    Err(value) => return Result::Err(value),
+                                },
+                            }
+                        },
+                    },
+                    None => {
+                        match step(machine, offset, instruction) {
+                            Ok(next) => {
+                                offset = next;
+                            },
+                            Err(value) => match recover_execution_error(machine, offset, value) {
+                                Ok(target) => {
+                                    offset = target;
+                                },
+                                Err(value) => return Result::Err(value),
+                            },
+                        }
+                    },
+                },
+                None => {
+                    match step(machine, offset, instruction) {
+                        Ok(next) => {
+                            offset = next;
+                        },
+                        Err(value) => match recover_execution_error(machine, offset, value) {
+                            Ok(target) => {
+                                offset = target;
+                            },
+                            Err(value) => return Result::Err(value),
+                        },
+                    }
+                },
+            },
+            bytecode::Instruction::SetEval(index) => match eval_binding_cache_hit(
+                function.eval_binding_cache(),
+                machine.eval_environment,
+                index,
+            ) {
+                Some(ResolvedEvalBinding::Cell { cell, .. }) => {
+                    let value = pop_verified(machine);
+                    cell.set(value);
+                    machine.stack.push(value);
+                    offset += 1;
+                },
+                Some(ResolvedEvalBinding::GlobalLexical { value, initialized, mutable }) => if initialized.get()
+                    && mutable {
+                    let cell_value = pop_verified(machine);
+                    value.set(cell_value);
+                    machine.stack.push(cell_value);
+                    offset += 1;
+                } else {
+                    match step(machine, offset, instruction) {
+                        Ok(next) => {
+                            offset = next;
+                        },
+                        Err(value) => match recover_execution_error(machine, offset, value) {
+                            Ok(target) => {
+                                offset = target;
+                            },
+                            Err(value) => return Result::Err(value),
+                        },
+                    }
+                },
+                Some(ResolvedEvalBinding::GlobalObject) | None => {
+                    match step(machine, offset, instruction) {
+                        Ok(next) => {
+                            offset = next;
+                        },
+                        Err(value) => match recover_execution_error(machine, offset, value) {
+                            Ok(target) => {
+                                offset = target;
+                            },
+                            Err(value) => return Result::Err(value),
+                        },
+                    }
+                },
+            },
+            bytecode::Instruction::Mul | bytecode::Instruction::Div | bytecode::Instruction::Mod | bytecode::Instruction::Add | bytecode::Instruction::Sub | bytecode::Instruction::Lt | bytecode::Instruction::Lte | bytecode::Instruction::Gt | bytecode::Instruction::Gte | bytecode::Instruction::Eq | bytecode::Instruction::Neq | bytecode::Instruction::StrictEq | bytecode::Instruction::StrictNeq | bytecode::Instruction::BitAnd | bytecode::Instruction::BitXor | bytecode::Instruction::BitOr | bytecode::Instruction::Shl | bytecode::Instruction::Sar | bytecode::Instruction::Shr | bytecode::Instruction::PreIncrement | bytecode::Instruction::PostIncrement | bytecode::Instruction::PreDecrement | bytecode::Instruction::PostDecrement | bytecode::Instruction::GetGlobal(_) | bytecode::Instruction::SetGlobal(_) | bytecode::Instruction::PutArrayEl | bytecode::Instruction::PutArrayElStrict => if match instruction {
                 bytecode::Instruction::GetGlobal(_) | bytecode::Instruction::SetGlobal(_) => {
                     fast_global_step(machine, offset, instruction)
                 },
