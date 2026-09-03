@@ -1,6 +1,7 @@
 package dtoa;
 
 use gomlang::quickjs::bigint;
+use std::math;
 use std::text;
 
 #[derive(PartialEq, Eq, Debug)]
@@ -271,7 +272,7 @@ fn big_bit_length(value: BigUInt) -> isize {
     }
 }
 
-fn big_round_ratio(numerator: BigUInt, denominator: BigUInt) -> u64 {
+fn big_round_ratio_with_ties(numerator: BigUInt, denominator: BigUInt, ties_to_even: bool) -> u64 {
     let remainder = big_clone(numerator);
     let mut quotient = 0.to_u64();
     let mut shift = big_bit_length(remainder) - big_bit_length(denominator);
@@ -285,11 +286,15 @@ fn big_round_ratio(numerator: BigUInt, denominator: BigUInt) -> u64 {
     }
     let doubled = big_shift_left(remainder, 1);
     let rounding = big_compare(doubled, denominator);
-    if rounding > 0 || (rounding == 0 && quotient & 1 == 1) {
+    if rounding > 0 || rounding == 0 && (!ties_to_even || quotient & 1 == 1) {
         quotient + 1
     } else {
         quotient
     }
+}
+
+fn big_round_ratio(numerator: BigUInt, denominator: BigUInt) -> u64 {
+    big_round_ratio_with_ties(numerator, denominator, true)
 }
 
 fn round_scaled_ratio(numerator: BigUInt, denominator: BigUInt, shift: isize) -> u64 {
@@ -297,6 +302,14 @@ fn round_scaled_ratio(numerator: BigUInt, denominator: BigUInt, shift: isize) ->
         big_round_ratio(big_shift_left(numerator, shift), denominator)
     } else {
         big_round_ratio(numerator, big_shift_left(denominator, -shift))
+    }
+}
+
+fn round_scaled_ratio_half_up(numerator: BigUInt, denominator: BigUInt, shift: isize) -> u64 {
+    if shift >= 0 {
+        big_round_ratio_with_ties(big_shift_left(numerator, shift), denominator, false)
+    } else {
+        big_round_ratio_with_ties(numerator, big_shift_left(denominator, -shift), false)
     }
 }
 
@@ -608,28 +621,23 @@ pub fn parse_number(value: string) -> f64 {
 }
 
 fn binary_parts(value: f64) -> BinaryParts {
-    let mut scaled = value;
-    let mut binary_exponent = 0;
-    while scaled >= 2.0 {
-        scaled *= 0.5;
-        binary_exponent += 1;
-    }
-    while scaled < 1.0 {
-        scaled *= 2.0;
-        binary_exponent -= 1;
-    }
-    let mut mantissa = 0.to_u64();
-    let mut index = 0;
-    while index < 53 {
-        mantissa <<= 1;
-        if scaled >= 1.0 {
-            mantissa |= 1;
-            scaled -= 1.0;
+    let bits = value.to_bits();
+    let encoded_exponent = ((bits >> 52) & 0x7ff).to_isize();
+    let fraction = bits & 0x000fffffffffffff;
+    if encoded_exponent != 0 {
+        BinaryParts {
+            mantissa: fraction | (1.to_u64() << 52),
+            exponent: encoded_exponent - 1023 - 52,
         }
-        scaled *= 2.0;
-        index += 1;
+    } else {
+        let mut mantissa = fraction;
+        let mut exponent = -1074;
+        while mantissa < 1.to_u64() << 52 {
+            mantissa <<= 1;
+            exponent -= 1;
+        }
+        BinaryParts { mantissa, exponent }
     }
-    BinaryParts { mantissa, exponent: binary_exponent - 52 }
 }
 
 fn compare_binary_to_power10(parts: BinaryParts, exponent: isize) -> isize {
@@ -691,6 +699,72 @@ fn decimal_power(exponent: isize) -> bigint::BigInteger {
     value
 }
 
+fn small_decimal_factor(exponent: isize) -> Option[f64] {
+    match exponent {
+        0 => Option::Some(1.0),
+        1 => Option::Some(10.0),
+        2 => Option::Some(100.0),
+        3 => Option::Some(1000.0),
+        4 => Option::Some(10000.0),
+        5 => Option::Some(100000.0),
+        6 => Option::Some(1000000.0),
+        7 => Option::Some(10000000.0),
+        8 => Option::Some(100000000.0),
+        9 => Option::Some(1000000000.0),
+        10 => Option::Some(10000000000.0),
+        11 => Option::Some(100000000000.0),
+        12 => Option::Some(1000000000000.0),
+        13 => Option::Some(10000000000000.0),
+        14 => Option::Some(100000000000000.0),
+        15 => Option::Some(1000000000000000.0),
+        _ => Option::None,
+    }
+}
+
+fn positive_integral_float_to_u64(value: f64) -> u64 {
+    if value == 0.0 {
+        return 0
+    }
+    let bits = value.to_bits();
+    let exponent = ((bits >> 52) & 0x7ff).to_isize() - 1023;
+    let mantissa = bits & 0x000fffffffffffff | 1.to_u64() << 52;
+    if exponent >= 52 {
+        mantissa << (exponent - 52)
+    } else {
+        mantissa >> (52 - exponent)
+    }
+}
+
+fn fast_rounded_decimal_integer(value: f64, scale: isize) -> Option[u64] {
+    let factor = small_decimal_factor(
+        if scale < 0 {
+            -scale
+        } else {
+            scale
+        },
+    )?;
+    let scaled = if scale < 0 {
+        value * factor
+    } else {
+        value / factor
+    };
+    if scaled >= 4503599627370496.0 {
+        return Option::None
+    }
+    let lower = math::floor(scaled);
+    let fraction = scaled - lower;
+    let distance = if fraction >= 0.5 {
+        fraction - 0.5
+    } else {
+        0.5 - fraction
+    };
+    if distance <= scaled * 0.0000000000000002220446049250313 + 0.000000000001 {
+        Option::None
+    } else {
+        Option::Some(positive_integral_float_to_u64(math::floor(scaled + 0.5)))
+    }
+}
+
 fn rounded_scaled_integer(parts: BinaryParts, decimal_scale: isize) -> bigint::BigInteger {
     let (mut numerator, mut denominator) = exact_binary_ratio(parts);
     if decimal_scale >= 0 {
@@ -711,8 +785,18 @@ fn rounded_scaled_integer(parts: BinaryParts, decimal_scale: isize) -> bigint::B
 fn exact_precision_parts(value: f64, negative: bool, precision: isize) -> DecimalParts {
     let parts = binary_parts(value);
     let mut order = decimal_order(parts);
-    let rounded = rounded_scaled_integer(parts, precision - 1 - order);
-    let mut digits = rounded.to_string_radix(10).unwrap_or("0");
+    let mut digits = if precision <= 19 {
+        let scale = order - precision + 1;
+        decimal_u64(
+            fast_rounded_decimal_integer(value, scale).unwrap_or_else(
+                || {
+                    rounded_decimal_integer(parts, scale, false)
+                },
+            ),
+        )
+    } else {
+        rounded_scaled_integer(parts, precision - 1 - order).to_string_radix(10).unwrap_or("0")
+    };
     if digits.byte_len() > precision {
         digits = digits.byte_slice(0, precision);
         order += 1;
@@ -725,13 +809,7 @@ fn exact_precision_parts(value: f64, negative: bool, precision: isize) -> Decima
     DecimalParts { negative, digits, exponent: order + 1 }
 }
 
-fn scaled_radix_text(
-    coefficient: bigint::BigInteger,
-    radix: isize,
-    fractional_digits: isize,
-    negative: bool,
-) -> string {
-    let digits = coefficient.to_string_radix(radix).unwrap_or("0");
+fn scaled_digits_text(digits: string, fractional_digits: isize, negative: bool) -> string {
     let builder = text::StringBuilder::with_capacity(digits.byte_len() + fractional_digits + 3);
     if negative {
         builder.values.push(b'-')
@@ -749,6 +827,19 @@ fn scaled_radix_text(
         builder.write_string(digits.byte_slice(point, digits.byte_len()))
     }
     builder.finish()
+}
+
+fn scaled_radix_text(
+    coefficient: bigint::BigInteger,
+    radix: isize,
+    fractional_digits: isize,
+    negative: bool,
+) -> string {
+    scaled_digits_text(
+        coefficient.to_string_radix(radix).unwrap_or("0"),
+        fractional_digits,
+        negative,
+    )
 }
 
 fn bigint_ratio_to_float(numerator: bigint::BigInteger, denominator: bigint::BigInteger) -> f64 {
@@ -827,7 +918,7 @@ fn shortest_radix_integer(integer: bigint::BigInteger, magnitude: f64, radix: is
     selected
 }
 
-fn rounded_decimal_significand(parts: BinaryParts, scale: isize) -> u64 {
+fn rounded_decimal_integer(parts: BinaryParts, scale: isize, ties_to_even: bool) -> u64 {
     let numerator = big_from_u64(parts.mantissa);
     let denominator = big_one();
     let mut binary_exponent = parts.exponent;
@@ -846,7 +937,15 @@ fn rounded_decimal_significand(parts: BinaryParts, scale: isize) -> u64 {
         }
         binary_exponent -= scale;
     }
-    round_scaled_ratio(numerator, denominator, binary_exponent)
+    if ties_to_even {
+        round_scaled_ratio(numerator, denominator, binary_exponent)
+    } else {
+        round_scaled_ratio_half_up(numerator, denominator, binary_exponent)
+    }
+}
+
+fn rounded_decimal_significand(parts: BinaryParts, scale: isize) -> u64 {
+    rounded_decimal_integer(parts, scale, true)
 }
 
 fn shortest_decimal_parts(value: f64, negative: bool) -> DecimalParts {
@@ -932,6 +1031,8 @@ pub fn number_to_string(value: f64) -> string {
         "-Infinity"
     } else if value == 0.0 {
         "0"
+    } else if value >= 0.000001 && value < 1.0e21 || value <= -0.000001 && value > -1.0e21 {
+        value.to_string()
     } else if value < 0.0 {
         format_decimal_parts(shortest_decimal_parts(-value, true))
     } else {
@@ -988,12 +1089,32 @@ pub fn number_to_fixed(value: f64, fractional_digits: isize) -> string {
     if magnitude >= 1.0e21 {
         return number_to_string(value)
     }
-    let coefficient = if magnitude == 0.0 {
-        bigint::BigInteger::zero()
+    if magnitude == 0.0 {
+        return scaled_digits_text("0", fractional_digits, negative)
+    }
+    let parts = binary_parts(magnitude);
+    let order = decimal_order(parts);
+    if order + fractional_digits <= 18 {
+        let scale = -fractional_digits;
+        scaled_digits_text(
+            decimal_u64(
+                fast_rounded_decimal_integer(magnitude, scale).unwrap_or_else(
+                    || {
+                        rounded_decimal_integer(parts, scale, false)
+                    },
+                ),
+            ),
+            fractional_digits,
+            negative,
+        )
     } else {
-        rounded_scaled_integer(binary_parts(magnitude), fractional_digits)
-    };
-    scaled_radix_text(coefficient, 10, fractional_digits, negative)
+        scaled_radix_text(
+            rounded_scaled_integer(parts, fractional_digits),
+            10,
+            fractional_digits,
+            negative,
+        )
+    }
 }
 
 pub fn number_to_exponential(value: f64, fractional_digits: Option[isize]) -> string {
