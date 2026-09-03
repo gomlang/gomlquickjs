@@ -94,6 +94,13 @@ type NativeConstructorCallable = (
 
 type VmCallable = (runtime::Value, Vec[runtime::Value], isize) -> Result[runtime::Value, VmError];
 
+pub enum IteratorStep {
+    Value(runtime::Value),
+    Done,
+}
+
+pub type ArrayIteratorFastNext = (runtime::Value, isize) -> Result[IteratorStep, VmError];
+
 type VmConstructorCallable = (
     runtime::ObjectId,
     Vec[runtime::Value],
@@ -376,6 +383,13 @@ pub struct ArrayIteratorState {
     pub validate_typed_array: bool,
 }
 
+struct IteratorRuntime {
+    array_prototype: Ref[Option[runtime::ObjectId]],
+    array_states: HashMap[runtime::ObjectId, ArrayIteratorState],
+    array_fast_next_function: Ref[Option[runtime::ObjectId]],
+    array_fast_next: Ref[Option[ArrayIteratorFastNext]],
+}
+
 enum UpvalueCell {
     Value(Ref[runtime::Value]),
     This(Ref[Option[runtime::Value]]),
@@ -545,6 +559,7 @@ struct Machine {
     generators: GeneratorRuntime,
     dynamic_eval_compiler: Ref[Option[DynamicEvalCompiler]],
     dynamic_module_loader: Ref[Option[DynamicModuleLoader]],
+    iterators: IteratorRuntime,
     depth: isize,
     eval_environment: Ref[Option[Ref[EvalEnvironment]]],
 }
@@ -587,8 +602,7 @@ pub struct Context {
     virtual_modules_value: HashMap[string, runtime::Value],
     worker_module_loader_value: Ref[Option[WorkerModuleLoader]],
     current_module_path_value: Ref[Option[string]],
-    array_iterator_prototype_value: Ref[Option[runtime::ObjectId]],
-    array_iterator_states_value: HashMap[runtime::ObjectId, ArrayIteratorState],
+    iterators_value: IteratorRuntime,
 }
 
 fn push_optional_root(roots: Vec[runtime::Value], value: Option[runtime::Value]) -> () {
@@ -781,8 +795,12 @@ impl Context {
             virtual_modules_value: HashMap::new(),
             worker_module_loader_value: Ref::new(Option::None),
             current_module_path_value: Ref::new(Option::None),
-            array_iterator_prototype_value: Ref::new(Option::None),
-            array_iterator_states_value: HashMap::new(),
+            iterators_value: IteratorRuntime {
+                array_prototype: Ref::new(Option::None),
+                array_states: HashMap::new(),
+                array_fast_next_function: Ref::new(Option::None),
+                array_fast_next: Ref::new(Option::None),
+            },
         }
     }
 
@@ -791,11 +809,25 @@ impl Context {
     }
 
     pub fn array_iterator_prototype(self: Context) -> Option[runtime::ObjectId] {
-        self.array_iterator_prototype_value.get()
+        self.iterators_value.array_prototype.get()
     }
 
     pub fn set_array_iterator_prototype(self: Context, prototype: runtime::ObjectId) -> () {
-        self.array_iterator_prototype_value.set(Option::Some(prototype))
+        self.iterators_value.array_prototype.set(Option::Some(prototype))
+    }
+
+    pub fn set_array_iterator_fast_next(
+        self: Context,
+        function: runtime::Value,
+        callback: ArrayIteratorFastNext,
+    ) -> () {
+        match function {
+            runtime::Value::Object(object) => {
+                self.iterators_value.array_fast_next_function.set(Option::Some(object));
+                self.iterators_value.array_fast_next.set(Option::Some(callback));
+            },
+            _ => (),
+        }
     }
 
     pub fn register_array_iterator(
@@ -805,7 +837,7 @@ impl Context {
         kind: isize,
         validate_typed_array: bool,
     ) -> () {
-        self.array_iterator_states_value[object] = ArrayIteratorState {
+        self.iterators_value.array_states[object] = ArrayIteratorState {
             iterable,
             index: Ref::new(0),
             done: Ref::new(false),
@@ -817,7 +849,7 @@ impl Context {
     pub fn array_iterator_state(self: Context, object: runtime::ObjectId) -> Option[
         ArrayIteratorState,
     ] {
-        self.array_iterator_states_value.get(object)
+        self.iterators_value.array_states.get(object)
     }
 
     pub fn add_external_root(self: Context, value: Ref[runtime::Value]) -> () {
@@ -895,7 +927,8 @@ impl Context {
         push_optional_root(roots, self.regexp_constructor_value.get());
         push_optional_root(roots, self.intrinsic_eval_value.get());
         push_optional_root(roots, self.intrinsic_array_constructor_value.get());
-        push_optional_object_root(roots, self.array_iterator_prototype_value.get());
+        push_optional_object_root(roots, self.iterators_value.array_prototype.get());
+        push_optional_object_root(roots, self.iterators_value.array_fast_next_function.get());
         push_optional_object_root(roots, self.generators_value.prototype.get());
         push_optional_object_root(roots, self.generators_value.generator_function_prototype.get());
         push_optional_object_root(roots, self.generators_value.async_function_prototype.get());
@@ -976,7 +1009,7 @@ impl Context {
             }
             edges.push(runtime::GcEdge { owner, values })
         }
-        for (owner, state) in self.array_iterator_states_value.entries() {
+        for (owner, state) in self.iterators_value.array_states.entries() {
             edges.push(runtime::GcEdge { owner, values: Vec::from_array([state.iterable]) })
         }
         for (_, object) in self.template_objects_value.entries() {
@@ -1031,13 +1064,13 @@ impl Context {
             let _ = self.generators_value.states.remove(object);
         }
         let stale_array_iterators: Vec[runtime::ObjectId] = Vec::new();
-        for (object, _) in self.array_iterator_states_value.entries() {
+        for (object, _) in self.iterators_value.array_states.entries() {
             if !self.heap_value.contains(object) {
                 stale_array_iterators.push(object)
             }
         }
         for object in stale_array_iterators {
-            let _ = self.array_iterator_states_value.remove(object);
+            let _ = self.iterators_value.array_states.remove(object);
         }
         result
     }
@@ -1455,6 +1488,7 @@ impl Context {
             generators: self.generators_value,
             dynamic_eval_compiler: self.dynamic_eval_compiler_value,
             dynamic_module_loader: self.dynamic_module_loader_value,
+            iterators: self.iterators_value,
             depth: depth + 1,
             eval_environment: frame.eval_environment,
         };
@@ -5208,6 +5242,62 @@ fn advance_iterator(machine: Machine, offset: isize) -> Result[(), VmError] {
     push_iterator_result(machine, offset, result, "iterator next result is not an object")
 }
 
+fn advance_iterator_direct(machine: Machine, offset: isize) -> Result[(), VmError] {
+    let next = pop(machine, offset)?;
+    let iterator = pop(machine, offset)?;
+    match (iterator, next, machine.iterators.array_fast_next_function.get()) {
+        (
+            runtime::Value::Object(iterator_object),
+            runtime::Value::Object(next_object),
+            Some(fast_next_object),
+        ) => if next_object == fast_next_object
+            && machine.iterators.array_states.get(iterator_object).is_some() {
+            match machine.iterators.array_fast_next.get() {
+                Some(callback) => {
+                    match callback(iterator, machine.depth + 1)? {
+                        IteratorStep::Value(value) => {
+                            machine.stack.push(value);
+                            machine.stack.push(runtime::Value::Bool(false));
+                        },
+                        IteratorStep::Done => {
+                            machine.stack.push(runtime::Value::Undefined);
+                            machine.stack.push(runtime::Value::Bool(true));
+                        },
+                    }
+                    return Result::Ok(())
+                },
+                None => (),
+            }
+        },
+        _ => (),
+    }
+    let result = call_value(machine, offset, next, Vec::new(), iterator)?;
+    push_iterator_value_result(machine, offset, result)
+}
+
+fn push_iterator_value_result(machine: Machine, offset: isize, result: runtime::Value) -> Result[
+    (),
+    VmError,
+] {
+    match result {
+        runtime::Value::Object(_) => (),
+        _ => return Result::Err(
+            error(offset, VmErrorKind::TypeError("iterator next result is not an object")),
+        ),
+    }
+    let done = runtime::to_boolean(
+        read_property(machine, offset, result, runtime::string_property_key("done"))?,
+    );
+    let value = if done {
+        runtime::Value::Undefined
+    } else {
+        read_property(machine, offset, result, runtime::string_property_key("value"))?
+    };
+    machine.stack.push(value);
+    machine.stack.push(runtime::Value::Bool(done));
+    Result::Ok(())
+}
+
 fn push_iterator_result(machine: Machine, offset: isize, result: runtime::Value, message: string) -> Result[
     (),
     VmError,
@@ -8082,6 +8172,7 @@ fn evaluate_source(
         machine.generators,
         machine.dynamic_eval_compiler,
         machine.dynamic_module_loader,
+        machine.iterators,
         machine.depth + 1,
     )
 }
@@ -8328,6 +8419,7 @@ fn prime_generator(machine: Machine, generator: runtime::ObjectId, offset: isize
         generators: machine.generators,
         dynamic_eval_compiler: machine.dynamic_eval_compiler,
         dynamic_module_loader: machine.dynamic_module_loader,
+        iterators: machine.iterators,
         depth: frame.depth,
         eval_environment: frame.eval_environment,
     };
@@ -8642,6 +8734,7 @@ fn call_value_with_mode_rooted(
                         machine.generators,
                         machine.dynamic_eval_compiler,
                         machine.dynamic_module_loader,
+                        machine.iterators,
                         machine.depth + 1,
                     )?;
                     if function.derived_constructor() && constructing {
@@ -9403,6 +9496,7 @@ fn step(machine: Machine, offset: isize, instruction: bytecode::Instruction) -> 
         bytecode::Instruction::IteratorStart => start_iterator(machine, offset)?,
         bytecode::Instruction::AsyncIteratorStart => start_async_iterator(machine, offset)?,
         bytecode::Instruction::IteratorNext => advance_iterator(machine, offset)?,
+        bytecode::Instruction::IteratorNextDirect => advance_iterator_direct(machine, offset)?,
         bytecode::Instruction::IteratorNextValue => {
             advance_iterator_with_value(machine, offset)?
         },
@@ -10098,6 +10192,7 @@ fn execute_initialized(
     generators: GeneratorRuntime,
     dynamic_eval_compiler: Ref[Option[DynamicEvalCompiler]],
     dynamic_module_loader: Ref[Option[DynamicModuleLoader]],
+    iterators: IteratorRuntime,
     depth: isize,
 ) -> Result[runtime::Value, VmError] {
     let verification = function.verification();
@@ -10168,6 +10263,7 @@ fn execute_initialized(
         generators,
         dynamic_eval_compiler,
         dynamic_module_loader,
+        iterators,
         depth,
     };
     let result = execute_machine(machine);
@@ -11672,6 +11768,7 @@ impl Context {
                 self.generators_value,
                 self.dynamic_eval_compiler_value,
                 self.dynamic_module_loader_value,
+                self.iterators_value,
                 0,
             )
         }
@@ -11714,6 +11811,7 @@ impl Context {
             self.generators_value,
             self.dynamic_eval_compiler_value,
             self.dynamic_module_loader_value,
+            self.iterators_value,
             0,
         )
     }
@@ -11771,6 +11869,7 @@ impl Context {
                 self.generators_value,
                 self.dynamic_eval_compiler_value,
                 self.dynamic_module_loader_value,
+                self.iterators_value,
                 0,
             )
         }
@@ -11819,6 +11918,7 @@ impl Context {
             self.generators_value,
             self.dynamic_eval_compiler_value,
             self.dynamic_module_loader_value,
+            self.iterators_value,
             0,
         )
     }
@@ -11943,6 +12043,7 @@ impl Context {
             self.generators_value,
             self.dynamic_eval_compiler_value,
             self.dynamic_module_loader_value,
+            self.iterators_value,
             depth,
         )
     }
@@ -11998,6 +12099,7 @@ impl Context {
             self.generators_value,
             self.dynamic_eval_compiler_value,
             self.dynamic_module_loader_value,
+            self.iterators_value,
             depth,
         )
     }
@@ -12119,6 +12221,7 @@ impl Context {
             self.generators_value,
             self.dynamic_eval_compiler_value,
             self.dynamic_module_loader_value,
+            self.iterators_value,
             depth,
         )
     }
@@ -12376,6 +12479,7 @@ impl Context {
             self.generators_value,
             self.dynamic_eval_compiler_value,
             self.dynamic_module_loader_value,
+            self.iterators_value,
             depth,
         ) {
             Ok(_) => Result::Ok(()),
@@ -12431,6 +12535,7 @@ impl Context {
             self.generators_value,
             self.dynamic_eval_compiler_value,
             self.dynamic_module_loader_value,
+            self.iterators_value,
             depth,
         )
     }

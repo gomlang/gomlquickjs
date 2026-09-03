@@ -2191,13 +2191,10 @@ fn array_iterator_kind(kind: isize) -> ArrayIteratorKind {
     }
 }
 
-fn array_iterator_next(
-    context: vm::Context,
-    this_value: runtime::Value,
-    arguments: Vec[runtime::Value],
-    depth: isize,
-) -> Result[runtime::Value, vm::VmError] {
-    let _ = arguments;
+fn array_iterator_next_step(context: vm::Context, this_value: runtime::Value, depth: isize) -> Result[
+    vm::IteratorStep,
+    vm::VmError,
+] {
     let iterator = match this_value {
         runtime::Value::Object(value) => value,
         _ => return Result::Err(function_vm_error("Array Iterator receiver is invalid")),
@@ -2207,7 +2204,7 @@ fn array_iterator_next(
         None => return Result::Err(function_vm_error("Array Iterator receiver is invalid")),
     };
     if state.done.get() {
-        return array_iterator_result(context, runtime::Value::Undefined, true)
+        return Result::Ok(vm::IteratorStep::Done)
     }
     match state.iterable {
         runtime::Value::Object(value) => if runtime::is_typed_array_detached(context.heap(), value)
@@ -2220,7 +2217,7 @@ fn array_iterator_next(
     let current = state.index.get();
     if current >= length {
         state.done.set(true);
-        array_iterator_result(context, runtime::Value::Undefined, true)
+        Result::Ok(vm::IteratorStep::Done)
     } else {
         state.index.set(current + 1);
         let value = array_iterator_value(
@@ -2230,7 +2227,22 @@ fn array_iterator_next(
             current,
             depth,
         )?;
-        array_iterator_result(context, value, false)
+        Result::Ok(vm::IteratorStep::Value(value))
+    }
+}
+
+fn array_iterator_next(
+    context: vm::Context,
+    this_value: runtime::Value,
+    arguments: Vec[runtime::Value],
+    depth: isize,
+) -> Result[runtime::Value, vm::VmError] {
+    let _ = arguments;
+    match array_iterator_next_step(context, this_value, depth)? {
+        vm::IteratorStep::Value(value) => array_iterator_result(context, value, false),
+        vm::IteratorStep::Done => {
+            array_iterator_result(context, runtime::Value::Undefined, true)
+        },
     }
 }
 
@@ -2256,6 +2268,10 @@ fn array_iterator_prototype(context: vm::Context) -> Result[runtime::ObjectId, v
         Ok(value) => value,
         Err(value) => return Result::Err(function_vm_error(value.message)),
     };
+    context.set_array_iterator_fast_next(
+        next,
+        |this_value, depth| array_iterator_next_step(context, this_value, depth),
+    );
     if !runtime::define_own_property(
         context.heap(),
         prototype,
