@@ -1674,6 +1674,56 @@ fn string_has_default_regexp_exec(
     }
 }
 
+fn string_has_default_regexp_flags(
+    context: vm::Context,
+    receiver: runtime::Value,
+    prototype: runtime::ObjectId,
+    flags_getter: runtime::Value,
+    flag_getters: Vec[(runtime::JsString, runtime::Value)],
+) -> bool {
+    let object = match receiver {
+        runtime::Value::Object(value) => value,
+        _ => return false,
+    };
+    let current = match context.heap().get(object) {
+        Some(value) => value,
+        None => return false,
+    };
+    let flags_key = runtime::string_property_key("flags");
+    if current.own_property(flags_key).is_some() {
+        return false
+    }
+    let inherited = match context.heap().get(prototype) {
+        Some(value) => value,
+        None => return false,
+    };
+    match inherited.own_property(flags_key) {
+        Some(descriptor) => match runtime::descriptor_get(descriptor) {
+            Some(value) => if !runtime::same_value(value, flags_getter) {
+                return false
+            },
+            None => return false,
+        },
+        None => return false,
+    }
+    for (name, expected) in flag_getters {
+        let key = runtime::PropertyKey::String(name);
+        if current.own_property(key).is_some() {
+            return false
+        }
+        match inherited.own_property(key) {
+            Some(descriptor) => match runtime::descriptor_get(descriptor) {
+                Some(value) => if !runtime::same_value(value, expected) {
+                    return false
+                },
+                None => return false,
+            },
+            None => return false,
+        }
+    }
+    true
+}
+
 fn string_plain_replacement(value: runtime::JsString) -> bool {
     let mut index = 0;
     while index < value.len() {
@@ -1881,6 +1931,8 @@ fn string_regexp_replace_at_depth(
     states: HashMap[runtime::ObjectId, RegExpState],
     regexp_prototype: runtime::ObjectId,
     builtin_exec: runtime::Value,
+    flags_getter: runtime::Value,
+    flag_getters: Vec[(runtime::JsString, runtime::Value)],
     this_value: runtime::Value,
     arguments: Vec[runtime::Value],
     depth: isize,
@@ -1901,6 +1953,36 @@ fn string_regexp_replace_at_depth(
                 replacement_root.set(
                     string_value_at_depth_with_root(context, replacement_root.get(), depth)?,
                 )
+            }
+            if string_has_default_regexp_exec(
+                context,
+                receiver_root.get(),
+                regexp_prototype,
+                builtin_exec,
+            )
+                && string_has_default_regexp_flags(
+                    context,
+                    receiver_root.get(),
+                    regexp_prototype,
+                    flags_getter,
+                    flag_getters,
+                ) {
+                match regexp_state(states, receiver_root.get()) {
+                    Ok((_, state)) => {
+                        return string_regexp_builtin_replace_at_depth(
+                            context,
+                            states,
+                            receiver_root.get(),
+                            input,
+                            replacement_root.get(),
+                            functional,
+                            state.global,
+                            state.unicode || state.unicode_sets,
+                            depth,
+                        )
+                    },
+                    Err(_) => (),
+                }
             }
             let flags = string_regexp_flags_at_depth(context, receiver_root.get(), depth)?;
             let global = string_global_flag(flags);
@@ -2967,6 +3049,8 @@ fn install_regexp_string_methods(
     regexp_prototype: runtime::ObjectId,
     states: HashMap[runtime::ObjectId, RegExpState],
     builtin_exec: runtime::Value,
+    flags_getter: runtime::Value,
+    flag_getters: Vec[(runtime::JsString, runtime::Value)],
     iterator_constructor: runtime::Value,
 ) -> Result[(), BuiltinError] {
     let regexp_iterator_states: HashMap[runtime::ObjectId, RegExpStringIteratorState] = HashMap::new();
@@ -3086,6 +3170,8 @@ fn install_regexp_string_methods(
                 states,
                 regexp_prototype,
                 builtin_exec,
+                flags_getter,
+                flag_getters,
                 this_value,
                 arguments,
                 depth,

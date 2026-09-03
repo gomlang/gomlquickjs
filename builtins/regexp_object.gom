@@ -40,6 +40,8 @@ struct RegExpInstall {
     prototype: runtime::ObjectId,
     states: HashMap[runtime::ObjectId, RegExpState],
     exec: runtime::Value,
+    flags_getter: runtime::Value,
+    flag_getters: Vec[(runtime::JsString, runtime::Value)],
 }
 
 struct RegExpConstructorInput {
@@ -1308,6 +1310,7 @@ fn install_regexp_runtime(context: vm::Context) -> Result[RegExpInstall, Builtin
         },
     )?;
     define_regexp_getter(heap, prototype, "flags", flags_getter)?;
+    let flag_getters: Vec[(runtime::JsString, runtime::Value)] = Vec::new();
     for name in Vec::from_array(
         [
             "source",
@@ -1329,7 +1332,8 @@ fn install_regexp_runtime(context: vm::Context) -> Result[RegExpInstall, Builtin
                 regexp_state_property(states, prototype, property, heap, this_value, arguments)
             },
         )?;
-        define_regexp_getter(heap, prototype, property, getter)?
+        define_regexp_getter(heap, prototype, property, getter)?;
+        flag_getters.push((js_string(property), getter));
     }
     let exec = allocate_vm_function(
         context,
@@ -1459,7 +1463,7 @@ fn install_regexp_runtime(context: vm::Context) -> Result[RegExpInstall, Builtin
         Ok(()) => (),
         Err(_) => return Result::Err(regexp_builtin_error("cannot register RegExp constructor")),
     }
-    Result::Ok(RegExpInstall { constructor, prototype, states, exec })
+    Result::Ok(RegExpInstall { constructor, prototype, states, exec, flags_getter, flag_getters })
 }
 
 pub fn install_regexp(context: vm::Context) -> Result[runtime::Value, BuiltinError] {
