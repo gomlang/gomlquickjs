@@ -2568,6 +2568,21 @@ fn is_string(value: runtime::Value) -> bool {
     }
 }
 
+fn fast_primitive_string(heap: runtime::Heap, value: runtime::Value) -> Option[runtime::JsString] {
+    match value {
+        runtime::Value::Undefined => Option::Some(js_string("undefined")),
+        runtime::Value::Null => Option::Some(js_string("null")),
+        runtime::Value::Bool(value) => Option::Some(js_string(value.to_string())),
+        runtime::Value::Int(value) => Option::Some(heap.integer_string(value)),
+        runtime::Value::Float(value) => {
+            Option::Some(js_string(dtoa::number_to_string(value)))
+        },
+        runtime::Value::String(value) => Option::Some(value),
+        runtime::Value::BigInt(value) => Option::Some(js_string(value.to_string())),
+        runtime::Value::Symbol(_) | runtime::Value::Object(_) => Option::None,
+    }
+}
+
 fn primitive_to_string(machine: Machine, offset: isize, value: runtime::Value) -> Result[
     runtime::JsString,
     VmError,
@@ -10692,7 +10707,22 @@ fn fast_numeric_step(machine: Machine, offset: isize, instruction: bytecode::Ins
                 machine.stack.push(runtime::Value::Float(left + runtime::int_to_number(right)));
                 true
             },
-            _ => {
+            _ => if is_string(left) || is_string(right) {
+                match (
+                    fast_primitive_string(machine.heap, left),
+                    fast_primitive_string(machine.heap, right),
+                ) {
+                    (Some(left), Some(right)) => {
+                        machine.stack.push(runtime::Value::String(left.concat(right)));
+                        true
+                    },
+                    _ => {
+                        machine.stack.push(left);
+                        machine.stack.push(right);
+                        false
+                    },
+                }
+            } else {
                 machine.stack.push(left);
                 machine.stack.push(right);
                 false

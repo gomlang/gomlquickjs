@@ -887,6 +887,7 @@ pub struct Heap {
     collection_callback_value: Ref[Option[() -> ()]],
     collection_threshold_value: Ref[isize],
     collection_in_progress_value: Ref[bool],
+    integer_string_cache_value: Vec[JsString],
 }
 
 pub struct GcStats {
@@ -1540,6 +1541,14 @@ fn mark_reachable(
 
 impl Heap {
     pub fn new() -> Heap {
+        let integer_string_cache: Vec[JsString] = Vec::with_capacity(1024);
+        let mut integer = 0;
+        while integer < 1024 {
+            let text = integer.to_string();
+            let bytes = text.to_bytes();
+            integer_string_cache.push(JsString::from_utf8(bytes.slice(0, bytes.len())));
+            integer += 1;
+        }
         Heap {
             identity_value: Ref::new(false),
             slots_value: Vec::new(),
@@ -1561,6 +1570,7 @@ impl Heap {
             collection_callback_value: Ref::new(Option::None),
             collection_threshold_value: Ref::new(4096),
             collection_in_progress_value: Ref::new(false),
+            integer_string_cache_value: integer_string_cache,
         }
     }
 
@@ -1594,6 +1604,16 @@ impl Heap {
                 self.collection_threshold_value.set(retained + retained_growth)
             },
             None => (),
+        }
+    }
+
+    pub fn integer_string(self: Heap, value: i32) -> JsString {
+        if value >= 0 && value < self.integer_string_cache_value.len().to_i32() {
+            self.integer_string_cache_value[value.to_isize()]
+        } else {
+            let text = value.to_string();
+            let bytes = text.to_bytes();
+            JsString::from_utf8(bytes.slice(0, bytes.len()))
         }
     }
 
