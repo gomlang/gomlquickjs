@@ -914,6 +914,28 @@ fn regexp_match_array(
     found: LocatedMatch,
     has_indices: bool,
 ) -> Result[runtime::Value, vm::NativeError] {
+    if !has_indices && found.captures.len() == 1 {
+        let matched = match found.captures[0] {
+            Some(capture) => runtime::Value::String(input.slice(capture.start, capture.end)),
+            None => runtime::Value::Undefined,
+        };
+        let object = match runtime::new_array_with_values_and_default_properties(
+            heap,
+            Vec::from_array([matched]),
+            1,
+            Vec::from_array(
+                [
+                    (runtime::string_property_key("index"), array_length_value(found.start)),
+                    (runtime::string_property_key("input"), runtime::Value::String(input)),
+                    (runtime::string_property_key("groups"), runtime::Value::Undefined),
+                ],
+            ),
+        ) {
+            Ok(value) => value,
+            Err(value) => return Result::Err(native_error(value.message)),
+        };
+        return Result::Ok(runtime::Value::Object(object))
+    }
     let values: Vec[runtime::Value] = Vec::with_capacity(found.captures.len());
     let mut index = 0;
     while index < found.captures.len() {

@@ -884,6 +884,9 @@ pub struct Heap {
     finalization_jobs_value: collections::Deque[FinalizationJob],
     environment_counter_value: Ref[u64],
     stack_pool_value: Ref[Vec[Vec[Value]]],
+    collection_callback_value: Ref[Option[() -> ()]],
+    collection_threshold_value: Ref[isize],
+    collection_in_progress_value: Ref[bool],
 }
 
 pub struct GcStats {
@@ -1555,6 +1558,42 @@ impl Heap {
             finalization_jobs_value: collections::Deque::new(),
             environment_counter_value: Ref::new(0),
             stack_pool_value: Ref::new(Vec::new()),
+            collection_callback_value: Ref::new(Option::None),
+            collection_threshold_value: Ref::new(4096),
+            collection_in_progress_value: Ref::new(false),
+        }
+    }
+
+    pub fn set_collection_callback(self: Heap, callback: () -> ()) -> () {
+        self.collection_callback_value.set(Option::Some(callback));
+        self.collection_threshold_value.set(self.live_count_value.get() + 4096)
+    }
+
+    pub fn collection_checkpoint(self: Heap) -> () {
+        let live = self.live_count_value.get();
+        if live < self.collection_threshold_value.get() || self.collection_in_progress_value.get() {
+            return
+        }
+        let growth = if live / 2 > 4096 {
+            live / 2
+        } else {
+            4096
+        };
+        self.collection_threshold_value.set(live + growth);
+        match self.collection_callback_value.get() {
+            Some(callback) => {
+                self.collection_in_progress_value.set(true);
+                callback();
+                self.collection_in_progress_value.set(false);
+                let retained = self.live_count_value.get();
+                let retained_growth = if retained / 2 > 4096 {
+                    retained / 2
+                } else {
+                    4096
+                };
+                self.collection_threshold_value.set(retained + retained_growth)
+            },
+            None => (),
         }
     }
 
@@ -2283,6 +2322,15 @@ pub fn new_array_with_values(heap: Heap, values: Vec[Value], length: isize) -> R
     ObjectId,
     TypeError,
 ] {
+    new_array_with_values_and_default_properties(heap, values, length, Vec::new())
+}
+
+pub fn new_array_with_values_and_default_properties(
+    heap: Heap,
+    values: Vec[Value],
+    length: isize,
+    properties: Vec[(PropertyKey, Value)],
+) -> Result[ObjectId, TypeError] {
     let object = new_array(heap, length)?;
     let target = match heap.get(object) {
         Some(value) => value,
@@ -2315,6 +2363,9 @@ pub fn new_array_with_values(heap: Heap, values: Vec[Value], length: isize) -> R
         target.state_value.get().array_dense_properties_value.push(
             Option::Some(ArrayElement::Default(value)),
         )
+    }
+    for (key, value) in properties {
+        target.state_value.get().properties_value.insert(key, OrdinaryProperty::Default(value));
     }
     Result::Ok(object)
 }

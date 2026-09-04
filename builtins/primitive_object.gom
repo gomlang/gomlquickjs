@@ -12,14 +12,10 @@ fn primitive_number_receiver(
     prototype: runtime::ObjectId,
 ) -> Result[f64, vm::NativeError] {
     match value {
-        runtime::Value::Int(value) => {
-            Result::Ok(num::parse_float64_structured(value.to_string()).unwrap_or(0.0))
-        },
+        runtime::Value::Int(value) => Result::Ok(runtime::int_to_number(value)),
         runtime::Value::Float(value) => Result::Ok(value),
         runtime::Value::Object(value) => match runtime::primitive_value(heap, value) {
-            Some(runtime::Value::Int(value)) => {
-                Result::Ok(num::parse_float64_structured(value.to_string()).unwrap_or(0.0))
-            },
+            Some(runtime::Value::Int(value)) => Result::Ok(runtime::int_to_number(value)),
             Some(runtime::Value::Float(value)) => Result::Ok(value),
             _ => if value == prototype {
                 Result::Ok(0.0)
@@ -28,6 +24,17 @@ fn primitive_number_receiver(
             },
         },
         _ => Result::Err(native_error("Number method requires a number receiver")),
+    }
+}
+
+fn primitive_number_integer(heap: runtime::Heap, value: runtime::Value) -> Option[i32] {
+    match value {
+        runtime::Value::Int(value) => Option::Some(value),
+        runtime::Value::Object(object) => match runtime::primitive_value(heap, object) {
+            Some(runtime::Value::Int(value)) => Option::Some(value),
+            _ => Option::None,
+        },
+        _ => Option::None,
     }
 }
 
@@ -151,7 +158,15 @@ fn primitive_number_to_string(
     arguments: Vec[runtime::Value],
 ) -> Result[runtime::Value, vm::NativeError] {
     let value = primitive_number_receiver(heap, this_value, prototype)?;
-    let text = primitive_number_text(value, primitive_radix(arguments)?)?;
+    let radix = primitive_radix(arguments)?;
+    let text = if radix == 10 {
+        match primitive_number_integer(heap, this_value) {
+            Some(value) => value.to_string(),
+            None => primitive_number_text(value, radix)?,
+        }
+    } else {
+        primitive_number_text(value, radix)?
+    };
     Result::Ok(runtime::Value::String(js_string(text)))
 }
 
