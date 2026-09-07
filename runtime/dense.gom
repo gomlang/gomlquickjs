@@ -1,0 +1,121 @@
+package runtime;
+
+struct DenseElements {
+    values: Vec[Value],
+    descriptors: Ref[Option[Vec[Option[ArrayElement]]]],
+}
+
+impl DenseElements {
+    fn new() -> DenseElements {
+        DenseElements { values: Vec::new(), descriptors: Ref::new(Option::None) }
+    }
+
+    fn len(self: DenseElements) -> isize {
+        match self.descriptors.get() {
+            Some(values) => values.len(),
+            None => self.values.len(),
+        }
+    }
+
+    fn is_empty(self: DenseElements) -> bool {
+        self.len() == 0
+    }
+
+    fn reserve(self: DenseElements, additional: isize) -> () {
+        match self.descriptors.get() {
+            Some(values) => values.reserve(additional),
+            None => self.values.reserve(additional),
+        }
+    }
+
+    fn general(self: DenseElements) -> Vec[Option[ArrayElement]] {
+        match self.descriptors.get() {
+            Some(values) => values,
+            None => {
+                let values = Vec::with_capacity(self.values.len());
+                for value in self.values {
+                    values.push(Option::Some(ArrayElement::Default(value)))
+                }
+                self.descriptors.set(Option::Some(values));
+                self.values.clear();
+                values
+            },
+        }
+    }
+
+    fn get(self: DenseElements, index: isize) -> Option[ArrayElement] {
+        match self.descriptors.get() {
+            Some(values) => values[index],
+            None => Option::Some(ArrayElement::Default(self.values[index])),
+        }
+    }
+
+    fn value(self: DenseElements, index: isize) -> Option[Value] {
+        match self.descriptors.get() {
+            Some(values) => match values[index] {
+                Some(element) => array_element_value(element),
+                None => Option::None,
+            },
+            None => Option::Some(self.values[index]),
+        }
+    }
+
+    fn write_value(self: DenseElements, index: isize, value: Value) -> bool {
+        if self.descriptors.get().is_none() && index >= 0 && index < self.values.len() {
+            self.values[index] = value;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn set(self: DenseElements, index: isize, value: Option[ArrayElement]) -> () {
+        if self.descriptors.get().is_none() {
+            match value {
+                Some(ArrayElement::Default(value)) => {
+                    self.values[index] = value;
+                    return ()
+                },
+                None => if index == self.values.len() - 1 {
+                    self.values.truncate(index);
+                    return ()
+                },
+                _ => (),
+            }
+        }
+        self.general()[index] = value;
+    }
+
+    fn push(self: DenseElements, value: Option[ArrayElement]) -> () {
+        if self.descriptors.get().is_none() {
+            match value {
+                Some(ArrayElement::Default(value)) => {
+                    self.values.push(value);
+                    return ()
+                },
+                _ => (),
+            }
+        }
+        self.general().push(value)
+    }
+
+    fn truncate(self: DenseElements, length: isize) -> () {
+        match self.descriptors.get() {
+            Some(values) => values.truncate(length),
+            None => self.values.truncate(length),
+        }
+    }
+
+    fn iter(self: DenseElements) -> FnIterator[Option[ArrayElement]] {
+        let index = Ref::new(0);
+        FnIterator::from_fn(
+            || if index.get() < self.len() {
+                let value = self.get(index.get());
+                index.set(index.get() + 1);
+                Option::Some(value)
+            } else {
+                Option::None
+            },
+        )
+    }
+}
