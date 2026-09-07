@@ -217,6 +217,26 @@ declarations persist through the global object, while top-level harness `let`, `
 declarations persist through the realm's global lexical environment and are visible to subsequent
 scripts and modules.
 
+The VM stores uncaptured locals in contiguous value slots. Capturing a local,
+including through mapped arguments or eval, promotes it to a shared cell;
+per-iteration rebinding detaches the previous cell. Only uncaptured local storage
+is returned to a bounded local-slot pool, with values cleared before reuse.
+Successful bytecode verification supplies the cached stack capacity without
+allocating an empty diagnostic vector on each call. Semantic updates invalidate
+this cache, and invalid functions retain their verification diagnostics.
+Synchronous source calls reuse argument
+buffers, while suspended calls and host callbacks without an explicit reuse
+contract receive independent buffers. Frame scratch storage is reused only when
+the arguments binding has not been initialized, since that binding can escape
+through a closure. Shared execution state is passed along the call chain.
+
+Dense arrays store default elements directly and switch to descriptor storage
+when an interior hole or a non-default descriptor is introduced. Both forms
+participate in heap tracing. Ordinary objects allocate their specialized state
+only when needed. The interpreter fuses eligible adjacent local loads and numeric
+operations without rewriting bytecode offsets; operations requiring coercion
+resume at the original arithmetic instruction.
+
 Run the module tests with:
 
 ```sh
