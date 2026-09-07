@@ -1,0 +1,59 @@
+package vm;
+
+use gomlang::quickjs::runtime;
+use std::testing;
+
+#[test]
+fn pooled_local_slots_reset_values_and_exclude_captured_storage() -> () {
+    let heap = runtime::Heap::new();
+    let pool = Vec::new();
+    let first = take_local_slots(pool, heap, 2);
+    first.set(0, runtime::Value::Int(10));
+    return_local_slots(pool, heap, first);
+    testing::assert_eq(pool.len(), 1);
+    let reused = take_local_slots(pool, heap, 3);
+    testing::assert_eq(pool.len(), 0);
+    testing::assert_eq(reused.len(), 3);
+    testing::assert(runtime::same_value(reused.get(0), runtime::Value::Undefined));
+    let active = take_local_slots(pool, heap, 1);
+    active.set(0, runtime::Value::Int(20));
+    testing::assert(runtime::same_value(reused.get(0), runtime::Value::Undefined));
+    let captured = active.capture(0);
+    return_local_slots(pool, heap, active);
+    testing::assert_eq(pool.len(), 0);
+    return_local_slots(pool, heap, reused);
+    let next = take_local_slots(pool, heap, 1);
+    next.set(0, runtime::Value::Int(30));
+    testing::assert(runtime::same_value(captured.get(), runtime::Value::Int(20)))
+}
+
+#[test]
+fn captured_slots_share_updates_and_renew_independently() -> () {
+    let slots = LocalSlots::new(2);
+    slots.set(0, runtime::Value::Int(10));
+    let first = slots.capture(0);
+    slots.set(0, runtime::Value::Int(20));
+    testing::assert(runtime::same_value(first.get(), runtime::Value::Int(20)));
+    first.set(runtime::Value::Int(30));
+    testing::assert(runtime::same_value(slots.get(0), runtime::Value::Int(30)));
+    slots.renew(0);
+    slots.set(0, runtime::Value::Int(40));
+    let second = slots.capture(0);
+    testing::assert(runtime::same_value(first.get(), runtime::Value::Int(30)));
+    testing::assert(runtime::same_value(second.get(), runtime::Value::Int(40)));
+    let roots = Vec::new();
+    slots.push_roots(roots);
+    testing::assert_eq(roots.len(), 2);
+    testing::assert(runtime::same_value(roots[0], runtime::Value::Int(40)));
+    testing::assert(runtime::same_value(roots[1], runtime::Value::Undefined))
+}
+
+#[test]
+fn imported_local_cells_preserve_external_aliases() -> () {
+    let cell = Ref::new(runtime::Value::Int(1));
+    let slots = LocalSlots::from_cells(Vec::from_array([cell]));
+    slots.set(0, runtime::Value::Int(2));
+    testing::assert(runtime::same_value(cell.get(), runtime::Value::Int(2)));
+    cell.set(runtime::Value::Int(3));
+    testing::assert(runtime::same_value(slots.get(0), runtime::Value::Int(3)))
+}

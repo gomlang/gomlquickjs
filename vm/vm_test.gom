@@ -217,6 +217,62 @@ fn numeric_fast_paths_preserve_overflow_negative_zero_and_mixed_comparisons() ->
     )
 }
 
+#[test]
+fn integer_remainder_preserves_numeric_edge_cases() -> () {
+    for (left, right, expected) in[
+        (7, 3, 1),
+        (-7, 3, -1),
+        (7, -3, 1),
+        (-7, -3, -1),
+        (0, -3, 0),
+        (2147483647, 3, 1),
+        (-2147483648, 3, -2),
+    ] {
+        testing::assert(
+            runtime::same_value(
+                execute_numeric_binary(
+                    runtime::Value::Int(left),
+                    runtime::Value::Int(right),
+                    bytecode::Instruction::Mod,
+                ),
+                runtime::Value::Int(expected),
+            ),
+        )
+    }
+    for (left, right) in[(-6, 3), (-6, -3), (-2147483648, -1), (-2147483648, 1)] {
+        testing::assert(
+            runtime::same_value(
+                execute_numeric_binary(
+                    runtime::Value::Int(left),
+                    runtime::Value::Int(right),
+                    bytecode::Instruction::Mod,
+                ),
+                runtime::Value::Float(-0.0),
+            ),
+        )
+    }
+    for left in[0, 1, -1, -2147483648] {
+        let result = expect_number(
+            execute_numeric_binary(
+                runtime::Value::Int(left),
+                runtime::Value::Int(0),
+                bytecode::Instruction::Mod,
+            ),
+        );
+        testing::assert(result != result)
+    }
+    testing::assert_eq(
+        expect_number(
+            execute_numeric_binary(
+                runtime::Value::Int(7),
+                runtime::Value::Int(2),
+                bytecode::Instruction::Div,
+            ),
+        ),
+        3.5,
+    )
+}
+
 fn big(value: string) -> runtime::Value {
     runtime::Value::BigInt(
         runtime::BigInt::parse_radix(value, 10).unwrap_or(runtime::BigInt::from_int64(0)),
@@ -1421,6 +1477,52 @@ fn string_virtual_properties_preserve_utf16_code_units() -> () {
     match execute_with_locals(length, runtime::Heap::new(), Vec::from_array([value])) {
         Ok(runtime::Value::Int(result)) => testing::assert_eq(result, 2),
         _ => testing::fail("expected virtual string length"),
+    }
+}
+
+#[test]
+fn cached_string_index_fields_yield_to_own_characters() -> () {
+    let heap = runtime::Heap::new();
+    let context = Context::new(heap);
+    let prototype = expect_object(runtime::new_ordinary_object(heap, Option::None));
+    testing::assert(
+        runtime::define_own_property(
+            heap,
+            prototype,
+            runtime::string_property_key("0"),
+            runtime::data_descriptor(
+                runtime::Value::String(test_js_string("prototype")),
+                true,
+                true,
+                true,
+            ),
+        ),
+    );
+    match context.set_primitive_prototype(PrimitiveKind::String, prototype) {
+        Ok(()) => (),
+        Err(value) => testing::fail(value.kind.debug()),
+    }
+    let function = bytecode::Function::new(
+        Vec::from_array([bytecode::Constant::String(test_js_string("0"))]),
+        Vec::from_array(
+            [
+                bytecode::Instruction::GetLoc(0),
+                bytecode::Instruction::GetField(0),
+                bytecode::Instruction::Return,
+            ],
+        ),
+        1,
+    );
+    for (receiver, expected) in[("", "prototype"), ("abc", "a"), ("", "prototype"), ("xyz", "x")] {
+        match context.execute_with_locals(
+            function,
+            Vec::from_array([runtime::Value::String(test_js_string(receiver))]),
+        ) {
+            Ok(value) => testing::assert(
+                runtime::same_value(value, runtime::Value::String(test_js_string(expected))),
+            ),
+            Err(value) => testing::fail(value.kind.debug()),
+        }
     }
 }
 

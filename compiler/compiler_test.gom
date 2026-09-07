@@ -204,6 +204,56 @@ fn compiles_numeric_and_bitwise_compound_assignments() -> () {
 }
 
 #[test]
+fn call_buffers_preserve_escaped_arguments_closures_and_suspension() -> () {
+    match execute_source_with_builtins(
+        "function keep(x) { return [arguments, () => arguments[0], () => x, v => { x = v; }]; } let a = keep(11); let b = keep(22); a[3](33); let captured = a[0][0] === 33 && a[1]() === 33 && a[2]() === 33 && b[0][0] === 22 && b[1]() === 22; function recursive(n) { let saved = arguments; if (n > 0) recursive(n - 1); return saved[0] === n; } function fromEval(x) { return eval('() => x'); } let e = fromEval(44); fromEval(55); function* generate(x) { yield arguments[0]; yield x; } let g = generate(66); generate(77); let asyncValue = 0; async function delayed(x) { await 0; asyncValue += arguments[0] + x; } delayed(3); delayed(5); Promise.drainJobs(); let loops = []; for (let i = 0; i < 3; i++) loops.push(() => i); return captured && recursive(8) && e() === 44 && g.next().value === 66 && g.next().value === 66 && asyncValue === 16 && loops[0]() === 0 && loops[1]() === 1 && loops[2]() === 2;",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected independent call storage"),
+    }
+}
+
+#[test]
+fn string_field_caches_preserve_virtual_properties_and_prototype_changes() -> () {
+    match execute_source_with_builtins(
+        "function method(value) { return value.indexOf; } function first(value) { return value[0]; } function length(value) { return value.length; } let original = String.prototype.indexOf; let initial = method('abc') === original; String.prototype.indexOf = 42; let replaced = method('def') === 42; delete String.prototype.indexOf; let deleted = method('ghi') === undefined; let hits = 0; Object.defineProperty(String.prototype, 'indexOf', {get() { hits++; return this.length; }, configurable: true}); let accessor = method('abcd') === 4 && method('xy') === 2 && hits === 2; Object.defineProperty(String.prototype, 'indexOf', {value: original, writable: true, configurable: true}); String.prototype[0] = 'prototype'; let virtual = first('') === 'prototype' && first('x') === 'x' && first('') === 'prototype' && length('abcd') === 4 && length('') === 0; delete String.prototype[0]; return initial && replaced && deleted && accessor && virtual;",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected string property cache semantics"),
+    }
+}
+
+#[test]
+fn call_sites_switch_between_source_native_bound_and_proxy_functions() -> () {
+    match execute_source_with_builtins(
+        "function invoke(f, x) { return f(x); } function twice(x) { return x * 2; } let native = invoke(Math.abs, -3); let source = invoke(twice, 4); let nativeAgain = invoke(Math.abs, -5); let bound = invoke(twice.bind(null), 6); let proxy = invoke(new Proxy(twice, {apply(target, receiver, args) { return target(args[0]) + 1; }}), 7); let delayed = 0; async function later(x) { await 0; return x; } invoke(later, 8).then(value => { delayed = value; }); invoke(twice, 9); Promise.drainJobs(); return native === 3 && source === 8 && nativeAgain === 5 && bound === 12 && proxy === 15 && delayed === 8;",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected polymorphic call site result"),
+    }
+}
+
+#[test]
+fn fused_local_operations_preserve_coercion_and_exception_handlers() -> () {
+    match execute_source_with_builtins(
+        "function add(a, b) { return a + b; } function sub(a, b) { try { return a - b; } catch (error) { return error; } } let order = ''; let left = {valueOf() { order += 'l'; return 4; }}; let right = {valueOf() { order += 'r'; return 2; }}; let value = add(left, right); let marker = {}; let bad = {valueOf() { throw marker; }}; return value === 6 && order === 'lr' && add('a', 'b') === 'ab' && add(2147483647, 1) === 2147483648 && sub(bad, 1) === marker && sub(7, 2) === 5;",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected fused operation semantics"),
+    }
+}
+
+#[test]
+fn remainder_indices_preserve_array_property_semantics() -> () {
+    match execute_source_with_builtins(
+        "function index(value) { return value % 3; } let array = [10, 20, 30]; let sum = 0; for (let i = 0; i < 9; i++) { array[index(i)] = i; sum += array[index(i)]; } let hits = 0; Object.defineProperty(array, '1', {get() { hits++; return 42; }, set(value) { hits += value; }}); array[index(4)] = 2; let accessor = array[index(7)] === 42 && hits === 3; let proto = Object.create(Array.prototype); proto[2] = 55; Object.setPrototypeOf(array, proto); delete array[2]; let inherited = array[index(5)] === 55; array[index(-4)] = 77; let negative = array['-1'] === 77 && array.length === 3; let keys = ''; let proxy = new Proxy(array, {get(target, key) { keys += key; return target[key]; }, set(target, key, value) { keys += key; target[key] = value; return true; }}); proxy[index(6)] = 99; let proxied = proxy[index(3)] === 99 && keys === '00'; let frozen = Object.freeze([1, 2, 3]); frozen[index(4)] = 8; let strictFailed = false; function strictWrite() { 'use strict'; frozen[index(4)] = 8; } try { strictWrite(); } catch (error) { strictFailed = error instanceof TypeError; } return sum === 36 && accessor && inherited && negative && proxied && frozen[1] === 2 && strictFailed && Object.is(index(-3), -0) && array[index(-3)] === 99;",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected remainder index semantics result"),
+    }
+}
+
+#[test]
 fn cached_string_numeric_conversion_tracks_changing_values() -> () {
     match execute_source_with_builtins(
         "function bitwise(value) { return value | 0; } function subtract(value) { return 100 - value; } return bitwise('12') === 12 && bitwise('27') === 27 && bitwise('bad') === 0 && subtract('1.5') === 98.5 && subtract('2.5') === 97.5 && Number.isNaN(subtract('bad')) && subtract({valueOf() { return 7; }}) === 93;",
