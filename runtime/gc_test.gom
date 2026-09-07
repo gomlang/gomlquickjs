@@ -25,6 +25,40 @@ fn gc_link(heap: Heap, from: ObjectId, name: string, to: ObjectId) -> () {
 }
 
 #[test]
+fn gc_preserves_dense_elements_across_descriptor_transitions() -> () {
+    let heap = Heap::new();
+    let first = gc_expect_object(new_ordinary_object(heap, Option::None));
+    let second = gc_expect_object(new_ordinary_object(heap, Option::None));
+    let array = gc_expect_object(
+        new_array_with_values(
+            heap,
+            Vec::from_array([Value::Object(first), Value::Object(second)]),
+            2,
+        ),
+    );
+    let roots = Vec::from_array([Value::Object(array)]);
+    let _ = heap.collect(roots);
+    testing::assert(heap.contains(first));
+    testing::assert(heap.contains(second));
+    testing::assert(
+        define_own_property(
+            heap,
+            array,
+            string_property_key("0"),
+            data_descriptor(Value::Object(first), false, true, false),
+        ),
+    );
+    let _ = heap.collect(roots);
+    testing::assert(heap.contains(first));
+    testing::assert(heap.contains(second));
+    testing::assert(delete_property(heap, array, string_property_key("1")));
+    let _ = heap.collect(roots);
+    testing::assert(heap.contains(first));
+    testing::assert(!heap.contains(second));
+    testing::assert(!delete_property(heap, array, string_property_key("0")))
+}
+
+#[test]
 fn gc_root_preserves_the_reachable_graph() -> () {
     let heap = Heap::new();
     let root = gc_expect_object(new_ordinary_object(heap, Option::None));
