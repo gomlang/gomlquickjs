@@ -322,6 +322,7 @@ pub struct Function {
     native_call_caches_value: Ref[Vec[Option[runtime::ObjectId]]],
     numeric_string_cache_value: Ref[Option[(isize, runtime::JsString, f64)]],
     stack_cache_value: Ref[Option[Vec[runtime::Value]]],
+    local_pair_offsets_value: Ref[Option[Vec[bool]]],
     eval_binding_cache_value: Ref[runtime::EvalBindingCache],
 }
 
@@ -506,6 +507,7 @@ impl Function {
             native_call_caches_value: Ref::new(native_call_caches),
             numeric_string_cache_value: Ref::new(Option::None),
             stack_cache_value: Ref::new(Option::None),
+            local_pair_offsets_value: Ref::new(Option::None),
             eval_binding_cache_value: Ref::new(runtime::EvalBindingCache::new()),
         }
     }
@@ -624,6 +626,35 @@ impl Function {
 
     pub fn instruction_unchecked(self: Function, offset: isize) -> Instruction {
         self.code_value[offset]
+    }
+
+    pub fn local_pair_offsets(self: Function) -> Vec[bool] {
+        match self.local_pair_offsets_value.get() {
+            Some(offsets) => offsets,
+            None => {
+                let offsets = Vec::with_capacity(self.code_value.len());
+                let mut offset = 0;
+                while offset < self.code_value.len() {
+                    let eligible = offset + 2 < self.code_value.len()
+                        && match self.code_value[offset] {
+                            Instruction::GetLoc(_) => true,
+                            _ => false,
+                        }
+                        && match self.code_value[offset + 1] {
+                            Instruction::GetLoc(_) | Instruction::PushI32(_) => true,
+                            _ => false,
+                        }
+                        && match self.code_value[offset + 2] {
+                            Instruction::Add | Instruction::Sub | Instruction::Mul | Instruction::Div | Instruction::Mod | Instruction::Lt | Instruction::Lte | Instruction::Gt | Instruction::Gte | Instruction::StrictEq | Instruction::StrictNeq => true,
+                            _ => false,
+                        };
+                    offsets.push(eligible);
+                    offset += 1;
+                }
+                self.local_pair_offsets_value.set(Option::Some(offsets));
+                offsets
+            },
+        }
     }
 
     pub fn code_len(self: Function) -> isize {
@@ -833,6 +864,13 @@ impl Function {
 
     pub fn source_text(self: Function) -> Option[runtime::JsString] {
         self.source_text_value.get()
+    }
+
+    pub fn verified_max_stack(self: Function) -> Option[isize] {
+        if self.verification_max_stack_value.get().is_none() {
+            let _ = self.verification();
+        }
+        self.verification_max_stack_value.get()
     }
 
     pub fn verification(self: Function) -> VerifyResult {

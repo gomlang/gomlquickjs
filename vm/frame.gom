@@ -1,0 +1,34 @@
+package vm;
+
+use gomlang::quickjs::runtime;
+
+struct FrameScratch {
+    arguments_object: Ref[Option[runtime::ObjectId]],
+    arguments_binding: Ref[runtime::Value],
+    arguments_binding_initialized: Ref[bool],
+    offset: Ref[isize],
+    argument_buffer: Vec[runtime::Value],
+}
+
+fn take_frame_scratch(pool: Vec[FrameScratch]) -> FrameScratch {
+    match pool.pop() {
+        Some(frame) => frame,
+        None => FrameScratch {
+            arguments_object: Ref::new(Option::None),
+            arguments_binding: Ref::new(runtime::Value::Undefined),
+            arguments_binding_initialized: Ref::new(false),
+            offset: Ref::new(0),
+            argument_buffer: Vec::new(),
+        },
+    }
+}
+
+fn return_frame_scratch(pool: Vec[FrameScratch], frame: FrameScratch) -> () {
+    if !frame.arguments_binding_initialized.get() && pool.len() < MAX_POOLED_STACKS {
+        frame.arguments_object.set(Option::None);
+        frame.arguments_binding.set(runtime::Value::Undefined);
+        frame.offset.set(0);
+        frame.argument_buffer.clear();
+        pool.push(frame)
+    }
+}

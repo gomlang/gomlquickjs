@@ -399,7 +399,7 @@ struct ActiveFrame {
     function: bytecode::Function,
     offset: Ref[isize],
     stack: Vec[runtime::Value],
-    locals: Vec[Ref[runtime::Value]],
+    locals: LocalSlots,
     upvalues: Vec[UpvalueCell],
     arguments: Vec[runtime::Value],
     this_value: Ref[Option[runtime::Value]],
@@ -430,7 +430,7 @@ enum GeneratorResumeKind {
 struct GeneratorFrame {
     function: bytecode::Function,
     stack: Vec[runtime::Value],
-    locals: Vec[Ref[runtime::Value]],
+    locals: LocalSlots,
     upvalues: Vec[UpvalueCell],
     arguments: Vec[runtime::Value],
     this_value: Ref[Option[runtime::Value]],
@@ -521,8 +521,33 @@ pub enum GeneratorCompletion {
 }
 
 struct Machine {
+    functions: HashMap[runtime::ObjectId, Ref[Closure]],
+    native_functions: HashMap[runtime::ObjectId, NativeFunction],
+    vm_functions: HashMap[runtime::ObjectId, VmCallable],
+    primitive_prototypes: PrimitivePrototypes,
+    home_object: Option[runtime::ObjectId],
+    new_target: Option[runtime::Value],
+    instance_initializer: Ref[Option[runtime::ObjectId]],
+    shared: Ref[MachineShared],
     function: bytecode::Function,
     heap: runtime::Heap,
+    stack: Vec[runtime::Value],
+    native_argument_buffer: Vec[runtime::Value],
+    locals: LocalSlots,
+    upvalues: Vec[UpvalueCell],
+    callee: Option[runtime::Value],
+    arguments: Vec[runtime::Value],
+    arguments_object: Ref[Option[runtime::ObjectId]],
+    arguments_binding: Ref[runtime::Value],
+    arguments_binding_initialized: Ref[bool],
+    this_value: Ref[Option[runtime::Value]],
+    depth: isize,
+    eval_environment: Ref[Option[Ref[EvalEnvironment]]],
+}
+
+struct MachineShared {
+    local_slots_pool: Vec[LocalSlots],
+    frame_scratch_pool: Vec[FrameScratch],
     functions: HashMap[runtime::ObjectId, Ref[Closure]],
     bound_functions: HashMap[runtime::ObjectId, BoundFunction],
     function_objects: HashMap[u64, runtime::ObjectId],
@@ -532,10 +557,6 @@ struct Machine {
     vm_functions: HashMap[runtime::ObjectId, VmCallable],
     vm_constructor_functions: HashMap[runtime::ObjectId, VmConstructorCallbacks],
     native_constructors: collections::HashSet[runtime::ObjectId],
-    stack: Vec[runtime::Value],
-    native_argument_buffer: Vec[runtime::Value],
-    locals: Vec[Ref[runtime::Value]],
-    upvalues: Vec[UpvalueCell],
     global_object: Option[runtime::ObjectId],
     primitive_prototypes: PrimitivePrototypes,
     error_prototypes: ErrorPrototypes,
@@ -546,22 +567,11 @@ struct Machine {
     to_primitive_symbol: Option[runtime::Symbol],
     has_instance_symbol: Option[runtime::Symbol],
     intrinsic_eval: Option[runtime::Value],
-    callee: Option[runtime::Value],
-    arguments: Vec[runtime::Value],
-    arguments_object: Ref[Option[runtime::ObjectId]],
-    arguments_binding: Ref[runtime::Value],
-    arguments_binding_initialized: Ref[bool],
-    this_value: Ref[Option[runtime::Value]],
-    home_object: Option[runtime::ObjectId],
-    new_target: Option[runtime::Value],
-    instance_initializer: Ref[Option[runtime::ObjectId]],
     active_frames: Vec[ActiveFrame],
     generators: GeneratorRuntime,
     dynamic_eval_compiler: Ref[Option[DynamicEvalCompiler]],
     dynamic_module_loader: Ref[Option[DynamicModuleLoader]],
     iterators: IteratorRuntime,
-    depth: isize,
-    eval_environment: Ref[Option[Ref[EvalEnvironment]]],
 }
 
 pub struct Context {
@@ -650,9 +660,7 @@ fn push_active_frame_roots(roots: Vec[runtime::Value], frame: ActiveFrame) -> ()
     for value in frame.stack {
         roots.push(value)
     }
-    for value in frame.locals {
-        roots.push(value.get())
-    }
+    frame.locals.push_roots(roots);
     push_upvalue_roots(roots, frame.upvalues);
     for value in frame.arguments {
         roots.push(value)
@@ -673,9 +681,7 @@ fn push_generator_frame_roots(roots: Vec[runtime::Value], frame: GeneratorFrame)
     for value in frame.stack {
         roots.push(value)
     }
-    for value in frame.locals {
-        roots.push(value.get())
-    }
+    frame.locals.push_roots(roots);
     push_upvalue_roots(roots, frame.upvalues);
     for value in frame.arguments {
         roots.push(value)
@@ -756,6 +762,43 @@ fn generator_completion_result(heap: runtime::Heap, completion: GeneratorComplet
 }
 
 impl Context {
+    fn machine_shared(self: Context) -> Ref[MachineShared] {
+        Ref::new(
+            MachineShared {
+                local_slots_pool: Vec::new(),
+                frame_scratch_pool: Vec::new(),
+                functions: self.functions_value,
+                bound_functions: self.bound_functions_value,
+                function_objects: self.function_objects_value,
+                template_objects: self.template_objects_value,
+                native_functions: self.native_functions_value,
+                native_constructor_functions: self.native_constructor_functions_value,
+                vm_functions: self.vm_functions_value,
+                vm_constructor_functions: self.vm_constructor_functions_value,
+                native_constructors: self.native_constructors_value,
+                global_object: self.global_object_value.get(),
+                primitive_prototypes: self.primitive_prototypes_value,
+                error_prototypes: self.error_prototypes_value,
+                object_builtin_tags: self.object_builtin_tags_value,
+                global_lexical_bindings: self.global_lexical_bindings_value,
+                regexp_constructor: self.regexp_constructor_value.get(),
+                iterator_symbol: self.iterator_symbol_value.get(),
+                to_primitive_symbol: self.well_known_symbols_value.slot(
+                    WellKnownSymbolKind::ToPrimitive,
+                ).get(),
+                has_instance_symbol: self.well_known_symbols_value.slot(
+                    WellKnownSymbolKind::HasInstance,
+                ).get(),
+                intrinsic_eval: self.intrinsic_eval_value.get(),
+                active_frames: self.active_frames_value,
+                generators: self.generators_value,
+                dynamic_eval_compiler: self.dynamic_eval_compiler_value,
+                dynamic_module_loader: self.dynamic_module_loader_value,
+                iterators: self.iterators_value,
+            },
+        )
+    }
+
     pub fn new(heap: runtime::Heap) -> Context {
         let context = Context {
             heap_value: heap,
@@ -1452,51 +1495,61 @@ impl Context {
         frame.status.set(GeneratorStatus::Executing);
         self.active_frames_value.push(generator_active_frame(frame));
         let machine = Machine {
+            shared: Ref::new(
+                MachineShared {
+                    local_slots_pool: Vec::new(),
+                    frame_scratch_pool: Vec::new(),
+                    functions: self.functions_value,
+                    bound_functions: self.bound_functions_value,
+                    function_objects: self.function_objects_value,
+                    template_objects: self.template_objects_value,
+                    native_functions: self.native_functions_value,
+                    native_constructor_functions: self.native_constructor_functions_value,
+                    vm_functions: self.vm_functions_value,
+                    vm_constructor_functions: self.vm_constructor_functions_value,
+                    native_constructors: self.native_constructors_value,
+                    global_object: self.global_object_value.get(),
+                    primitive_prototypes: self.primitive_prototypes_value,
+                    error_prototypes: self.error_prototypes_value,
+                    object_builtin_tags: self.object_builtin_tags_value,
+                    global_lexical_bindings: self.global_lexical_bindings_value,
+                    regexp_constructor: self.regexp_constructor_value.get(),
+                    iterator_symbol: self.iterator_symbol_value.get(),
+                    to_primitive_symbol: self.well_known_symbols_value.slot(
+                        WellKnownSymbolKind::ToPrimitive,
+                    ).get(),
+                    has_instance_symbol: self.well_known_symbols_value.slot(
+                        WellKnownSymbolKind::HasInstance,
+                    ).get(),
+                    intrinsic_eval: self.intrinsic_eval_value.get(),
+                    active_frames: self.active_frames_value,
+                    generators: self.generators_value,
+                    dynamic_eval_compiler: self.dynamic_eval_compiler_value,
+                    dynamic_module_loader: self.dynamic_module_loader_value,
+                    iterators: self.iterators_value,
+                },
+            ),
             function: frame.function,
             heap: self.heap_value,
-            functions: self.functions_value,
-            bound_functions: self.bound_functions_value,
-            function_objects: self.function_objects_value,
-            template_objects: self.template_objects_value,
-            native_functions: self.native_functions_value,
-            native_constructor_functions: self.native_constructor_functions_value,
-            vm_functions: self.vm_functions_value,
-            vm_constructor_functions: self.vm_constructor_functions_value,
-            native_constructors: self.native_constructors_value,
             stack: frame.stack,
             native_argument_buffer: Vec::new(),
             locals: frame.locals,
             upvalues: frame.upvalues,
-            global_object: self.global_object_value.get(),
-            primitive_prototypes: self.primitive_prototypes_value,
-            error_prototypes: self.error_prototypes_value,
-            object_builtin_tags: self.object_builtin_tags_value,
-            global_lexical_bindings: self.global_lexical_bindings_value,
-            regexp_constructor: self.regexp_constructor_value.get(),
-            iterator_symbol: self.iterator_symbol_value.get(),
-            to_primitive_symbol: self.well_known_symbols_value.slot(
-                WellKnownSymbolKind::ToPrimitive,
-            ).get(),
-            has_instance_symbol: self.well_known_symbols_value.slot(
-                WellKnownSymbolKind::HasInstance,
-            ).get(),
-            intrinsic_eval: self.intrinsic_eval_value.get(),
             callee: frame.callee,
             arguments: frame.arguments,
             arguments_object: frame.arguments_object,
             arguments_binding: frame.arguments_binding,
             arguments_binding_initialized: frame.arguments_binding_initialized,
             this_value: frame.this_value,
+            depth: depth + 1,
+            eval_environment: frame.eval_environment,
             home_object: frame.home_object,
             new_target: frame.new_target,
             instance_initializer: frame.instance_initializer,
-            active_frames: self.active_frames_value,
-            generators: self.generators_value,
-            dynamic_eval_compiler: self.dynamic_eval_compiler_value,
-            dynamic_module_loader: self.dynamic_module_loader_value,
-            iterators: self.iterators_value,
-            depth: depth + 1,
-            eval_environment: frame.eval_environment,
+            functions: self.functions_value,
+            native_functions: self.native_functions_value,
+            vm_functions: self.vm_functions_value,
+            primitive_prototypes: self.primitive_prototypes_value,
         };
         let result = execute_machine_from(machine, start);
         let _ = self.active_frames_value.pop();
@@ -2194,8 +2247,8 @@ fn materialize_error_value(
 ) -> runtime::Value {
     materialize_error_value_with_runtime(
         machine.heap,
-        machine.error_prototypes,
-        machine.object_builtin_tags,
+        machine.shared.get().error_prototypes,
+        machine.shared.get().object_builtin_tags,
         prototype,
         name,
         message,
@@ -2219,11 +2272,11 @@ fn stack_line(function: bytecode::Function, offset: isize) -> string {
 
 fn error_stack(machine: Machine, offset: isize) -> runtime::JsString {
     let mut result = "";
-    let mut index = machine.active_frames.len();
+    let mut index = machine.shared.get().active_frames.len();
     while index > 0 {
         index -= 1;
-        let frame = machine.active_frames[index];
-        let frame_offset = if index + 1 == machine.active_frames.len() {
+        let frame = machine.shared.get().active_frames[index];
+        let frame_offset = if index + 1 == machine.shared.get().active_frames.len() {
             offset
         } else {
             frame.offset.get()
@@ -2241,7 +2294,7 @@ fn ensure_error_stack(machine: Machine, value: runtime::Value, offset: isize) ->
         runtime::Value::Object(value) => value,
         _ => return value,
     };
-    match machine.object_builtin_tags.get(object) {
+    match machine.shared.get().object_builtin_tags.get(object) {
         Some(tag) => if error_type_from_builtin_tag(tag).is_none() {
             return value
         },
@@ -2272,28 +2325,28 @@ fn error_value(machine: Machine, kind: VmErrorKind) -> runtime::Value {
         VmErrorKind::Thrown(value) => value,
         VmErrorKind::TypeError(message) => materialize_error_value(
             machine,
-            machine.error_prototypes.type_error_value.get(),
+            machine.shared.get().error_prototypes.type_error_value.get(),
             "TypeError",
             message,
             false,
         ),
         VmErrorKind::RangeError(message) => materialize_error_value(
             machine,
-            machine.error_prototypes.range_error_value.get(),
+            machine.shared.get().error_prototypes.range_error_value.get(),
             "RangeError",
             message,
             false,
         ),
         VmErrorKind::ReferenceError(message) => materialize_error_value(
             machine,
-            machine.error_prototypes.reference_error_value.get(),
+            machine.shared.get().error_prototypes.reference_error_value.get(),
             "ReferenceError",
             message,
             false,
         ),
         VmErrorKind::SyntaxError(message) => materialize_error_value(
             machine,
-            machine.error_prototypes.syntax_error_value.get(),
+            machine.shared.get().error_prototypes.syntax_error_value.get(),
             "SyntaxError",
             message,
             false,
@@ -2301,7 +2354,7 @@ fn error_value(machine: Machine, kind: VmErrorKind) -> runtime::Value {
         VmErrorKind::SyntaxErrorAt(message, location) => {
             let value = materialize_error_value(
                 machine,
-                machine.error_prototypes.syntax_error_value.get(),
+                machine.shared.get().error_prototypes.syntax_error_value.get(),
                 "SyntaxError",
                 message,
                 false,
@@ -2330,14 +2383,14 @@ fn error_value(machine: Machine, kind: VmErrorKind) -> runtime::Value {
         },
         VmErrorKind::UriError(message) => materialize_error_value(
             machine,
-            machine.error_prototypes.uri_error_value.get(),
+            machine.shared.get().error_prototypes.uri_error_value.get(),
             "URIError",
             message,
             false,
         ),
         VmErrorKind::CallDepthExceeded => materialize_error_value(
             machine,
-            machine.error_prototypes.internal_error_value.get(),
+            machine.shared.get().error_prototypes.internal_error_value.get(),
             "InternalError",
             "call depth exceeded",
             true,
@@ -2469,7 +2522,7 @@ fn to_primitive(machine: Machine, offset: isize, value: runtime::Value, hint: Pr
         runtime::Value::Object(value) => value,
         _ => return Result::Ok(value),
     };
-    match machine.to_primitive_symbol {
+    match machine.shared.get().to_primitive_symbol {
         Some(symbol) => {
             let method = read_property(machine, offset, value, runtime::PropertyKey::Symbol(symbol))?;
             match method {
@@ -2642,11 +2695,11 @@ fn materialize_template(machine: Machine, offset: isize, template: Ref[bytecode:
     VmError,
 ] {
     let identity = ptr_hash(template);
-    match machine.template_objects.get(identity) {
+    match machine.shared.get().template_objects.get(identity) {
         Some(object) => if machine.heap.contains(object) {
             return Result::Ok(runtime::Value::Object(object))
         } else {
-            let _ = machine.template_objects.remove(identity);
+            let _ = machine.shared.get().template_objects.remove(identity);
         },
         None => (),
     }
@@ -2668,7 +2721,7 @@ fn materialize_template(machine: Machine, offset: isize, template: Ref[bytecode:
         || !runtime::seal_object(machine.heap, cooked, true) {
         return Result::Err(error(offset, VmErrorKind::TypeError("cannot freeze template object")))
     }
-    machine.template_objects[identity] = cooked;
+    machine.shared.get().template_objects[identity] = cooked;
     Result::Ok(runtime::Value::Object(cooked))
 }
 
@@ -2763,7 +2816,7 @@ fn materialize_frame_arguments(
     offset: isize,
     function: bytecode::Function,
     arguments: Vec[runtime::Value],
-    locals: Vec[Ref[runtime::Value]],
+    locals: LocalSlots,
     callee: Option[runtime::Value],
     arguments_object: Ref[Option[runtime::ObjectId]],
 ) -> Result[runtime::Value, VmError] {
@@ -2779,7 +2832,7 @@ fn materialize_frame_arguments(
         Ok(value) => value,
         Err(value) => return Result::Err(error(offset, VmErrorKind::TypeError(value.message))),
     };
-    machine.object_builtin_tags[object] = js_string("Arguments");
+    machine.shared.get().object_builtin_tags[object] = js_string("Arguments");
     if !runtime::define_own_property(
         machine.heap,
         object,
@@ -2800,7 +2853,12 @@ fn materialize_frame_arguments(
         }
         match function.argument_local(index) {
             Some(local) => if local >= 0 && local < locals.len() {
-                if !runtime::map_argument_index(machine.heap, object, index.to_u32(), locals[local]) {
+                if !runtime::map_argument_index(
+                    machine.heap,
+                    object,
+                    index.to_u32(),
+                    locals.capture(local),
+                ) {
                     return Result::Err(error(offset, VmErrorKind::TypeError("cannot map argument")))
                 }
             } else {
@@ -2832,7 +2890,7 @@ fn materialize_frame_arguments(
     if !callee_defined {
         return Result::Err(error(offset, VmErrorKind::TypeError("cannot define arguments callee")))
     }
-    match (machine.iterator_symbol, machine.heap.array_prototype()) {
+    match (machine.shared.get().iterator_symbol, machine.heap.array_prototype()) {
         (Some(symbol), Some(prototype)) => match runtime::get_property(
             machine.heap,
             prototype,
@@ -3015,10 +3073,10 @@ fn machine_function_kind_prototype(machine: Machine, kind: FunctionKind) -> Opti
 ] {
     let configured = match kind {
         FunctionKind::Ordinary => machine.heap.function_prototype(),
-        FunctionKind::Generator => machine.generators.generator_function_prototype.get(),
-        FunctionKind::Async => machine.generators.async_function_prototype.get(),
+        FunctionKind::Generator => machine.shared.get().generators.generator_function_prototype.get(),
+        FunctionKind::Async => machine.shared.get().generators.async_function_prototype.get(),
         FunctionKind::AsyncGenerator => {
-            machine.generators.async_generator_function_prototype.get()
+            machine.shared.get().generators.async_generator_function_prototype.get()
         },
     };
     match configured {
@@ -3051,7 +3109,7 @@ fn materialize_function(
                         if local < 0 || local >= machine.locals.len() {
                             return Result::Err(error(offset, VmErrorKind::InvalidLocal(local)))
                         } else {
-                            UpvalueCell::Value(machine.locals[local])
+                            UpvalueCell::Value(machine.locals.capture(local))
                         }
                     },
                     Some(bytecode::UpvalueSource::Upvalue(upvalue)) => {
@@ -3130,9 +3188,9 @@ fn materialize_function(
             if function.get().constructable() || function.get().generator() {
                 let instance_prototype = if function.get().generator() {
                     if function.get().asynchronous() {
-                        machine.generators.async_generator_prototype.get()
+                        machine.shared.get().generators.async_generator_prototype.get()
                     } else {
-                        machine.generators.prototype.get()
+                        machine.shared.get().generators.prototype.get()
                     }
                 } else {
                     Option::None
@@ -3178,7 +3236,7 @@ fn materialize_function(
             }
             match identity {
                 Some(value) => {
-                    machine.function_objects[value] = object;
+                    machine.shared.get().function_objects[value] = object;
                 },
                 None => (),
             }
@@ -3207,6 +3265,7 @@ fn cached_primitive_property_prototype(machine: Machine, receiver: runtime::Valu
             machine.primitive_prototypes.number_value.get()
         },
         runtime::Value::BigInt(_) => machine.primitive_prototypes.bigint_value.get(),
+        runtime::Value::String(_) => machine.primitive_prototypes.string_value.get(),
         _ => Option::None,
     }
 }
@@ -3215,6 +3274,19 @@ fn read_field(machine: Machine, offset: isize, index: isize, receiver: runtime::
     runtime::Value,
     VmError,
 ] {
+    match receiver {
+        runtime::Value::String(value) => {
+            let key = field_key(machine, offset, index)?;
+            if runtime::is_length_property_key(key)
+                || match string_property_index(key) {
+                    Some(index) => index >= 0 && index < value.len(),
+                    None => false,
+                } {
+                return read_property(machine, offset, receiver, key)
+            }
+        },
+        _ => (),
+    }
     match receiver {
         runtime::Value::Object(object) => match machine.function.field_cache(offset) {
             Some(cache) => match cache.get().read(machine.heap, object) {
@@ -3328,7 +3400,7 @@ fn write_field(
 }
 
 fn global_object(machine: Machine, offset: isize) -> Result[runtime::ObjectId, VmError] {
-    match machine.global_object {
+    match machine.shared.get().global_object {
         Some(object) => if machine.heap.contains(object) {
             Result::Ok(object)
         } else {
@@ -3406,7 +3478,7 @@ fn eval_environment_root_key(machine: Machine) -> (u64, u64) {
 fn resolve_eval_binding(machine: Machine, name: string) -> ResolvedEvalBinding {
     match eval_environment_cell_annotated(machine.eval_environment.get(), name) {
         Some((cell, epoch)) => ResolvedEvalBinding::Cell { cell, epoch },
-        None => match machine.global_lexical_bindings.get(name) {
+        None => match machine.shared.get().global_lexical_bindings.get(name) {
             Some(binding) => ResolvedEvalBinding::GlobalLexical {
                 value: binding.value,
                 initialized: binding.initialized,
@@ -3638,7 +3710,7 @@ fn read_eval_binding(machine: Machine, offset: isize, index: isize, missing_is_u
 fn has_eval_binding(machine: Machine, offset: isize, index: isize) -> Result[bool, VmError] {
     let name = eval_name(machine, offset, index)?;
     if eval_environment_cell(machine.eval_environment.get(), name).is_some()
-        || machine.global_lexical_bindings.get(name).is_some() {
+        || machine.shared.get().global_lexical_bindings.get(name).is_some() {
         Result::Ok(true)
     } else {
         let object = global_object(machine, offset)?;
@@ -3707,7 +3779,7 @@ fn initialize_global_lexical_binding(machine: Machine, offset: isize, index: isi
 ] {
     let name = eval_name(machine, offset, index)?;
     let value = pop(machine, offset)?;
-    match machine.global_lexical_bindings.get(name) {
+    match machine.shared.get().global_lexical_bindings.get(name) {
         Some(binding) => if binding.initialized.get() {
             Result::Err(
                 error(offset, VmErrorKind::TypeError("global lexical binding is initialized")),
@@ -3739,7 +3811,7 @@ fn initialize_eval_binding(machine: Machine, offset: isize, index: isize) -> Res
             Result::Ok(())
         },
         None => {
-            if machine.global_lexical_bindings.get(name).is_some() {
+            if machine.shared.get().global_lexical_bindings.get(name).is_some() {
                 return Result::Err(
                     error(offset, VmErrorKind::SyntaxError("global lexical binding already exists")),
                 )
@@ -3781,7 +3853,7 @@ fn delete_eval_binding(machine: Machine, offset: isize, index: isize) -> Result[
                 }
             },
             None => {
-                if machine.global_lexical_bindings.get(name).is_some() {
+                if machine.shared.get().global_lexical_bindings.get(name).is_some() {
                     return Result::Ok(false)
                 }
                 return Result::Ok(
@@ -4108,10 +4180,10 @@ fn validate_proxy_set(
 }
 
 fn active_function_frame(machine: Machine, object: runtime::ObjectId) -> Option[isize] {
-    let mut index = machine.active_frames.len();
+    let mut index = machine.shared.get().active_frames.len();
     while index > 0 {
         index -= 1;
-        match machine.active_frames[index].callee {
+        match machine.shared.get().active_frames[index].callee {
             Some(runtime::Value::Object(value)) => if value == object {
                 return Option::Some(index)
             },
@@ -4139,7 +4211,7 @@ fn active_frame_caller(machine: Machine, frame_index: isize) -> runtime::Value {
     let mut index = frame_index;
     while index > 0 {
         index -= 1;
-        match machine.active_frames[index].callee {
+        match machine.shared.get().active_frames[index].callee {
             Some(value) => return if restricted_legacy_caller(machine, value) {
                 runtime::Value::Null
             } else {
@@ -4192,7 +4264,7 @@ fn read_object_property(
                         Some(index) => if property_name(key, "caller") {
                             Result::Ok(active_frame_caller(machine, index))
                         } else {
-                            let frame = machine.active_frames[index];
+                            let frame = machine.shared.get().active_frames[index];
                             materialize_frame_arguments(
                                 machine,
                                 offset,
@@ -4498,7 +4570,7 @@ fn append_custom_iterable(
     array: runtime::ObjectId,
     source: runtime::Value,
 ) -> Result[bool, VmError] {
-    let symbol = match machine.iterator_symbol {
+    let symbol = match machine.shared.get().iterator_symbol {
         Some(value) => value,
         None => return Result::Ok(false),
     };
@@ -5216,7 +5288,7 @@ fn enumerate_value(machine: Machine, offset: isize) -> Result[(), VmError] {
 
 fn start_iterator(machine: Machine, offset: isize) -> Result[(), VmError] {
     let source = pop(machine, offset)?;
-    let symbol = match machine.iterator_symbol {
+    let symbol = match machine.shared.get().iterator_symbol {
         Some(value) => value,
         None => return Result::Err(error(offset, VmErrorKind::TypeError("value is not iterable"))),
     };
@@ -5246,7 +5318,7 @@ fn start_iterator(machine: Machine, offset: isize) -> Result[(), VmError] {
 
 fn start_async_iterator(machine: Machine, offset: isize) -> Result[(), VmError] {
     let source = pop(machine, offset)?;
-    let method = match machine.generators.async_iterator_symbol.get() {
+    let method = match machine.shared.get().generators.async_iterator_symbol.get() {
         Some(symbol) => match read_property(
             machine,
             offset,
@@ -5262,7 +5334,7 @@ fn start_async_iterator(machine: Machine, offset: isize) -> Result[(), VmError] 
     let selected = match method {
         Some(value) => value,
         None => {
-            let symbol = match machine.iterator_symbol {
+            let symbol = match machine.shared.get().iterator_symbol {
                 Some(value) => value,
                 None => return Result::Err(
                     error(offset, VmErrorKind::TypeError("value is not async iterable")),
@@ -5290,7 +5362,7 @@ fn start_async_iterator(machine: Machine, offset: isize) -> Result[(), VmError] 
     }
     if !asynchronous {
         let next = read_property(machine, offset, iterator, runtime::string_property_key("next"))?;
-        iterator = match machine.generators.async_from_sync_iterator_factory.get() {
+        iterator = match machine.shared.get().generators.async_from_sync_iterator_factory.get() {
             Some(factory) => factory(iterator, next, machine.depth + 1)?,
             None => return Result::Err(
                 error(
@@ -5316,13 +5388,13 @@ fn advance_iterator(machine: Machine, offset: isize) -> Result[(), VmError] {
 fn advance_iterator_direct(machine: Machine, offset: isize) -> Result[(), VmError] {
     let next = pop(machine, offset)?;
     let iterator = pop(machine, offset)?;
-    match (iterator, next, machine.iterators.array_fast_next_function.get()) {
+    match (iterator, next, machine.shared.get().iterators.array_fast_next_function.get()) {
         (
             runtime::Value::Object(iterator_object),
             runtime::Value::Object(next_object),
             Some(fast_next_object),
         ) => if next_object == fast_next_object {
-            match machine.iterators.array_states.get(iterator_object) {
+            match machine.shared.get().iterators.array_states.get(iterator_object) {
                 Some(state) => {
                     if state.kind == 1 && !state.done.get() {
                         match state.iterable {
@@ -5355,7 +5427,7 @@ fn advance_iterator_direct(machine: Machine, offset: isize) -> Result[(), VmErro
                             _ => (),
                         }
                     }
-                    match machine.iterators.array_fast_next.get() {
+                    match machine.shared.get().iterators.array_fast_next.get() {
                         Some(callback) => {
                             match callback(iterator, machine.depth + 1)? {
                                 IteratorStep::Value(value) => {
@@ -5907,10 +5979,10 @@ fn callable_constructor(machine: Machine, object: runtime::ObjectId) -> bool {
     } else {
         match machine.functions.get(object) {
             Some(closure) => closure.get().function.get().constructable(),
-            None => if machine.native_constructors.contains(object) {
+            None => if machine.shared.get().native_constructors.contains(object) {
                 true
             } else {
-                match machine.bound_functions.get(object) {
+                match machine.shared.get().bound_functions.get(object) {
                     Some(bound) => match bound.target {
                         runtime::Value::Object(target) => callable_constructor(machine, target),
                         _ => false,
@@ -7661,7 +7733,7 @@ fn push_with_has_binding(machine: Machine, offset: isize) -> Result[(), VmError]
         machine.stack.push(runtime::Value::Bool(false));
         return Result::Ok(())
     }
-    let global = match machine.global_object {
+    let global = match machine.shared.get().global_object {
         Some(value) => value,
         None => {
             machine.stack.push(runtime::Value::Bool(true));
@@ -7782,7 +7854,7 @@ fn ordinary_has_instance(
         },
         _ => return Result::Ok(false),
     };
-    match machine.bound_functions.get(constructor) {
+    match machine.shared.get().bound_functions.get(constructor) {
         Some(bound) => return instance_of_value(machine, offset, left, bound.target),
         None => (),
     }
@@ -7837,7 +7909,7 @@ fn instance_of_value(machine: Machine, offset: isize, left: runtime::Value, righ
             error(offset, VmErrorKind::TypeError("right operand of instanceof is not an object")),
         ),
     };
-    match machine.has_instance_symbol {
+    match machine.shared.get().has_instance_symbol {
         Some(symbol) => match read_object_property(
             machine,
             offset,
@@ -7905,7 +7977,7 @@ fn local_get(machine: Machine, offset: isize, index: isize) -> Result[runtime::V
     if index < 0 || index >= machine.locals.len() {
         Result::Err(error(offset, VmErrorKind::InvalidLocal(index)))
     } else {
-        Result::Ok(machine.locals[index].get())
+        Result::Ok(machine.locals.get(index))
     }
 }
 
@@ -7938,7 +8010,7 @@ fn local_put(machine: Machine, offset: isize, index: isize, value: runtime::Valu
     if index < 0 || index >= machine.locals.len() {
         Result::Err(error(offset, VmErrorKind::InvalidLocal(index)))
     } else {
-        machine.locals[index].set(value);
+        machine.locals.set(index, value);
         Result::Ok(())
     }
 }
@@ -7947,7 +8019,7 @@ fn local_clone(machine: Machine, offset: isize, index: isize) -> Result[(), VmEr
     if index < 0 || index >= machine.locals.len() {
         Result::Err(error(offset, VmErrorKind::InvalidLocal(index)))
     } else {
-        machine.locals[index] = Ref::new(machine.locals[index].get());
+        machine.locals.renew(index);
         Result::Ok(())
     }
 }
@@ -8137,18 +8209,16 @@ fn pop_arguments(machine: Machine, offset: isize, count: isize) -> Result[
 }
 
 fn initialize_call_locals(
+    heap: runtime::Heap,
+    pool: Vec[LocalSlots],
     function: bytecode::Function,
     arguments: Vec[runtime::Value],
     offset: isize,
-) -> Result[Vec[Ref[runtime::Value]], VmError] {
-    let verification = function.verification();
-    if !verification.errors.is_empty() {
-        Result::Err(error(offset, VmErrorKind::VerificationFailed(verification.errors)))
+) -> Result[LocalSlots, VmError] {
+    if function.verified_max_stack().is_none() {
+        Result::Err(error(offset, VmErrorKind::VerificationFailed(function.verification().errors)))
     } else {
-        let locals: Vec[Ref[runtime::Value]] = Vec::with_capacity(function.local_count());
-        for _ in 0..function.local_count() {
-            locals.push(Ref::new(runtime::Value::Undefined))
-        }
+        let locals = take_local_slots(pool, heap, function.local_count());
         let count = if arguments.len() < function.parameter_count() {
             arguments.len()
         } else {
@@ -8156,7 +8226,7 @@ fn initialize_call_locals(
         };
         let mut index = 0;
         while index < count {
-            locals[index].set(arguments[index]);
+            locals.set(index, arguments[index]);
             index += 1;
         }
         Result::Ok(locals)
@@ -8185,7 +8255,7 @@ fn capture_eval_upvalues(machine: Machine, offset: isize, function: bytecode::Fu
                 if local < 0 || local >= machine.locals.len() {
                     return Result::Err(error(offset, VmErrorKind::InvalidLocal(local)))
                 } else {
-                    UpvalueCell::Value(machine.locals[local])
+                    UpvalueCell::Value(machine.locals.capture(local))
                 }
             },
             Some(bytecode::UpvalueSource::Upvalue(upvalue)) => {
@@ -8229,7 +8299,7 @@ fn evaluate_source(
         runtime::Value::String(value) => value,
         _ => return Result::Ok(source),
     };
-    let function = match machine.dynamic_eval_compiler.get() {
+    let function = match machine.shared.get().dynamic_eval_compiler.get() {
         Some(callback) => match callback(source_text, bindings) {
             Ok(value) => value,
             Err(value) => return Result::Err(
@@ -8240,31 +8310,19 @@ fn evaluate_source(
             error(offset, VmErrorKind::TypeError("dynamic eval compiler is not installed")),
         ),
     };
-    let locals = initialize_call_locals(function, Vec::new(), offset)?;
+    let locals = initialize_call_locals(
+        machine.heap,
+        machine.shared.get().local_slots_pool,
+        function,
+        Vec::new(),
+        offset,
+    )?;
     let upvalues = capture_eval_upvalues(machine, offset, function)?;
     instantiate_eval_declarations(machine, offset, function)?;
     execute_initialized(
+        machine.shared,
         function,
         machine.heap,
-        machine.functions,
-        machine.bound_functions,
-        machine.function_objects,
-        machine.template_objects,
-        machine.native_functions,
-        machine.native_constructor_functions,
-        machine.vm_functions,
-        machine.vm_constructor_functions,
-        machine.native_constructors,
-        machine.global_object,
-        machine.primitive_prototypes,
-        machine.error_prototypes,
-        machine.object_builtin_tags,
-        machine.global_lexical_bindings,
-        machine.regexp_constructor,
-        machine.iterator_symbol,
-        machine.to_primitive_symbol,
-        machine.has_instance_symbol,
-        machine.intrinsic_eval,
         Option::None,
         Vec::new(),
         locals,
@@ -8274,11 +8332,6 @@ fn evaluate_source(
         machine.new_target,
         machine.instance_initializer,
         machine.eval_environment,
-        machine.active_frames,
-        machine.generators,
-        machine.dynamic_eval_compiler,
-        machine.dynamic_module_loader,
-        machine.iterators,
         machine.depth + 1,
     )
 }
@@ -8288,7 +8341,7 @@ fn push_dynamic_import(machine: Machine, offset: isize) -> Result[(), VmError] {
     let referrer = pop(machine, offset)?;
     let options = pop(machine, offset)?;
     let specifier = pop(machine, offset)?;
-    let loader = match machine.dynamic_module_loader.get() {
+    let loader = match machine.shared.get().dynamic_module_loader.get() {
         Some(value) => value,
         None => return Result::Err(
             error(offset, VmErrorKind::TypeError("dynamic module loader is not installed")),
@@ -8304,7 +8357,7 @@ fn sloppy_this_value(machine: Machine, offset: isize, value: runtime::Value) -> 
     VmError,
 ] {
     match value {
-        runtime::Value::Undefined | runtime::Value::Null => match machine.global_object {
+        runtime::Value::Undefined | runtime::Value::Null => match machine.shared.get().global_object {
             Some(object) => if machine.heap.contains(object) {
                 Result::Ok(runtime::Value::Object(object))
             } else {
@@ -8399,7 +8452,7 @@ fn create_generator(
     object: runtime::ObjectId,
     function: bytecode::Function,
     arguments: Vec[runtime::Value],
-    locals: Vec[Ref[runtime::Value]],
+    locals: LocalSlots,
     closure: Closure,
     this_value: Ref[Option[runtime::Value]],
     new_target: Option[runtime::Value],
@@ -8407,9 +8460,9 @@ fn create_generator(
 ) -> Result[runtime::Value, VmError] {
     let configured_prototype = if function.generator() {
         if function.asynchronous() {
-            machine.generators.async_generator_prototype.get()
+            machine.shared.get().generators.async_generator_prototype.get()
         } else {
-            machine.generators.prototype.get()
+            machine.shared.get().generators.prototype.get()
         }
     } else {
         Option::None
@@ -8430,7 +8483,7 @@ fn create_generator(
     if !verification.errors.is_empty() {
         return Result::Err(error(offset, VmErrorKind::VerificationFailed(verification.errors)))
     }
-    machine.generators.states[generator] = GeneratorFrame {
+    machine.shared.get().generators.states[generator] = GeneratorFrame {
         function,
         stack: Vec::with_capacity(verification.max_stack),
         locals,
@@ -8478,59 +8531,69 @@ fn prime_generator(machine: Machine, generator: runtime::ObjectId, offset: isize
     (),
     VmError,
 ] {
-    let frame = match machine.generators.states.get(generator) {
+    let frame = match machine.shared.get().generators.states.get(generator) {
         Some(value) => value,
         None => return Result::Err(
             error(offset, VmErrorKind::TypeError("generator frame is not initialized")),
         ),
     };
     frame.status.set(GeneratorStatus::Executing);
-    machine.active_frames.push(generator_active_frame(frame));
+    machine.shared.get().active_frames.push(generator_active_frame(frame));
     let initial_machine = Machine {
+        shared: Ref::new(
+            MachineShared {
+                local_slots_pool: Vec::new(),
+                frame_scratch_pool: Vec::new(),
+                functions: machine.functions,
+                bound_functions: machine.shared.get().bound_functions,
+                function_objects: machine.shared.get().function_objects,
+                template_objects: machine.shared.get().template_objects,
+                native_functions: machine.native_functions,
+                native_constructor_functions: machine.shared.get().native_constructor_functions,
+                vm_functions: machine.vm_functions,
+                vm_constructor_functions: machine.shared.get().vm_constructor_functions,
+                native_constructors: machine.shared.get().native_constructors,
+                global_object: machine.shared.get().global_object,
+                primitive_prototypes: machine.primitive_prototypes,
+                error_prototypes: machine.shared.get().error_prototypes,
+                object_builtin_tags: machine.shared.get().object_builtin_tags,
+                global_lexical_bindings: machine.shared.get().global_lexical_bindings,
+                regexp_constructor: machine.shared.get().regexp_constructor,
+                iterator_symbol: machine.shared.get().iterator_symbol,
+                to_primitive_symbol: machine.shared.get().to_primitive_symbol,
+                has_instance_symbol: machine.shared.get().has_instance_symbol,
+                intrinsic_eval: machine.shared.get().intrinsic_eval,
+                active_frames: machine.shared.get().active_frames,
+                generators: machine.shared.get().generators,
+                dynamic_eval_compiler: machine.shared.get().dynamic_eval_compiler,
+                dynamic_module_loader: machine.shared.get().dynamic_module_loader,
+                iterators: machine.shared.get().iterators,
+            },
+        ),
         function: frame.function,
         heap: machine.heap,
-        functions: machine.functions,
-        bound_functions: machine.bound_functions,
-        function_objects: machine.function_objects,
-        template_objects: machine.template_objects,
-        native_functions: machine.native_functions,
-        native_constructor_functions: machine.native_constructor_functions,
-        vm_functions: machine.vm_functions,
-        vm_constructor_functions: machine.vm_constructor_functions,
-        native_constructors: machine.native_constructors,
         stack: frame.stack,
         native_argument_buffer: Vec::new(),
         locals: frame.locals,
         upvalues: frame.upvalues,
-        global_object: machine.global_object,
-        primitive_prototypes: machine.primitive_prototypes,
-        error_prototypes: machine.error_prototypes,
-        object_builtin_tags: machine.object_builtin_tags,
-        global_lexical_bindings: machine.global_lexical_bindings,
-        regexp_constructor: machine.regexp_constructor,
-        iterator_symbol: machine.iterator_symbol,
-        to_primitive_symbol: machine.to_primitive_symbol,
-        has_instance_symbol: machine.has_instance_symbol,
-        intrinsic_eval: machine.intrinsic_eval,
         callee: frame.callee,
         arguments: frame.arguments,
         arguments_object: frame.arguments_object,
         arguments_binding: frame.arguments_binding,
         arguments_binding_initialized: frame.arguments_binding_initialized,
         this_value: frame.this_value,
+        depth: frame.depth,
+        eval_environment: frame.eval_environment,
         home_object: frame.home_object,
         new_target: frame.new_target,
         instance_initializer: frame.instance_initializer,
-        active_frames: machine.active_frames,
-        generators: machine.generators,
-        dynamic_eval_compiler: machine.dynamic_eval_compiler,
-        dynamic_module_loader: machine.dynamic_module_loader,
-        iterators: machine.iterators,
-        depth: frame.depth,
-        eval_environment: frame.eval_environment,
+        functions: machine.functions,
+        native_functions: machine.native_functions,
+        vm_functions: machine.vm_functions,
+        primitive_prototypes: machine.primitive_prototypes,
     };
     let result = execute_machine_from(initial_machine, 0);
-    let _ = machine.active_frames.pop();
+    let _ = machine.shared.get().active_frames.pop();
     match result {
         Ok(ExecutionResult::Yield(_, next)) => {
             frame.offset.set(next);
@@ -8603,9 +8666,9 @@ fn with_machine_roots[T](
 }
 
 fn update_active_frame_offset(machine: Machine, offset: isize) -> () {
-    let length = machine.active_frames.len();
+    let length = machine.shared.get().active_frames.len();
     if length > 0 {
-        machine.active_frames[length - 1].offset.set(offset)
+        machine.shared.get().active_frames[length - 1].offset.set(offset)
     }
 }
 
@@ -8642,6 +8705,156 @@ fn call_value_with_mode(
     result
 }
 
+fn invoke_source_function(
+    machine: Machine,
+    offset: isize,
+    object: runtime::ObjectId,
+    closure: Ref[Closure],
+    arguments: Vec[runtime::Value],
+    this_value: runtime::Value,
+    constructing: bool,
+    new_target: Option[runtime::Value],
+) -> Result[runtime::Value, VmError] {
+    if machine.depth >= MAX_CALL_DEPTH {
+        return Result::Err(error(offset, VmErrorKind::CallDepthExceeded))
+    }
+    let shared = machine.shared.get();
+    let closure = closure.get();
+    let function = closure.function.get();
+    if function.class_constructor() && !constructing {
+        return Result::Err(
+            error(offset, VmErrorKind::TypeError("class constructor cannot be invoked without new")),
+        )
+    }
+    let locals = initialize_call_locals(
+        machine.heap,
+        shared.local_slots_pool,
+        function,
+        arguments,
+        offset,
+    )?;
+    let this_cell = if function.lexical_this() {
+        match closure_this_cell(closure.upvalues) {
+            Some(value) => value,
+            None => Ref::new(Option::Some(runtime::Value::Undefined)),
+        }
+    } else {
+        Ref::new(
+            if function.derived_constructor() && constructing {
+                Option::None
+            } else if function.strict() {
+                Option::Some(this_value)
+            } else {
+                Option::Some(sloppy_this_value(machine, offset, this_value)?)
+            },
+        )
+    };
+    let eval_environment = if function.eval_site_count() > 0
+        || !function.eval_declarations().is_empty() {
+        let identity = machine.heap.next_environment_identity();
+        Ref::new(
+            Option::Some(
+                Ref::new(
+                    EvalEnvironment {
+                        values: HashMap::new(),
+                        parent: closure.eval_environment,
+                        identity_value: identity,
+                        epoch_value: Ref::new(0),
+                    },
+                ),
+            ),
+        )
+    } else {
+        Ref::new(closure.eval_environment)
+    };
+    if function.generator() || function.asynchronous() {
+        if constructing {
+            return Result::Err(
+                error(
+                    offset,
+                    VmErrorKind::TypeError(
+                        if function.asynchronous() {
+                            "async function is not a constructor"
+                        } else {
+                            "generator function is not a constructor"
+                        },
+                    ),
+                ),
+            )
+        }
+        let suspended = create_generator(
+            machine,
+            offset,
+            object,
+            function,
+            arguments,
+            locals,
+            closure,
+            this_cell,
+            new_target,
+            eval_environment,
+        )?;
+        if function.asynchronous() && function.generator() {
+            return match shared.generators.async_generator_runner.get() {
+                Some(runner) => runner(suspended, machine.depth + 1),
+                None => Result::Err(
+                    error(offset, VmErrorKind::TypeError("async generator runner is not installed")),
+                ),
+            }
+        } else if function.asynchronous() {
+            return match shared.generators.async_function_runner.get() {
+                Some(runner) => runner(suspended, machine.depth + 1),
+                None => Result::Err(
+                    error(offset, VmErrorKind::TypeError("async function runner is not installed")),
+                ),
+            }
+        } else {
+            return Result::Ok(suspended)
+        }
+    }
+    let result = execute_initialized(
+        machine.shared,
+        function,
+        machine.heap,
+        Option::Some(runtime::Value::Object(object)),
+        arguments,
+        locals,
+        closure.upvalues,
+        this_cell,
+        closure.home_object.get(),
+        if function.lexical_this() {
+            closure.new_target
+        } else {
+            new_target
+        },
+        closure.instance_initializer,
+        eval_environment,
+        machine.depth + 1,
+    )?;
+    if function.derived_constructor() && constructing {
+        match result {
+            runtime::Value::Object(_) => Result::Ok(result),
+            runtime::Value::Undefined => match this_cell.get() {
+                Some(value) => Result::Ok(value),
+                None => Result::Err(
+                    error(
+                        offset,
+                        VmErrorKind::ReferenceError("derived constructor did not initialize this"),
+                    ),
+                ),
+            },
+            _ => Result::Err(
+                error(
+                    offset,
+                    VmErrorKind::TypeError("derived constructor returned a non-object value"),
+                ),
+            ),
+        }
+    } else {
+        Result::Ok(result)
+    }
+}
+
 fn call_value_with_mode_rooted(
     machine: Machine,
     offset: isize,
@@ -8651,6 +8864,7 @@ fn call_value_with_mode_rooted(
     constructing: bool,
     new_target: Option[runtime::Value],
 ) -> Result[runtime::Value, VmError] {
+    let shared = machine.shared.get();
     if machine.depth >= MAX_CALL_DEPTH {
         return Result::Err(error(offset, VmErrorKind::CallDepthExceeded))
     }
@@ -8658,7 +8872,7 @@ fn call_value_with_mode_rooted(
         runtime::Value::Object(object) => if !object.is_callable() || !machine.heap.contains(object) {
             Result::Err(error(offset, VmErrorKind::TypeError("value is not callable")))
         } else {
-            match machine.bound_functions.get(object) {
+            match shared.bound_functions.get(object) {
                 Some(bound) => return call_value_with_mode(
                     machine,
                     offset,
@@ -8697,180 +8911,18 @@ fn call_value_with_mode_rooted(
                 },
                 None => (),
             }
-            match machine.functions.get(object) {
-                Some(closure) => {
-                    let closure = closure.get();
-                    let function = closure.function.get();
-                    if function.class_constructor() && !constructing {
-                        return Result::Err(
-                            error(
-                                offset,
-                                VmErrorKind::TypeError(
-                                    "class constructor cannot be invoked without new",
-                                ),
-                            ),
-                        )
-                    }
-                    let locals = initialize_call_locals(function, arguments, offset)?;
-                    let this_cell = if function.lexical_this() {
-                        match closure_this_cell(closure.upvalues) {
-                            Some(value) => value,
-                            None => Ref::new(Option::Some(runtime::Value::Undefined)),
-                        }
-                    } else {
-                        Ref::new(
-                            if function.derived_constructor() && constructing {
-                                Option::None
-                            } else if function.strict() {
-                                Option::Some(this_value)
-                            } else {
-                                Option::Some(sloppy_this_value(machine, offset, this_value)?)
-                            },
-                        )
-                    };
-                    let eval_environment = if function.eval_site_count() > 0
-                        || !function.eval_declarations().is_empty() {
-                        let identity = machine.heap.next_environment_identity();
-                        Ref::new(
-                            Option::Some(
-                                Ref::new(
-                                    EvalEnvironment {
-                                        values: HashMap::new(),
-                                        parent: closure.eval_environment,
-                                        identity_value: identity,
-                                        epoch_value: Ref::new(0),
-                                    },
-                                ),
-                            ),
-                        )
-                    } else {
-                        Ref::new(closure.eval_environment)
-                    };
-                    if function.generator() || function.asynchronous() {
-                        if constructing {
-                            return Result::Err(
-                                error(
-                                    offset,
-                                    VmErrorKind::TypeError(
-                                        if function.asynchronous() {
-                                            "async function is not a constructor"
-                                        } else {
-                                            "generator function is not a constructor"
-                                        },
-                                    ),
-                                ),
-                            )
-                        }
-                        let suspended = create_generator(
-                            machine,
-                            offset,
-                            object,
-                            function,
-                            arguments,
-                            locals,
-                            closure,
-                            this_cell,
-                            new_target,
-                            eval_environment,
-                        )?;
-                        if function.asynchronous() && function.generator() {
-                            return match machine.generators.async_generator_runner.get() {
-                                Some(runner) => runner(suspended, machine.depth + 1),
-                                None => Result::Err(
-                                    error(
-                                        offset,
-                                        VmErrorKind::TypeError(
-                                            "async generator runner is not installed",
-                                        ),
-                                    ),
-                                ),
-                            }
-                        } else if function.asynchronous() {
-                            return match machine.generators.async_function_runner.get() {
-                                Some(runner) => runner(suspended, machine.depth + 1),
-                                None => Result::Err(
-                                    error(
-                                        offset,
-                                        VmErrorKind::TypeError(
-                                            "async function runner is not installed",
-                                        ),
-                                    ),
-                                ),
-                            }
-                        } else {
-                            return Result::Ok(suspended)
-                        }
-                    }
-                    let result = execute_initialized(
-                        function,
-                        machine.heap,
-                        machine.functions,
-                        machine.bound_functions,
-                        machine.function_objects,
-                        machine.template_objects,
-                        machine.native_functions,
-                        machine.native_constructor_functions,
-                        machine.vm_functions,
-                        machine.vm_constructor_functions,
-                        machine.native_constructors,
-                        machine.global_object,
-                        machine.primitive_prototypes,
-                        machine.error_prototypes,
-                        machine.object_builtin_tags,
-                        machine.global_lexical_bindings,
-                        machine.regexp_constructor,
-                        machine.iterator_symbol,
-                        machine.to_primitive_symbol,
-                        machine.has_instance_symbol,
-                        machine.intrinsic_eval,
-                        Option::Some(runtime::Value::Object(object)),
-                        arguments,
-                        locals,
-                        closure.upvalues,
-                        this_cell,
-                        closure.home_object.get(),
-                        if function.lexical_this() {
-                            closure.new_target
-                        } else {
-                            new_target
-                        },
-                        closure.instance_initializer,
-                        eval_environment,
-                        machine.active_frames,
-                        machine.generators,
-                        machine.dynamic_eval_compiler,
-                        machine.dynamic_module_loader,
-                        machine.iterators,
-                        machine.depth + 1,
-                    )?;
-                    if function.derived_constructor() && constructing {
-                        match result {
-                            runtime::Value::Object(_) => Result::Ok(result),
-                            runtime::Value::Undefined => match this_cell.get() {
-                                Some(value) => Result::Ok(value),
-                                None => Result::Err(
-                                    error(
-                                        offset,
-                                        VmErrorKind::ReferenceError(
-                                            "derived constructor did not initialize this",
-                                        ),
-                                    ),
-                                ),
-                            },
-                            _ => Result::Err(
-                                error(
-                                    offset,
-                                    VmErrorKind::TypeError(
-                                        "derived constructor returned a non-object value",
-                                    ),
-                                ),
-                            ),
-                        }
-                    } else {
-                        Result::Ok(result)
-                    }
-                },
-                None => match machine.native_functions.get(object) {
+            match shared.functions.get(object) {
+                Some(closure) => invoke_source_function(
+                    machine,
+                    offset,
+                    object,
+                    closure,
+                    arguments,
+                    this_value,
+                    constructing,
+                    new_target,
+                ),
+                None => match shared.native_functions.get(object) {
                     Some(function) => invoke_native_callable(
                         machine,
                         offset,
@@ -8878,7 +8930,7 @@ fn call_value_with_mode_rooted(
                         this_value,
                         arguments,
                     ),
-                    None => match machine.vm_functions.get(object) {
+                    None => match shared.vm_functions.get(object) {
                         Some(callback) => match callback(this_value, arguments, machine.depth) {
                             Ok(value) => Result::Ok(ensure_error_stack(machine, value, offset)),
                             Err(VmError { offset: inner_offset, kind }) => if inner_offset < 0 {
@@ -8999,7 +9051,7 @@ fn finish_construct_value_with_new_target(
     prototype: Option[runtime::ObjectId],
     receiver: runtime::Value,
 ) -> Result[runtime::Value, VmError] {
-    match (receiver, machine.native_constructor_functions.get(object)) {
+    match (receiver, machine.shared.get().native_constructor_functions.get(object)) {
         (runtime::Value::Object(receiver_object), Some(callback)) => {
             return match callback(machine.heap, receiver_object, arguments, prototype, new_target) {
                 Ok(runtime::Value::Object(value)) => Result::Ok(
@@ -9011,7 +9063,7 @@ fn finish_construct_value_with_new_target(
         },
         _ => (),
     }
-    match (receiver, machine.vm_constructor_functions.get(object)) {
+    match (receiver, machine.shared.get().vm_constructor_functions.get(object)) {
         (runtime::Value::Object(receiver_object), Some(callbacks)) => {
             return match callbacks.callback {
                 Some(callback) => match callback(
@@ -9075,7 +9127,7 @@ fn validate_constructor_realm(machine: Machine, offset: isize, object: runtime::
 ] {
     match proxy_parts(machine, offset, object)? {
         Some((target, _)) => validate_constructor_realm(machine, offset, target),
-        None => match machine.bound_functions.get(object) {
+        None => match machine.shared.get().bound_functions.get(object) {
             Some(bound) => match bound.target {
                 runtime::Value::Object(target) => {
                     validate_constructor_realm(machine, offset, target)
@@ -9096,7 +9148,7 @@ fn construct_prepared_value_with_new_target(
     new_target: runtime::Value,
     new_target_object: runtime::ObjectId,
 ) -> Result[runtime::Value, VmError] {
-    match machine.vm_constructor_functions.get(object) {
+    match machine.shared.get().vm_constructor_functions.get(object) {
         Some(callbacks) => match callbacks.self_allocating {
             Some(callback) => return callback(arguments, machine.depth),
             None => (),
@@ -9180,7 +9232,7 @@ fn construct_value_with_new_target_rooted(
         runtime::Value::Object(value) => value,
         _ => return Result::Err(error(offset, VmErrorKind::TypeError("value is not a constructor"))),
     };
-    match machine.bound_functions.get(object) {
+    match machine.shared.get().bound_functions.get(object) {
         Some(bound) => {
             let target = bound.target;
             let effective_new_target = if runtime::same_value(new_target, callee) {
@@ -9240,7 +9292,7 @@ fn construct_value_with_new_target_rooted(
         None => false,
     };
     if !machine.heap.contains(object) || !object.is_callable()
-        || !source_constructable && !machine.native_constructors.contains(object) {
+        || !source_constructable && !machine.shared.get().native_constructors.contains(object) {
         let message = match source_function {
             Some(closure) => match closure.get().function.get().name() {
                 Some(name) => host_string(name) + " is not a constructor",
@@ -9256,7 +9308,7 @@ fn construct_value_with_new_target_rooted(
             error(offset, VmErrorKind::TypeError("new target is not an object")),
         ),
     };
-    let arguments = match machine.vm_constructor_functions.get(object) {
+    let arguments = match machine.shared.get().vm_constructor_functions.get(object) {
         Some(callbacks) => match callbacks.prepare {
             Some(prepare) => prepare(arguments, machine.depth)?,
             None => arguments,
@@ -9298,7 +9350,7 @@ fn construct_regexp_literal(
         runtime::Value::Object(value) => value,
         _ => return construct_value(machine, offset, constructor, Vec::from_array([pattern, flags])),
     };
-    let callbacks = match machine.vm_constructor_functions.get(object) {
+    let callbacks = match machine.shared.get().vm_constructor_functions.get(object) {
         Some(value) => value,
         None => return construct_value(
             machine,
@@ -9425,15 +9477,41 @@ fn push_call(machine: Machine, offset: isize, argument_count: isize, method: boo
     };
     let argument_start = callee_index + 1;
     let callee = machine.stack[callee_index];
-    let native_function = cached_native_function(machine, offset, callee);
-    let vm_function = if native_function.is_some() {
+    let cached_host = match (callee, machine.function.native_call_cache(offset)) {
+        (runtime::Value::Object(object), Some(cached)) => object == cached,
+        _ => false,
+    };
+    let source_function = match callee {
+        runtime::Value::Object(object) => if !cached_host && object.is_callable()
+            && machine.heap.contains(object) {
+            match machine.functions.get(object) {
+                Some(closure) => Option::Some((object, closure)),
+                None => Option::None,
+            }
+        } else {
+            Option::None
+        },
+        _ => Option::None,
+    };
+    let native_function = if source_function.is_some() {
+        Option::None
+    } else {
+        cached_native_function(machine, offset, callee)
+    };
+    let vm_function = if source_function.is_some() || native_function.is_some() {
         Option::None
     } else {
         cached_vm_function(machine, offset, callee)
     };
-    let reusable_arguments = match native_function {
-        Some(function) => function.reusable_arguments,
-        None => false,
+    let reusable_arguments = match source_function {
+        Some((_, closure)) => {
+            let function = closure.get().function.get();
+            !function.generator() && !function.asynchronous()
+        },
+        None => match native_function {
+            Some(function) => function.reusable_arguments,
+            None => false,
+        },
     };
     let arguments: Vec[runtime::Value] = if reusable_arguments {
         machine.native_argument_buffer.truncate(0);
@@ -9452,21 +9530,39 @@ fn push_call(machine: Machine, offset: isize, argument_count: isize, method: boo
         runtime::Value::Undefined
     };
     update_active_frame_offset(machine, offset);
-    let result = match native_function {
-        Some(function) => {
-            invoke_native_callable(machine, offset, function.callback, this_value, arguments)
-        },
-        None => match vm_function {
-            Some(callback) => invoke_vm_callable(machine, offset, callback, this_value, arguments),
-            None => call_value_with_mode_rooted(
-                machine,
-                offset,
-                callee,
-                arguments,
-                this_value,
-                false,
-                Option::None,
-            ),
+    let result = match source_function {
+        Some((object, closure)) => invoke_source_function(
+            machine,
+            offset,
+            object,
+            closure,
+            arguments,
+            this_value,
+            false,
+            Option::None,
+        ),
+        None => match native_function {
+            Some(function) => {
+                invoke_native_callable(machine, offset, function.callback, this_value, arguments)
+            },
+            None => match vm_function {
+                Some(callback) => invoke_vm_callable(
+                    machine,
+                    offset,
+                    callback,
+                    this_value,
+                    arguments,
+                ),
+                None => call_value_with_mode_rooted(
+                    machine,
+                    offset,
+                    callee,
+                    arguments,
+                    this_value,
+                    false,
+                    Option::None,
+                ),
+            },
         },
     };
     if reusable_arguments {
@@ -9628,7 +9724,7 @@ fn step(machine: Machine, offset: isize, instruction: bytecode::Instruction) -> 
             },
         },
         bytecode::Instruction::NewRegExp(pattern, flags) => {
-            let constructor = match machine.regexp_constructor {
+            let constructor = match machine.shared.get().regexp_constructor {
                 Some(value) => value,
                 None => return Result::Err(
                     error(offset, VmErrorKind::TypeError("RegExp is not installed")),
@@ -10098,7 +10194,7 @@ fn step(machine: Machine, offset: isize, instruction: bytecode::Instruction) -> 
             };
             let callee_index = machine.stack.len() - arguments - 1;
             let direct = callee_index >= 0
-                && match machine.intrinsic_eval {
+                && match machine.shared.get().intrinsic_eval {
                     Some(intrinsic) => runtime::same_value(machine.stack[callee_index], intrinsic),
                     None => false,
                 };
@@ -10120,7 +10216,7 @@ fn step(machine: Machine, offset: isize, instruction: bytecode::Instruction) -> 
             };
             let callee_index = machine.stack.len() - 2;
             let direct = callee_index >= 0
-                && match machine.intrinsic_eval {
+                && match machine.shared.get().intrinsic_eval {
                     Some(intrinsic) => runtime::same_value(machine.stack[callee_index], intrinsic),
                     None => false,
                 };
@@ -10321,52 +10417,34 @@ fn return_stack_pooled(heap: runtime::Heap, stack: Vec[runtime::Value]) -> () {
 }
 
 fn execute_initialized(
+    shared: Ref[MachineShared],
     function: bytecode::Function,
     heap: runtime::Heap,
-    functions: HashMap[runtime::ObjectId, Ref[Closure]],
-    bound_functions: HashMap[runtime::ObjectId, BoundFunction],
-    function_objects: HashMap[u64, runtime::ObjectId],
-    template_objects: HashMap[u64, runtime::ObjectId],
-    native_functions: HashMap[runtime::ObjectId, NativeFunction],
-    native_constructor_functions: HashMap[runtime::ObjectId, NativeConstructorCallable],
-    vm_functions: HashMap[runtime::ObjectId, VmCallable],
-    vm_constructor_functions: HashMap[runtime::ObjectId, VmConstructorCallbacks],
-    native_constructors: collections::HashSet[runtime::ObjectId],
-    global_object: Option[runtime::ObjectId],
-    primitive_prototypes: PrimitivePrototypes,
-    error_prototypes: ErrorPrototypes,
-    object_builtin_tags: HashMap[runtime::ObjectId, runtime::JsString],
-    global_lexical_bindings: HashMap[string, GlobalLexicalBinding],
-    regexp_constructor: Option[runtime::Value],
-    iterator_symbol: Option[runtime::Symbol],
-    to_primitive_symbol: Option[runtime::Symbol],
-    has_instance_symbol: Option[runtime::Symbol],
-    intrinsic_eval: Option[runtime::Value],
     callee: Option[runtime::Value],
     arguments: Vec[runtime::Value],
-    locals: Vec[Ref[runtime::Value]],
+    locals: LocalSlots,
     upvalues: Vec[UpvalueCell],
     this_value: Ref[Option[runtime::Value]],
     home_object: Option[runtime::ObjectId],
     new_target: Option[runtime::Value],
     instance_initializer: Ref[Option[runtime::ObjectId]],
     eval_environment: Ref[Option[Ref[EvalEnvironment]]],
-    active_frames: Vec[ActiveFrame],
-    generators: GeneratorRuntime,
-    dynamic_eval_compiler: Ref[Option[DynamicEvalCompiler]],
-    dynamic_module_loader: Ref[Option[DynamicModuleLoader]],
-    iterators: IteratorRuntime,
     depth: isize,
 ) -> Result[runtime::Value, VmError] {
-    let verification = function.verification();
-    if !verification.errors.is_empty() {
-        return Result::Err(error(-1, VmErrorKind::VerificationFailed(verification.errors)))
-    }
-    let stack = take_stack_pooled(heap, verification.max_stack);
-    let arguments_object = Ref::new(Option::None);
-    let arguments_binding = Ref::new(runtime::Value::Undefined);
-    let arguments_binding_initialized = Ref::new(false);
-    let frame_offset = Ref::new(0);
+    let context = shared.get();
+    let active_frames = context.active_frames;
+    let max_stack = match function.verified_max_stack() {
+        Some(value) => value,
+        None => return Result::Err(
+            error(-1, VmErrorKind::VerificationFailed(function.verification().errors)),
+        ),
+    };
+    let stack = take_stack_pooled(heap, max_stack);
+    let scratch = take_frame_scratch(context.frame_scratch_pool);
+    let arguments_object = scratch.arguments_object;
+    let arguments_binding = scratch.arguments_binding;
+    let arguments_binding_initialized = scratch.arguments_binding_initialized;
+    let frame_offset = scratch.offset;
     active_frames.push(
         ActiveFrame {
             function,
@@ -10387,51 +10465,34 @@ fn execute_initialized(
         },
     );
     let machine = Machine {
+        shared,
         function,
         heap,
-        functions,
-        bound_functions,
-        function_objects,
-        template_objects,
-        native_functions,
-        native_constructor_functions,
-        vm_functions,
-        vm_constructor_functions,
-        native_constructors,
         stack,
-        native_argument_buffer: Vec::new(),
+        native_argument_buffer: scratch.argument_buffer,
         locals,
         upvalues,
-        global_object,
-        primitive_prototypes,
-        error_prototypes,
-        object_builtin_tags,
-        global_lexical_bindings,
-        regexp_constructor,
-        iterator_symbol,
-        to_primitive_symbol,
-        has_instance_symbol,
-        intrinsic_eval,
         callee,
         arguments,
         arguments_object,
         arguments_binding,
         arguments_binding_initialized,
         this_value,
+        eval_environment,
+        depth,
         home_object,
         new_target,
         instance_initializer,
-        eval_environment,
-        active_frames,
-        generators,
-        dynamic_eval_compiler,
-        dynamic_module_loader,
-        iterators,
-        depth,
+        functions: context.functions,
+        native_functions: context.native_functions,
+        vm_functions: context.vm_functions,
+        primitive_prototypes: context.primitive_prototypes,
     };
     let result = execute_machine(machine);
     let _ = active_frames.pop();
     return_stack_pooled(heap, stack);
+    return_frame_scratch(context.frame_scratch_pool, scratch);
+    return_local_slots(context.local_slots_pool, heap, locals);
     result
 }
 
@@ -10630,7 +10691,7 @@ fn fast_update_step(machine: Machine, instruction: bytecode::Instruction) -> boo
 
 fn fast_add_local(machine: Machine, index: isize) -> bool {
     let right = pop_verified(machine);
-    let left = machine.locals[index].get();
+    let left = machine.locals.get(index);
     let value = match (left, right) {
         (runtime::Value::Int(left), runtime::Value::Int(right)) => {
             let result = left.to_i64() + right.to_i64();
@@ -10648,7 +10709,7 @@ fn fast_add_local(machine: Machine, index: isize) -> bool {
             return false
         },
     };
-    machine.locals[index].set(value);
+    machine.locals.set(index, value);
     machine.stack.push(value);
     true
 }
@@ -10831,6 +10892,17 @@ fn fast_numeric_step(machine: Machine, offset: isize, instruction: bytecode::Ins
                 true
             },
             (runtime::Value::Int(left), runtime::Value::Int(right)) => {
+                if instruction == bytecode::Instruction::Mod && right != 0 {
+                    let result = (left.to_i64() % right.to_i64()).to_i32();
+                    machine.stack.push(
+                        if result == 0 && left < 0 {
+                            runtime::Value::Float(-0.0)
+                        } else {
+                            runtime::Value::Int(result)
+                        },
+                    );
+                    return true
+                }
                 let left_number = runtime::int_to_number(left);
                 let right_number = runtime::int_to_number(right);
                 machine.stack.push(
@@ -11097,7 +11169,7 @@ fn fast_global_step(machine: Machine, offset: isize, instruction: bytecode::Inst
         bytecode::Instruction::SetGlobal(index) => (index, true),
         _ => return false,
     };
-    let object = match machine.global_object {
+    let object = match machine.shared.get().global_object {
         Some(value) => value,
         None => return false,
     };
@@ -11165,7 +11237,7 @@ fn fast_argument_element(machine: Machine, offset: isize, name_index: isize, dep
     }
     match machine.function.argument_local(argument_index) {
         Some(local) => if local >= 0 && local < machine.locals.len() {
-            Option::Some(machine.locals[local].get())
+            Option::Some(machine.locals.get(local))
         } else {
             Option::None
         },
@@ -11176,7 +11248,7 @@ fn fast_argument_element(machine: Machine, offset: isize, name_index: isize, dep
 fn global_field_cache(machine: Machine, function: bytecode::Function, offset: isize, index: isize) -> Option[
     (runtime::ObjectId, Ref[runtime::PropertyAccessCache]),
 ] {
-    let object = match machine.global_object {
+    let object = match machine.shared.get().global_object {
         Some(value) => value,
         None => return Option::None,
     };
@@ -11285,6 +11357,7 @@ fn recover_execution_error(machine: Machine, offset: isize, value: VmError) -> R
 
 fn execute_machine_from(machine: Machine, start: isize) -> Result[ExecutionResult, VmError] {
     let function = machine.function;
+    let local_pairs = function.local_pair_offsets();
     let mut offset = start;
     while offset >= 0 && offset < function.code_len() {
         let instruction = function.instruction_unchecked(offset);
@@ -11349,17 +11422,21 @@ fn execute_machine_from(machine: Machine, start: isize) -> Result[ExecutionResul
                 offset += 1;
             },
             bytecode::Instruction::GetLoc(index) => {
-                machine.stack.push(machine.locals[index].get());
-                offset += 1;
+                if local_pairs[offset] {
+                    offset = fused_local_pair(machine, offset, index);
+                } else {
+                    machine.stack.push(machine.locals.get(index));
+                    offset += 1;
+                }
             },
             bytecode::Instruction::PutLoc(index) => {
-                machine.locals[index].set(pop_verified(machine));
+                machine.locals.set(index, pop_verified(machine));
                 offset += 1;
             },
             bytecode::Instruction::SetLoc(index) => {
                 let value = pop_verified(machine);
                 machine.stack.push(value);
-                machine.locals[index].set(value);
+                machine.locals.set(index, value);
                 offset += 1;
             },
             bytecode::Instruction::AddLoc(index) => if fast_add_local(machine, index) {
@@ -11849,7 +11926,7 @@ fn instantiate_eval_declarations(machine: Machine, offset: isize, function: byte
             instantiate_global_eval_declarations(
                 machine.heap,
                 global,
-                machine.global_lexical_bindings,
+                machine.shared.get().global_lexical_bindings,
                 declarations,
                 offset,
             )
@@ -12064,70 +12141,26 @@ impl Context {
         };
         if function.local_count() < 0 {
             return execute_initialized(
+                self.machine_shared(),
                 function,
                 self.heap_value,
-                self.functions_value,
-                self.bound_functions_value,
-                self.function_objects_value,
-                self.template_objects_value,
-                self.native_functions_value,
-                self.native_constructor_functions_value,
-                self.vm_functions_value,
-                self.vm_constructor_functions_value,
-                self.native_constructors_value,
-                self.global_object_value.get(),
-                self.primitive_prototypes_value,
-                self.error_prototypes_value,
-                self.object_builtin_tags_value,
-                self.global_lexical_bindings_value,
-                self.regexp_constructor_value.get(),
-                self.iterator_symbol_value.get(),
-                self.well_known_symbols_value.slot(WellKnownSymbolKind::ToPrimitive).get(),
-                self.well_known_symbols_value.slot(WellKnownSymbolKind::HasInstance).get(),
-                self.intrinsic_eval_value.get(),
                 Option::None,
                 Vec::new(),
-                Vec::new(),
+                LocalSlots::new(0),
                 Vec::new(),
                 Ref::new(Option::Some(global_this)),
                 Option::None,
                 Option::None,
                 Ref::new(Option::None),
                 Ref::new(Option::None),
-                self.active_frames_value,
-                self.generators_value,
-                self.dynamic_eval_compiler_value,
-                self.dynamic_module_loader_value,
-                self.iterators_value,
                 0,
             )
         }
-        let locals: Vec[Ref[runtime::Value]] = Vec::with_capacity(function.local_count());
-        for _ in 0..function.local_count() {
-            locals.push(Ref::new(runtime::Value::Undefined))
-        }
+        let locals = LocalSlots::new(function.local_count());
         execute_initialized(
+            self.machine_shared(),
             function,
             self.heap_value,
-            self.functions_value,
-            self.bound_functions_value,
-            self.function_objects_value,
-            self.template_objects_value,
-            self.native_functions_value,
-            self.native_constructor_functions_value,
-            self.vm_functions_value,
-            self.vm_constructor_functions_value,
-            self.native_constructors_value,
-            self.global_object_value.get(),
-            self.primitive_prototypes_value,
-            self.error_prototypes_value,
-            self.object_builtin_tags_value,
-            self.global_lexical_bindings_value,
-            self.regexp_constructor_value.get(),
-            self.iterator_symbol_value.get(),
-            self.well_known_symbols_value.slot(WellKnownSymbolKind::ToPrimitive).get(),
-            self.well_known_symbols_value.slot(WellKnownSymbolKind::HasInstance).get(),
-            self.intrinsic_eval_value.get(),
             Option::None,
             Vec::new(),
             locals,
@@ -12137,11 +12170,6 @@ impl Context {
             Option::None,
             Ref::new(Option::None),
             Ref::new(Option::None),
-            self.active_frames_value,
-            self.generators_value,
-            self.dynamic_eval_compiler_value,
-            self.dynamic_module_loader_value,
-            self.iterators_value,
             0,
         )
     }
@@ -12165,41 +12193,18 @@ impl Context {
     ) -> Result[runtime::Value, VmError] {
         if function.local_count() < 0 {
             return execute_initialized(
+                self.machine_shared(),
                 function,
                 self.heap_value,
-                self.functions_value,
-                self.bound_functions_value,
-                self.function_objects_value,
-                self.template_objects_value,
-                self.native_functions_value,
-                self.native_constructor_functions_value,
-                self.vm_functions_value,
-                self.vm_constructor_functions_value,
-                self.native_constructors_value,
-                self.global_object_value.get(),
-                self.primitive_prototypes_value,
-                self.error_prototypes_value,
-                self.object_builtin_tags_value,
-                self.global_lexical_bindings_value,
-                self.regexp_constructor_value.get(),
-                self.iterator_symbol_value.get(),
-                self.well_known_symbols_value.slot(WellKnownSymbolKind::ToPrimitive).get(),
-                self.well_known_symbols_value.slot(WellKnownSymbolKind::HasInstance).get(),
-                self.intrinsic_eval_value.get(),
                 Option::None,
                 Vec::new(),
-                Vec::new(),
+                LocalSlots::new(0),
                 Vec::new(),
                 Ref::new(Option::Some(runtime::Value::Undefined)),
                 Option::None,
                 Option::None,
                 Ref::new(Option::None),
                 Ref::new(Option::None),
-                self.active_frames_value,
-                self.generators_value,
-                self.dynamic_eval_compiler_value,
-                self.dynamic_module_loader_value,
-                self.iterators_value,
                 0,
             )
         }
@@ -12213,28 +12218,11 @@ impl Context {
         while locals.len() < function.local_count() {
             locals.push(Ref::new(runtime::Value::Undefined))
         }
+        let locals = LocalSlots::from_cells(locals);
         execute_initialized(
+            self.machine_shared(),
             function,
             self.heap_value,
-            self.functions_value,
-            self.bound_functions_value,
-            self.function_objects_value,
-            self.template_objects_value,
-            self.native_functions_value,
-            self.native_constructor_functions_value,
-            self.vm_functions_value,
-            self.vm_constructor_functions_value,
-            self.native_constructors_value,
-            self.global_object_value.get(),
-            self.primitive_prototypes_value,
-            self.error_prototypes_value,
-            self.object_builtin_tags_value,
-            self.global_lexical_bindings_value,
-            self.regexp_constructor_value.get(),
-            self.iterator_symbol_value.get(),
-            self.well_known_symbols_value.slot(WellKnownSymbolKind::ToPrimitive).get(),
-            self.well_known_symbols_value.slot(WellKnownSymbolKind::HasInstance).get(),
-            self.intrinsic_eval_value.get(),
             Option::None,
             Vec::new(),
             locals,
@@ -12244,11 +12232,6 @@ impl Context {
             Option::None,
             Ref::new(Option::None),
             Ref::new(Option::None),
-            self.active_frames_value,
-            self.generators_value,
-            self.dynamic_eval_compiler_value,
-            self.dynamic_module_loader_value,
-            self.iterators_value,
             0,
         )
     }
@@ -12276,6 +12259,7 @@ impl Context {
         while locals.len() < function.local_count() {
             locals.push(Ref::new(runtime::Value::Undefined))
         }
+        let locals = LocalSlots::from_cells(locals);
         let prototype = match self.generators_value.prototype.get() {
             Some(value) => Option::Some(value),
             None => self.heap_value.object_prototype(),
@@ -12339,41 +12323,18 @@ impl Context {
             locals.push(Ref::new(value))
         }
         execute_initialized(
+            self.machine_shared(),
             bytecode::Function::new(Vec::new(), code, locals.len()),
             self.heap_value,
-            self.functions_value,
-            self.bound_functions_value,
-            self.function_objects_value,
-            self.template_objects_value,
-            self.native_functions_value,
-            self.native_constructor_functions_value,
-            self.vm_functions_value,
-            self.vm_constructor_functions_value,
-            self.native_constructors_value,
-            self.global_object_value.get(),
-            self.primitive_prototypes_value,
-            self.error_prototypes_value,
-            self.object_builtin_tags_value,
-            self.global_lexical_bindings_value,
-            self.regexp_constructor_value.get(),
-            self.iterator_symbol_value.get(),
-            self.well_known_symbols_value.slot(WellKnownSymbolKind::ToPrimitive).get(),
-            self.well_known_symbols_value.slot(WellKnownSymbolKind::HasInstance).get(),
-            self.intrinsic_eval_value.get(),
             Option::None,
             Vec::new(),
-            locals,
+            LocalSlots::from_cells(locals),
             Vec::new(),
             Ref::new(Option::Some(runtime::Value::Undefined)),
             Option::None,
             Option::None,
             Ref::new(Option::None),
             Ref::new(Option::None),
-            self.active_frames_value,
-            self.generators_value,
-            self.dynamic_eval_compiler_value,
-            self.dynamic_module_loader_value,
-            self.iterators_value,
             depth,
         )
     }
@@ -12395,41 +12356,18 @@ impl Context {
         code.push(instruction);
         code.push(bytecode::Instruction::Return);
         execute_initialized(
+            self.machine_shared(),
             bytecode::Function::new(Vec::new(), code, locals.len()),
             self.heap_value,
-            self.functions_value,
-            self.bound_functions_value,
-            self.function_objects_value,
-            self.template_objects_value,
-            self.native_functions_value,
-            self.native_constructor_functions_value,
-            self.vm_functions_value,
-            self.vm_constructor_functions_value,
-            self.native_constructors_value,
-            self.global_object_value.get(),
-            self.primitive_prototypes_value,
-            self.error_prototypes_value,
-            self.object_builtin_tags_value,
-            self.global_lexical_bindings_value,
-            self.regexp_constructor_value.get(),
-            self.iterator_symbol_value.get(),
-            self.well_known_symbols_value.slot(WellKnownSymbolKind::ToPrimitive).get(),
-            self.well_known_symbols_value.slot(WellKnownSymbolKind::HasInstance).get(),
-            self.intrinsic_eval_value.get(),
             Option::None,
             Vec::new(),
-            locals,
+            LocalSlots::from_cells(locals),
             Vec::new(),
             Ref::new(Option::Some(runtime::Value::Undefined)),
             Option::None,
             Option::None,
             Ref::new(Option::None),
             Ref::new(Option::None),
-            self.active_frames_value,
-            self.generators_value,
-            self.dynamic_eval_compiler_value,
-            self.dynamic_module_loader_value,
-            self.iterators_value,
             depth,
         )
     }
@@ -12506,6 +12444,7 @@ impl Context {
         }
         let locals: Vec[Ref[runtime::Value]] = Vec::from_array([Ref::new(receiver), Ref::new(key)]);
         execute_initialized(
+            self.machine_shared(),
             bytecode::Function::new(
                 Vec::new(),
                 Vec::from_array(
@@ -12519,39 +12458,15 @@ impl Context {
                 locals.len(),
             ),
             self.heap_value,
-            self.functions_value,
-            self.bound_functions_value,
-            self.function_objects_value,
-            self.template_objects_value,
-            self.native_functions_value,
-            self.native_constructor_functions_value,
-            self.vm_functions_value,
-            self.vm_constructor_functions_value,
-            self.native_constructors_value,
-            self.global_object_value.get(),
-            self.primitive_prototypes_value,
-            self.error_prototypes_value,
-            self.object_builtin_tags_value,
-            self.global_lexical_bindings_value,
-            self.regexp_constructor_value.get(),
-            self.iterator_symbol_value.get(),
-            self.well_known_symbols_value.slot(WellKnownSymbolKind::ToPrimitive).get(),
-            self.well_known_symbols_value.slot(WellKnownSymbolKind::HasInstance).get(),
-            self.intrinsic_eval_value.get(),
             Option::None,
             Vec::new(),
-            locals,
+            LocalSlots::from_cells(locals),
             Vec::new(),
             Ref::new(Option::Some(runtime::Value::Undefined)),
             Option::None,
             Option::None,
             Ref::new(Option::None),
             Ref::new(Option::None),
-            self.active_frames_value,
-            self.generators_value,
-            self.dynamic_eval_compiler_value,
-            self.dynamic_module_loader_value,
-            self.iterators_value,
             depth,
         )
     }
@@ -12764,6 +12679,7 @@ impl Context {
     ) -> Result[(), VmError] {
         let locals: Vec[Ref[runtime::Value]] = Vec::from_array([Ref::new(key), Ref::new(value)]);
         match execute_initialized(
+            self.machine_shared(),
             bytecode::Function::new(
                 Vec::new(),
                 Vec::from_array(
@@ -12777,39 +12693,15 @@ impl Context {
                 locals.len(),
             ),
             self.heap_value,
-            self.functions_value,
-            self.bound_functions_value,
-            self.function_objects_value,
-            self.template_objects_value,
-            self.native_functions_value,
-            self.native_constructor_functions_value,
-            self.vm_functions_value,
-            self.vm_constructor_functions_value,
-            self.native_constructors_value,
-            self.global_object_value.get(),
-            self.primitive_prototypes_value,
-            self.error_prototypes_value,
-            self.object_builtin_tags_value,
-            self.global_lexical_bindings_value,
-            self.regexp_constructor_value.get(),
-            self.iterator_symbol_value.get(),
-            self.well_known_symbols_value.slot(WellKnownSymbolKind::ToPrimitive).get(),
-            self.well_known_symbols_value.slot(WellKnownSymbolKind::HasInstance).get(),
-            self.intrinsic_eval_value.get(),
             Option::None,
             Vec::new(),
-            locals,
+            LocalSlots::from_cells(locals),
             Vec::new(),
             Ref::new(Option::Some(receiver)),
             Option::None,
             Option::None,
             Ref::new(Option::None),
             Ref::new(Option::None),
-            self.active_frames_value,
-            self.generators_value,
-            self.dynamic_eval_compiler_value,
-            self.dynamic_module_loader_value,
-            self.iterators_value,
             depth,
         ) {
             Ok(_) => Result::Ok(()),
@@ -12825,6 +12717,7 @@ impl Context {
     ) -> Result[runtime::Value, VmError] {
         let locals: Vec[Ref[runtime::Value]] = Vec::from_array([Ref::new(value)]);
         execute_initialized(
+            self.machine_shared(),
             bytecode::Function::new(
                 Vec::new(),
                 Vec::from_array(
@@ -12833,39 +12726,15 @@ impl Context {
                 1,
             ),
             self.heap_value,
-            self.functions_value,
-            self.bound_functions_value,
-            self.function_objects_value,
-            self.template_objects_value,
-            self.native_functions_value,
-            self.native_constructor_functions_value,
-            self.vm_functions_value,
-            self.vm_constructor_functions_value,
-            self.native_constructors_value,
-            self.global_object_value.get(),
-            self.primitive_prototypes_value,
-            self.error_prototypes_value,
-            self.object_builtin_tags_value,
-            self.global_lexical_bindings_value,
-            self.regexp_constructor_value.get(),
-            self.iterator_symbol_value.get(),
-            self.well_known_symbols_value.slot(WellKnownSymbolKind::ToPrimitive).get(),
-            self.well_known_symbols_value.slot(WellKnownSymbolKind::HasInstance).get(),
-            self.intrinsic_eval_value.get(),
             Option::None,
             Vec::new(),
-            locals,
+            LocalSlots::from_cells(locals),
             Vec::new(),
             Ref::new(Option::Some(runtime::Value::Undefined)),
             Option::None,
             Option::None,
             Ref::new(Option::None),
             Ref::new(Option::None),
-            self.active_frames_value,
-            self.generators_value,
-            self.dynamic_eval_compiler_value,
-            self.dynamic_module_loader_value,
-            self.iterators_value,
             depth,
         )
     }

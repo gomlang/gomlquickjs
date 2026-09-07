@@ -1,0 +1,110 @@
+package vm;
+
+use gomlang::quickjs::runtime;
+
+struct LocalSlots {
+    values: Vec[runtime::Value],
+    cells: Vec[Option[Ref[runtime::Value]]],
+}
+
+fn take_local_slots(pool: Vec[LocalSlots], heap: runtime::Heap, count: isize) -> LocalSlots {
+    match pool.pop() {
+        Some(slots) => {
+            for _ in 0..count {
+                slots.values.push(runtime::Value::Undefined)
+            }
+            slots
+        },
+        None => LocalSlots::with_storage(take_stack_pooled(heap, count), count),
+    }
+}
+
+fn return_local_slots(pool: Vec[LocalSlots], heap: runtime::Heap, slots: LocalSlots) -> () {
+    if slots.cells.is_empty() {
+        slots.values.clear();
+        if pool.len() < MAX_POOLED_STACKS {
+            pool.push(slots)
+        } else {
+            return_stack_pooled(heap, slots.values)
+        }
+    }
+}
+
+impl LocalSlots {
+    fn new(count: isize) -> LocalSlots {
+        LocalSlots::with_storage(Vec::with_capacity(count), count)
+    }
+
+    fn with_storage(values: Vec[runtime::Value], count: isize) -> LocalSlots {
+        for _ in 0..count {
+            values.push(runtime::Value::Undefined)
+        }
+        LocalSlots { values, cells: Vec::new() }
+    }
+
+    fn from_cells(source: Vec[Ref[runtime::Value]]) -> LocalSlots {
+        let slots = LocalSlots::new(source.len());
+        for cell in source {
+            slots.cells.push(Option::Some(cell))
+        }
+        slots
+    }
+
+    fn len(self: LocalSlots) -> isize {
+        self.values.len()
+    }
+
+    fn get(self: LocalSlots, index: isize) -> runtime::Value {
+        if index < self.cells.len() {
+            match self.cells[index] {
+                Some(cell) => return cell.get(),
+                None => (),
+            }
+        }
+        self.values[index]
+    }
+
+    fn set(self: LocalSlots, index: isize, value: runtime::Value) -> () {
+        if index < self.cells.len() {
+            match self.cells[index] {
+                Some(cell) => {
+                    cell.set(value);
+                    return ()
+                },
+                None => (),
+            }
+        }
+        self.values[index] = value;
+    }
+
+    fn capture(self: LocalSlots, index: isize) -> Ref[runtime::Value] {
+        while self.cells.len() <= index {
+            self.cells.push(Option::None)
+        }
+        match self.cells[index] {
+            Some(cell) => cell,
+            None => {
+                let cell = Ref::new(self.values[index]);
+                self.values[index] = runtime::Value::Undefined;
+                self.cells[index] = Option::Some(cell);
+                cell
+            },
+        }
+    }
+
+    fn renew(self: LocalSlots, index: isize) -> () {
+        let value = self.get(index);
+        if index < self.cells.len() {
+            self.cells[index] = Option::None;
+        }
+        self.values[index] = value;
+    }
+
+    fn push_roots(self: LocalSlots, roots: Vec[runtime::Value]) -> () {
+        let mut index = 0;
+        while index < self.len() {
+            roots.push(self.get(index));
+            index += 1;
+        }
+    }
+}

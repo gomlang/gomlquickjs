@@ -1,0 +1,69 @@
+package vm;
+
+use gomlang::quickjs::bytecode;
+use gomlang::quickjs::runtime;
+
+fn fused_local_pair(machine: Machine, offset: isize, first: isize) -> isize {
+    let function = machine.function;
+    if offset + 2 >= function.code_len() {
+        machine.stack.push(machine.locals.get(first));
+        return offset + 1
+    }
+    let right = match function.instruction_unchecked(offset + 1) {
+        bytecode::Instruction::GetLoc(index) => machine.locals.get(index),
+        bytecode::Instruction::PushI32(value) => runtime::Value::Int(value),
+        _ => {
+            machine.stack.push(machine.locals.get(first));
+            return offset + 1
+        },
+    };
+    let instruction = function.instruction_unchecked(offset + 2);
+    let left = machine.locals.get(first);
+    match instruction {
+        bytecode::Instruction::Lt | bytecode::Instruction::Lte | bytecode::Instruction::Gt | bytecode::Instruction::Gte | bytecode::Instruction::StrictEq | bytecode::Instruction::StrictNeq => match (
+            left,
+            right,
+        ) {
+            (runtime::Value::Int(left), runtime::Value::Int(right)) => {
+                let condition = match instruction {
+                    bytecode::Instruction::Lt => left < right,
+                    bytecode::Instruction::Lte => left <= right,
+                    bytecode::Instruction::Gt => left > right,
+                    bytecode::Instruction::Gte => left >= right,
+                    bytecode::Instruction::StrictEq => left == right,
+                    _ => left != right,
+                };
+                match function.instruction(offset + 3) {
+                    Some(bytecode::Instruction::IfFalse(target)) => return if condition {
+                        offset + 4
+                    } else {
+                        target
+                    },
+                    Some(bytecode::Instruction::IfTrue(target)) => return if condition {
+                        target
+                    } else {
+                        offset + 4
+                    },
+                    _ => (),
+                }
+            },
+            _ => (),
+        },
+        _ => (),
+    }
+    match instruction {
+        bytecode::Instruction::Add | bytecode::Instruction::Sub | bytecode::Instruction::Mul | bytecode::Instruction::Div | bytecode::Instruction::Mod | bytecode::Instruction::Lt | bytecode::Instruction::Lte | bytecode::Instruction::Gt | bytecode::Instruction::Gte | bytecode::Instruction::StrictEq | bytecode::Instruction::StrictNeq => {
+            machine.stack.push(left);
+            machine.stack.push(right);
+            if fast_numeric_step(machine, offset + 2, instruction) {
+                offset + 3
+            } else {
+                offset + 2
+            }
+        },
+        _ => {
+            machine.stack.push(left);
+            offset + 1
+        },
+    }
+}
