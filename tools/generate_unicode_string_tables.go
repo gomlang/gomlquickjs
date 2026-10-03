@@ -39,20 +39,21 @@ func main() {
 	}
 	var output strings.Builder
 	output.WriteString("package unicode;\n\n")
-	output.WriteString("fn string_hex_nibble(value: byte) -> uint32 {\n")
+	output.WriteString("fn string_hex_nibble(value: byte) -> u32 {\n")
 	output.WriteString("    if value >= b'0' && value <= b'9' {\n")
-	output.WriteString("        (value - b'0').to_uint32()\n")
+	output.WriteString("        (value - b'0').to_u32()\n")
 	output.WriteString("    } else {\n")
-	output.WriteString("        (value - b'a' + 10).to_uint32()\n")
+	output.WriteString("        (value - b'a' + 10).to_u32()\n")
 	output.WriteString("    }\n")
 	output.WriteString("}\n\n")
-	for _, type_ := range []string{"uint8", "uint16", "uint32"} {
+	gomlTypes := map[string]string{"uint8": "u8", "uint16": "u16", "uint32": "u32"}
+	for _, type_ := range []string{"uint16", "uint32"} {
 		width := map[string]int{"uint8": 2, "uint16": 4, "uint32": 8}[type_]
-		fmt.Fprintf(&output, "fn string_decode_%s(input: string) -> Vec[%s] {\n", type_, type_)
-		fmt.Fprintf(&output, "    let output: Vec[%s] = Vec::with_capacity(input.byte_len() / %d);\n", type_, width)
+		fmt.Fprintf(&output, "fn string_decode_%s(input: string) -> Vec[%s] {\n", type_, gomlTypes[type_])
+		fmt.Fprintf(&output, "    let output: Vec[%s] = Vec::with_capacity(input.byte_len() / %d);\n", gomlTypes[type_], width)
 		output.WriteString("    let mut index = 0;\n")
 		output.WriteString("    while index < input.byte_len() {\n")
-		output.WriteString("        let mut value: uint32 = 0;\n")
+		output.WriteString("        let mut value: u32 = 0;\n")
 		fmt.Fprintf(&output, "        let end = index + %d;\n", width)
 		output.WriteString("        while index < end {\n")
 		output.WriteString("            value = (value << 4) | string_hex_nibble(input.byte_get(index));\n")
@@ -61,7 +62,7 @@ func main() {
 		if type_ == "uint32" {
 			output.WriteString("        output.push(value);\n")
 		} else {
-			fmt.Fprintf(&output, "        output.push(value.to_%s());\n", type_)
+			fmt.Fprintf(&output, "        output.push(value.to_%s());\n", gomlTypes[type_])
 		}
 		output.WriteString("    }\n")
 		output.WriteString("    output\n")
@@ -87,10 +88,25 @@ func main() {
 			if err != nil {
 				panic(err)
 			}
-			fmt.Fprintf(&encoded, "%0*x", width, parsed)
+			if spec.type_ == "uint8" {
+				switch {
+				case parsed == '"' || parsed == '\\':
+					fmt.Fprintf(&encoded, "\\%c", parsed)
+				case parsed >= 32 && parsed <= 126:
+					fmt.Fprintf(&encoded, "%c", parsed)
+				default:
+					fmt.Fprintf(&encoded, "\\x%02X", parsed)
+				}
+			} else {
+				fmt.Fprintf(&encoded, "%0*x", width, parsed)
+			}
 		}
-		fmt.Fprintf(&output, "fn string_%s() -> Vec[%s] {\n", spec.field, spec.type_)
-		fmt.Fprintf(&output, "    string_decode_%s(\"%s\")\n", spec.type_, encoded.String())
+		fmt.Fprintf(&output, "fn string_%s() -> Vec[%s] {\n", spec.field, gomlTypes[spec.type_])
+		if spec.type_ == "uint8" {
+			fmt.Fprintf(&output, "    b\"%s\"\n", encoded.String())
+		} else {
+			fmt.Fprintf(&output, "    string_decode_%s(\"%s\")\n", spec.type_, encoded.String())
+		}
 		output.WriteString("}\n\n")
 	}
 	output.WriteString("fn string_unicode_data() -> StringUnicodeData {\n")

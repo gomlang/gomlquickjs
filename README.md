@@ -237,22 +237,49 @@ only when needed. The interpreter fuses eligible adjacent local loads and numeri
 operations without rewriting bytecode offsets; operations requiring coercion
 resume at the original arithmetic instruction.
 
-Run the module tests with:
+## Build and test
+
+This repository builds independently of the GoML compiler repository. Use
+Linux amd64, Go 1.26 or newer on `PATH`, Bash, curl, tar, sha256sum, and `just`.
+The released GoML version and archive checksum are pinned in
+`toolchain/goml.env` (currently GoML 0.1.57). Sources use `.goml`.
+
+Install the toolchain and run the full local CI checks:
 
 ```sh
-../stage2/bin/goml test --compiler ../stage2/bin/gomlc
+just toolchain
+just ci
 ```
 
 Build the current qjs-compatible command with:
 
 ```sh
-../stage2/bin/goml build --compiler ../stage2/bin/gomlc
+just build
 _artifact/bin/cmd/qjs/qjs --help
+_artifact/bin/cmd/qjs/qjs -e 'print(1 + 2)'
 ```
 
 Build and run selected Test262 files with:
 
 ```sh
-../stage2/bin/goml build --compiler ../stage2/bin/gomlc
+just build
 _artifact/bin/cmd/run_test262/run_test262 --harness /path/to/test262/harness test.js
+```
+
+`just test` runs the module tests, `just smoke` checks both command-line tools,
+and `just fmt` formats the sources. Set `GOML` to use another installed GoML
+executable. `GOML_BUILD_JOBS` and `GOML_TEST_JOBS` default to 2. All downloaded
+toolchains and generated outputs stay under `_artifact/`.
+
+The port was extracted from the `gomlquickjs/` directory of
+[`gomlang/goml`](https://github.com/gomlang/goml), preserving its Git history.
+Its independent home is [`gomlang/gomlquickjs`](https://github.com/gomlang/gomlquickjs).
+
+Regenerate `unicode/string_data.goml` from `libunicode-table.h` at the QuickJS
+commit pinned in `UPSTREAM.toml`, then format and test the module:
+
+```sh
+go run tools/generate_unicode_string_tables.go /path/to/quickjs/libunicode-table.h unicode/string_data.goml
+just fmt
+just test
 ```
