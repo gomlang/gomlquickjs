@@ -192,7 +192,6 @@ fn skips_unsupported_features_and_blocking_hosts() -> () {
             "export-defer",
             "import-text",
             "immutable-arraybuffer",
-            "host-gc-required",
             "cross-realm",
             "intl-normative-optional",
             "tail-call-optimization",
@@ -299,6 +298,34 @@ fn installs_test262_eval_script_in_the_current_realm() -> () {
         empty_harness,
     );
     testing::assert_eq(results[0].status, RunStatus::Passed)
+}
+
+#[test]
+fn installs_test262_gc_and_retains_live_values() -> () {
+    let results = run(
+        case_from(
+            "/*---\nfeatures: [host-gc-required]\n---*/\nlet live = {value: 42}; let weak = new WeakRef(live); let dead = (() => new WeakRef({value: 0}))(); if ($262.gc() !== undefined || weak.deref() !== live || live.value !== 42 || dead.deref() !== undefined) throw 'incorrect collection';",
+        ),
+        empty_harness,
+    );
+    testing::assert_eq(results.len(), 2);
+    for result in results {
+        testing::assert_eq(result.status, RunStatus::Passed)
+    }
+}
+
+#[test]
+fn installs_callable_html_dda_with_legacy_coercions() -> () {
+    let results = run(
+        case_from(
+            "/*---\nfeatures: [IsHTMLDDA]\n---*/\nlet value = $262.IsHTMLDDA; if (value || Boolean(value) || typeof value !== 'undefined' || !(value == null) || !(null == value) || !(value == undefined) || !(undefined == value)) throw 'legacy coercion'; if (value === undefined || value === null || Object(value) !== value || (value ?? 42) !== value || value() !== null || value?.() !== null) throw 'object identity'; value.answer = 42; let proxy = new Proxy(value, {}); if (!proxy || typeof proxy !== 'function' || proxy == null || proxy() !== null || proxy.answer !== 42) throw 'proxy inherited flag'; let bound = value.bind(null); if (!bound || typeof bound !== 'function' || bound == null || bound() !== null) throw 'bound inherited flag'; $262.gc(); if (value.answer !== 42 || value() !== null || Boolean(value)) throw 'gc lost object';",
+        ),
+        empty_harness,
+    );
+    testing::assert_eq(results.len(), 2);
+    for result in results {
+        testing::assert_eq(result.status, RunStatus::Passed)
+    }
 }
 
 #[test]

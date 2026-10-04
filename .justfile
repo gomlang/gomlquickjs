@@ -27,7 +27,14 @@ build:
 smoke: build
     bash tools/smoke.sh
 
-ci: fmt-check test smoke
+test-tools:
+    go test tools/compare_test262.go tools/compare_test262_test.go
+
+test262-compare quickjs:
+    systemd-run --user --scope --quiet --slice=gomlquickjs.slice -p MemoryMax=1536M -p MemorySwapMax=1G -p CPUQuota=150% -p TasksMax=128 env GOMAXPROCS=2 GOMEMLIMIT=512MiB "{{goml}}" build --jobs 1
+    systemd-run --user --scope --quiet --slice=gomlquickjs.slice -p MemoryMax=1536M -p MemorySwapMax=1G -p CPUQuota=150% -p TasksMax=128 env GOMAXPROCS=2 GOMEMLIMIT=512MiB go run tools/compare_test262.go --quickjs "{{quickjs}}"
+
+ci: fmt-check test-tools test smoke
 
 clean:
     rm -rf _artifact

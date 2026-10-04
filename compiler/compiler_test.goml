@@ -1738,6 +1738,56 @@ fn runtime_computed_eval_rejects_lexical_conflicts_and_shadows_known_globals() -
 }
 
 #[test]
+fn empty_global_regexp_replacement_stops_and_resets_last_index() -> () {
+    match execute_source_with_builtins(
+        "let pattern = new RegExp(undefined, 'g'); let result = 'asdf'.replace(pattern, '1'); return result === '1a1s1d1f1' && pattern.lastIndex === 0 && ''.replace(pattern, '-') === '-' && '😀'.replace(new RegExp('', 'gu'), '-') === '-😀-';",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected bounded empty RegExp replacement"),
+    }
+}
+
+#[test]
+fn array_callbacks_retain_results_and_removed_values_during_collection() -> () {
+    match execute_source_with_builtins(
+        "let mapped = [1, 2].map(value => { std.gc(); return {value}; }); let filtered = [{value: 3}, {value: 4}].filter((value, index, source) => { source[index] = null; std.gc(); return true; }); return mapped[0].value === 1 && mapped[1].value === 2 && filtered[0].value === 3 && filtered[1].value === 4;",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected rooted Array callback values"),
+    }
+}
+
+#[test]
+fn typed_array_mapping_retains_species_result_during_collection() -> () {
+    match execute_source_with_builtins(
+        "let mapped = new Uint8Array([1, 2]).map(value => { std.gc(); return value + 1; }); let big = new BigInt64Array([3n, 4n]).map(value => { std.gc(); return value + 1n; }); return mapped[0] === 2 && mapped[1] === 3 && big[0] === 4n && big[1] === 5n;",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected rooted TypedArray callback result"),
+    }
+}
+
+#[test]
+fn collection_iterator_intrinsics_survive_without_live_iterators() -> () {
+    match execute_source_with_builtins(
+        "std.gc(); let set = new Set([1, 2]); let map = new Map([[3, 4]]); return [...set.values()].join(',') === '1,2' && [...set.entries()][1][1] === 2 && [...map.keys()][0] === 3 && [...map.values()][0] === 4 && [...map.entries()][0][1] === 4;",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected persistent collection iterator prototypes"),
+    }
+}
+
+#[test]
+fn array_shift_preserves_readonly_elements_and_partial_failure_order() -> () {
+    match execute_source_with_builtins(
+        "let first = Object.defineProperty([10, 20, 30], '0', {writable: false}); let second = Object.defineProperty([10, 20, 30], '1', {writable: false}); let third = Object.preventExtensions([, 1]); let errors = 0; try { first.shift(); } catch(error) { if (error instanceof TypeError) errors++; } try { second.shift(); } catch(error) { if (error instanceof TypeError) errors++; } try { third.shift(); } catch(error) { if (error instanceof TypeError) errors++; } return errors === 3 && first.join(',') === '10,20,30' && second.join(',') === '20,20,30' && !Object.getOwnPropertyDescriptor(second, '1').writable && !(0 in third) && third[1] === 1;",
+    ) {
+        runtime::Value::Bool(value) => testing::assert(value),
+        _ => testing::fail("expected Array shift descriptor semantics"),
+    }
+}
+
+#[test]
 fn dynamic_eval_compilation_periodically_collects_unreachable_objects() -> () {
     let context = script_test_context();
     match execute_script_source(
@@ -5764,6 +5814,16 @@ fn aggregate_error_collects_iterables_and_accepts_proxy_new_targets() -> () {
     expect_bool(
         execute_source_with_builtins(
             "let order = ''; let errors = {[Symbol.iterator]() { order += 'iterator,'; let index = 0; return {next() { order += 'next,'; index += 1; return index <= 2 ? {value: index, done: false} : {done: true}; }}; }}; let message = {toString() { order += 'message,'; return 'many'; }}; let custom = {}; let NewTarget = new Proxy(function() {}, {get(target, key) { return key === 'prototype' ? custom : target[key]; }}); let result = Reflect.construct(AggregateError, [errors, message], NewTarget); let revoked = Proxy.revocable(function() {}, {}); revoked.revoke(); let revokedFailed = false; try { Reflect.construct(Error, [], revoked.proxy); } catch (error) { revokedFailed = error instanceof TypeError; } return Object.getPrototypeOf(result) === custom && result.message === 'many' && result.errors.join(',') === '1,2' && order === 'message,iterator,next,next,next,' && revokedFailed;",
+        ),
+        true,
+    )
+}
+
+#[test]
+fn proxy_define_property_receives_normalized_partial_descriptors() -> () {
+    expect_bool(
+        execute_source_with_builtins(
+            "let reads = 0; let calls = 0; let attributes = { get configurable() { reads++; return 17; }, enumerable: undefined, value: null }; let proxy = new Proxy({}, { defineProperty(target, key, descriptor) { calls++; if (descriptor === attributes || Object.getPrototypeOf(descriptor) !== Object.prototype || descriptor.configurable !== true || descriptor.enumerable !== false || descriptor.value !== null || Object.hasOwn(descriptor, 'writable') || Object.hasOwn(descriptor, 'get') || Object.hasOwn(descriptor, 'set')) throw 'wrong descriptor'; return true; } }); Reflect.defineProperty(proxy, 'first', attributes); Object.defineProperty(proxy, 'second', attributes); Object.defineProperties(proxy, {third: attributes}); let writable; Reflect.defineProperty(new Proxy({}, {defineProperty(target, key, descriptor) { writable = descriptor.writable; return true; }}), 'fourth', {writable: 'yes'}); return reads === 3 && calls === 3 && writable === true;",
         ),
         true,
     )
