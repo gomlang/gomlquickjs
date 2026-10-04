@@ -95,8 +95,7 @@ fn variant_source(case: TestCase, variant: SourceVariant) -> string {
 }
 
 fn unsupported_feature(feature: string) -> bool {
-    feature == "Array.fromAsync" || feature == "Atomics.waitAsync" || feature == "IsHTMLDDA"
-        || feature == "ShadowRealm"
+    feature == "Array.fromAsync" || feature == "Atomics.waitAsync" || feature == "ShadowRealm"
         || feature == "WebAssembly"
         || feature == "arbitrary-module-namespace-names"
         || feature == "await-dictionary"
@@ -107,7 +106,6 @@ fn unsupported_feature(feature: string) -> bool {
         || feature == "error-stack-accessor"
         || feature == "explicit-resource-management"
         || feature == "export-defer"
-        || feature == "host-gc-required"
         || feature == "immutable-arraybuffer"
         || feature == "import-bytes"
         || feature == "import-defer"
@@ -425,6 +423,25 @@ fn install_test262_host(
         Ok(Some(value)) => value,
         _ => return Result::Err("cannot find evalScript host function"),
     };
+    let collect_garbage = match runtime::get_property(
+        heap,
+        std_object,
+        runtime::string_property_key("gc"),
+    ) {
+        Ok(Some(value)) => value,
+        _ => return Result::Err("cannot find gc host function"),
+    };
+    let html_dda = match context.new_html_dda_function(
+        |heap, this_value, arguments| {
+            let _ = heap;
+            let _ = this_value;
+            let _ = arguments;
+            Result::Ok(runtime::Value::Null)
+        },
+    ) {
+        Ok(value) => value,
+        Err(value) => return Result::Err(value.kind.debug()),
+    };
     let host = match runtime::new_ordinary_object(heap, heap.object_prototype()) {
         Ok(value) => value,
         Err(value) => return Result::Err(value.message),
@@ -458,6 +475,18 @@ fn install_test262_host(
         runtime::string_property_key("evalScript"),
         runtime::data_descriptor(eval_script, true, true, true),
     )
+        || !runtime::define_own_property(
+            heap,
+            host,
+            runtime::string_property_key("gc"),
+            runtime::data_descriptor(collect_garbage, true, true, true),
+        )
+        || !runtime::define_own_property(
+            heap,
+            host,
+            runtime::string_property_key("IsHTMLDDA"),
+            runtime::data_descriptor(html_dda, true, true, true),
+        )
         || !runtime::define_own_property(
             heap,
             host,

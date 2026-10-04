@@ -3703,7 +3703,16 @@ fn parsed_descriptor_from_object_at_depth(
                 key_value,
                 depth,
             )?;
-            fields.push((name, value))
+            fields.push(
+                (
+                    name,
+                    if name == "enumerable" || name == "configurable" || name == "writable" {
+                        runtime::Value::Bool(runtime::to_boolean(value))
+                    } else {
+                        value
+                    },
+                ),
+            )
         }
     }
     for name in Vec::from_array(["value", "writable", "get", "set", "enumerable", "configurable"]) {
@@ -3720,12 +3729,21 @@ fn parsed_descriptor_from_object_at_depth(
         }
     }
     match descriptor_from_object(context.heap(), snapshot, current) {
-        Ok(value) => Result::Ok(
-            ParsedPropertyDescriptor {
-                descriptor: value,
-                trap_value: runtime::Value::Object(snapshot),
-            },
-        ),
+        Ok(value) => {
+            if !runtime::set_prototype_of(
+                context.heap(),
+                snapshot,
+                context.heap().object_prototype(),
+            ) {
+                return Result::Err(reflect_type_error("cannot set property descriptor prototype"))
+            }
+            Result::Ok(
+                ParsedPropertyDescriptor {
+                    descriptor: value,
+                    trap_value: runtime::Value::Object(snapshot),
+                },
+            )
+        },
         Err(value) => Result::Err(function_native_error(value)),
     }
 }

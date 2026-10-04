@@ -136,6 +136,7 @@ custom `newTarget` inheritance, and Iterator-prototype generator helpers,
 catchable Error subtype objects with preserved explicit throw values and Error.isError branding,
 revocable Proxy objects with all thirteen fundamental traps, target invariants, lazy for-in enumeration,
 and the primary Reflect and Object ownership, descriptor, prototype, extensibility, and key-enumeration paths,
+including normalized partial descriptors with ordinary object prototypes passed to `defineProperty` traps,
 RegExp with literal escaping, UTC Date helpers, Map/Set,
 Promise and RegExp species metadata, ArrayBuffer/SharedArrayBuffer/DataView, single-agent Atomics load/store/read-modify-write/notify/pause operations and nonblocking host rejection for wait, the complete Number-backed typed-array family, and BigInt64Array/BigUint64Array, with live integer-indexed exotic properties,
 canonical numeric index handling, buffer aliasing, detachment, reflective descriptors, iterable and
@@ -216,6 +217,10 @@ yet provide a wall-clock timeout for indefinitely pending async tests. Harness `
 declarations persist through the global object, while top-level harness `let`, `const`, and `class`
 declarations persist through the realm's global lexical environment and are visible to subsequent
 scripts and modules.
+The runner exposes `$262.gc()` through the existing collector and executes `host-gc-required`
+tests. Its callable `$262.IsHTMLDDA` object implements Annex B boolean, `typeof`, and loose-equality
+semantics while preserving ordinary object identity, property access, and nullish operations.
+Proxy wrappers and bound functions do not inherit the special coercions.
 
 The VM stores uncaptured locals in contiguous value slots. Capturing a local,
 including through mapped arguments or eval, promotes it to a shared cell;
@@ -236,6 +241,9 @@ participate in heap tracing. Ordinary objects allocate their specialized state
 only when needed. The interpreter fuses eligible adjacent local loads and numeric
 operations without rewriting bytecode offsets; operations requiring coercion
 resume at the original arithmetic instruction.
+Array and TypedArray callback results and retained Array elements remain rooted
+while callbacks can collect garbage. Map and Set iterator prototypes remain
+rooted even when no iterator instances are alive.
 
 ## Build and test
 
@@ -274,6 +282,32 @@ toolchains and generated outputs stay under `_artifact/`.
 The port was extracted from the `gomlquickjs/` directory of
 [`gomlang/goml`](https://github.com/gomlang/goml), preserving its Git history.
 Its independent home is [`gomlang/gomlquickjs`](https://github.com/gomlang/gomlquickjs).
+
+Compare Test262 against the C implementation with a QuickJS checkout at the
+commit in `UPSTREAM.toml`. Build its `run-test262` executable and install the
+Test262 revision and harness patch specified by its Makefile, then run:
+
+```sh
+just test262-compare /path/to/quickjs
+```
+
+This optional recipe requires a systemd user manager. Each build or comparison
+runs in a resource-limited scope with 1.5 GiB of memory, 1 GiB of swap, and
+1.5 CPUs, using one GoML runner process. Both implementations use the same
+Test262 checkout, harness, and `America/Los_Angeles` timezone. The C runner uses
+its upstream exclusions and feature settings and runs both strict and sloppy
+variants where applicable. Known C failures remain failures in the report.
+The comparison checks runner completion, keeps raw logs and checkout patches,
+and writes revisions, variant counts, and a file-by-file status matrix to
+`_artifact/test262-compare-*/summary.json`. Files that C passes but GoML skips
+are listed separately as coverage gaps; passing all executed GoML tests does
+not imply full C QuickJS coverage. C failures that GoML passes are also listed
+separately. The ordinary `just ci` workflow tests the comparison tool but does
+not download or run the full external Test262 suite.
+
+For custom output paths, batch timeouts, or a failure exit status on coverage
+gaps, run `go run tools/compare_test262.go --help` and use `--require-coverage`
+for the latter. Keep these full runs inside equivalent systemd resource limits.
 
 Regenerate `unicode/string_data.goml` from `libunicode-table.h` at the QuickJS
 commit pinned in `UPSTREAM.toml`, then format and test the module:

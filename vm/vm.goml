@@ -1964,7 +1964,17 @@ impl Context {
             NativeError,
         ],
     ) -> Result[runtime::Value, VmError] {
-        self.new_native_function_with_arguments(callback, false)
+        self.new_native_function_with_arguments(callback, false, false)
+    }
+
+    pub fn new_html_dda_function(
+        self: Context,
+        callback: (runtime::Heap, runtime::Value, Vec[runtime::Value]) -> Result[
+            runtime::Value,
+            NativeError,
+        ],
+    ) -> Result[runtime::Value, VmError] {
+        self.new_native_function_with_arguments(callback, false, true)
     }
 
     pub fn new_builtin_function(
@@ -1974,7 +1984,7 @@ impl Context {
             NativeError,
         ],
     ) -> Result[runtime::Value, VmError] {
-        self.new_native_function_with_arguments(callback, true)
+        self.new_native_function_with_arguments(callback, true, false)
     }
 
     fn new_native_function_with_arguments(
@@ -1984,15 +1994,18 @@ impl Context {
             NativeError,
         ],
         reusable_arguments: bool,
+        html_dda: bool,
     ) -> Result[runtime::Value, VmError] {
-        match runtime::new_object(
-            self.heap_value,
-            runtime::ObjectKind::Function,
-            match self.heap_value.function_prototype() {
-                Some(value) => Option::Some(value),
-                None => self.heap_value.object_prototype(),
-            },
-        ) {
+        let prototype = match self.heap_value.function_prototype() {
+            Some(value) => Option::Some(value),
+            None => self.heap_value.object_prototype(),
+        };
+        let allocated = if html_dda {
+            self.heap_value.allocate_html_dda(prototype)
+        } else {
+            runtime::new_object(self.heap_value, runtime::ObjectKind::Function, prototype)
+        };
+        match allocated {
             Ok(object) => {
                 self.native_functions_value[object] = NativeFunction {
                     callback,
@@ -7362,6 +7375,13 @@ fn abstract_equal(machine: Machine, offset: isize, left: runtime::Value, right: 
     VmError,
 ] {
     match (left, right) {
+        (runtime::Value::Object(value), runtime::Value::Undefined) | (
+            runtime::Value::Object(value),
+            runtime::Value::Null,
+        ) | (runtime::Value::Undefined, runtime::Value::Object(value)) | (
+            runtime::Value::Null,
+            runtime::Value::Object(value),
+        ) => Result::Ok(value.is_html_dda()),
         (runtime::Value::Undefined, runtime::Value::Null) | (
             runtime::Value::Null,
             runtime::Value::Undefined,

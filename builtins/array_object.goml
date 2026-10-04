@@ -1525,101 +1525,114 @@ fn array_iterate_with_length(
     let callback = array_iteration_callback(arguments)?;
     let callback_this = argument(arguments, 1);
     let output = array_iteration_result_array(context, mode, object, length, depth)?;
-    let reverse = array_iteration_reverse(mode);
-    let mut output_index = 0;
-    let mut index = if reverse {
-        length - 1
-    } else {
-        0
-    };
-    while if reverse {
-        index >= 0
-    } else {
-        index < length
-    } {
-        let present = if dense {
-            true
-        } else {
-            array_property_present(context, object, index, depth)?
-        };
-        if present || array_iteration_visits_holes(mode) {
-            let value = array_copy_read(context, object, index, depth)?;
-            let selected = context.invoke_with_this_at_depth(
-                callback,
-                Vec::from_array([value, array_length_value(index), object]),
-                callback_this,
-                depth,
-            )?;
-            match mode {
-                ArrayIterationMode::ForEach => (),
-                ArrayIterationMode::Map => match output {
-                    Some(result) => {
-                        context.create_data_property_at_depth(
-                            result,
-                            array_length_value(index),
-                            selected,
-                            depth,
-                        )?
-                    },
-                    None => return Result::Err(function_vm_error("mapped Array is unavailable")),
-                },
-                ArrayIterationMode::Filter => if runtime::to_boolean(selected) {
-                    match output {
-                        Some(result) => {
-                            context.create_data_property_at_depth(
-                                result,
-                                array_length_value(output_index),
-                                value,
-                                depth,
-                            )?;
-                            output_index += 1;
+    let current_root = Ref::new(runtime::Value::Undefined);
+    context.add_external_root(current_root);
+    let result = array_from_with_root(
+        context,
+        output.unwrap_or(runtime::Value::Undefined),
+        || {
+            let reverse = array_iteration_reverse(mode);
+            let mut output_index = 0;
+            let mut index = if reverse {
+                length - 1
+            } else {
+                0
+            };
+            while if reverse {
+                index >= 0
+            } else {
+                index < length
+            } {
+                let present = if dense {
+                    true
+                } else {
+                    array_property_present(context, object, index, depth)?
+                };
+                if present || array_iteration_visits_holes(mode) {
+                    let value = array_copy_read(context, object, index, depth)?;
+                    current_root.set(value);
+                    let selected = context.invoke_with_this_at_depth(
+                        callback,
+                        Vec::from_array([value, array_length_value(index), object]),
+                        callback_this,
+                        depth,
+                    )?;
+                    match mode {
+                        ArrayIterationMode::ForEach => (),
+                        ArrayIterationMode::Map => match output {
+                            Some(result) => {
+                                context.create_data_property_at_depth(
+                                    result,
+                                    array_length_value(index),
+                                    selected,
+                                    depth,
+                                )?
+                            },
+                            None => return Result::Err(
+                                function_vm_error("mapped Array is unavailable"),
+                            ),
                         },
-                        None => return Result::Err(
-                            function_vm_error("filtered Array is unavailable"),
-                        ),
+                        ArrayIterationMode::Filter => if runtime::to_boolean(selected) {
+                            match output {
+                                Some(result) => {
+                                    context.create_data_property_at_depth(
+                                        result,
+                                        array_length_value(output_index),
+                                        value,
+                                        depth,
+                                    )?;
+                                    output_index += 1;
+                                },
+                                None => return Result::Err(
+                                    function_vm_error("filtered Array is unavailable"),
+                                ),
+                            }
+                        },
+                        ArrayIterationMode::Every => if !runtime::to_boolean(selected) {
+                            return Result::Ok(runtime::Value::Bool(false))
+                        },
+                        ArrayIterationMode::Some => if runtime::to_boolean(selected) {
+                            return Result::Ok(runtime::Value::Bool(true))
+                        },
+                        ArrayIterationMode::Find => if runtime::to_boolean(selected) {
+                            return Result::Ok(value)
+                        },
+                        ArrayIterationMode::FindIndex => if runtime::to_boolean(selected) {
+                            return Result::Ok(array_length_value(index))
+                        },
+                        ArrayIterationMode::FindLast => if runtime::to_boolean(selected) {
+                            return Result::Ok(value)
+                        },
+                        ArrayIterationMode::FindLastIndex => if runtime::to_boolean(selected) {
+                            return Result::Ok(array_length_value(index))
+                        },
                     }
-                },
-                ArrayIterationMode::Every => if !runtime::to_boolean(selected) {
-                    return Result::Ok(runtime::Value::Bool(false))
-                },
-                ArrayIterationMode::Some => if runtime::to_boolean(selected) {
-                    return Result::Ok(runtime::Value::Bool(true))
-                },
-                ArrayIterationMode::Find => if runtime::to_boolean(selected) {
-                    return Result::Ok(value)
-                },
-                ArrayIterationMode::FindIndex => if runtime::to_boolean(selected) {
-                    return Result::Ok(array_length_value(index))
-                },
-                ArrayIterationMode::FindLast => if runtime::to_boolean(selected) {
-                    return Result::Ok(value)
-                },
-                ArrayIterationMode::FindLastIndex => if runtime::to_boolean(selected) {
-                    return Result::Ok(array_length_value(index))
-                },
+                }
+                if reverse {
+                    index -= 1;
+                } else {
+                    index += 1;
+                }
             }
-        }
-        if reverse {
-            index -= 1;
-        } else {
-            index += 1;
-        }
-    }
-    match mode {
-        ArrayIterationMode::Map | ArrayIterationMode::Filter => match output {
-            Some(value) => Result::Ok(value),
-            None => Result::Err(function_vm_error("Array iteration result is unavailable")),
+            match mode {
+                ArrayIterationMode::Map | ArrayIterationMode::Filter => match output {
+                    Some(value) => Result::Ok(value),
+                    None => Result::Err(function_vm_error("Array iteration result is unavailable")),
+                },
+                ArrayIterationMode::Every => Result::Ok(runtime::Value::Bool(true)),
+                ArrayIterationMode::Some => Result::Ok(runtime::Value::Bool(false)),
+                ArrayIterationMode::Find | ArrayIterationMode::FindLast => {
+                    Result::Ok(runtime::Value::Undefined)
+                },
+                ArrayIterationMode::FindIndex | ArrayIterationMode::FindLastIndex => {
+                    Result::Ok(runtime::Value::Int(-1))
+                },
+                ArrayIterationMode::ForEach => Result::Ok(runtime::Value::Undefined),
+            }
         },
-        ArrayIterationMode::Every => Result::Ok(runtime::Value::Bool(true)),
-        ArrayIterationMode::Some => Result::Ok(runtime::Value::Bool(false)),
-        ArrayIterationMode::Find | ArrayIterationMode::FindLast => {
-            Result::Ok(runtime::Value::Undefined)
-        },
-        ArrayIterationMode::FindIndex | ArrayIterationMode::FindLastIndex => {
-            Result::Ok(runtime::Value::Int(-1))
-        },
-        ArrayIterationMode::ForEach => Result::Ok(runtime::Value::Undefined),
-    }
+    );
+    let _ = context.remove_external_root(current_root);
+    result
 }
 
 fn array_reduce(

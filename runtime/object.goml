@@ -321,6 +321,7 @@ pub struct ObjectId {
     slot_value: isize,
     generation_value: u64,
     callable_value: bool,
+    html_dda_value: bool,
 }
 
 impl ObjectId {
@@ -334,6 +335,10 @@ impl ObjectId {
 
     pub fn is_callable(self: ObjectId) -> bool {
         self.callable_value
+    }
+
+    pub fn is_html_dda(self: ObjectId) -> bool {
+        self.html_dda_value
     }
 }
 
@@ -1696,23 +1701,24 @@ impl Heap {
         next
     }
 
-    fn make_id(self: Heap, slot: isize, generation: u64, callable: bool) -> ObjectId {
+    fn make_id(self: Heap, slot: isize, generation: u64, callable: bool, html_dda: bool) -> ObjectId {
         ObjectId {
             heap_identity_value: self.identity_value,
             slot_value: slot,
             generation_value: generation,
             callable_value: callable,
+            html_dda_value: html_dda,
         }
     }
 
-    fn append(self: Heap, object: Object, callable: bool) -> ObjectId {
+    fn append(self: Heap, object: Object, callable: bool, html_dda: bool) -> ObjectId {
         let slot = self.slots_value.len();
         self.slots_value.push(HeapSlot::Occupied { generation: 0, object });
         self.live_count_value.set(self.live_count_value.get() + 1);
-        self.make_id(slot, 0, callable)
+        self.make_id(slot, 0, callable, html_dda)
     }
 
-    fn allocate_validated(self: Heap, kind: ObjectKind, prototype: Option[ObjectId]) -> ObjectId {
+    fn allocate_validated(self: Heap, kind: ObjectKind, prototype: Option[ObjectId], html_dda: bool) -> ObjectId {
         let callable = object_is_callable(kind);
         let object = make_object(kind, prototype);
         match self.free_head_value.get() {
@@ -1722,18 +1728,18 @@ impl Heap {
                         self.slots_value.set(slot, HeapSlot::Occupied { generation, object });
                         self.free_head_value.set(next);
                         self.live_count_value.set(self.live_count_value.get() + 1);
-                        self.make_id(slot, generation, callable)
+                        self.make_id(slot, generation, callable, html_dda)
                     },
                     HeapSlot::Occupied { .. } => {
                         self.free_head_value.set(Option::None);
-                        self.append(object, callable)
+                        self.append(object, callable, html_dda)
                     },
                 }
             } else {
                 self.free_head_value.set(Option::None);
-                self.append(object, callable)
+                self.append(object, callable, html_dda)
             },
-            None => self.append(object, callable),
+            None => self.append(object, callable, html_dda),
         }
     }
 
@@ -1741,13 +1747,26 @@ impl Heap {
         ObjectId,
         TypeError,
     ] {
+        self.allocate_with_html_dda(kind, prototype, false)
+    }
+
+    pub fn allocate_html_dda(self: Heap, prototype: Option[ObjectId]) -> Result[ObjectId, TypeError] {
+        self.allocate_with_html_dda(ObjectKind::Function, prototype, true)
+    }
+
+    fn allocate_with_html_dda(
+        self: Heap,
+        kind: ObjectKind,
+        prototype: Option[ObjectId],
+        html_dda: bool,
+    ) -> Result[ObjectId, TypeError] {
         match prototype {
             Some(value) => if self.contains(value) {
-                Result::Ok(self.allocate_validated(kind, Option::Some(value)))
+                Result::Ok(self.allocate_validated(kind, Option::Some(value), html_dda))
             } else {
                 Result::Err(TypeError { message: "prototype does not belong to this heap" })
             },
-            None => Result::Ok(self.allocate_validated(kind, Option::None)),
+            None => Result::Ok(self.allocate_validated(kind, Option::None, html_dda)),
         }
     }
 
@@ -3723,7 +3742,7 @@ pub fn try_fast_array_shift(heap: Heap, object: ObjectId) -> Option[Value] {
         Some(value) => value,
         None => return Option::None,
     };
-    if !fast_array_object(target) {
+    if !fast_array_object(target) || !target.extensible() {
         return Option::None
     }
     let length_state = match target.state_value.get().array_length_value.get() {
@@ -3740,6 +3759,15 @@ pub fn try_fast_array_shift(heap: Heap, object: ObjectId) -> Option[Value] {
     }
     let mut index: u32 = 0;
     while index < length.to_u32() {
+        match array_index_descriptor(target, index) {
+            Some(PropertyDescriptor::Data {
+                writable: true,
+                enumerable: true,
+                configurable: true,
+                ..,
+            }) | None => (),
+            _ => return Option::None,
+        }
         match fast_array_slot(target, index) {
             FastArraySlot::Data(_) => (),
             FastArraySlot::Observable => return Option::None,

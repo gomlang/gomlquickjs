@@ -5522,35 +5522,47 @@ fn typed_array_map_filter(
     } else {
         typed_array_species_create(context, source, constructor, length, depth)?
     };
-    let mut index = 0;
-    while index < length {
-        let value = array_copy_read(context, source, index, depth)?;
-        let mapped = context.invoke_with_this_at_depth(
-            callback,
-            Vec::from_array([value, runtime::Value::Int(index.to_i32()), source]),
-            callback_this,
-            depth,
-        )?;
-        if filter {
-            if runtime::to_boolean(mapped) {
-                values.push(value)
+    array_from_with_root(
+        context,
+        target,
+        || {
+            let mut index = 0;
+            while index < length {
+                let value = array_copy_read(context, source, index, depth)?;
+                let mapped = context.invoke_with_this_at_depth(
+                    callback,
+                    Vec::from_array([value, runtime::Value::Int(index.to_i32()), source]),
+                    callback_this,
+                    depth,
+                )?;
+                if filter {
+                    if runtime::to_boolean(mapped) {
+                        values.push(value)
+                    }
+                } else {
+                    array_set_value(context, target, index, mapped, depth)?
+                }
+                index += 1;
             }
-        } else {
-            array_set_value(context, target, index, mapped, depth)?
-        }
-        index += 1;
-    }
-    if filter {
-        let result = typed_array_species_create(context, source, constructor, values.len(), depth)?;
-        index = 0;
-        while index < values.len() {
-            array_set_value(context, result, index, values[index], depth)?;
-            index += 1;
-        }
-        Result::Ok(result)
-    } else {
-        Result::Ok(target)
-    }
+            if filter {
+                let result = typed_array_species_create(
+                    context,
+                    source,
+                    constructor,
+                    values.len(),
+                    depth,
+                )?;
+                index = 0;
+                while index < values.len() {
+                    array_set_value(context, result, index, values[index], depth)?;
+                    index += 1;
+                }
+                Result::Ok(result)
+            } else {
+                Result::Ok(target)
+            }
+        },
+    )
 }
 
 fn typed_array_slice(
