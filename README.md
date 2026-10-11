@@ -250,7 +250,7 @@ rooted even when no iterator instances are alive.
 This repository builds independently of the GoML compiler repository. Use
 Linux amd64, Go 1.26 or newer on `PATH`, Bash, curl, tar, sha256sum, and `just`.
 The released GoML version and archive checksum are pinned in
-`toolchain/goml.env` (currently GoML 0.1.57). Sources use `.goml`.
+`toolchain/goml.env` (currently GoML 0.1.59). Sources use `.goml`.
 
 Install the toolchain and run the full local CI checks:
 
