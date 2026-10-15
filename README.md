@@ -190,6 +190,9 @@ objects tagged as `Module`. The upstream cyclic-import fixture executes
 without the native implementation's documented resolution crash workaround.
 
 This is an active compatibility port, not yet a complete QuickJS replacement.
+Transcendental Math results can differ in their last binary64 bit from the
+platform math library used by C QuickJS. Precision regressions use explicit
+error bounds around independently computed reference values.
 General native binary module loading, externally delivered host signals, process-wide directory mutation for module resolution,
 dynamic `TZ` changes after realm creation and Intl locale-sensitive Date options,
 locale-sensitive formatting and the remaining regular-expression syntax remain under
@@ -250,7 +253,7 @@ rooted even when no iterator instances are alive.
 This repository builds independently of the GoML compiler repository. Use
 Linux amd64, Go 1.26 or newer on `PATH`, Bash, curl, tar, sha256sum, and `just`.
 The released GoML version and archive checksum are pinned in
-`toolchain/goml.env` (currently GoML 0.1.59). Sources use `.goml`.
+`toolchain/goml.env` (currently GoML 0.1.60). Sources use `.goml`.
 
 Install the toolchain and run the full local CI checks:
 
